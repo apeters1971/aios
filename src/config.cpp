@@ -1,0 +1,120 @@
+#include "config.hpp"
+
+#include "node_id.hpp"
+
+#include <yaml-cpp/yaml.h>
+
+#include <string>
+
+namespace aios {
+
+bool split_host_port(const std::string& addr, std::string& host, std::string& port) {
+  const auto pos = addr.rfind(':');
+  if (pos == std::string::npos || pos == 0 || pos + 1 >= addr.size()) {
+    return false;
+  }
+  host = addr.substr(0, pos);
+  port = addr.substr(pos + 1);
+  return !host.empty() && !port.empty();
+}
+
+bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
+  try {
+    YAML::Node root = YAML::LoadFile(path);
+    if (!root || !root.IsMap()) {
+      err = "config root must be a mapping";
+      return false;
+    }
+    if (root["node_id"]) cfg.node_id = root["node_id"].as<std::string>();
+    if (root["listen"]) cfg.listen = root["listen"].as<std::string>();
+    if (root["gossip_interval_ms"])
+      cfg.gossip_interval_ms = root["gossip_interval_ms"].as<int>();
+    if (root["suspect_after_ms"])
+      cfg.suspect_after_ms = root["suspect_after_ms"].as<int>();
+    if (root["dead_after_ms"]) cfg.dead_after_ms = root["dead_after_ms"].as<int>();
+    if (root["scan_interval_ms"])
+      cfg.scan_interval_ms = root["scan_interval_ms"].as<int>();
+    if (root["status_file"]) cfg.status_file = root["status_file"].as<std::string>();
+    if (root["cluster_key"]) cfg.cluster_key = root["cluster_key"].as<std::string>();
+    if (root["auth_skew_ms"]) cfg.auth_skew_ms = root["auth_skew_ms"].as<int>();
+    if (root["peers"]) {
+      cfg.peers.clear();
+      for (const auto& p : root["peers"]) {
+        cfg.peers.push_back(p.as<std::string>());
+      }
+    }
+  } catch (const std::exception& e) {
+    err = e.what();
+    return false;
+  }
+  return true;
+}
+
+bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help) {
+  help = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    auto need = [&](const char* name) -> const char* {
+      if (i + 1 >= argc) {
+        err = std::string("missing value for ") + name;
+        return nullptr;
+      }
+      return argv[++i];
+    };
+    if (arg == "--help" || arg == "-h") {
+      help = true;
+      continue;
+    }
+    if (arg == "--config" || arg == "-c") {
+      const char* v = need("--config");
+      if (!v) return false;
+      if (!load_config_file(v, cfg, err)) return false;
+      continue;
+    }
+    if (arg == "--listen") {
+      const char* v = need("--listen");
+      if (!v) return false;
+      cfg.listen = v;
+      continue;
+    }
+    if (arg == "--peer") {
+      const char* v = need("--peer");
+      if (!v) return false;
+      cfg.peers.emplace_back(v);
+      continue;
+    }
+    if (arg == "--node-id") {
+      const char* v = need("--node-id");
+      if (!v) return false;
+      cfg.node_id = v;
+      continue;
+    }
+    if (arg == "--status-file") {
+      const char* v = need("--status-file");
+      if (!v) return false;
+      cfg.status_file = v;
+      continue;
+    }
+    if (arg == "--cluster-key") {
+      const char* v = need("--cluster-key");
+      if (!v) return false;
+      cfg.cluster_key = v;
+      continue;
+    }
+    err = "unknown argument: " + arg;
+    return false;
+  }
+  if (help) {
+    return true;
+  }
+  if (cfg.node_id.empty()) {
+    cfg.node_id = default_hostname();
+  }
+  if (cfg.cluster_key.empty()) {
+    err = "cluster_key is required (--cluster-key or config cluster_key)";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace aios

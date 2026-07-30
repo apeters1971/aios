@@ -1,0 +1,14 @@
+# AIOS daemon example configuration
+node_id: "node-a"          # stable string; default = hostname
+listen: "0.0.0.0:7400"
+# Shared cluster secret (UUID recommended). Required.
+cluster_key: "550e8400-e29b-41d4-a716-446655440000"
+# auth_skew_ms: 60000      # max |now-ts| for signed messages
+peers:                     # none / one / several; may be empty (first node)
+  - "host2:7400"
+  - "host3:7400"
+gossip_interval_ms: 1000
+suspect_after_ms: 5000
+dead_after_ms: 15000
+scan_interval_ms: 5000
+# status_file: "/tmp/aios-status.json"

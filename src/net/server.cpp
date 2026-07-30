@@ -1,0 +1,143 @@
+#include "net/server.hpp"
+
+#include "util/auth.hpp"
+#include "util/log.hpp"
+
+#include <arpa/inet.h>
+
+#include <array>
+#include <cstring>
+#include <vector>
+
+namespace aios {
+
+bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
+                boost::system::error_code& ec) {
+  std::array<std::uint8_t, kHeaderSize> header{};
+  boost::asio::read(sock, boost::asio::buffer(header), ec);
+  if (ec) {
+    err = ec.message();
+    return false;
+  }
+  if (std::memcmp(header.data(), kMagic, 4) != 0) {
+    err = "bad magic";
+    return false;
+  }
+  std::uint32_t len_be = 0;
+  std::memcpy(&len_be, header.data() + 8, 4);
+  const std::uint32_t body_len = ntohl(len_be);
+  if (body_len > kMaxBodySize) {
+    err = "body too large";
+    return false;
+  }
+  std::vector<std::uint8_t> buf(kHeaderSize + body_len);
+  std::memcpy(buf.data(), header.data(), kHeaderSize);
+  if (body_len > 0) {
+    boost::asio::read(sock, boost::asio::buffer(buf.data() + kHeaderSize, body_len),
+                      ec);
+    if (ec) {
+      err = ec.message();
+      return false;
+    }
+  }
+  std::size_t consumed = 0;
+  return decode_frame(buf.data(), buf.size(), out, consumed, err);
+}
+
+bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
+                 boost::system::error_code& ec) {
+  try {
+    auto bytes = encode_frame(frame);
+    boost::asio::write(sock, boost::asio::buffer(bytes), ec);
+    if (ec) {
+      err = ec.message();
+      return false;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    err = e.what();
+    return false;
+  }
+}
+
+TcpServer::TcpServer(boost::asio::io_context& ioc, const std::string& listen_host,
+                     const std::string& listen_port, GossipHandlers handlers)
+    : ioc_(ioc),
+      acceptor_(ioc),
+      handlers_(std::move(handlers)) {
+  tcp::resolver resolver(ioc_);
+  const auto endpoints = resolver.resolve(listen_host, listen_port);
+  const tcp::endpoint ep = *endpoints.begin();
+  acceptor_.open(ep.protocol());
+  acceptor_.set_option(tcp::acceptor::reuse_address(true));
+  acceptor_.bind(ep);
+  acceptor_.listen();
+  AIOS_LOG_INFO("listening on ", ep.address().to_string(), ":", ep.port());
+}
+
+void TcpServer::start() { do_accept(); }
+
+void TcpServer::do_accept() {
+  auto sock = std::make_shared<tcp::socket>(ioc_);
+  acceptor_.async_accept(*sock, [this, sock](boost::system::error_code ec) {
+    if (!ec) {
+      boost::asio::post(ioc_, [this, sock] { handle_session(sock); });
+    } else {
+      AIOS_LOG_WARN("accept error: ", ec.message());
+    }
+    do_accept();
+  });
+}
+
+void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
+  boost::system::error_code ec;
+  std::string err;
+
+  Frame hello;
+  if (!read_frame(*sock, hello, err, ec) || hello.type != MsgType::Hello) {
+    AIOS_LOG_DEBUG("inbound hello failed: ", err);
+    return;
+  }
+  if (!auth_verify(hello.body, MsgType::Hello, handlers_.cluster_key,
+                   handlers_.auth_skew_ms, err)) {
+    AIOS_LOG_WARN("reject hello auth: ", err);
+    return;
+  }
+  const std::string peer_id = hello.body.value("node_id", "");
+  const std::string peer_listen = hello.body.value("listen", "");
+
+  Frame hello_reply;
+  hello_reply.type = MsgType::Hello;
+  hello_reply.body = {
+      {"node_id", handlers_.local_node_id},
+      {"listen", handlers_.local_listen},
+  };
+  auth_sign(hello_reply.body, MsgType::Hello, handlers_.cluster_key);
+  if (!write_frame(*sock, hello_reply, err, ec)) return;
+
+  Frame req;
+  if (!read_frame(*sock, req, err, ec)) {
+    AIOS_LOG_DEBUG("inbound request read failed: ", err);
+    return;
+  }
+  if (req.type == MsgType::Ping) {
+    Frame pong;
+    pong.type = MsgType::Pong;
+    write_frame(*sock, pong, err, ec);
+    return;
+  }
+  if (req.type != MsgType::Gossip || !handlers_.on_gossip) return;
+
+  if (!auth_verify(req.body, MsgType::Gossip, handlers_.cluster_key,
+                   handlers_.auth_skew_ms, err)) {
+    AIOS_LOG_WARN("reject gossip auth from ", peer_id, ": ", err);
+    return;
+  }
+
+  auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, req);
+  if (!gossip_reply) return;
+  auth_sign(gossip_reply->body, MsgType::Gossip, handlers_.cluster_key);
+  write_frame(*sock, *gossip_reply, err, ec);
+}
+
+}  // namespace aios

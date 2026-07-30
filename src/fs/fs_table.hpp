@@ -1,0 +1,52 @@
+#pragma once
+
+#include "fs/aios_scan.hpp"
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+namespace aios {
+
+struct FsEntry {
+  std::string node_id;
+  std::string mount;
+  std::string target_path;
+  std::string aios_path;
+  std::uint64_t bsize{0};
+  std::uint64_t blocks{0};
+  std::uint64_t bfree{0};
+  std::uint64_t bavail{0};
+  std::uint64_t files{0};
+  std::uint64_t ffree{0};
+  bool usable{false};
+  std::int64_t updated_ms{0};
+};
+
+class FsTable {
+ public:
+  // Replace all local-origin entries with scan results.
+  void set_local(const std::string& node_id, const std::vector<AiosTarget>& targets);
+
+  void merge(const std::vector<FsEntry>& remote);
+
+  std::vector<FsEntry> snapshot() const;
+
+  nlohmann::json to_json() const;
+  static std::vector<FsEntry> from_json(const nlohmann::json& j);
+
+ private:
+  static std::string key_of(const FsEntry& e) {
+    return e.node_id + "\n" + e.aios_path;
+  }
+
+  mutable std::mutex mu_;
+  std::string local_id_;
+  std::unordered_map<std::string, FsEntry> entries_;
+};
+
+}  // namespace aios
