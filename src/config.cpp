@@ -46,6 +46,8 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["http_listen"]) cfg.http_listen = root["http_listen"].as<std::string>();
     if (root["http_body_sync"])
       cfg.http_body_sync = root["http_body_sync"].as<std::string>();
+    if (root["max_versions"]) cfg.max_versions = root["max_versions"].as<int>();
+    if (root["clone_required"]) cfg.clone_required = root["clone_required"].as<bool>();
     if (root["peers"]) {
       cfg.peers.clear();
       for (const auto& p : root["peers"]) {

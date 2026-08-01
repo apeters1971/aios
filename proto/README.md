@@ -31,6 +31,10 @@ Maximum body size: 16 MiB.
 | 10   | ObjectStat   | see below |
 | 11   | ObjectReply | see below |
 | 12   | ObjectPutRange | JSON header + raw body (`flags` bit0); see below |
+| 13   | ObjectPublishTip | publish prepared `seq` as tip |
+| 14   | ObjectAbortVersion | drop unpublished / non-tip `seq` |
+| 15   | ObjectListVersions | list versions for oid |
+| 16   | ObjectPurgeVersions | trim (`keep`) or purge one `seq` |
 
 HTTP front-end (external clients): [`http.md`](http.md).
 
@@ -99,7 +103,7 @@ Built locally from Alive members × usable `fs_table` entries. `epoch` is a cont
 
 Short-lived TCP sessions: `Hello` → object request → `ObjectReply`.
 
-Clients compute `place(oid)` from the cluster map and send mutating ops to the **primary** (`acting_set[0]`). The primary writes locally, fans out to secondaries with `"role":"replica"`, and ACKs when `write_quorum` copies succeed (capped by acting-set size).
+Clients compute `place(oid)` from the cluster map and send mutating ops to the **primary** (`acting_set[0]`). The primary **prepares** a new immutable version (tip unpublished), fans out **install** to secondaries (`role=replica` + `seq`), and on `write_quorum` **publishes** the tip (`ObjectPublishTip`). On quorum failure it **aborts** the version (`ObjectAbortVersion`) so tip is unchanged.
 
 ### ObjectPut
 
@@ -110,13 +114,16 @@ Clients compute `place(oid)` from the cluster map and send mutating ops to the *
   "oid": "my-object",
   "data_b64": "...",
   "attrs": { "k": "v" },
+  "crc32c": 123456789,
   "role": "primary",
   "ts": 0,
   "sig": "..."
 }
 ```
 
-`role` is `primary` (client → primary; triggers fan-out) or `replica` (primary → secondary; local write only).
+`role` is `primary` (prepare → quorum install → publish) or `replica` with `seq` (install unpublished version only). Replica install fields: `seq`, `base_seq`, `size`, `inline_body`, `fs_path`, `is_delete`, `crc32c`.
+Optional `crc32c` is verified against the body before accept; replicas should send it.
+Reply may include `seq`.
 
 ### ObjectPutRange (raw body)
 
@@ -126,8 +133,9 @@ When `flags & 0x0001` is set, the frame body is:
 [u32be json_len][json bytes][raw octets]
 ```
 
-JSON fields: `epoch`, `aios_path`, `oid`, `offset`, `attrs`, `replace_attrs`, `role`, `ts`, `sig`.
+JSON fields: `epoch`, `aios_path`, `oid`, `offset`, `attrs`, `replace_attrs`, `range_crc32c`, `role`, `ts`, `sig`.
 Raw octets are the range payload (not base64). HMAC covers JSON only.
+`range_crc32c` is CRC32C of the raw range bytes; the store recomputes the **whole-object** CRC after applying the overwrite.
 
 ### ObjectGet / ObjectDel / ObjectStat
 
@@ -136,11 +144,24 @@ Raw octets are the range payload (not base64). HMAC covers JSON only.
   "epoch": 123456789,
   "aios_path": "/data/aios",
   "oid": "my-object",
+  "seq": 3,
   "role": "primary"
 }
 ```
 
-`role` applies to `ObjectDel` the same way as Put. Get/Stat omit `role`.
+Optional `seq` selects a version for Get/Stat. `ObjectDel` prepares a delete-marker version and uses the same publish-after-quorum flow. Replica `ObjectDel` with `seq` installs that delete marker without publishing.
+
+### ObjectPublishTip / ObjectAbortVersion
+
+```json
+{ "epoch": 1, "aios_path": "/data/aios", "oid": "my-object", "seq": 3, "role": "replica" }
+```
+
+Publish moves tip to `seq` (then trims to `max_versions`). Abort drops an unpublished (or non-tip) version and unlinks its FS body.
+
+### ObjectListVersions / ObjectPurgeVersions
+
+List returns `versions: [{seq,size,crc32c,ctime_ms,is_delete}, ...]` newest first. Purge: `{keep:N}` trims, or `{seq, allow_tip}` removes one version.
 
 ### ObjectReply
 

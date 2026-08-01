@@ -62,7 +62,9 @@ add_library(aios_core STATIC
   src/fs/fs_table.cpp
   src/util/auth.cpp
   src/util/base64.cpp
+  src/util/crc32c.cpp
   src/store/object_store.cpp
+  src/store/fs_clone.cpp
   src/store/local_stores.cpp
   src/cluster/cluster_map.cpp
   src/cluster/place.cpp
@@ -100,6 +102,8 @@ add_executable(aios_tests
   tests/test_store_range.cpp
   tests/test_http_auth.cpp
   tests/test_http_api.cpp
+  tests/test_crc32c.cpp
+  tests/test_versions.cpp
   tests/test_main.cpp
 )
 target_link_libraries(aios_tests PRIVATE aios_core)

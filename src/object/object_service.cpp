@@ -3,6 +3,7 @@
 #include "cluster/place.hpp"
 #include "net/object_client.hpp"
 #include "util/base64.hpp"
+#include "util/crc32c.hpp"
 #include "util/log.hpp"
 
 #include <algorithm>
@@ -83,107 +84,126 @@ PrecondResult ObjectService::check_preds_on(ObjectStore* store, const std::strin
   return store->check_preconditions(oid, preds, err);
 }
 
-bool ObjectService::local_put(const std::string& aios_path, const std::string& oid,
-                              const std::uint8_t* data, std::size_t len,
-                              const std::unordered_map<std::string, std::string>& attrs,
-                              std::string& err) {
-  auto* store = stores_.get(aios_path);
-  if (!store) {
-    err = "no local store for " + aios_path;
-    return false;
-  }
-  return store->put(oid, data, len, attrs, true, err);
-}
-
-bool ObjectService::local_put_range(const std::string& aios_path, const std::string& oid,
-                                    std::uint64_t offset, const std::uint8_t* data,
-                                    std::size_t len,
-                                    const std::unordered_map<std::string, std::string>& attrs,
-                                    bool replace_attrs, std::string& err) {
-  auto* store = stores_.get(aios_path);
-  if (!store) {
-    err = "no local store for " + aios_path;
-    return false;
-  }
-  return store->put_range(oid, offset, data, len, attrs, replace_attrs, err);
-}
-
-bool ObjectService::local_del(const std::string& aios_path, const std::string& oid,
-                              std::string& err) {
-  auto* store = stores_.get(aios_path);
-  if (!store) {
-    err = "no local store for " + aios_path;
-    return false;
-  }
-  return store->del(oid, err);
-}
-
-int ObjectService::replicate_put(const Placement& placement, const std::string& oid,
+bool ObjectService::local_install(const std::string& aios_path, const PreparedVersion& v,
                                  const std::uint8_t* data, std::size_t len,
-                                 const std::unordered_map<std::string, std::string>& attrs) {
+                                 const std::unordered_map<std::string, std::string>& attrs,
+                                 std::string& err) {
+  auto* store = stores_.get(aios_path);
+  if (!store) {
+    err = "no local store for " + aios_path;
+    return false;
+  }
+  return store->install_version(v, data, len, attrs, err);
+}
+
+bool ObjectService::local_publish(const std::string& aios_path, const std::string& oid,
+                                 std::uint64_t seq, std::string& err) {
+  auto* store = stores_.get(aios_path);
+  if (!store) {
+    err = "no local store for " + aios_path;
+    return false;
+  }
+  return store->publish_tip(oid, seq, err);
+}
+
+bool ObjectService::local_abort(const std::string& aios_path, const std::string& oid,
+                               std::uint64_t seq, std::string& err) {
+  auto* store = stores_.get(aios_path);
+  if (!store) {
+    err = "no local store for " + aios_path;
+    return false;
+  }
+  return store->abort_version(oid, seq, err);
+}
+
+int ObjectService::replicate_install(
+    const Placement& placement, const PreparedVersion& v, const std::uint8_t* data,
+    std::size_t len, const std::unordered_map<std::string, std::string>& attrs) {
   int ok = 0;
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     const auto& t = placement.acting_set[i];
     if (t.node_id == cfg_.node_id) {
       std::string err;
-      if (local_put(t.aios_path, oid, data, len, attrs, err)) {
+      if (local_install(t.aios_path, v, data, len, attrs, err)) {
         ++ok;
       } else {
-        AIOS_LOG_WARN("local replica put failed ", t.aios_path, " oid=", oid, ": ", err);
+        AIOS_LOG_WARN("local replica install failed ", t.aios_path, " oid=", v.oid, ": ",
+                      err);
       }
       continue;
     }
-    auto r = object_put_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                               cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid, data,
-                               len, attrs, /*as_replica=*/true);
+    auto r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                   cfg_.auth_skew_ms, placement.epoch, t.aios_path, v, data,
+                                   len, attrs);
     if (r.ok) ++ok;
     else
-      AIOS_LOG_WARN("remote replica put failed ", t.addr, ": ", r.error);
+      AIOS_LOG_WARN("remote replica install failed ", t.addr, ": ", r.error);
   }
   return ok;
 }
 
-int ObjectService::replicate_put_range(
-    const Placement& placement, const std::string& oid, std::uint64_t offset,
+int ObjectService::replicate_publish(const Placement& placement, const std::string& oid,
+                                     std::uint64_t seq) {
+  int ok = 0;
+  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
+    const auto& t = placement.acting_set[i];
+    if (t.node_id == cfg_.node_id) {
+      std::string err;
+      if (local_publish(t.aios_path, oid, seq, err)) ++ok;
+      else
+        AIOS_LOG_WARN("local replica publish failed ", t.aios_path, ": ", err);
+      continue;
+    }
+    auto r = object_publish_tip_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                       cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid,
+                                       seq);
+    if (r.ok) ++ok;
+    else
+      AIOS_LOG_WARN("remote replica publish failed ", t.addr, ": ", r.error);
+  }
+  return ok;
+}
+
+void ObjectService::replicate_abort(const Placement& placement, const std::string& oid,
+                                    std::uint64_t seq) {
+  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
+    const auto& t = placement.acting_set[i];
+    if (t.node_id == cfg_.node_id) {
+      std::string err;
+      local_abort(t.aios_path, oid, seq, err);
+      continue;
+    }
+    object_abort_version_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid, seq);
+  }
+}
+
+ApiResult ObjectService::commit_prepared(
+    ObjectStore* store, const Placement& placement, PreparedVersion& pv,
     const std::uint8_t* data, std::size_t len,
-    const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs) {
-  int ok = 0;
-  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
-    const auto& t = placement.acting_set[i];
-    if (t.node_id == cfg_.node_id) {
-      std::string err;
-      if (local_put_range(t.aios_path, oid, offset, data, len, attrs, replace_attrs, err)) {
-        ++ok;
-      } else {
-        AIOS_LOG_WARN("local replica put_range failed ", t.aios_path, ": ", err);
-      }
-      continue;
-    }
-    auto r = object_put_range_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                     cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid,
-                                     offset, data, len, attrs, replace_attrs,
-                                     /*as_replica=*/true);
-    if (r.ok) ++ok;
-    else
-      AIOS_LOG_WARN("remote replica put_range failed ", t.addr, ": ", r.error);
+    const std::unordered_map<std::string, std::string>& attrs) {
+  const int total_ok = 1 + replicate_install(placement, pv, data, len, attrs);
+  if (total_ok < quorum_need(placement)) {
+    std::string aerr;
+    store->abort_version(pv.oid, pv.seq, aerr);
+    replicate_abort(placement, pv.oid, pv.seq);
+    return fail("quorum_failed", "quorum failed");
   }
-  return ok;
-}
+  std::string err;
+  if (!store->publish_tip(pv.oid, pv.seq, err)) {
+    store->abort_version(pv.oid, pv.seq, err);
+    replicate_abort(placement, pv.oid, pv.seq);
+    return fail("store_error", err);
+  }
+  replicate_publish(placement, pv.oid, pv.seq);
 
-int ObjectService::replicate_del(const Placement& placement, const std::string& oid) {
-  int ok = 0;
-  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
-    const auto& t = placement.acting_set[i];
-    if (t.node_id == cfg_.node_id) {
-      std::string err;
-      if (local_del(t.aios_path, oid, err) || err == "object not found") ++ok;
-      continue;
-    }
-    auto r = object_del_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                               cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid, true);
-    if (r.ok || r.code == "not_found") ++ok;
-  }
-  return ok;
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.replicas = total_ok;
+  r.placement = placement;
+  if (auto st = store->stat(pv.oid, err)) r.info = st;
+  return r;
 }
 
 Frame ObjectService::handle(const Frame& req) {
@@ -199,9 +219,28 @@ Frame ObjectService::handle(const Frame& req) {
       return handle_del(req.body);
     case MsgType::ObjectStat:
       return handle_stat(req.body);
+    case MsgType::ObjectPublishTip:
+      return handle_publish_tip(req.body);
+    case MsgType::ObjectAbortVersion:
+      return handle_abort_version(req.body);
+    case MsgType::ObjectListVersions:
+      return handle_list_versions(req.body);
+    case MsgType::ObjectPurgeVersions:
+      return handle_purge_versions(req.body);
     default:
       return reply_err(map_.epoch, "bad_type", "unsupported object message");
   }
+}
+
+static std::unordered_map<std::string, std::string> parse_attrs_json(
+    const nlohmann::json& body) {
+  std::unordered_map<std::string, std::string> attrs;
+  if (body.contains("attrs") && body["attrs"].is_object()) {
+    for (auto it = body["attrs"].begin(); it != body["attrs"].end(); ++it) {
+      if (it.value().is_string()) attrs[it.key()] = it.value().get<std::string>();
+    }
+  }
+  return attrs;
 }
 
 Frame ObjectService::handle_put(const nlohmann::json& body) {
@@ -216,16 +255,22 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
   }
 
   std::vector<std::uint8_t> data;
-  std::string derr;
-  if (!body.contains("data_b64") || !body["data_b64"].is_string() ||
-      !base64_decode(body["data_b64"].get<std::string>(), data, derr)) {
-    return reply_err(map_.epoch, "bad_request", "invalid data_b64: " + derr);
+  const bool is_delete = body.value("is_delete", false);
+  if (!is_delete) {
+    std::string derr;
+    if (!body.contains("data_b64") || !body["data_b64"].is_string() ||
+        !base64_decode(body["data_b64"].get<std::string>(), data, derr)) {
+      return reply_err(map_.epoch, "bad_request", "invalid data_b64: " + derr);
+    }
   }
 
-  std::unordered_map<std::string, std::string> attrs;
-  if (body.contains("attrs") && body["attrs"].is_object()) {
-    for (auto it = body["attrs"].begin(); it != body["attrs"].end(); ++it) {
-      if (it.value().is_string()) attrs[it.key()] = it.value().get<std::string>();
+  auto attrs = parse_attrs_json(body);
+
+  std::optional<std::uint32_t> expected_crc;
+  if (body.contains("crc32c") && !body["crc32c"].is_null()) {
+    expected_crc = body.value("crc32c", 0u);
+    if (!is_delete && crc32c(data.data(), data.size()) != *expected_crc) {
+      return reply_err(map_.epoch, "crc_mismatch", "crc32c mismatch");
     }
   }
 
@@ -234,12 +279,39 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     return reply_err(map_.epoch, "no_targets", "no storage targets in cluster map");
   }
 
-  if (role == "replica") {
+  // Replica install of a prepared version (seq present).
+  if (role == "replica" && body.contains("seq")) {
     if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
     }
+    PreparedVersion v;
+    v.oid = oid;
+    v.seq = body.value("seq", static_cast<std::uint64_t>(0));
+    v.prev_tip = body.value("base_seq", static_cast<std::uint64_t>(0));
+    v.size = is_delete ? 0 : body.value("size", static_cast<std::uint64_t>(data.size()));
+    if (v.size == 0 && !is_delete) v.size = data.size();
+    v.crc32c = expected_crc.value_or(is_delete ? crc32c(nullptr, 0) : crc32c(data.data(), data.size()));
+    v.inline_body = body.value("inline_body", false);
+    v.fs_path = body.value("fs_path", "");
+    v.is_delete = is_delete;
     std::string err;
-    if (!local_put(aios_path, oid, data.data(), data.size(), attrs, err)) {
+    if (!local_install(aios_path, v, data.data(), data.size(), attrs, err)) {
+      return reply_err(map_.epoch, "store_error", err);
+    }
+    auto f = reply_ok(map_.epoch);
+    f.body["seq"] = v.seq;
+    return f;
+  }
+
+  if (role == "replica") {
+    // Legacy full put (publish immediately) — kept for repair tooling.
+    if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+      return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
+    }
+    auto* store = stores_.get(aios_path);
+    if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+    std::string err;
+    if (!store->put(oid, data.data(), data.size(), attrs, true, expected_crc, err)) {
       return reply_err(map_.epoch, "store_error", err);
     }
     return reply_ok(map_.epoch);
@@ -255,16 +327,20 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     return f;
   }
 
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
-  if (!local_put(aios_path, oid, data.data(), data.size(), attrs, err)) {
+  PreparedVersion pv;
+  if (!store->prepare_put(oid, data.data(), data.size(), attrs, true, expected_crc, pv,
+                          err)) {
+    if (err == "crc32c mismatch") return reply_err(map_.epoch, "crc_mismatch", err);
     return reply_err(map_.epoch, "store_error", err);
   }
-  const int total_ok = 1 + replicate_put(placement, oid, data.data(), data.size(), attrs);
-  if (total_ok < quorum_need(placement)) {
-    return reply_err(map_.epoch, "quorum_failed", "quorum failed");
-  }
+  auto r = commit_prepared(store, placement, pv, data.data(), data.size(), attrs);
+  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
   auto f = reply_ok(map_.epoch);
-  f.body["replicas"] = total_ok;
+  f.body["replicas"] = r.replicas;
+  f.body["seq"] = pv.seq;
   return f;
 }
 
@@ -284,11 +360,12 @@ Frame ObjectService::handle_put_range(const Frame& req) {
 
   const auto* data = req.raw.data();
   const auto len = req.raw.size();
+  auto attrs = parse_attrs_json(body);
 
-  std::unordered_map<std::string, std::string> attrs;
-  if (body.contains("attrs") && body["attrs"].is_object()) {
-    for (auto it = body["attrs"].begin(); it != body["attrs"].end(); ++it) {
-      if (it.value().is_string()) attrs[it.key()] = it.value().get<std::string>();
+  if (body.contains("range_crc32c") && !body["range_crc32c"].is_null()) {
+    const auto expect = body.value("range_crc32c", 0u);
+    if (crc32c(data, len) != expect) {
+      return reply_err(map_.epoch, "crc_mismatch", "range crc32c mismatch");
     }
   }
 
@@ -298,31 +375,35 @@ Frame ObjectService::handle_put_range(const Frame& req) {
   }
 
   if (role == "replica") {
-    if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
-      return reply_err(map_.epoch, "not_replica", "not in acting set");
-    }
-    std::string err;
-    if (!local_put_range(aios_path, oid, offset, data, len, attrs, replace_attrs, err)) {
-      return reply_err(map_.epoch, "store_error", err);
-    }
-    return reply_ok(map_.epoch);
+    // Range replicas are installed as full versions via ObjectPut+seq.
+    return reply_err(map_.epoch, "bad_request",
+                     "use ObjectPut with seq to install prepared range versions");
   }
 
   if (!is_primary_for(oid, map_, cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_primary", "not primary");
   }
 
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
-  if (!local_put_range(aios_path, oid, offset, data, len, attrs, replace_attrs, err)) {
+  PreparedVersion pv;
+  if (!store->prepare_put_range(oid, offset, data, len, attrs, replace_attrs, pv, err)) {
     return reply_err(map_.epoch, "store_error", err);
   }
-  const int total_ok =
-      1 + replicate_put_range(placement, oid, offset, data, len, attrs, replace_attrs);
-  if (total_ok < quorum_need(placement)) {
-    return reply_err(map_.epoch, "quorum_failed", "quorum failed");
+  auto full = store->get(oid, pv.seq, err);
+  if (!full) {
+    store->abort_version(oid, pv.seq, err);
+    return reply_err(map_.epoch, "store_error", err);
   }
+  // Replicate as full-body install (same seq).
+  PreparedVersion install = pv;
+  install.inline_body = false;  // range versions are FS-backed
+  auto r = commit_prepared(store, placement, install, full->data(), full->size(), attrs);
+  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
   auto f = reply_ok(map_.epoch);
-  f.body["replicas"] = total_ok;
+  f.body["replicas"] = r.replicas;
+  f.body["seq"] = pv.seq;
   return f;
 }
 
@@ -339,12 +420,20 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
   }
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  std::optional<std::uint64_t> seq;
+  if (body.contains("seq") && !body["seq"].is_null()) {
+    seq = body.value("seq", static_cast<std::uint64_t>(0));
+  }
   std::string err;
-  auto data = store->get(oid, err);
+  auto data = store->get(oid, seq, err);
   if (!data) return reply_err(map_.epoch, "not_found", err);
   auto f = reply_ok(map_.epoch);
   f.body["data_b64"] = base64_encode(*data);
   f.body["size"] = data->size();
+  if (auto st = store->stat(oid, seq, err)) {
+    f.body["seq"] = st->seq;
+    if (st->crc32c_known) f.body["crc32c"] = st->crc32c;
+  }
   return f;
 }
 
@@ -361,28 +450,55 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
   if (placement.acting_set.empty()) {
     return reply_err(map_.epoch, "no_targets", "no storage targets");
   }
-  if (role == "replica") {
+
+  // Replica install of delete-marker version.
+  if (role == "replica" && body.contains("seq")) {
     if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set");
     }
+    PreparedVersion v;
+    v.oid = oid;
+    v.seq = body.value("seq", static_cast<std::uint64_t>(0));
+    v.prev_tip = body.value("base_seq", static_cast<std::uint64_t>(0));
+    v.is_delete = true;
+    v.crc32c = crc32c(nullptr, 0);
     std::string err;
-    if (!local_del(aios_path, oid, err) && err != "object not found") {
+    if (!local_install(aios_path, v, nullptr, 0, {}, err)) {
       return reply_err(map_.epoch, "store_error", err);
     }
     return reply_ok(map_.epoch);
   }
+
+  if (role == "replica") {
+    if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+      return reply_err(map_.epoch, "not_replica", "not in acting set");
+    }
+    auto* store = stores_.get(aios_path);
+    if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+    std::string err;
+    if (!store->del(oid, err) && err != "object not found") {
+      return reply_err(map_.epoch, "store_error", err);
+    }
+    return reply_ok(map_.epoch);
+  }
+
   if (!is_primary_for(oid, map_, cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_primary", "not primary");
   }
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
-  if (!local_del(aios_path, oid, err) && err != "object not found") {
+  PreparedVersion pv;
+  if (!store->prepare_delete(oid, pv, err)) {
+    if (err == "object not found") return reply_err(map_.epoch, "not_found", err);
     return reply_err(map_.epoch, "store_error", err);
   }
-  const int total_ok = 1 + replicate_del(placement, oid);
-  if (total_ok < quorum_need(placement)) {
-    return reply_err(map_.epoch, "quorum_failed", "quorum failed");
-  }
-  return reply_ok(map_.epoch);
+  auto r = commit_prepared(store, placement, pv, nullptr, 0, {});
+  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
+  auto f = reply_ok(map_.epoch);
+  f.body["replicas"] = r.replicas;
+  f.body["seq"] = pv.seq;
+  return f;
 }
 
 Frame ObjectService::handle_stat(const nlohmann::json& body) {
@@ -395,8 +511,12 @@ Frame ObjectService::handle_stat(const nlohmann::json& body) {
   }
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  std::optional<std::uint64_t> seq;
+  if (body.contains("seq") && !body["seq"].is_null()) {
+    seq = body.value("seq", static_cast<std::uint64_t>(0));
+  }
   std::string err;
-  auto info = store->stat(oid, err);
+  auto info = store->stat(oid, seq, err);
   if (!info) return reply_err(map_.epoch, "not_found", err);
   auto f = reply_ok(map_.epoch);
   f.body["size"] = info->size;
@@ -404,14 +524,109 @@ Frame ObjectService::handle_stat(const nlohmann::json& body) {
   f.body["ctime_ms"] = info->ctime_ms;
   f.body["shard"] = info->shard;
   f.body["inline_body"] = info->inline_body;
+  f.body["seq"] = info->seq;
+  f.body["is_delete"] = info->is_delete;
+  if (info->crc32c_known) f.body["crc32c"] = info->crc32c;
   return f;
+}
+
+Frame ObjectService::handle_publish_tip(const nlohmann::json& body) {
+  Frame errf;
+  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string oid = body.value("oid", "");
+  const std::string aios_path = body.value("aios_path", "");
+  const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
+  if (oid.empty() || aios_path.empty() || seq == 0) {
+    return reply_err(map_.epoch, "bad_request", "oid, aios_path, seq required");
+  }
+  if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+    return reply_err(map_.epoch, "not_replica", "not in acting set");
+  }
+  std::string err;
+  if (!local_publish(aios_path, oid, seq, err)) {
+    return reply_err(map_.epoch, "store_error", err);
+  }
+  return reply_ok(map_.epoch);
+}
+
+Frame ObjectService::handle_abort_version(const nlohmann::json& body) {
+  Frame errf;
+  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string oid = body.value("oid", "");
+  const std::string aios_path = body.value("aios_path", "");
+  const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
+  if (oid.empty() || aios_path.empty() || seq == 0) {
+    return reply_err(map_.epoch, "bad_request", "oid, aios_path, seq required");
+  }
+  if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+    return reply_err(map_.epoch, "not_replica", "not in acting set");
+  }
+  std::string err;
+  if (!local_abort(aios_path, oid, seq, err)) {
+    return reply_err(map_.epoch, "store_error", err);
+  }
+  return reply_ok(map_.epoch);
+}
+
+Frame ObjectService::handle_list_versions(const nlohmann::json& body) {
+  Frame errf;
+  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string oid = body.value("oid", "");
+  const std::string aios_path = body.value("aios_path", "");
+  if (oid.empty() || aios_path.empty()) {
+    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+  }
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  std::string err;
+  auto vers = store->list_versions(oid, err);
+  auto f = reply_ok(map_.epoch);
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& v : vers) {
+    nlohmann::json j = {{"seq", v.seq},
+                        {"size", v.size},
+                        {"ctime_ms", v.ctime_ms},
+                        {"is_delete", v.is_delete},
+                        {"inline_body", v.inline_body}};
+    if (v.crc32c_known) j["crc32c"] = v.crc32c;
+    arr.push_back(std::move(j));
+  }
+  f.body["versions"] = std::move(arr);
+  return f;
+}
+
+Frame ObjectService::handle_purge_versions(const nlohmann::json& body) {
+  Frame errf;
+  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string oid = body.value("oid", "");
+  const std::string aios_path = body.value("aios_path", "");
+  if (oid.empty() || aios_path.empty()) {
+    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+  }
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  std::string err;
+  if (body.contains("seq") && !body["seq"].is_null()) {
+    const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
+    const bool allow_tip = body.value("allow_tip", false);
+    if (!store->purge_version(oid, seq, allow_tip, err)) {
+      return reply_err(map_.epoch, "store_error", err);
+    }
+  } else {
+    int keep = body.value("keep", store->options().max_versions);
+    if (!store->trim_versions(oid, keep, err)) {
+      return reply_err(map_.epoch, "store_error", err);
+    }
+  }
+  return reply_ok(map_.epoch);
 }
 
 ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* data,
                                 std::size_t len,
                                 const std::unordered_map<std::string, std::string>& attrs,
                                 bool replace_attrs,
-                                const std::vector<AttrPrecondition>& preds) {
+                                const std::vector<AttrPrecondition>& preds,
+                                std::optional<std::uint32_t> expected_crc32c) {
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
@@ -427,17 +642,12 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
-  if (!store->put(oid, data, len, attrs, replace_attrs, err)) {
+  PreparedVersion pv;
+  if (!store->prepare_put(oid, data, len, attrs, replace_attrs, expected_crc32c, pv, err)) {
+    if (err == "crc32c mismatch") return fail("crc_mismatch", err);
     return fail("store_error", err);
   }
-  const int total_ok = 1 + replicate_put(placement, oid, data, len, attrs);
-  if (total_ok < quorum_need(placement)) return fail("quorum_failed", "quorum failed");
-  ApiResult r;
-  r.ok = true;
-  r.epoch = map_.epoch;
-  r.replicas = total_ok;
-  r.placement = placement;
-  return r;
+  return commit_prepared(store, placement, pv, data, len, attrs);
 }
 
 ApiResult ObjectService::api_put_range(
@@ -459,27 +669,27 @@ ApiResult ObjectService::api_put_range(
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
-  if (!store->put_range(oid, offset, data, len, attrs, replace_attrs, err)) {
+  PreparedVersion pv;
+  if (!store->prepare_put_range(oid, offset, data, len, attrs, replace_attrs, pv, err)) {
     return fail("store_error", err);
   }
-  const int total_ok =
-      1 + replicate_put_range(placement, oid, offset, data, len, attrs, replace_attrs);
-  if (total_ok < quorum_need(placement)) return fail("quorum_failed", "quorum failed");
-  ApiResult r;
-  r.ok = true;
-  r.epoch = map_.epoch;
-  r.replicas = total_ok;
-  r.placement = placement;
-  return r;
+  auto full = store->get(oid, pv.seq, err);
+  if (!full) {
+    store->abort_version(oid, pv.seq, err);
+    return fail("store_error", err);
+  }
+  PreparedVersion install = pv;
+  install.inline_body = false;
+  return commit_prepared(store, placement, install, full->data(), full->size(), attrs);
 }
 
 ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint64_t> offset,
                                 std::optional<std::uint64_t> end_inclusive,
-                                const std::vector<AttrPrecondition>& preds) {
+                                const std::vector<AttrPrecondition>& preds,
+                                std::optional<std::uint64_t> seq) {
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
-  // Prefer primary; allow any local acting-set member.
   ObjectStore* store = nullptr;
   std::string err;
   for (const auto& t : placement.acting_set) {
@@ -488,23 +698,33 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     if (store) break;
   }
   if (!store) return fail("not_local", "no local replica for oid");
-  auto pr = check_preds_on(store, oid, preds, err);
-  if (pr == PrecondResult::NotFound) return fail("not_found", err);
-  if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+  // Preconditions apply to tip unless a version is selected.
+  if (!seq.has_value()) {
+    auto pr = check_preds_on(store, oid, preds, err);
+    if (pr == PrecondResult::NotFound) return fail("not_found", err);
+    if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+  }
 
-  auto info = store->stat(oid, err);
+  auto info = store->stat(oid, seq, err);
   if (!info) return fail("not_found", err);
+  if (info->is_delete && !seq.has_value()) return fail("not_found", "object not found");
 
   ApiResult r;
   r.ok = true;
   r.epoch = map_.epoch;
   r.info = info;
-  r.attrs = store->list_attrs(oid, err);
+  if (!seq.has_value()) r.attrs = store->list_attrs(oid, err);
   r.placement = placement;
 
   if (!offset.has_value()) {
-    r.data = store->get(oid, err);
-    if (!r.data) return fail("not_found", err);
+    r.data = store->get(oid, seq, err);
+    if (!r.data) {
+      if (info->is_delete) {
+        r.data = std::vector<std::uint8_t>{};
+        return r;
+      }
+      return fail("not_found", err);
+    }
     return r;
   }
   if (*offset >= info->size) return fail("range_unsatisfiable", "range unsatisfiable");
@@ -512,7 +732,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   if (end >= info->size) end = info->size - 1;
   if (end < *offset) return fail("range_unsatisfiable", "range unsatisfiable");
   const std::size_t len = static_cast<std::size_t>(end - *offset + 1);
-  r.data = store->get_range(oid, *offset, len, err);
+  r.data = store->get_range(oid, seq, *offset, len, err);
   if (!r.data) {
     if (err == "range unsatisfiable") return fail("range_unsatisfiable", err);
     return fail("store_error", err);
@@ -521,8 +741,9 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
 }
 
 ApiResult ObjectService::api_head(const std::string& oid,
-                                 const std::vector<AttrPrecondition>& preds) {
-  return api_get(oid, std::nullopt, std::nullopt, preds);
+                                 const std::vector<AttrPrecondition>& preds,
+                                 std::optional<std::uint64_t> seq) {
+  return api_get(oid, std::nullopt, std::nullopt, preds, seq);
 }
 
 ApiResult ObjectService::api_del(const std::string& oid,
@@ -542,21 +763,18 @@ ApiResult ObjectService::api_del(const std::string& oid,
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
-  if (!store->del(oid, err) && err != "object not found") return fail("store_error", err);
-  const int total_ok = 1 + replicate_del(placement, oid);
-  if (total_ok < quorum_need(placement)) return fail("quorum_failed", "quorum failed");
-  ApiResult r;
-  r.ok = true;
-  r.epoch = map_.epoch;
-  r.replicas = total_ok;
-  return r;
+  PreparedVersion pv;
+  if (!store->prepare_delete(oid, pv, err)) {
+    if (err == "object not found") return fail("not_found", err);
+    return fail("store_error", err);
+  }
+  return commit_prepared(store, placement, pv, nullptr, 0, {});
 }
 
 ApiResult ObjectService::api_list(const std::string& prefix, const std::string& attr_eq_key,
                                   const std::string& attr_eq_value, std::size_t limit,
                                   const std::string& cursor, bool include_attrs) {
   std::lock_guard lock(mu_);
-  // LIST aggregates local stores only (this node's targets).
   ApiResult r;
   r.ok = true;
   r.epoch = map_.epoch;
@@ -581,6 +799,86 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
       return r;
     }
   }
+  return r;
+}
+
+ApiResult ObjectService::api_list_versions(const std::string& oid) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  ObjectStore* store = nullptr;
+  std::string err;
+  for (const auto& t : placement.acting_set) {
+    if (t.node_id != cfg_.node_id) continue;
+    store = stores_.get(t.aios_path);
+    if (store) break;
+  }
+  if (!store) {
+    for (const auto& path : stores_.paths()) {
+      store = stores_.get(path);
+      if (store) break;
+    }
+  }
+  if (!store) return fail("not_local", "no local store");
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.versions = store->list_versions(oid, err);
+  return r;
+}
+
+ApiResult ObjectService::api_purge_version(const std::string& oid, std::uint64_t seq,
+                                           bool allow_tip) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    return fail("not_primary", "this node is not primary for oid");
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  if (!store->purge_version(oid, seq, allow_tip, err)) return fail("store_error", err);
+  // Best-effort fan-out.
+  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
+    const auto& t = placement.acting_set[i];
+    if (t.node_id == cfg_.node_id) {
+      local_abort(t.aios_path, oid, seq, err);
+      continue;
+    }
+    object_abort_version_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid, seq);
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  return r;
+}
+
+ApiResult ObjectService::api_trim_versions(const std::string& oid, int keep) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    return fail("not_primary", "this node is not primary for oid");
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  if (keep <= 0) keep = store->options().max_versions;
+  if (!store->trim_versions(oid, keep, err)) return fail("store_error", err);
+  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
+    const auto& t = placement.acting_set[i];
+    if (t.node_id == cfg_.node_id) {
+      auto* s = stores_.get(t.aios_path);
+      if (s) s->trim_versions(oid, keep, err);
+      continue;
+    }
+    object_purge_versions_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                 cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid, keep);
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
   return r;
 }
 

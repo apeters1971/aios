@@ -33,6 +33,14 @@ const char* msg_type_name(MsgType t) {
       return "ObjectReply";
     case MsgType::ObjectPutRange:
       return "ObjectPutRange";
+    case MsgType::ObjectPublishTip:
+      return "ObjectPublishTip";
+    case MsgType::ObjectAbortVersion:
+      return "ObjectAbortVersion";
+    case MsgType::ObjectListVersions:
+      return "ObjectListVersions";
+    case MsgType::ObjectPurgeVersions:
+      return "ObjectPurgeVersions";
   }
   return "Unknown";
 }

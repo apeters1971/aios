@@ -3,6 +3,7 @@
 #include "http/http_auth.hpp"
 #include "net/framing.hpp"
 #include "util/auth.hpp"
+#include "util/crc32c.hpp"
 #include "util/log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -178,6 +179,7 @@ int status_for(const ApiResult& r) {
   if (r.ok) return 200;
   if (r.code == "not_found") return 404;
   if (r.code == "precondition_failed") return 412;
+  if (r.code == "crc_mismatch") return 400;
   if (r.code == "range_unsatisfiable") return 416;
   if (r.code == "not_primary") return 307;
   if (r.code == "no_targets") return 503;
@@ -382,14 +384,91 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     }
 
     if (path.rfind("/o/", 0) == 0) {
-      const std::string oid = url_decode(path.substr(3));
+      const std::string rest = path.substr(3);
+      std::string oid_raw = rest;
+      std::string sub;
+      const auto slash = rest.find('/');
+      if (slash != std::string::npos) {
+        oid_raw = rest.substr(0, slash);
+        sub = rest.substr(slash + 1);
+      }
+      const std::string oid = url_decode(oid_raw);
       if (oid.empty()) {
         write_json(*sock, 400, "Bad Request", {{"error", "empty oid"}}, keep_alive);
         continue;
       }
 
+      auto parse_version = [&]() -> std::optional<std::uint64_t> {
+        std::string vs;
+        if (qmap.count("version")) vs = qmap["version"];
+        if (vs.empty()) vs = header_get(headers, "x-aios-version");
+        if (vs.empty()) return std::nullopt;
+        try {
+          return static_cast<std::uint64_t>(std::stoull(vs));
+        } catch (...) {
+          return std::nullopt;
+        }
+      };
+
+      if (sub == "versions" && method == "GET") {
+        auto r = objects_.api_list_versions(oid);
+        if (!r.ok) {
+          write_json(*sock, status_for(r), "Error",
+                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          continue;
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& v : r.versions) {
+          nlohmann::json j = {{"seq", v.seq},
+                              {"size", v.size},
+                              {"ctime_ms", v.ctime_ms},
+                              {"is_delete", v.is_delete}};
+          if (v.crc32c_known) j["crc32c"] = v.crc32c;
+          arr.push_back(std::move(j));
+        }
+        write_json(*sock, 200, "OK", {{"oid", oid}, {"versions", arr}}, keep_alive);
+        continue;
+      }
+
+      if (sub == "purge" && method == "POST") {
+        int keep = 0;
+        if (qmap.count("keep")) {
+          try {
+            keep = std::stoi(qmap["keep"]);
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad keep"}}, keep_alive);
+            continue;
+          }
+        }
+        auto r = objects_.api_trim_versions(oid, keep);
+        if (!r.ok) {
+          write_json(*sock, status_for(r), "Error",
+                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          continue;
+        }
+        write_response(*sock, 204, "No Content",
+                       {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, keep_alive);
+        continue;
+      }
+
+      if (!sub.empty()) {
+        write_json(*sock, 404, "Not Found", {{"error", "not found"}}, keep_alive);
+        continue;
+      }
+
       if (method == "PUT") {
         std::string cr = header_get(headers, "content-range");
+        std::optional<std::uint32_t> expected_crc;
+        const auto crc_hdr = header_get(headers, "x-aios-crc32c");
+        if (!crc_hdr.empty()) {
+          try {
+            expected_crc = static_cast<std::uint32_t>(std::stoul(crc_hdr));
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-crc32c"}},
+                       keep_alive);
+            continue;
+          }
+        }
         ApiResult r;
         if (!cr.empty()) {
           std::uint64_t start = 0, end = 0;
@@ -403,24 +482,45 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                        {{"error", "Content-Range length mismatch"}}, keep_alive);
             continue;
           }
+          if (expected_crc && crc32c(body.data(), body.size()) != *expected_crc) {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "range crc32c mismatch"}, {"code", "crc_mismatch"}},
+                       keep_alive);
+            continue;
+          }
           r = objects_.api_put_range(oid, start, body.data(), body.size(), attrs, false,
                                      preds);
         } else {
-          r = objects_.api_put(oid, body.data(), body.size(), attrs, true, preds);
+          r = objects_.api_put(oid, body.data(), body.size(), attrs, true, preds,
+                               expected_crc);
         }
         if (!r.ok) {
           write_json(*sock, status_for(r), "Error",
                      {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
           continue;
         }
-        write_response(*sock, 204, "No Content",
-                       {{"x-aios-epoch", std::to_string(r.epoch)},
-                        {"x-aios-replicas", std::to_string(r.replicas)}},
-                       nullptr, 0, keep_alive);
+        std::unordered_map<std::string, std::string> rh = {
+            {"x-aios-epoch", std::to_string(r.epoch)},
+            {"x-aios-replicas", std::to_string(r.replicas)},
+        };
+        if (r.info) {
+          rh["x-aios-version"] = std::to_string(r.info->seq);
+          if (r.info->crc32c_known) {
+            rh["x-aios-crc32c"] = std::to_string(r.info->crc32c);
+          }
+        }
+        write_response(*sock, 204, "No Content", rh, nullptr, 0, keep_alive);
         continue;
       }
 
       if (method == "GET" || method == "HEAD") {
+        auto ver = parse_version();
+        if (qmap.count("version") || !header_get(headers, "x-aios-version").empty()) {
+          if (!ver.has_value()) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad version"}}, keep_alive);
+            continue;
+          }
+        }
         std::optional<std::uint64_t> off, end;
         const auto range = header_get(headers, "range");
         if (!range.empty()) {
@@ -434,7 +534,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           off = start;
           end = end_opt;
         }
-        auto r = objects_.api_get(oid, off, end, preds);
+        auto r = objects_.api_get(oid, off, end, preds, ver);
         if (!r.ok) {
           write_json(*sock, status_for(r), "Error",
                      {{"error", r.error}, {"code", r.code}}, keep_alive);
@@ -448,6 +548,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         if (r.info) {
           rh["x-aios-size"] = std::to_string(r.info->size);
           rh["x-aios-mtime-ms"] = std::to_string(r.info->mtime_ms);
+          rh["x-aios-version"] = std::to_string(r.info->seq);
+          if (r.info->crc32c_known) {
+            rh["x-aios-crc32c"] = std::to_string(r.info->crc32c);
+          }
         }
         for (const auto& [k, v] : r.attrs) {
           rh["x-aios-attr-" + k] = v;
@@ -474,14 +578,34 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
 
       if (method == "DELETE") {
+        auto ver = parse_version();
+        if (qmap.count("version") || !header_get(headers, "x-aios-version").empty()) {
+          if (!ver.has_value()) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad version"}}, keep_alive);
+            continue;
+          }
+          auto r = objects_.api_purge_version(oid, *ver, /*allow_tip=*/false);
+          if (!r.ok) {
+            write_json(*sock, status_for(r), "Error",
+                       {{"error", r.error}, {"code", r.code}}, keep_alive);
+            continue;
+          }
+          write_response(*sock, 204, "No Content",
+                         {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0,
+                         keep_alive);
+          continue;
+        }
         auto r = objects_.api_del(oid, preds);
         if (!r.ok) {
           write_json(*sock, status_for(r), "Error",
                      {{"error", r.error}, {"code", r.code}}, keep_alive);
           continue;
         }
-        write_response(*sock, 204, "No Content",
-                       {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, keep_alive);
+        std::unordered_map<std::string, std::string> rh = {
+            {"x-aios-epoch", std::to_string(r.epoch)},
+        };
+        if (r.info) rh["x-aios-version"] = std::to_string(r.info->seq);
+        write_response(*sock, 204, "No Content", rh, nullptr, 0, keep_alive);
         continue;
       }
     }

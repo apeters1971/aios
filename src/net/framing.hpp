@@ -21,6 +21,10 @@ enum class MsgType : std::uint8_t {
   ObjectStat = 10,
   ObjectReply = 11,
   ObjectPutRange = 12,
+  ObjectPublishTip = 13,
+  ObjectAbortVersion = 14,
+  ObjectListVersions = 15,
+  ObjectPurgeVersions = 16,
 };
 
 constexpr std::uint8_t kProtoVersion = 1;

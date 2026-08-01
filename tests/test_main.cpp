@@ -9,6 +9,8 @@ int test_object_rpc();
 int test_store_range();
 int test_http_auth();
 int test_http_api();
+int test_crc32c();
+int test_versions();
 
 int main() {
   int failures = 0;
@@ -21,6 +23,8 @@ int main() {
   failures += test_store_range();
   failures += test_http_auth();
   failures += test_http_api();
+  failures += test_crc32c();
+  failures += test_versions();
   if (failures == 0) {
     std::cout << "all tests passed\n";
     return 0;

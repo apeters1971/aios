@@ -64,7 +64,9 @@ namespace {
 
 bool is_object_req(MsgType t) {
   return t == MsgType::ObjectPut || t == MsgType::ObjectGet || t == MsgType::ObjectDel ||
-         t == MsgType::ObjectStat || t == MsgType::ObjectPutRange;
+         t == MsgType::ObjectStat || t == MsgType::ObjectPutRange ||
+         t == MsgType::ObjectPublishTip || t == MsgType::ObjectAbortVersion ||
+         t == MsgType::ObjectListVersions || t == MsgType::ObjectPurgeVersions;
 }
 
 }  // namespace

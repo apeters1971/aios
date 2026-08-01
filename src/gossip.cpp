@@ -60,6 +60,8 @@ void GossipEngine::sync_local_stores() {
   ObjectStoreOptions opts;
   // Fewer shards for daemon-managed targets keeps repair listing light.
   opts.shard_count = 16;
+  opts.max_versions = cfg_.max_versions;
+  opts.clone_required = cfg_.clone_required;
   local_stores_.sync_paths(paths, opts);
 }
 

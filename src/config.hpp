@@ -29,6 +29,10 @@ struct Config {
   std::string http_listen{"0.0.0.0:7480"};
   // Body durability for ranged FS puts: none | data | full (informational; store fsyncs).
   std::string http_body_sync{"data"};
+  // Retain newest N object versions per oid (default 16).
+  int max_versions{16};
+  // If true, FS COW requires reflink/clonefile; if false, allow full-copy fallback.
+  bool clone_required{true};
 };
 
 // Load YAML config file (optional). Returns false on parse failure.

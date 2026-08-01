@@ -30,16 +30,31 @@ Canonical string:
 
 | Method | Path | Notes |
 |--------|------|-------|
-| `PUT` | `/o/{oid}` | Full replace, or partial with `Content-Range: bytes start-end/*` |
-| `GET` | `/o/{oid}` | Full or `Range: bytes=start-end` → 206 |
-| `HEAD` | `/o/{oid}` | Stat + attr headers |
-| `DELETE` | `/o/{oid}` | Delete |
-| `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1` | LIST (local stores; shard fan-out) |
+| `PUT` | `/o/{oid}` | Full replace, or partial with `Content-Range: bytes start-end/*` (new version) |
+| `GET` | `/o/{oid}` | Tip, or `?version={seq}` / `x-aios-version`; `Range` → 206 |
+| `HEAD` | `/o/{oid}` | Stat + attr headers (+ version selection as GET) |
+| `DELETE` | `/o/{oid}` | Delete-marker version at tip |
+| `DELETE` | `/o/{oid}?version={seq}` | Purge one non-tip version |
+| `GET` | `/o/{oid}/versions` | List versions newest first (`seq,size,crc32c,ctime_ms,is_delete`) |
+| `POST` | `/o/{oid}/purge?keep={n}` | Keep newest `n` versions (default `max_versions`) |
+| `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1` | LIST tip objects (local stores) |
 | `GET` | `/map` | Cluster map JSON |
+
+### Versions
+
+Every successful mutating write creates an immutable `seq` (uint64). Responses include `x-aios-version: {seq}`. Tip GET/HEAD/DELETE (without `version`) operate on the highest non-deleted tip, or a delete-marker tip after `DELETE`. Large (FS) versions use clone/COW (`FICLONE` / `clonefile`); set `clone_required: false` to allow full-copy fallback. Config: `max_versions` (default 16).
 
 ### Attrs
 
 Request/response: `x-aios-attr-<key>: <value>`
+
+### Checksums (CRC32C)
+
+Whole-object Castagnoli CRC-32C is stored with each object and updated on full and ranged PUTs.
+
+- Response / HEAD: `x-aios-crc32c: <uint32 decimal>`
+- Optional request on PUT: `x-aios-crc32c` must match the request body (full object or the ranged patch bytes). Mismatch → `400` / `crc_mismatch`.
+- Replication carries `crc32c` / `range_crc32c`; replicas verify before accepting. Scrub repairs size or CRC mismatches.
 
 ### Preconditions (412 on failure)
 

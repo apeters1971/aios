@@ -4,6 +4,7 @@
 #include "net/server.hpp"
 #include "util/auth.hpp"
 #include "util/base64.hpp"
+#include "util/crc32c.hpp"
 #include "util/log.hpp"
 
 #include <boost/asio.hpp>
@@ -94,6 +95,10 @@ ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& loca
   result.epoch = reply.body.value("epoch", static_cast<std::uint64_t>(0));
   result.size = reply.body.value("size", static_cast<std::uint64_t>(0));
   result.mtime_ms = reply.body.value("mtime_ms", static_cast<std::int64_t>(0));
+  if (reply.body.contains("crc32c") && !reply.body["crc32c"].is_null()) {
+    result.crc32c = reply.body.value("crc32c", 0u);
+    result.crc32c_known = true;
+  }
   if (reply.body.contains("data_b64") && reply.body["data_b64"].is_string()) {
     std::vector<std::uint8_t> data;
     std::string derr;
@@ -125,6 +130,7 @@ ObjectRpcResult object_put_remote(const std::string& peer_addr,
       {"oid", oid},
       {"data_b64", base64_encode(data, len)},
       {"attrs", attrs_j},
+      {"crc32c", crc32c(data, len)},
       {"role", as_replica ? "replica" : "primary"},
   };
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
@@ -193,11 +199,92 @@ ObjectRpcResult object_put_range_remote(
       {"offset", offset},
       {"attrs", attrs_j},
       {"replace_attrs", replace_attrs},
+      {"range_crc32c", crc32c(data, len)},
       {"role", as_replica ? "replica" : "primary"},
   };
   std::vector<std::uint8_t> raw(data, data + len);
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
                     MsgType::ObjectPutRange, std::move(body), std::move(raw));
+}
+
+ObjectRpcResult object_install_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
+    const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs) {
+  nlohmann::json attrs_j = nlohmann::json::object();
+  for (const auto& [k, vattr] : attrs) attrs_j[k] = vattr;
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", v.oid},
+      {"seq", v.seq},
+      {"base_seq", v.prev_tip},
+      {"size", v.size},
+      {"crc32c", v.crc32c},
+      {"inline_body", v.inline_body},
+      {"fs_path", v.fs_path},
+      {"is_delete", v.is_delete},
+      {"attrs", attrs_j},
+      {"role", "replica"},
+  };
+  if (!v.is_delete) {
+    body["data_b64"] = base64_encode(data, len);
+  }
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectPut, std::move(body));
+}
+
+ObjectRpcResult object_publish_tip_remote(const std::string& peer_addr,
+                                          const std::string& local_node_id,
+                                          const std::string& local_listen,
+                                          const std::string& cluster_key, int auth_skew_ms,
+                                          std::uint64_t epoch, const std::string& aios_path,
+                                          const std::string& oid, std::uint64_t seq) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"seq", seq},
+      {"role", "replica"},
+  };
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectPublishTip, std::move(body));
+}
+
+ObjectRpcResult object_abort_version_remote(const std::string& peer_addr,
+                                            const std::string& local_node_id,
+                                            const std::string& local_listen,
+                                            const std::string& cluster_key, int auth_skew_ms,
+                                            std::uint64_t epoch, const std::string& aios_path,
+                                            const std::string& oid, std::uint64_t seq) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"seq", seq},
+      {"role", "replica"},
+  };
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectAbortVersion, std::move(body));
+}
+
+ObjectRpcResult object_purge_versions_remote(const std::string& peer_addr,
+                                             const std::string& local_node_id,
+                                             const std::string& local_listen,
+                                             const std::string& cluster_key, int auth_skew_ms,
+                                             std::uint64_t epoch, const std::string& aios_path,
+                                             const std::string& oid, int keep) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"keep", keep},
+      {"role", "replica"},
+  };
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectPurgeVersions, std::move(body));
 }
 
 }  // namespace aios

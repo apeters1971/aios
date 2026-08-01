@@ -18,4 +18,6 @@ replica_count: 3
 # repair_batch_oids: 256
 http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # http_body_sync: data
+# max_versions: 16            # retain newest N versions per oid
+# clone_required: true        # FS COW via FICLONE/clonefile; false allows full-copy fallback
 # status_file: "/tmp/aios-status.json"
