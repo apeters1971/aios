@@ -1,0 +1,493 @@
+#include "http/http_server.hpp"
+
+#include "http/http_auth.hpp"
+#include "net/framing.hpp"
+#include "util/auth.hpp"
+#include "util/log.hpp"
+
+#include <nlohmann/json.hpp>
+#include <openssl/evp.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
+
+namespace aios {
+namespace {
+
+using tcp = boost::asio::ip::tcp;
+
+std::string sha256_hex(const std::uint8_t* data, std::size_t len) {
+  unsigned char md[EVP_MAX_MD_SIZE];
+  unsigned int md_len = 0;
+  EVP_Digest(data, len, md, &md_len, EVP_sha256(), nullptr);
+  static const char* hexd = "0123456789abcdef";
+  std::string out(md_len * 2, '\0');
+  for (unsigned int i = 0; i < md_len; ++i) {
+    out[i * 2] = hexd[md[i] >> 4];
+    out[i * 2 + 1] = hexd[md[i] & 0xf];
+  }
+  return out;
+}
+
+std::string url_decode(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (std::size_t i = 0; i < in.size(); ++i) {
+    if (in[i] == '%' && i + 2 < in.size()) {
+      auto hex = in.substr(i + 1, 2);
+      char* end = nullptr;
+      const long v = std::strtol(hex.c_str(), &end, 16);
+      if (end && *end == '\0') {
+        out.push_back(static_cast<char>(v));
+        i += 2;
+        continue;
+      }
+    }
+    if (in[i] == '+') out.push_back(' ');
+    else out.push_back(in[i]);
+  }
+  return out;
+}
+
+std::unordered_map<std::string, std::string> parse_query(const std::string& q) {
+  std::unordered_map<std::string, std::string> out;
+  std::size_t i = 0;
+  while (i < q.size()) {
+    auto amp = q.find('&', i);
+    if (amp == std::string::npos) amp = q.size();
+    auto eq = q.find('=', i);
+    if (eq != std::string::npos && eq < amp) {
+      out[url_decode(q.substr(i, eq - i))] = url_decode(q.substr(eq + 1, amp - eq - 1));
+    } else if (amp > i) {
+      out[url_decode(q.substr(i, amp - i))] = "";
+    }
+    i = amp + 1;
+  }
+  return out;
+}
+
+bool parse_content_range(const std::string& v, std::uint64_t& start, std::uint64_t& end,
+                         std::string& err) {
+  // bytes START-END/* or bytes START-END/TOTAL
+  if (v.rfind("bytes ", 0) != 0) {
+    err = "Content-Range must start with bytes ";
+    return false;
+  }
+  auto rest = v.substr(6);
+  auto dash = rest.find('-');
+  auto slash = rest.find('/');
+  if (dash == std::string::npos || slash == std::string::npos || slash < dash) {
+    err = "bad Content-Range";
+    return false;
+  }
+  try {
+    start = std::stoull(rest.substr(0, dash));
+    end = std::stoull(rest.substr(dash + 1, slash - dash - 1));
+  } catch (...) {
+    err = "bad Content-Range numbers";
+    return false;
+  }
+  if (end < start) {
+    err = "Content-Range end < start";
+    return false;
+  }
+  return true;
+}
+
+bool parse_range(const std::string& v, std::uint64_t& start, std::optional<std::uint64_t>& end,
+                 std::string& err) {
+  // bytes=START-END or bytes=START-
+  if (v.rfind("bytes=", 0) != 0) {
+    err = "Range must start with bytes=";
+    return false;
+  }
+  auto rest = v.substr(6);
+  auto dash = rest.find('-');
+  if (dash == std::string::npos) {
+    err = "bad Range";
+    return false;
+  }
+  try {
+    start = std::stoull(rest.substr(0, dash));
+    auto end_s = rest.substr(dash + 1);
+    if (!end_s.empty()) end = std::stoull(end_s);
+  } catch (...) {
+    err = "bad Range numbers";
+    return false;
+  }
+  return true;
+}
+
+std::vector<AttrPrecondition> parse_preconditions(
+    const std::unordered_map<std::string, std::string>& headers) {
+  std::vector<AttrPrecondition> preds;
+  auto inm = header_get(headers, "if-none-match");
+  if (inm == "*") {
+    preds.push_back({AttrPrecondition::Kind::MustNotExist, {}, {}});
+  }
+  auto im = header_get(headers, "if-match");
+  if (im == "*") {
+    preds.push_back({AttrPrecondition::Kind::MustExist, {}, {}});
+  }
+
+  // Multi-value headers may be joined; also accept repeated logical via comma.
+  auto add_kv = [&](AttrPrecondition::Kind kind, const std::string& raw) {
+    auto eq = raw.find('=');
+    AttrPrecondition p;
+    p.kind = kind;
+    if (eq == std::string::npos) {
+      p.key = raw;
+    } else {
+      p.key = raw.substr(0, eq);
+      p.value = raw.substr(eq + 1);
+    }
+    if (!p.key.empty()) preds.push_back(std::move(p));
+  };
+
+  // Scan all headers for x-aios-if-attr-*
+  for (const auto& [k, v] : headers) {
+    if (k == "x-aios-if-attr-eq") add_kv(AttrPrecondition::Kind::Eq, v);
+    else if (k == "x-aios-if-attr-ne") add_kv(AttrPrecondition::Kind::Ne, v);
+    else if (k == "x-aios-if-attr-absent")
+      preds.push_back({AttrPrecondition::Kind::Absent, v, {}});
+    else if (k == "x-aios-if-attr-present")
+      preds.push_back({AttrPrecondition::Kind::Present, v, {}});
+  }
+  return preds;
+}
+
+std::unordered_map<std::string, std::string> parse_attrs(
+    const std::unordered_map<std::string, std::string>& headers) {
+  std::unordered_map<std::string, std::string> attrs;
+  const std::string prefix = "x-aios-attr-";
+  for (const auto& [k, v] : headers) {
+    if (k.rfind(prefix, 0) == 0) {
+      attrs[k.substr(prefix.size())] = v;
+    }
+  }
+  return attrs;
+}
+
+int status_for(const ApiResult& r) {
+  if (r.ok) return 200;
+  if (r.code == "not_found") return 404;
+  if (r.code == "precondition_failed") return 412;
+  if (r.code == "range_unsatisfiable") return 416;
+  if (r.code == "not_primary") return 307;
+  if (r.code == "no_targets") return 503;
+  if (r.code == "quorum_failed") return 503;
+  if (r.code == "bad_request") return 400;
+  return 500;
+}
+
+void write_response(tcp::socket& sock, int status, const std::string& reason,
+                    const std::unordered_map<std::string, std::string>& headers,
+                    const std::uint8_t* body, std::size_t body_len, bool keep_alive) {
+  std::ostringstream oss;
+  oss << "HTTP/1.1 " << status << ' ' << reason << "\r\n";
+  oss << "Content-Length: " << body_len << "\r\n";
+  oss << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
+  for (const auto& [k, v] : headers) {
+    oss << k << ": " << v << "\r\n";
+  }
+  oss << "\r\n";
+  const auto head = oss.str();
+  boost::system::error_code ec;
+  boost::asio::write(sock, boost::asio::buffer(head), ec);
+  if (!ec && body_len > 0 && body) {
+    boost::asio::write(sock, boost::asio::buffer(body, body_len), ec);
+  }
+}
+
+void write_json(tcp::socket& sock, int status, const std::string& reason,
+                const nlohmann::json& j, bool keep_alive) {
+  const auto body = j.dump();
+  write_response(sock, status, reason, {{"Content-Type", "application/json"}},
+                 reinterpret_cast<const std::uint8_t*>(body.data()), body.size(), keep_alive);
+}
+
+bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& ec) {
+  line.clear();
+  char c;
+  while (true) {
+    boost::asio::read(sock, boost::asio::buffer(&c, 1), ec);
+    if (ec) return false;
+    if (c == '\n') {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      return true;
+    }
+    line.push_back(c);
+    if (line.size() > 64 * 1024) {
+      ec = boost::asio::error::message_size;
+      return false;
+    }
+  }
+}
+
+}  // namespace
+
+HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects)
+    : ioc_(ioc), cfg_(std::move(cfg)), objects_(objects), acceptor_(ioc) {
+  std::string host, port;
+  if (!split_host_port(cfg_.http_listen, host, port)) {
+    throw std::runtime_error("invalid http_listen: " + cfg_.http_listen);
+  }
+  tcp::resolver resolver(ioc_);
+  const auto endpoints = resolver.resolve(host, port);
+  const tcp::endpoint ep = *endpoints.begin();
+  acceptor_.open(ep.protocol());
+  acceptor_.set_option(tcp::acceptor::reuse_address(true));
+  acceptor_.bind(ep);
+  acceptor_.listen();
+  AIOS_LOG_INFO("http listening on ", ep.address().to_string(), ":", ep.port());
+}
+
+void HttpServer::start() { do_accept(); }
+
+void HttpServer::do_accept() {
+  auto sock = std::make_shared<tcp::socket>(ioc_);
+  acceptor_.async_accept(*sock, [this, sock](boost::system::error_code ec) {
+    if (!ec) {
+      boost::asio::post(ioc_, [this, sock] { handle_session(sock); });
+    } else {
+      AIOS_LOG_WARN("http accept: ", ec.message());
+    }
+    do_accept();
+  });
+}
+
+void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
+  boost::system::error_code ec;
+  bool keep_alive = true;
+
+  while (keep_alive) {
+    std::string req_line;
+    if (!read_line(*sock, req_line, ec) || req_line.empty()) return;
+
+    std::istringstream rls(req_line);
+    std::string method, target, version;
+    rls >> method >> target >> version;
+    if (method.empty() || target.empty()) return;
+
+    std::unordered_map<std::string, std::string> headers;
+    while (true) {
+      std::string line;
+      if (!read_line(*sock, line, ec)) return;
+      if (line.empty()) break;
+      auto colon = line.find(':');
+      if (colon == std::string::npos) continue;
+      auto name = line.substr(0, colon);
+      auto value = line.substr(colon + 1);
+      while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+      }
+      for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      headers[name] = value;
+    }
+
+    std::size_t content_length = 0;
+    {
+      auto cl = header_get(headers, "content-length");
+      if (!cl.empty()) {
+        try {
+          content_length = static_cast<std::size_t>(std::stoull(cl));
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad Content-Length"}}, false);
+          return;
+        }
+      }
+    }
+    if (content_length > kMaxBodySize) {
+      write_json(*sock, 413, "Payload Too Large", {{"error", "body too large"}}, false);
+      return;
+    }
+
+    std::vector<std::uint8_t> body(content_length);
+    if (content_length > 0) {
+      boost::asio::read(*sock, boost::asio::buffer(body), ec);
+      if (ec) return;
+    }
+
+    const auto conn = header_get(headers, "connection");
+    if (version == "HTTP/1.0") keep_alive = (conn == "keep-alive");
+    else keep_alive = (conn != "close");
+
+    requests_.fetch_add(1);
+
+    std::string path = target;
+    std::string query;
+    auto qpos = target.find('?');
+    if (qpos != std::string::npos) {
+      path = target.substr(0, qpos);
+      query = target.substr(qpos + 1);
+    }
+    auto qmap = parse_query(query);
+
+    // Auth
+    const bool unsigned_payload =
+        header_get(headers, "x-aios-content-sha256") == "UNSIGNED-PAYLOAD";
+    const std::string payload_hash =
+        unsigned_payload ? "UNSIGNED-PAYLOAD" : sha256_hex(body.data(), body.size());
+    auto auth = http_auth_verify(method, target, headers, payload_hash, cfg_.cluster_key,
+                                 cfg_.auth_skew_ms);
+    if (!auth.ok) {
+      write_json(*sock, 401, "Unauthorized", {{"error", auth.error}}, keep_alive);
+      continue;
+    }
+
+    auto preds = parse_preconditions(headers);
+    auto attrs = parse_attrs(headers);
+
+    if (method == "GET" && path == "/map") {
+      write_json(*sock, 200, "OK", objects_.map().to_json(), keep_alive);
+      continue;
+    }
+
+    if (method == "GET" && path == "/o") {
+      const auto prefix = qmap.count("prefix") ? qmap["prefix"] : "";
+      std::string attr_key, attr_val;
+      if (qmap.count("attr_eq")) {
+        auto v = qmap["attr_eq"];
+        auto c = v.find(':');
+        if (c != std::string::npos) {
+          attr_key = v.substr(0, c);
+          attr_val = v.substr(c + 1);
+        }
+      }
+      std::size_t limit = 1000;
+      if (qmap.count("limit")) {
+        try {
+          limit = static_cast<std::size_t>(std::stoull(qmap["limit"]));
+        } catch (...) {
+        }
+      }
+      const auto cursor = qmap.count("cursor") ? qmap["cursor"] : "";
+      const bool include_attrs = qmap.count("attrs") && qmap["attrs"] == "1";
+      auto r = objects_.api_list(prefix, attr_key, attr_val, limit, cursor, include_attrs);
+      nlohmann::json arr = nlohmann::json::array();
+      for (const auto& o : r.list.objects) {
+        nlohmann::json jo = {{"oid", o.oid}, {"size", o.size}, {"mtime_ms", o.mtime_ms}};
+        if (include_attrs) jo["attrs"] = o.attrs;
+        arr.push_back(std::move(jo));
+      }
+      nlohmann::json resp = {{"objects", arr}, {"next_cursor", r.list.next_cursor}};
+      write_json(*sock, 200, "OK", resp, keep_alive);
+      continue;
+    }
+
+    if (path.rfind("/o/", 0) == 0) {
+      const std::string oid = url_decode(path.substr(3));
+      if (oid.empty()) {
+        write_json(*sock, 400, "Bad Request", {{"error", "empty oid"}}, keep_alive);
+        continue;
+      }
+
+      if (method == "PUT") {
+        std::string cr = header_get(headers, "content-range");
+        ApiResult r;
+        if (!cr.empty()) {
+          std::uint64_t start = 0, end = 0;
+          std::string perr;
+          if (!parse_content_range(cr, start, end, perr)) {
+            write_json(*sock, 400, "Bad Request", {{"error", perr}}, keep_alive);
+            continue;
+          }
+          if (end - start + 1 != body.size()) {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "Content-Range length mismatch"}}, keep_alive);
+            continue;
+          }
+          r = objects_.api_put_range(oid, start, body.data(), body.size(), attrs, false,
+                                     preds);
+        } else {
+          r = objects_.api_put(oid, body.data(), body.size(), attrs, true, preds);
+        }
+        if (!r.ok) {
+          write_json(*sock, status_for(r), "Error",
+                     {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
+          continue;
+        }
+        write_response(*sock, 204, "No Content",
+                       {{"x-aios-epoch", std::to_string(r.epoch)},
+                        {"x-aios-replicas", std::to_string(r.replicas)}},
+                       nullptr, 0, keep_alive);
+        continue;
+      }
+
+      if (method == "GET" || method == "HEAD") {
+        std::optional<std::uint64_t> off, end;
+        const auto range = header_get(headers, "range");
+        if (!range.empty()) {
+          std::uint64_t start = 0;
+          std::optional<std::uint64_t> end_opt;
+          std::string perr;
+          if (!parse_range(range, start, end_opt, perr)) {
+            write_json(*sock, 400, "Bad Request", {{"error", perr}}, keep_alive);
+            continue;
+          }
+          off = start;
+          end = end_opt;
+        }
+        auto r = objects_.api_get(oid, off, end, preds);
+        if (!r.ok) {
+          write_json(*sock, status_for(r), "Error",
+                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          continue;
+        }
+        std::unordered_map<std::string, std::string> rh = {
+            {"Content-Type", "application/octet-stream"},
+            {"x-aios-epoch", std::to_string(r.epoch)},
+            {"Accept-Ranges", "bytes"},
+        };
+        if (r.info) {
+          rh["x-aios-size"] = std::to_string(r.info->size);
+          rh["x-aios-mtime-ms"] = std::to_string(r.info->mtime_ms);
+        }
+        for (const auto& [k, v] : r.attrs) {
+          rh["x-aios-attr-" + k] = v;
+        }
+
+        if (off.has_value() && r.info && r.data) {
+          const auto start = *off;
+          const auto end_v = start + r.data->size() - 1;
+          rh["Content-Range"] = "bytes " + std::to_string(start) + "-" +
+                                std::to_string(end_v) + "/" + std::to_string(r.info->size);
+          if (method == "HEAD") {
+            write_response(*sock, 206, "Partial Content", rh, nullptr, r.data->size(),
+                           keep_alive);
+          } else {
+            write_response(*sock, 206, "Partial Content", rh, r.data->data(), r.data->size(),
+                           keep_alive);
+          }
+        } else {
+          const auto* p = (method == "HEAD" || !r.data) ? nullptr : r.data->data();
+          const auto n = r.data ? r.data->size() : 0;
+          write_response(*sock, 200, "OK", rh, p, n, keep_alive);
+        }
+        continue;
+      }
+
+      if (method == "DELETE") {
+        auto r = objects_.api_del(oid, preds);
+        if (!r.ok) {
+          write_json(*sock, status_for(r), "Error",
+                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          continue;
+        }
+        write_response(*sock, 204, "No Content",
+                       {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, keep_alive);
+        continue;
+      }
+    }
+
+    write_json(*sock, 404, "Not Found", {{"error", "not found"}}, keep_alive);
+  }
+}
+
+}  // namespace aios

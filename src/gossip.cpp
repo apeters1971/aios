@@ -3,13 +3,16 @@
 #include "fs/aios_scan.hpp"
 #include "net/client.hpp"
 #include "node_id.hpp"
+#include "object/repair.hpp"
 #include "util/log.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace aios {
 
@@ -21,7 +24,10 @@ GossipEngine::GossipEngine(boost::asio::io_context& ioc, Config cfg,
       fs_table_(fs_table),
       gossip_timer_(ioc),
       scan_timer_(ioc),
-      status_timer_(ioc) {}
+      status_timer_(ioc),
+      repair_timer_(ioc) {
+  object_service_ = std::make_unique<ObjectService>(cfg_, cluster_map_, local_stores_);
+}
 
 std::string GossipEngine::advertise_addr() const {
   std::string host, port;
@@ -29,10 +35,32 @@ std::string GossipEngine::advertise_addr() const {
     return cfg_.listen;
   }
   if (host == "0.0.0.0" || host == "::") {
-    // Prefer hostname for peer dialing when bound on all interfaces.
     return default_hostname() + ":" + port;
   }
   return cfg_.listen;
+}
+
+void GossipEngine::rebuild_cluster_map() {
+  const auto prev = cluster_map_.epoch;
+  cluster_map_ = ClusterMap::build(membership_, fs_table_, cfg_.replica_count);
+  if (cluster_map_.epoch != prev) {
+    AIOS_LOG_INFO("cluster map epoch=", cluster_map_.epoch,
+                  " targets=", cluster_map_.targets.size(),
+                  " replica_count=", cluster_map_.replica_count);
+  }
+}
+
+void GossipEngine::sync_local_stores() {
+  std::vector<std::string> paths;
+  for (const auto& e : fs_table_.snapshot()) {
+    if (e.node_id == cfg_.node_id && e.usable && !e.aios_path.empty()) {
+      paths.push_back(e.aios_path);
+    }
+  }
+  ObjectStoreOptions opts;
+  // Fewer shards for daemon-managed targets keeps repair listing light.
+  opts.shard_count = 16;
+  local_stores_.sync_paths(paths, opts);
 }
 
 void GossipEngine::start() {
@@ -42,14 +70,18 @@ void GossipEngine::start() {
     membership_.add_seed(p);
   }
 
+  object_service_->set_advertise(adv);
+
   run_scan();
+  rebuild_cluster_map();
+  sync_local_stores();
 
   std::string host, port;
   if (!split_host_port(cfg_.listen, host, port)) {
     throw std::runtime_error("invalid listen address: " + cfg_.listen);
   }
 
-  GossipHandlers handlers;
+  RpcHandlers handlers;
   handlers.local_node_id = cfg_.node_id;
   handlers.local_listen = adv;
   handlers.cluster_key = cfg_.cluster_key;
@@ -58,11 +90,16 @@ void GossipEngine::start() {
                               const Frame& req) -> std::optional<Frame> {
     return handle_inbound_gossip(peer_id, peer_listen, req);
   };
+  handlers.on_object = [this](const Frame& req) { return object_service_->handle(req); };
 
   server_ = std::make_unique<TcpServer>(ioc_, host, port, std::move(handlers));
   server_->start();
 
-  // Immediate seed contact.
+  if (!cfg_.http_listen.empty()) {
+    http_server_ = std::make_unique<HttpServer>(ioc_, cfg_, *object_service_);
+    http_server_->start();
+  }
+
   boost::asio::post(ioc_, [this] {
     for (const auto& p : cfg_.peers) {
       auto r = gossip_with_peer(ioc_, p, cfg_.node_id, advertise_addr(),
@@ -70,6 +107,7 @@ void GossipEngine::start() {
                                 fs_table_);
       if (r.ok) {
         AIOS_LOG_INFO("seed gossip ok with ", p, " as ", r.peer_node_id);
+        rebuild_cluster_map();
         write_status();
       } else {
         AIOS_LOG_WARN("seed gossip failed ", p, ": ", r.error);
@@ -87,8 +125,14 @@ void GossipEngine::start() {
   status_timer_.expires_after(std::chrono::seconds(5));
   status_timer_.async_wait([this](auto ec) { on_status_timer(ec); });
 
+  if (cfg_.repair_interval_ms > 0) {
+    repair_timer_.expires_after(std::chrono::milliseconds(cfg_.repair_interval_ms));
+    repair_timer_.async_wait([this](auto ec) { on_repair_timer(ec); });
+  }
+
   AIOS_LOG_INFO("node ", cfg_.node_id, " advertise=", adv,
-                " peers=", cfg_.peers.size(), " auth=hmac-sha256");
+                " peers=", cfg_.peers.size(), " auth=hmac-sha256",
+                " replica_count=", cfg_.replica_count);
 }
 
 Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
@@ -105,12 +149,14 @@ Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
   if (req.body.contains("fs_table")) {
     fs_table_.merge(FsTable::from_json(req.body["fs_table"]));
   }
+  rebuild_cluster_map();
 
   Frame reply;
   reply.type = MsgType::Gossip;
   reply.body = {
       {"membership", membership_.to_json()},
       {"fs_table", fs_table_.to_json()},
+      {"cluster_map", cluster_map_.to_json()},
   };
   return reply;
 }
@@ -131,6 +177,7 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
       AIOS_LOG_DEBUG("gossip fail ", p.addr, ": ", r.error);
     }
   }
+  rebuild_cluster_map();
 
   gossip_timer_.expires_after(std::chrono::milliseconds(cfg_.gossip_interval_ms));
   gossip_timer_.async_wait([this](auto e) { on_gossip_timer(e); });
@@ -154,8 +201,25 @@ void GossipEngine::run_scan() {
 void GossipEngine::on_scan_timer(const boost::system::error_code& ec) {
   if (ec) return;
   run_scan();
+  sync_local_stores();
+  rebuild_cluster_map();
   scan_timer_.expires_after(std::chrono::milliseconds(cfg_.scan_interval_ms));
   scan_timer_.async_wait([this](auto e) { on_scan_timer(e); });
+}
+
+void GossipEngine::on_repair_timer(const boost::system::error_code& ec) {
+  if (ec) return;
+  rebuild_cluster_map();
+  const auto stats =
+      run_repair(cfg_, advertise_addr(), cluster_map_, local_stores_,
+                 static_cast<std::size_t>(std::max(1, cfg_.repair_batch_oids)));
+  if (stats.oids_scanned > 0 || stats.under_replicated > 0) {
+    AIOS_LOG_INFO("repair scanned=", stats.oids_scanned,
+                  " under_replicated=", stats.under_replicated,
+                  " repaired=", stats.repaired, " failed=", stats.failed);
+  }
+  repair_timer_.expires_after(std::chrono::milliseconds(cfg_.repair_interval_ms));
+  repair_timer_.async_wait([this](auto e) { on_repair_timer(e); });
 }
 
 void GossipEngine::write_status() {
@@ -163,8 +227,13 @@ void GossipEngine::write_status() {
       {"node_id", cfg_.node_id},
       {"listen", cfg_.listen},
       {"advertise", advertise_addr()},
+      {"http_listen", cfg_.http_listen},
+      {"http_requests", http_server_ ? http_server_->requests() : 0},
+      {"replica_count", cfg_.replica_count},
+      {"write_quorum", cfg_.write_quorum > 0 ? cfg_.write_quorum : cfg_.replica_count},
       {"membership", membership_.to_json()},
       {"fs_table", fs_table_.to_json()},
+      {"cluster_map", cluster_map_.to_json()},
   };
   const auto members = membership_.snapshot();
   std::size_t alive = 0;
@@ -172,7 +241,9 @@ void GossipEngine::write_status() {
     if (m.state == MemberState::Alive) ++alive;
   }
   AIOS_LOG_INFO("status members=", members.size(), " alive=", alive,
-                " fs_entries=", fs_table_.snapshot().size());
+                " fs_entries=", fs_table_.snapshot().size(),
+                " map_targets=", cluster_map_.targets.size(),
+                " epoch=", cluster_map_.epoch);
 
   if (cfg_.status_file.empty()) return;
   const std::string tmp = cfg_.status_file + ".tmp";
@@ -193,6 +264,7 @@ void GossipEngine::write_status() {
 
 void GossipEngine::on_status_timer(const boost::system::error_code& ec) {
   if (ec) return;
+  rebuild_cluster_map();
   write_status();
   status_timer_.expires_after(std::chrono::seconds(5));
   status_timer_.async_wait([this](auto e) { on_status_timer(e); });

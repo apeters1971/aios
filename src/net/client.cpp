@@ -60,6 +60,8 @@ GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
   result.peer_listen = hello_reply.body.value("listen", peer_addr);
   if (result.peer_listen.empty()) result.peer_listen = peer_addr;
 
+  // cluster_map is rebuilt locally from membership + fs_table; gossip carries
+  // only those sources. Peers may optionally echo cluster_map in replies.
   Frame gossip;
   gossip.type = MsgType::Gossip;
   gossip.body = {

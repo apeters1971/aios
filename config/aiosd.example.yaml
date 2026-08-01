@@ -11,4 +11,11 @@ gossip_interval_ms: 1000
 suspect_after_ms: 5000
 dead_after_ms: 15000
 scan_interval_ms: 5000
+# Server-side redundancy (primary fans out to secondaries).
+replica_count: 3
+# write_quorum: 0          # 0 => same as replica_count (capped by acting set size)
+# repair_interval_ms: 30000
+# repair_batch_oids: 256
+http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
+# http_body_sync: data
 # status_file: "/tmp/aios-status.json"

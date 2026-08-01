@@ -37,6 +37,15 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["status_file"]) cfg.status_file = root["status_file"].as<std::string>();
     if (root["cluster_key"]) cfg.cluster_key = root["cluster_key"].as<std::string>();
     if (root["auth_skew_ms"]) cfg.auth_skew_ms = root["auth_skew_ms"].as<int>();
+    if (root["replica_count"]) cfg.replica_count = root["replica_count"].as<int>();
+    if (root["write_quorum"]) cfg.write_quorum = root["write_quorum"].as<int>();
+    if (root["repair_interval_ms"])
+      cfg.repair_interval_ms = root["repair_interval_ms"].as<int>();
+    if (root["repair_batch_oids"])
+      cfg.repair_batch_oids = root["repair_batch_oids"].as<int>();
+    if (root["http_listen"]) cfg.http_listen = root["http_listen"].as<std::string>();
+    if (root["http_body_sync"])
+      cfg.http_body_sync = root["http_body_sync"].as<std::string>();
     if (root["peers"]) {
       cfg.peers.clear();
       for (const auto& p : root["peers"]) {
@@ -99,6 +108,24 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       const char* v = need("--cluster-key");
       if (!v) return false;
       cfg.cluster_key = v;
+      continue;
+    }
+    if (arg == "--replica-count") {
+      const char* v = need("--replica-count");
+      if (!v) return false;
+      cfg.replica_count = std::stoi(v);
+      continue;
+    }
+    if (arg == "--write-quorum") {
+      const char* v = need("--write-quorum");
+      if (!v) return false;
+      cfg.write_quorum = std::stoi(v);
+      continue;
+    }
+    if (arg == "--http-listen") {
+      const char* v = need("--http-listen");
+      if (!v) return false;
+      cfg.http_listen = v;
       continue;
     }
     err = "unknown argument: " + arg;

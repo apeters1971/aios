@@ -18,6 +18,17 @@ struct Config {
   int dead_after_ms{15000};
   int scan_interval_ms{5000};
   std::string status_file;
+  // Server-side replication: primary fans out to replica_count targets.
+  int replica_count{3};
+  // Successful copies required for Put/Del ACK (including primary). 0 => replica_count.
+  int write_quorum{0};
+  int repair_interval_ms{30000};
+  // Max oids scanned per local store each repair tick.
+  int repair_batch_oids{256};
+  // HTTP object API listen address; empty disables HTTP front-end.
+  std::string http_listen{"0.0.0.0:7480"};
+  // Body durability for ranged FS puts: none | data | full (informational; store fsyncs).
+  std::string http_body_sync{"data"};
 };
 
 // Load YAML config file (optional). Returns false on parse failure.

@@ -33,6 +33,34 @@ struct ObjectInfo {
   std::int64_t mtime_ms{0};
 };
 
+struct ObjectListEntry {
+  std::string oid;
+  std::uint64_t size{0};
+  std::int64_t mtime_ms{0};
+  std::unordered_map<std::string, std::string> attrs;
+};
+
+struct ObjectListResult {
+  std::vector<ObjectListEntry> objects;
+  std::string next_cursor;  // empty if done; opaque "shard:oid"
+};
+
+enum class PrecondResult { Ok, NotFound, Conflict };
+
+struct AttrPrecondition {
+  enum class Kind {
+    Eq,
+    Ne,
+    Absent,
+    Present,
+    MustExist,     // If-Match: *
+    MustNotExist,  // If-None-Match: *
+  };
+  Kind kind{Kind::Eq};
+  std::string key;
+  std::string value;
+};
+
 // Maps oid -> shard index via SHA-256 (stable across processes).
 std::uint32_t shard_of_oid(const std::string& oid, std::uint32_t shard_count);
 
@@ -64,7 +92,23 @@ class ObjectStore {
                replace_attrs, err);
   }
 
+  // Random-overwrite ranged put. Always FS-backed; grows object to offset+len.
+  // Holes are sparse zeros. Merges attrs unless replace_attrs.
+  bool put_range(const std::string& oid, std::uint64_t offset, const std::uint8_t* data,
+                 std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
+                 bool replace_attrs, std::string& err);
+
   std::optional<std::vector<std::uint8_t>> get(const std::string& oid, std::string& err);
+
+  // Read [offset, offset+len). Returns empty optional on error; empty vector if len==0.
+  // err = "object not found" | "range unsatisfiable" | ...
+  std::optional<std::vector<std::uint8_t>> get_range(const std::string& oid,
+                                                     std::uint64_t offset, std::size_t len,
+                                                     std::string& err);
+
+  // Absolute path to FS body for sendfile, if FS-backed.
+  std::optional<std::string> fs_body_path(const std::string& oid, std::string& err);
+
   std::optional<ObjectInfo> stat(const std::string& oid, std::string& err);
   bool del(const std::string& oid, std::string& err);
 
@@ -75,8 +119,21 @@ class ObjectStore {
   std::unordered_map<std::string, std::string> list_attrs(const std::string& oid,
                                                           std::string& err);
 
+  PrecondResult check_preconditions(const std::string& oid,
+                                    const std::vector<AttrPrecondition>& preds,
+                                    std::string& err);
+
+  // Fan-out prefix scan across shards. cursor empty = start.
+  // attr_eq empty key means no attr filter. include_attrs fills attrs map.
+  ObjectListResult list(const std::string& prefix, const std::string& attr_eq_key,
+                        const std::string& attr_eq_value, std::size_t limit,
+                        const std::string& cursor, bool include_attrs, std::string& err);
+
   // Remove orphan files under each shard's objects/ with no DB row.
   std::size_t scrub_orphans(std::string& err);
+
+  // List object ids present in any opened or on-disk shard (for repair).
+  std::vector<std::string> list_oids(std::size_t max_count, std::string& err);
 
  private:
   struct Shard {
@@ -94,11 +151,17 @@ class ObjectStore {
   static bool ensure_schema(sqlite3* db, std::string& err);
   bool use_inline(std::size_t len) const;
 
-  // Paths relative to shard dir.
   std::string body_relpath(const std::string& oid) const;
   bool write_fs_object(Shard& shard, const std::string& relpath, const std::uint8_t* data,
                        std::size_t len, std::string& err);
   bool remove_fs_object(Shard& shard, const std::string& relpath, std::string& err);
+  bool ensure_fs_size(Shard& shard, const std::string& relpath, std::uint64_t size,
+                      std::string& err);
+  bool pwrite_fs(Shard& shard, const std::string& relpath, std::uint64_t offset,
+                 const std::uint8_t* data, std::size_t len, std::string& err);
+  bool promote_inline_to_fs_locked(Shard& s, const std::string& oid,
+                                   const std::uint8_t* inline_data, std::size_t inline_len,
+                                   std::string& fs_path_out, std::string& err);
 
   bool begin(Shard& s, std::string& err);
   bool commit(Shard& s, std::string& err);
@@ -106,6 +169,9 @@ class ObjectStore {
 
   bool delete_attrs_locked(Shard& s, const std::string& oid, std::string& err);
   bool insert_attrs_locked(Shard& s, const std::string& oid,
+                           const std::unordered_map<std::string, std::string>& attrs,
+                           std::string& err);
+  bool upsert_attrs_locked(Shard& s, const std::string& oid,
                            const std::unordered_map<std::string, std::string>& attrs,
                            std::string& err);
   bool object_exists_locked(Shard& s, const std::string& oid, std::string& err);

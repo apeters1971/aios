@@ -1,9 +1,13 @@
 #pragma once
 
+#include "cluster/cluster_map.hpp"
 #include "config.hpp"
 #include "fs/fs_table.hpp"
+#include "http/http_server.hpp"
 #include "membership.hpp"
 #include "net/server.hpp"
+#include "object/object_service.hpp"
+#include "store/local_stores.hpp"
 
 #include <boost/asio.hpp>
 
@@ -18,11 +22,18 @@ class GossipEngine {
 
   void start();
 
+  const ClusterMap& cluster_map() const { return cluster_map_; }
+  LocalStores& local_stores() { return local_stores_; }
+  ObjectService& object_service() { return *object_service_; }
+
  private:
   void on_gossip_timer(const boost::system::error_code& ec);
   void on_scan_timer(const boost::system::error_code& ec);
   void on_status_timer(const boost::system::error_code& ec);
+  void on_repair_timer(const boost::system::error_code& ec);
   void run_scan();
+  void rebuild_cluster_map();
+  void sync_local_stores();
   void write_status();
   Frame handle_inbound_gossip(const std::string& peer_node_id,
                               const std::string& peer_listen, const Frame& req);
@@ -33,10 +44,15 @@ class GossipEngine {
   Config cfg_;
   MembershipTable& membership_;
   FsTable& fs_table_;
+  ClusterMap cluster_map_;
+  LocalStores local_stores_;
+  std::unique_ptr<ObjectService> object_service_;
   std::unique_ptr<TcpServer> server_;
+  std::unique_ptr<HttpServer> http_server_;
   boost::asio::steady_timer gossip_timer_;
   boost::asio::steady_timer scan_timer_;
   boost::asio::steady_timer status_timer_;
+  boost::asio::steady_timer repair_timer_;
 };
 
 }  // namespace aios

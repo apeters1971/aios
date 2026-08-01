@@ -21,25 +21,57 @@ const char* msg_type_name(MsgType t) {
       return "Ping";
     case MsgType::Pong:
       return "Pong";
+    case MsgType::ObjectPut:
+      return "ObjectPut";
+    case MsgType::ObjectGet:
+      return "ObjectGet";
+    case MsgType::ObjectDel:
+      return "ObjectDel";
+    case MsgType::ObjectStat:
+      return "ObjectStat";
+    case MsgType::ObjectReply:
+      return "ObjectReply";
+    case MsgType::ObjectPutRange:
+      return "ObjectPutRange";
   }
   return "Unknown";
 }
 
 std::vector<std::uint8_t> encode_frame(const Frame& frame) {
-  const std::string body = frame.body.dump();
-  if (body.size() > kMaxBodySize) {
+  const std::string json = frame.body.dump();
+  std::vector<std::uint8_t> payload;
+  std::uint16_t flags = frame.flags;
+
+  if (!frame.raw.empty() || (flags & kFlagRawBody)) {
+    flags |= kFlagRawBody;
+    if (json.size() > 0xffffffffu) throw std::runtime_error("json too large");
+    const std::uint32_t jlen = static_cast<std::uint32_t>(json.size());
+    payload.resize(4 + json.size() + frame.raw.size());
+    const std::uint32_t jlen_be = htonl(jlen);
+    std::memcpy(payload.data(), &jlen_be, 4);
+    if (!json.empty()) {
+      std::memcpy(payload.data() + 4, json.data(), json.size());
+    }
+    if (!frame.raw.empty()) {
+      std::memcpy(payload.data() + 4 + json.size(), frame.raw.data(), frame.raw.size());
+    }
+  } else {
+    payload.assign(json.begin(), json.end());
+  }
+
+  if (payload.size() > kMaxBodySize) {
     throw std::runtime_error("frame body too large");
   }
-  std::vector<std::uint8_t> out(kHeaderSize + body.size());
+  std::vector<std::uint8_t> out(kHeaderSize + payload.size());
   std::memcpy(out.data(), kMagic, 4);
   out[4] = kProtoVersion;
   out[5] = static_cast<std::uint8_t>(frame.type);
-  const std::uint16_t flags_be = htons(frame.flags);
+  const std::uint16_t flags_be = htons(flags);
   std::memcpy(out.data() + 6, &flags_be, 2);
-  const std::uint32_t len_be = htonl(static_cast<std::uint32_t>(body.size()));
+  const std::uint32_t len_be = htonl(static_cast<std::uint32_t>(payload.size()));
   std::memcpy(out.data() + 8, &len_be, 4);
-  if (!body.empty()) {
-    std::memcpy(out.data() + kHeaderSize, body.data(), body.size());
+  if (!payload.empty()) {
+    std::memcpy(out.data() + kHeaderSize, payload.data(), payload.size());
   }
   return out;
 }
@@ -47,6 +79,7 @@ std::vector<std::uint8_t> encode_frame(const Frame& frame) {
 bool decode_frame(const std::uint8_t* data, std::size_t len, Frame& out,
                   std::size_t& consumed, std::string& err) {
   consumed = 0;
+  out.raw.clear();
   if (len < kHeaderSize) {
     err = "incomplete header";
     return false;
@@ -74,17 +107,44 @@ bool decode_frame(const std::uint8_t* data, std::size_t len, Frame& out,
     err = "incomplete body";
     return false;
   }
+
   nlohmann::json body = nlohmann::json::object();
-  if (body_len > 0) {
+  const std::uint8_t* payload = data + kHeaderSize;
+  if (flags & kFlagRawBody) {
+    if (body_len < 4) {
+      err = "raw body missing json_len";
+      return false;
+    }
+    std::uint32_t jlen_be = 0;
+    std::memcpy(&jlen_be, payload, 4);
+    const std::uint32_t jlen = ntohl(jlen_be);
+    if (4u + jlen > body_len) {
+      err = "raw body json_len overflow";
+      return false;
+    }
+    if (jlen > 0) {
+      try {
+        body = nlohmann::json::parse(reinterpret_cast<const char*>(payload + 4),
+                                     reinterpret_cast<const char*>(payload + 4 + jlen));
+      } catch (const std::exception& e) {
+        err = std::string("json parse: ") + e.what();
+        return false;
+      }
+    }
+    const std::size_t raw_len = body_len - 4 - jlen;
+    if (raw_len > 0) {
+      out.raw.assign(payload + 4 + jlen, payload + 4 + jlen + raw_len);
+    }
+  } else if (body_len > 0) {
     try {
-      body = nlohmann::json::parse(
-          reinterpret_cast<const char*>(data + kHeaderSize),
-          reinterpret_cast<const char*>(data + kHeaderSize + body_len));
+      body = nlohmann::json::parse(reinterpret_cast<const char*>(payload),
+                                   reinterpret_cast<const char*>(payload + body_len));
     } catch (const std::exception& e) {
       err = std::string("json parse: ") + e.what();
       return false;
     }
   }
+
   out.type = type;
   out.flags = flags;
   out.body = std::move(body);

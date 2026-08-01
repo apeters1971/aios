@@ -56,11 +56,20 @@ add_library(aios_core STATIC
   src/net/framing.cpp
   src/net/server.cpp
   src/net/client.cpp
+  src/net/object_client.cpp
   src/fs/mounts.cpp
   src/fs/aios_scan.cpp
   src/fs/fs_table.cpp
   src/util/auth.cpp
+  src/util/base64.cpp
   src/store/object_store.cpp
+  src/store/local_stores.cpp
+  src/cluster/cluster_map.cpp
+  src/cluster/place.cpp
+  src/object/object_service.cpp
+  src/object/repair.cpp
+  src/http/http_auth.cpp
+  src/http/http_server.cpp
 )
 target_include_directories(aios_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -86,6 +95,11 @@ add_executable(aios_tests
   tests/test_aios_scan.cpp
   tests/test_auth.cpp
   tests/test_object_store.cpp
+  tests/test_cluster_map.cpp
+  tests/test_object_rpc.cpp
+  tests/test_store_range.cpp
+  tests/test_http_auth.cpp
+  tests/test_http_api.cpp
   tests/test_main.cpp
 )
 target_link_libraries(aios_tests PRIVATE aios_core)

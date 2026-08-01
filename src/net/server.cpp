@@ -60,8 +60,17 @@ bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
   }
 }
 
+namespace {
+
+bool is_object_req(MsgType t) {
+  return t == MsgType::ObjectPut || t == MsgType::ObjectGet || t == MsgType::ObjectDel ||
+         t == MsgType::ObjectStat || t == MsgType::ObjectPutRange;
+}
+
+}  // namespace
+
 TcpServer::TcpServer(boost::asio::io_context& ioc, const std::string& listen_host,
-                     const std::string& listen_port, GossipHandlers handlers)
+                     const std::string& listen_port, RpcHandlers handlers)
     : ioc_(ioc),
       acceptor_(ioc),
       handlers_(std::move(handlers)) {
@@ -126,18 +135,34 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     write_frame(*sock, pong, err, ec);
     return;
   }
-  if (req.type != MsgType::Gossip || !handlers_.on_gossip) return;
-
-  if (!auth_verify(req.body, MsgType::Gossip, handlers_.cluster_key,
-                   handlers_.auth_skew_ms, err)) {
-    AIOS_LOG_WARN("reject gossip auth from ", peer_id, ": ", err);
+  if (req.type == MsgType::Gossip) {
+    if (!handlers_.on_gossip) return;
+    if (!auth_verify(req.body, MsgType::Gossip, handlers_.cluster_key,
+                     handlers_.auth_skew_ms, err)) {
+      AIOS_LOG_WARN("reject gossip auth from ", peer_id, ": ", err);
+      return;
+    }
+    auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, req);
+    if (!gossip_reply) return;
+    auth_sign(gossip_reply->body, MsgType::Gossip, handlers_.cluster_key);
+    write_frame(*sock, *gossip_reply, err, ec);
     return;
   }
-
-  auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, req);
-  if (!gossip_reply) return;
-  auth_sign(gossip_reply->body, MsgType::Gossip, handlers_.cluster_key);
-  write_frame(*sock, *gossip_reply, err, ec);
+  if (is_object_req(req.type)) {
+    if (!handlers_.on_object) return;
+    if (!auth_verify(req.body, req.type, handlers_.cluster_key, handlers_.auth_skew_ms,
+                     err)) {
+      AIOS_LOG_WARN("reject object auth from ", peer_id, ": ", err);
+      return;
+    }
+    Frame reply = handlers_.on_object(req);
+    if (reply.type != MsgType::ObjectReply) {
+      reply.type = MsgType::ObjectReply;
+    }
+    auth_sign(reply.body, MsgType::ObjectReply, handlers_.cluster_key);
+    write_frame(*sock, reply, err, ec);
+    return;
+  }
 }
 
 }  // namespace aios

@@ -6,8 +6,11 @@
 #include <openssl/evp.h>
 #include <sqlite3.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -304,6 +307,94 @@ bool ObjectStore::remove_fs_object(Shard& shard, const std::string& relpath, std
     err = ec.message();
     return false;
   }
+  return true;
+}
+
+bool ObjectStore::ensure_fs_size(Shard& shard, const std::string& relpath, std::uint64_t size,
+                                std::string& err) {
+  const fs::path path = fs::path(shard.dir) / relpath;
+  std::error_code ec;
+  fs::create_directories(path.parent_path(), ec);
+  int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+  if (fd < 0) {
+    err = std::string("open for truncate: ") + std::strerror(errno);
+    return false;
+  }
+  if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+    err = std::string("ftruncate: ") + std::strerror(errno);
+    ::close(fd);
+    return false;
+  }
+  ::close(fd);
+  return true;
+}
+
+bool ObjectStore::pwrite_fs(Shard& shard, const std::string& relpath, std::uint64_t offset,
+                           const std::uint8_t* data, std::size_t len, std::string& err) {
+  const fs::path path = fs::path(shard.dir) / relpath;
+  int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+  if (fd < 0) {
+    err = std::string("open for pwrite: ") + std::strerror(errno);
+    return false;
+  }
+  std::size_t done = 0;
+  while (done < len) {
+    const ssize_t n =
+        ::pwrite(fd, data + done, len - done, static_cast<off_t>(offset + done));
+    if (n < 0) {
+      err = std::string("pwrite: ") + std::strerror(errno);
+      ::close(fd);
+      return false;
+    }
+    if (n == 0) {
+      err = "pwrite short write";
+      ::close(fd);
+      return false;
+    }
+    done += static_cast<std::size_t>(n);
+  }
+  if (::fsync(fd) != 0) {
+    err = std::string("fsync: ") + std::strerror(errno);
+    ::close(fd);
+    return false;
+  }
+  ::close(fd);
+  return true;
+}
+
+bool ObjectStore::promote_inline_to_fs_locked(Shard& s, const std::string& oid,
+                                             const std::uint8_t* inline_data,
+                                             std::size_t inline_len, std::string& fs_path_out,
+                                             std::string& err) {
+  fs_path_out = body_relpath(oid);
+  if (!write_fs_object(s, fs_path_out, inline_data, inline_len, err)) return false;
+  return true;
+}
+
+bool ObjectStore::upsert_attrs_locked(
+    Shard& s, const std::string& oid,
+    const std::unordered_map<std::string, std::string>& attrs, std::string& err) {
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(s.db,
+                         "INSERT INTO attrs(oid,key,value) VALUES(?1,?2,?3) "
+                         "ON CONFLICT(oid,key) DO UPDATE SET value=excluded.value;",
+                         -1, &stmt, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    return false;
+  }
+  for (const auto& [k, v] : attrs) {
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, k.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 3, v.data(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+      err = sqlite3_errmsg(s.db);
+      sqlite3_finalize(stmt);
+      return false;
+    }
+  }
+  sqlite3_finalize(stmt);
   return true;
 }
 
@@ -772,6 +863,52 @@ std::unordered_map<std::string, std::string> ObjectStore::list_attrs(const std::
   return out;
 }
 
+std::vector<std::string> ObjectStore::list_oids(std::size_t max_count, std::string& err) {
+  std::vector<std::string> out;
+  if (!is_open()) {
+    err = "store not open";
+    return out;
+  }
+  err.clear();
+  const fs::path shards_root = fs::path(root_) / "shards";
+  std::error_code ec;
+  if (!fs::exists(shards_root, ec)) return out;
+
+  for (auto it = fs::directory_iterator(shards_root, ec);
+       it != fs::directory_iterator(); ++it) {
+    if (!it->is_directory(ec)) continue;
+    const auto db_path = it->path() / "meta.sqlite";
+    if (!fs::is_regular_file(db_path, ec)) continue;
+
+    // Resolve shard id from dirname by opening via index when possible.
+    std::uint32_t id = 0;
+    try {
+      id = static_cast<std::uint32_t>(std::stoul(it->path().filename().string(), nullptr, 16));
+    } catch (...) {
+      continue;
+    }
+    if (id >= opts_.shard_count) continue;
+    if (!open_shard(id, err)) return out;
+    Shard& s = *shards_[id];
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(s.db, "SELECT oid FROM objects;", -1, &stmt, nullptr) !=
+        SQLITE_OK) {
+      err = sqlite3_errmsg(s.db);
+      return out;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      const auto* oid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+      if (oid) out.emplace_back(oid);
+      if (max_count > 0 && out.size() >= max_count) {
+        sqlite3_finalize(stmt);
+        return out;
+      }
+    }
+    sqlite3_finalize(stmt);
+  }
+  return out;
+}
+
 std::size_t ObjectStore::scrub_orphans(std::string& err) {
   if (!is_open()) {
     err = "store not open";
@@ -804,6 +941,354 @@ std::size_t ObjectStore::scrub_orphans(std::string& err) {
     }
   }
   return removed;
+}
+
+bool ObjectStore::put_range(const std::string& oid, std::uint64_t offset,
+                           const std::uint8_t* data, std::size_t len,
+                           const std::unordered_map<std::string, std::string>& attrs,
+                           bool replace_attrs, std::string& err) {
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  if (oid.empty()) {
+    err = "empty oid";
+    return false;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  Shard& s = *sp;
+  const auto now = now_ms();
+  const std::uint64_t end = offset + static_cast<std::uint64_t>(len);
+
+  if (!begin(s, err)) return false;
+
+  std::uint64_t old_size = 0;
+  std::string fs_path;
+  std::vector<std::uint8_t> inline_body;
+  bool had_old = false;
+  std::int64_t old_ctime = now;
+  bool was_inline = false;
+
+  {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            s.db, "SELECT size, inline, fs_path, ctime_ms FROM objects WHERE oid=?1;", -1,
+            &stmt, nullptr) != SQLITE_OK) {
+      err = sqlite3_errmsg(s.db);
+      rollback(s);
+      return false;
+    }
+    sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+      had_old = true;
+      old_size = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
+      was_inline = sqlite3_column_type(stmt, 1) != SQLITE_NULL;
+      if (was_inline) {
+        const void* blob = sqlite3_column_blob(stmt, 1);
+        const int n = sqlite3_column_bytes(stmt, 1);
+        if (n > 0 && blob) {
+          inline_body.assign(reinterpret_cast<const std::uint8_t*>(blob),
+                            reinterpret_cast<const std::uint8_t*>(blob) + n);
+        }
+      }
+      const auto* p = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+      if (p) fs_path = p;
+      old_ctime = sqlite3_column_int64(stmt, 3);
+    } else if (rc != SQLITE_DONE) {
+      err = sqlite3_errmsg(s.db);
+      sqlite3_finalize(stmt);
+      rollback(s);
+      return false;
+    }
+    sqlite3_finalize(stmt);
+  }
+
+  if (was_inline) {
+    if (!promote_inline_to_fs_locked(s, oid, inline_body.data(), inline_body.size(), fs_path,
+                                     err)) {
+      rollback(s);
+      return false;
+    }
+  } else if (fs_path.empty()) {
+    fs_path = body_relpath(oid);
+  }
+
+  const std::uint64_t new_size = std::max(old_size, end);
+  if (!ensure_fs_size(s, fs_path, new_size, err)) {
+    rollback(s);
+    return false;
+  }
+  if (len > 0) {
+    if (!pwrite_fs(s, fs_path, offset, data, len, err)) {
+      rollback(s);
+      return false;
+    }
+  }
+
+  sqlite3_stmt* upsert = nullptr;
+  const char* sql =
+      "INSERT INTO objects(oid,size,inline,fs_path,ctime_ms,mtime_ms) "
+      "VALUES(?1,?2,NULL,?3,?4,?5) "
+      "ON CONFLICT(oid) DO UPDATE SET "
+      "size=excluded.size, inline=NULL, fs_path=excluded.fs_path, "
+      "mtime_ms=excluded.mtime_ms;";
+  if (sqlite3_prepare_v2(s.db, sql, -1, &upsert, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    rollback(s);
+    return false;
+  }
+  sqlite3_bind_text(upsert, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(upsert, 2, static_cast<sqlite3_int64>(new_size));
+  sqlite3_bind_text(upsert, 3, fs_path.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(upsert, 4, had_old ? old_ctime : now);
+  sqlite3_bind_int64(upsert, 5, now);
+  if (sqlite3_step(upsert) != SQLITE_DONE) {
+    err = sqlite3_errmsg(s.db);
+    sqlite3_finalize(upsert);
+    rollback(s);
+    return false;
+  }
+  sqlite3_finalize(upsert);
+
+  if (replace_attrs) {
+    if (!delete_attrs_locked(s, oid, err) || !insert_attrs_locked(s, oid, attrs, err)) {
+      rollback(s);
+      return false;
+    }
+  } else if (!attrs.empty()) {
+    if (!upsert_attrs_locked(s, oid, attrs, err)) {
+      rollback(s);
+      return false;
+    }
+  }
+
+  if (!commit(s, err)) {
+    rollback(s);
+    return false;
+  }
+  return true;
+}
+
+std::optional<std::vector<std::uint8_t>> ObjectStore::get_range(const std::string& oid,
+                                                                std::uint64_t offset,
+                                                                std::size_t len,
+                                                                std::string& err) {
+  if (!is_open()) {
+    err = "store not open";
+    return std::nullopt;
+  }
+  auto info = stat(oid, err);
+  if (!info) return std::nullopt;
+  if (offset >= info->size) {
+    err = "range unsatisfiable";
+    return std::nullopt;
+  }
+  const std::uint64_t avail = info->size - offset;
+  const std::size_t want = std::min(len, static_cast<std::size_t>(avail));
+  if (want == 0) return std::vector<std::uint8_t>{};
+
+  if (info->inline_body) {
+    auto full = get(oid, err);
+    if (!full) return std::nullopt;
+    std::vector<std::uint8_t> out(full->begin() + static_cast<std::ptrdiff_t>(offset),
+                                  full->begin() + static_cast<std::ptrdiff_t>(offset + want));
+    return out;
+  }
+
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return std::nullopt;
+  }
+  const fs::path path = fs::path(sp->dir) / info->fs_path;
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    err = std::string("open: ") + std::strerror(errno);
+    return std::nullopt;
+  }
+  std::vector<std::uint8_t> out(want);
+  std::size_t done = 0;
+  while (done < want) {
+    const ssize_t n =
+        ::pread(fd, out.data() + done, want - done, static_cast<off_t>(offset + done));
+    if (n < 0) {
+      err = std::string("pread: ") + std::strerror(errno);
+      ::close(fd);
+      return std::nullopt;
+    }
+    if (n == 0) break;
+    done += static_cast<std::size_t>(n);
+  }
+  ::close(fd);
+  out.resize(done);
+  return out;
+}
+
+std::optional<std::string> ObjectStore::fs_body_path(const std::string& oid, std::string& err) {
+  auto info = stat(oid, err);
+  if (!info) return std::nullopt;
+  if (info->inline_body || info->fs_path.empty()) {
+    err = "not fs-backed";
+    return std::nullopt;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return std::nullopt;
+  }
+  return (fs::path(sp->dir) / info->fs_path).string();
+}
+
+PrecondResult ObjectStore::check_preconditions(const std::string& oid,
+                                              const std::vector<AttrPrecondition>& preds,
+                                              std::string& err) {
+  err.clear();
+  if (preds.empty()) return PrecondResult::Ok;
+
+  std::string serr;
+  auto info = stat(oid, serr);
+  const bool exists = info.has_value();
+
+  for (const auto& p : preds) {
+    if (p.kind == AttrPrecondition::Kind::MustExist) {
+      if (!exists) {
+        err = "object must exist";
+        return PrecondResult::NotFound;
+      }
+      continue;
+    }
+    if (p.kind == AttrPrecondition::Kind::MustNotExist) {
+      if (exists) {
+        err = "object must not exist";
+        return PrecondResult::Conflict;
+      }
+      continue;
+    }
+    if (!exists) {
+      // Attr predicates on missing object: absent ok; others fail not found.
+      if (p.kind == AttrPrecondition::Kind::Absent) continue;
+      err = "object not found";
+      return PrecondResult::NotFound;
+    }
+    auto cur = get_attr(oid, p.key, serr);
+    const bool present = cur.has_value();
+    switch (p.kind) {
+      case AttrPrecondition::Kind::Eq:
+        if (!present || *cur != p.value) {
+          err = "attr eq failed: " + p.key;
+          return PrecondResult::Conflict;
+        }
+        break;
+      case AttrPrecondition::Kind::Ne:
+        if (present && *cur == p.value) {
+          err = "attr ne failed: " + p.key;
+          return PrecondResult::Conflict;
+        }
+        break;
+      case AttrPrecondition::Kind::Absent:
+        if (present) {
+          err = "attr must be absent: " + p.key;
+          return PrecondResult::Conflict;
+        }
+        break;
+      case AttrPrecondition::Kind::Present:
+        if (!present) {
+          err = "attr must be present: " + p.key;
+          return PrecondResult::Conflict;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return PrecondResult::Ok;
+}
+
+ObjectListResult ObjectStore::list(const std::string& prefix, const std::string& attr_eq_key,
+                                  const std::string& attr_eq_value, std::size_t limit,
+                                  const std::string& cursor, bool include_attrs,
+                                  std::string& err) {
+  ObjectListResult out;
+  if (!is_open()) {
+    err = "store not open";
+    return out;
+  }
+  if (limit == 0) limit = 1000;
+
+  std::uint32_t start_shard = 0;
+  std::string start_oid;
+  if (!cursor.empty()) {
+    const auto pos = cursor.find(':');
+    if (pos == std::string::npos) {
+      err = "bad cursor";
+      return out;
+    }
+    try {
+      start_shard = static_cast<std::uint32_t>(std::stoul(cursor.substr(0, pos), nullptr, 16));
+    } catch (...) {
+      err = "bad cursor shard";
+      return out;
+    }
+    start_oid = cursor.substr(pos + 1);
+  }
+
+  const std::string like = prefix + "%";
+  for (std::uint32_t id = start_shard; id < opts_.shard_count && out.objects.size() < limit;
+       ++id) {
+    if (!open_shard(id, err)) return out;
+    Shard& s = *shards_[id];
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql =
+        "SELECT oid, size, mtime_ms FROM objects WHERE oid LIKE ?1 "
+        "AND (?2 = '' OR oid > ?2) ORDER BY oid;";
+    if (sqlite3_prepare_v2(s.db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+      err = sqlite3_errmsg(s.db);
+      return out;
+    }
+    sqlite3_bind_text(stmt, 1, like.c_str(), -1, SQLITE_TRANSIENT);
+    const std::string oid_bound = (id == start_shard) ? start_oid : "";
+    sqlite3_bind_text(stmt, 2, oid_bound.c_str(), -1, SQLITE_TRANSIENT);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW && out.objects.size() < limit) {
+      const auto* oidp = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+      if (!oidp) continue;
+      ObjectListEntry e;
+      e.oid = oidp;
+      e.size = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 1));
+      e.mtime_ms = sqlite3_column_int64(stmt, 2);
+
+      if (!attr_eq_key.empty()) {
+        std::string aerr;
+        auto v = get_attr(e.oid, attr_eq_key, aerr);
+        if (!v || *v != attr_eq_value) continue;
+      }
+      if (include_attrs) {
+        std::string aerr;
+        e.attrs = list_attrs(e.oid, aerr);
+      }
+      out.objects.push_back(std::move(e));
+    }
+    sqlite3_finalize(stmt);
+
+    if (out.objects.size() >= limit) {
+      // Cursor points past last returned oid in this shard.
+      std::ostringstream oss;
+      oss << std::hex << id << ':' << out.objects.back().oid;
+      out.next_cursor = oss.str();
+      // If this shard may have more, keep cursor; else advance.
+      // Simpler: always set cursor to last oid; next call continues.
+      break;
+    }
+  }
+
+  if (out.objects.size() < limit) out.next_cursor.clear();
+  err.clear();
+  return out;
 }
 
 }  // namespace aios

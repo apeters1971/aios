@@ -9,8 +9,11 @@ This repository currently ships **`aiosd`**: a standalone C++20 daemon that
 3. Scans mount points for a top-level `.aios` marker
 4. Prepares `…/aios/` object-storage target directories
 5. Gossips `statvfs` capacity for usable targets
+6. Builds a **cluster map** (epoch + targets) and serves object **Put/Get/Del/Stat** RPCs
+7. Performs **server-side primary replication** (`replica_count`) with a background repair loop
+8. Exposes an **HTTP object API** (`http_listen`, default `:7480`) with ranged PUT/GET, attr preconditions, LIST, DELETE
 
-Plus a local **hybrid object store** library and **`aios-bench`** (not yet served over the network).
+Plus a local **hybrid object store** library and **`aios-bench`**. Clients are thin and placement-aware: they contact the primary (HTTP or TCP++); the primary fans out replicas. See [`proto/http.md`](proto/http.md).
 
 ## Build
 
@@ -46,10 +49,15 @@ gossip_interval_ms: 1000
 suspect_after_ms: 5000
 dead_after_ms: 15000
 scan_interval_ms: 5000
+replica_count: 3
 status_file: "/tmp/aios-a.json"
 ```
 
-CLI overrides: `--cluster-key`, `--config`, `--listen`, `--peer` (repeatable), `--node-id`, `--status-file`.
+CLI overrides: `--cluster-key`, `--config`, `--listen`, `--peer` (repeatable), `--node-id`, `--status-file`, `--replica-count`, `--write-quorum`, `--http-listen`.
+
+### Redundancy
+
+Placement is deterministic: `place(oid, cluster_map) → acting_set` (primary = `[0]`). The primary writes locally, replicates synchronously to secondaries, and ACKs when `write_quorum` copies succeed (default = `replica_count`, capped by acting-set size). A periodic repair pass re-pushes missing replicas. See [`proto/README.md`](proto/README.md).
 
 ### Cluster key
 

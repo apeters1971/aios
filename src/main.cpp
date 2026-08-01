@@ -34,10 +34,13 @@ int main(int argc, char** argv) {
     std::cout
         << "usage: aiosd --cluster-key UUID [--config PATH] [--listen HOST:PORT]\n"
         << "             [--peer HOST:PORT] [--node-id ID] [--status-file PATH]\n"
+        << "             [--replica-count N] [--write-quorum N]\n"
+        << "             [--http-listen HOST:PORT]\n"
         << "\n"
-        << "Standalone AIOS daemon: gossip membership + .aios filesystem discovery.\n"
-        << "cluster_key is a shared secret (UUID recommended); Hello/Gossip are\n"
-        << "authenticated with HMAC-SHA256.\n";
+        << "Standalone AIOS daemon: gossip membership, .aios discovery,\n"
+        << "server-side primary replication, and HTTP object API.\n"
+        << "cluster_key is a shared secret (UUID recommended); Hello/Gossip/object\n"
+        << "RPCs and HTTP Authorization use HMAC-SHA256.\n";
     return 0;
   }
 
