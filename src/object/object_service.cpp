@@ -202,7 +202,17 @@ ApiResult ObjectService::commit_prepared(
   r.epoch = map_.epoch;
   r.replicas = total_ok;
   r.placement = placement;
-  if (auto st = store->stat(pv.oid, err)) r.info = st;
+  if (auto st = store->stat(pv.oid, err)) {
+    r.info = st;
+    if (!st->redirect_oid.empty()) {
+      r.redirect_oid = st->redirect_oid;
+      r.code = "redirect";
+    }
+  } else if (!pv.redirect_oid.empty()) {
+    // Tip may be redirect; stat succeeds for redirects (unlike delete markers).
+    r.redirect_oid = pv.redirect_oid;
+    r.code = "redirect";
+  }
   return r;
 }
 
@@ -256,7 +266,9 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
 
   std::vector<std::uint8_t> data;
   const bool is_delete = body.value("is_delete", false);
-  if (!is_delete) {
+  const std::string redirect_oid = body.value("redirect", "");
+  const bool is_redirect = !redirect_oid.empty();
+  if (!is_delete && !is_redirect) {
     std::string derr;
     if (!body.contains("data_b64") || !body["data_b64"].is_string() ||
         !base64_decode(body["data_b64"].get<std::string>(), data, derr)) {
@@ -269,7 +281,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
   std::optional<std::uint32_t> expected_crc;
   if (body.contains("crc32c") && !body["crc32c"].is_null()) {
     expected_crc = body.value("crc32c", 0u);
-    if (!is_delete && crc32c(data.data(), data.size()) != *expected_crc) {
+    if (!is_delete && !is_redirect && crc32c(data.data(), data.size()) != *expected_crc) {
       return reply_err(map_.epoch, "crc_mismatch", "crc32c mismatch");
     }
   }
@@ -288,12 +300,16 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     v.oid = oid;
     v.seq = body.value("seq", static_cast<std::uint64_t>(0));
     v.prev_tip = body.value("base_seq", static_cast<std::uint64_t>(0));
-    v.size = is_delete ? 0 : body.value("size", static_cast<std::uint64_t>(data.size()));
-    if (v.size == 0 && !is_delete) v.size = data.size();
-    v.crc32c = expected_crc.value_or(is_delete ? crc32c(nullptr, 0) : crc32c(data.data(), data.size()));
+    v.size = (is_delete || is_redirect)
+                 ? 0
+                 : body.value("size", static_cast<std::uint64_t>(data.size()));
+    if (v.size == 0 && !is_delete && !is_redirect) v.size = data.size();
+    v.crc32c = expected_crc.value_or(
+        (is_delete || is_redirect) ? crc32c(nullptr, 0) : crc32c(data.data(), data.size()));
     v.inline_body = body.value("inline_body", false);
     v.fs_path = body.value("fs_path", "");
     v.is_delete = is_delete;
+    v.redirect_oid = redirect_oid;
     std::string err;
     if (!local_install(aios_path, v, data.data(), data.size(), attrs, err)) {
       return reply_err(map_.epoch, "store_error", err);
@@ -311,7 +327,11 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     auto* store = stores_.get(aios_path);
     if (!store) return reply_err(map_.epoch, "store_error", "no local store");
     std::string err;
-    if (!store->put(oid, data.data(), data.size(), attrs, true, expected_crc, err)) {
+    if (is_redirect) {
+      if (!store->put_redirect(oid, redirect_oid, attrs, true, nullptr, err)) {
+        return reply_err(map_.epoch, "store_error", err);
+      }
+    } else if (!store->put(oid, data.data(), data.size(), attrs, true, expected_crc, err)) {
       return reply_err(map_.epoch, "store_error", err);
     }
     return reply_ok(map_.epoch);
@@ -331,8 +351,12 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
   PreparedVersion pv;
-  if (!store->prepare_put(oid, data.data(), data.size(), attrs, true, expected_crc, pv,
-                          err)) {
+  if (is_redirect) {
+    if (!store->prepare_redirect(oid, redirect_oid, attrs, true, pv, err)) {
+      return reply_err(map_.epoch, "store_error", err);
+    }
+  } else if (!store->prepare_put(oid, data.data(), data.size(), attrs, true, expected_crc, pv,
+                                 err)) {
     if (err == "crc32c mismatch") return reply_err(map_.epoch, "crc_mismatch", err);
     return reply_err(map_.epoch, "store_error", err);
   }
@@ -341,6 +365,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
   auto f = reply_ok(map_.epoch);
   f.body["replicas"] = r.replicas;
   f.body["seq"] = pv.seq;
+  if (!pv.redirect_oid.empty()) f.body["redirect"] = pv.redirect_oid;
   return f;
 }
 
@@ -425,15 +450,22 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
     seq = body.value("seq", static_cast<std::uint64_t>(0));
   }
   std::string err;
+  auto st = store->stat(oid, seq, err);
+  if (!st) return reply_err(map_.epoch, "not_found", err);
+  if (!st->redirect_oid.empty()) {
+    auto f = reply_ok(map_.epoch);
+    f.body["redirect"] = st->redirect_oid;
+    f.body["seq"] = st->seq;
+    f.body["code"] = "redirect";
+    return f;
+  }
   auto data = store->get(oid, seq, err);
   if (!data) return reply_err(map_.epoch, "not_found", err);
   auto f = reply_ok(map_.epoch);
   f.body["data_b64"] = base64_encode(*data);
   f.body["size"] = data->size();
-  if (auto st = store->stat(oid, seq, err)) {
-    f.body["seq"] = st->seq;
-    if (st->crc32c_known) f.body["crc32c"] = st->crc32c;
-  }
+  f.body["seq"] = st->seq;
+  if (st->crc32c_known) f.body["crc32c"] = st->crc32c;
   return f;
 }
 
@@ -526,6 +558,7 @@ Frame ObjectService::handle_stat(const nlohmann::json& body) {
   f.body["inline_body"] = info->inline_body;
   f.body["seq"] = info->seq;
   f.body["is_delete"] = info->is_delete;
+  if (!info->redirect_oid.empty()) f.body["redirect"] = info->redirect_oid;
   if (info->crc32c_known) f.body["crc32c"] = info->crc32c;
   return f;
 }
@@ -589,6 +622,7 @@ Frame ObjectService::handle_list_versions(const nlohmann::json& body) {
                         {"is_delete", v.is_delete},
                         {"inline_body", v.inline_body}};
     if (v.crc32c_known) j["crc32c"] = v.crc32c;
+    if (!v.redirect_oid.empty()) j["redirect"] = v.redirect_oid;
     arr.push_back(std::move(j));
   }
   f.body["versions"] = std::move(arr);
@@ -648,6 +682,34 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
     return fail("store_error", err);
   }
   return commit_prepared(store, placement, pv, data, len, attrs);
+}
+
+ApiResult ObjectService::api_put_redirect(
+    const std::string& oid, const std::string& target_oid,
+    const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
+    const std::vector<AttrPrecondition>& preds) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return fail("not_found", err);
+  if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+
+  PreparedVersion pv;
+  if (!store->prepare_redirect(oid, target_oid, attrs, replace_attrs, pv, err)) {
+    return fail("store_error", err);
+  }
+  auto r = commit_prepared(store, placement, pv, nullptr, 0, attrs);
+  if (r.ok) r.redirect_oid = target_oid;
+  return r;
 }
 
 ApiResult ObjectService::api_put_range(
@@ -715,6 +777,11 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   r.info = info;
   if (!seq.has_value()) r.attrs = store->list_attrs(oid, err);
   r.placement = placement;
+  if (!info->redirect_oid.empty()) {
+    r.redirect_oid = info->redirect_oid;
+    r.code = "redirect";
+    return r;
+  }
 
   if (!offset.has_value()) {
     r.data = store->get(oid, seq, err);

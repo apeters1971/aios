@@ -106,6 +106,19 @@ int test_http_api() {
   auto lst = svc.api_list("dir/", "", "", 10, "", true);
   expect(lst.ok && !lst.list.objects.empty(), "list");
 
+  // Redirect object → target.
+  const std::string alias = "dir/alias";
+  auto redir = svc.api_put_redirect(alias, oid, {{"kind", "link"}}, true, {});
+  expect(redir.ok, "put_redirect");
+  expect(redir.redirect_oid == oid, "redirect target");
+  auto redir_get = svc.api_get(alias, std::nullopt, std::nullopt, {});
+  expect(redir_get.ok && redir_get.code == "redirect", "get redirect");
+  expect(redir_get.redirect_oid == oid, "get redirect oid");
+  expect(!redir_get.data.has_value(), "redirect has no body");
+
+  auto self = svc.api_put_redirect(alias, alias, {}, true, {});
+  expect(!self.ok, "reject self-redirect");
+
   auto del = svc.api_del(oid, {});
   expect(del.ok, "del");
 

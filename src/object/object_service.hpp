@@ -27,6 +27,8 @@ struct ApiResult {
   ObjectListResult list;
   std::vector<VersionInfo> versions;
   Placement placement;
+  // Non-empty when tip (or selected version) is a redirect.
+  std::string redirect_oid;
 };
 
 // Handles object RPC + primary replication (prepare → quorum install → publish tip).
@@ -42,6 +44,9 @@ class ObjectService {
                     const std::unordered_map<std::string, std::string>& attrs,
                     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
                     std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+  ApiResult api_put_redirect(const std::string& oid, const std::string& target_oid,
+                             const std::unordered_map<std::string, std::string>& attrs,
+                             bool replace_attrs, const std::vector<AttrPrecondition>& preds);
   ApiResult api_put_range(const std::string& oid, std::uint64_t offset,
                           const std::uint8_t* data, std::size_t len,
                           const std::unordered_map<std::string, std::string>& attrs,

@@ -126,6 +126,23 @@ int test_versions() {
 
   expect(clone_file_supported() || !opts.clone_required, "clone support note");
 
+  // Redirect versions.
+  {
+    expect(store.put("target", std::string("hello"), {}, true, err), "put target");
+    expect(store.put_redirect("alias", "target", {}, true, nullptr, err), "put_redirect");
+    auto st = store.stat("alias", err);
+    expect(st && st->redirect_oid == "target", "stat redirect");
+    expect(store.get("alias", err) == std::nullopt, "get redirect fails");
+    expect(err == "object is redirect", "redirect err");
+    expect(!store.put_redirect("alias", "alias", {}, true, nullptr, err), "no self");
+    // Replace redirect with real body.
+    expect(store.put("alias", std::string("real"), {}, true, err), "replace redirect");
+    auto body2 = store.get("alias", err);
+    expect(body2 && std::string(body2->begin(), body2->end()) == "real", "real body");
+    st = store.stat("alias", err);
+    expect(st && st->redirect_oid.empty(), "no longer redirect");
+  }
+
   fs::remove_all(base);
   return failures;
 }

@@ -56,6 +56,23 @@ std::string url_decode(const std::string& in) {
   return out;
 }
 
+std::string url_encode_path(const std::string& in) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(in.size() * 3);
+  for (unsigned char c : in) {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(hex[c >> 4]);
+      out.push_back(hex[c & 0xf]);
+    }
+  }
+  return out;
+}
+
 std::unordered_map<std::string, std::string> parse_query(const std::string& q) {
   std::unordered_map<std::string, std::string> out;
   std::size_t i = 0;
@@ -424,6 +441,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                               {"ctime_ms", v.ctime_ms},
                               {"is_delete", v.is_delete}};
           if (v.crc32c_known) j["crc32c"] = v.crc32c;
+          if (!v.redirect_oid.empty()) j["redirect"] = v.redirect_oid;
           arr.push_back(std::move(j));
         }
         write_json(*sock, 200, "OK", {{"oid", oid}, {"versions", arr}}, keep_alive);
@@ -457,6 +475,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
 
       if (method == "PUT") {
+        const auto redirect_to = header_get(headers, "x-aios-redirect");
         std::string cr = header_get(headers, "content-range");
         std::optional<std::uint32_t> expected_crc;
         const auto crc_hdr = header_get(headers, "x-aios-crc32c");
@@ -470,7 +489,19 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
         }
         ApiResult r;
-        if (!cr.empty()) {
+        if (!redirect_to.empty()) {
+          if (!cr.empty()) {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "Content-Range not allowed with redirect"}}, keep_alive);
+            continue;
+          }
+          if (!body.empty()) {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "redirect PUT must have empty body"}}, keep_alive);
+            continue;
+          }
+          r = objects_.api_put_redirect(oid, redirect_to, attrs, true, preds);
+        } else if (!cr.empty()) {
           std::uint64_t start = 0, end = 0;
           std::string perr;
           if (!parse_content_range(cr, start, end, perr)) {
@@ -503,6 +534,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             {"x-aios-epoch", std::to_string(r.epoch)},
             {"x-aios-replicas", std::to_string(r.replicas)},
         };
+        if (!r.redirect_oid.empty()) rh["x-aios-redirect"] = r.redirect_oid;
         if (r.info) {
           rh["x-aios-version"] = std::to_string(r.info->seq);
           if (r.info->crc32c_known) {
@@ -538,6 +570,16 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         if (!r.ok) {
           write_json(*sock, status_for(r), "Error",
                      {{"error", r.error}, {"code", r.code}}, keep_alive);
+          continue;
+        }
+        if (!r.redirect_oid.empty()) {
+          std::unordered_map<std::string, std::string> rh = {
+              {"Location", "/o/" + url_encode_path(r.redirect_oid)},
+              {"x-aios-redirect", r.redirect_oid},
+              {"x-aios-epoch", std::to_string(r.epoch)},
+          };
+          if (r.info) rh["x-aios-version"] = std::to_string(r.info->seq);
+          write_response(*sock, 307, "Temporary Redirect", rh, nullptr, 0, keep_alive);
           continue;
         }
         std::unordered_map<std::string, std::string> rh = {

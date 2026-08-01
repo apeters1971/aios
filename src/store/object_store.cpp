@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS object_versions (
   crc32c INTEGER,
   is_delete INTEGER NOT NULL DEFAULT 0,
   ctime_ms INTEGER NOT NULL,
+  redirect_oid TEXT,
   PRIMARY KEY (oid, seq)
 );
 CREATE TABLE IF NOT EXISTS version_attrs (
@@ -202,7 +203,11 @@ CREATE INDEX IF NOT EXISTS idx_object_versions_fs_path ON object_versions(fs_pat
   if (!exec_db(db, "PRAGMA foreign_keys = ON;", err)) return false;
   if (!exec_db(db, "PRAGMA journal_mode = WAL;", err)) return false;
   if (!exec_db(db, "PRAGMA synchronous = NORMAL;", err)) return false;
-  return exec_db(db, ddl, err);
+  if (!exec_db(db, ddl, err)) return false;
+  // Older versioned DBs may lack redirect_oid (duplicate column errors ignored).
+  sqlite3_exec(db, "ALTER TABLE object_versions ADD COLUMN redirect_oid TEXT;", nullptr,
+               nullptr, nullptr);
+  return true;
 }
 
 bool ObjectStore::migrate_legacy_if_needed(sqlite3* db, const std::string& shard_dir,
@@ -748,8 +753,8 @@ bool ObjectStore::insert_version_locked(
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(s.db,
                          "INSERT INTO object_versions"
-                         "(oid,seq,size,inline,fs_path,crc32c,is_delete,ctime_ms) "
-                         "VALUES(?1,?2,?3,?4,?5,?6,?7,?8);",
+                         "(oid,seq,size,inline,fs_path,crc32c,is_delete,ctime_ms,redirect_oid) "
+                         "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);",
                          -1, &stmt, nullptr) != SQLITE_OK) {
     err = sqlite3_errmsg(s.db);
     return false;
@@ -757,11 +762,12 @@ bool ObjectStore::insert_version_locked(
   sqlite3_bind_text(stmt, 1, v.oid.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(v.seq));
   sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(v.size));
-  if (v.inline_body && !v.is_delete) {
+  const bool is_redir = !v.redirect_oid.empty();
+  if (v.inline_body && !v.is_delete && !is_redir) {
     sqlite3_bind_blob(stmt, 4, inline_len ? inline_data : reinterpret_cast<const std::uint8_t*>(""),
                       static_cast<int>(inline_len), SQLITE_TRANSIENT);
     sqlite3_bind_null(stmt, 5);
-  } else if (!v.fs_path.empty() && !v.is_delete) {
+  } else if (!v.fs_path.empty() && !v.is_delete && !is_redir) {
     sqlite3_bind_null(stmt, 4);
     sqlite3_bind_text(stmt, 5, v.fs_path.c_str(), -1, SQLITE_TRANSIENT);
   } else {
@@ -771,6 +777,11 @@ bool ObjectStore::insert_version_locked(
   sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(v.crc32c));
   sqlite3_bind_int(stmt, 7, v.is_delete ? 1 : 0);
   sqlite3_bind_int64(stmt, 8, now);
+  if (is_redir) {
+    sqlite3_bind_text(stmt, 9, v.redirect_oid.c_str(), -1, SQLITE_TRANSIENT);
+  } else {
+    sqlite3_bind_null(stmt, 9);
+  }
   if (sqlite3_step(stmt) != SQLITE_DONE) {
     err = sqlite3_errmsg(s.db);
     sqlite3_finalize(stmt);
@@ -808,8 +819,8 @@ bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uin
                                       ObjectInfo& out, std::string& err) {
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(s.db,
-                         "SELECT size, inline, fs_path, crc32c, is_delete, ctime_ms "
-                         "FROM object_versions WHERE oid=?1 AND seq=?2;",
+                         "SELECT size, inline, fs_path, crc32c, is_delete, ctime_ms, "
+                         "redirect_oid FROM object_versions WHERE oid=?1 AND seq=?2;",
                          -1, &stmt, nullptr) != SQLITE_OK) {
     err = sqlite3_errmsg(s.db);
     return false;
@@ -842,6 +853,8 @@ bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uin
   out.is_delete = sqlite3_column_int(stmt, 4) != 0;
   out.ctime_ms = sqlite3_column_int64(stmt, 5);
   out.mtime_ms = out.ctime_ms;
+  const auto* redir = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+  if (redir) out.redirect_oid = redir;
   if (!out.fs_path.empty()) out.inline_body = false;
   sqlite3_finalize(stmt);
   return true;
@@ -1225,6 +1238,103 @@ bool ObjectStore::prepare_delete(const std::string& oid, PreparedVersion& out, s
   return true;
 }
 
+bool ObjectStore::prepare_redirect(const std::string& oid, const std::string& target_oid,
+                                  const std::unordered_map<std::string, std::string>& attrs,
+                                  bool replace_attrs, PreparedVersion& out, std::string& err) {
+  out = PreparedVersion{};
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  if (oid.empty()) {
+    err = "empty oid";
+    return false;
+  }
+  if (target_oid.empty()) {
+    err = "empty redirect target";
+    return false;
+  }
+  if (target_oid == oid) {
+    err = "redirect to self";
+    return false;
+  }
+
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  Shard& s = *sp;
+
+  if (!begin(s, err)) return false;
+
+  std::uint64_t tip = 0;
+  if (!tip_seq_locked(s, oid, tip, err)) {
+    rollback(s);
+    return false;
+  }
+
+  std::unordered_map<std::string, std::string> merged;
+  if (replace_attrs) {
+    merged = attrs;
+  } else if (tip > 0) {
+    ObjectInfo tip_info;
+    std::string lerr;
+    if (load_version_locked(s, oid, tip, tip_info, lerr) && !tip_info.is_delete) {
+      if (!load_attrs_for_seq(s.db, oid, tip, merged, err)) {
+        rollback(s);
+        return false;
+      }
+      for (const auto& [k, v] : attrs) merged[k] = v;
+    } else {
+      merged = attrs;
+    }
+  } else {
+    merged = attrs;
+  }
+
+  std::uint64_t seq = 0;
+  if (!next_seq_locked(s, oid, seq, err)) {
+    rollback(s);
+    return false;
+  }
+
+  PreparedVersion pv;
+  pv.oid = oid;
+  pv.seq = seq;
+  pv.prev_tip = tip;
+  pv.size = 0;
+  pv.crc32c = crc32c(nullptr, 0);
+  pv.inline_body = false;
+  pv.is_delete = false;
+  pv.redirect_oid = target_oid;
+
+  if (!insert_version_locked(s, pv, nullptr, 0, merged, err)) {
+    rollback(s);
+    return false;
+  }
+  if (!commit(s, err)) {
+    rollback(s);
+    return false;
+  }
+  out = std::move(pv);
+  return true;
+}
+
+bool ObjectStore::put_redirect(const std::string& oid, const std::string& target_oid,
+                              const std::unordered_map<std::string, std::string>& attrs,
+                              bool replace_attrs, std::uint64_t* out_seq, std::string& err) {
+  PreparedVersion pv;
+  if (!prepare_redirect(oid, target_oid, attrs, replace_attrs, pv, err)) return false;
+  if (!publish_tip(oid, pv.seq, err)) {
+    std::string aerr;
+    abort_version(oid, pv.seq, aerr);
+    return false;
+  }
+  if (out_seq) *out_seq = pv.seq;
+  return true;
+}
+
 bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* data,
                                   std::size_t len,
                                   const std::unordered_map<std::string, std::string>& attrs,
@@ -1253,7 +1363,7 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
   if (load_version_locked(s, v.oid, v.seq, existing, lerr)) {
     const bool same =
         existing.is_delete == v.is_delete && existing.size == v.size &&
-        existing.crc32c == v.crc32c;
+        existing.crc32c == v.crc32c && existing.redirect_oid == v.redirect_oid;
     rollback(s);
     if (same) return true;
     err = "version already exists";
@@ -1267,7 +1377,7 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
 
   PreparedVersion pv = v;
   std::string written_fs;
-  if (pv.is_delete) {
+  if (pv.is_delete || !pv.redirect_oid.empty()) {
     pv.size = 0;
     pv.inline_body = false;
     pv.fs_path.clear();
@@ -1523,6 +1633,10 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get(const std::string& oid
     err = "object is delete marker";
     return std::nullopt;
   }
+  if (!info->redirect_oid.empty()) {
+    err = "object is redirect";
+    return std::nullopt;
+  }
 
   Shard* sp = shard_for(oid);
   if (!sp) {
@@ -1580,6 +1694,10 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get_range(
   if (!info) return std::nullopt;
   if (info->is_delete) {
     err = "object is delete marker";
+    return std::nullopt;
+  }
+  if (!info->redirect_oid.empty()) {
+    err = "object is redirect";
     return std::nullopt;
   }
   if (offset >= info->size) {
@@ -1895,8 +2013,8 @@ std::vector<VersionInfo> ObjectStore::list_versions(const std::string& oid, std:
   }
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(sp->db,
-                         "SELECT seq, size, crc32c, is_delete, ctime_ms, inline, fs_path "
-                         "FROM object_versions WHERE oid=?1 ORDER BY seq DESC;",
+                         "SELECT seq, size, crc32c, is_delete, ctime_ms, inline, fs_path, "
+                         "redirect_oid FROM object_versions WHERE oid=?1 ORDER BY seq DESC;",
                          -1, &stmt, nullptr) != SQLITE_OK) {
     err = sqlite3_errmsg(sp->db);
     return out;
@@ -1915,6 +2033,8 @@ std::vector<VersionInfo> ObjectStore::list_versions(const std::string& oid, std:
     const bool has_inline = sqlite3_column_type(stmt, 5) != SQLITE_NULL;
     const auto* fsp = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
     v.inline_body = has_inline && !(fsp && *fsp);
+    const auto* redir = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+    if (redir) v.redirect_oid = redir;
     out.push_back(v);
   }
   sqlite3_finalize(stmt);
@@ -2054,7 +2174,7 @@ ObjectListResult ObjectStore::list(const std::string& prefix, const std::string&
     Shard& s = *shards_[id];
     sqlite3_stmt* stmt = nullptr;
     const char* sql =
-        "SELECT t.oid, v.seq, v.size, v.ctime_ms, v.crc32c, v.is_delete "
+        "SELECT t.oid, v.seq, v.size, v.ctime_ms, v.crc32c, v.is_delete, v.redirect_oid "
         "FROM object_tips t "
         "JOIN object_versions v ON v.oid = t.oid AND v.seq = t.tip_seq "
         "WHERE t.tip_seq > 0 AND v.is_delete = 0 AND t.oid LIKE ?1 "
@@ -2080,6 +2200,8 @@ ObjectListResult ObjectStore::list(const std::string& prefix, const std::string&
         e.crc32c_known = true;
       }
       e.is_delete = sqlite3_column_int(stmt, 5) != 0;
+      const auto* redir = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+      if (redir) e.redirect_oid = redir;
 
       if (!attr_eq_key.empty()) {
         std::string aerr;

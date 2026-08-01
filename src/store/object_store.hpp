@@ -33,6 +33,8 @@ struct ObjectInfo {
   std::uint32_t crc32c{0};
   bool crc32c_known{false};
   bool is_delete{false};
+  // If non-empty, this version is a redirect to another oid (no body).
+  std::string redirect_oid;
 };
 
 struct VersionInfo {
@@ -43,6 +45,7 @@ struct VersionInfo {
   bool is_delete{false};
   std::int64_t ctime_ms{0};
   bool inline_body{false};
+  std::string redirect_oid;
 };
 
 struct ObjectListEntry {
@@ -53,6 +56,7 @@ struct ObjectListEntry {
   std::uint32_t crc32c{0};
   bool crc32c_known{false};
   bool is_delete{false};
+  std::string redirect_oid;
   std::unordered_map<std::string, std::string> attrs;
 };
 
@@ -80,6 +84,7 @@ struct PreparedVersion {
   bool inline_body{false};
   std::string fs_path;
   bool is_delete{false};
+  std::string redirect_oid;
 };
 
 std::uint32_t shard_of_oid(const std::string& oid, std::uint32_t shard_count);
@@ -141,6 +146,13 @@ class ObjectStore {
                          const std::unordered_map<std::string, std::string>& attrs,
                          bool replace_attrs, PreparedVersion& out, std::string& err);
   bool prepare_delete(const std::string& oid, PreparedVersion& out, std::string& err);
+  // Create a redirect version (empty body) pointing at target_oid.
+  bool prepare_redirect(const std::string& oid, const std::string& target_oid,
+                        const std::unordered_map<std::string, std::string>& attrs,
+                        bool replace_attrs, PreparedVersion& out, std::string& err);
+  bool put_redirect(const std::string& oid, const std::string& target_oid,
+                    const std::unordered_map<std::string, std::string>& attrs,
+                    bool replace_attrs, std::uint64_t* out_seq, std::string& err);
   // Install a replica-prepared version at exact seq (tip not published).
   bool install_version(const PreparedVersion& v, const std::uint8_t* data, std::size_t len,
                        const std::unordered_map<std::string, std::string>& attrs,

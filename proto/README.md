@@ -121,9 +121,9 @@ Clients compute `place(oid)` from the cluster map and send mutating ops to the *
 }
 ```
 
-`role` is `primary` (prepare → quorum install → publish) or `replica` with `seq` (install unpublished version only). Replica install fields: `seq`, `base_seq`, `size`, `inline_body`, `fs_path`, `is_delete`, `crc32c`.
+`role` is `primary` (prepare → quorum install → publish) or `replica` with `seq` (install unpublished version only). Replica install fields: `seq`, `base_seq`, `size`, `inline_body`, `fs_path`, `is_delete`, `redirect`, `crc32c`.
 Optional `crc32c` is verified against the body before accept; replicas should send it.
-Reply may include `seq`.
+Reply may include `seq`. Set `"redirect":"other-oid"` (no `data_b64`) to create a redirect version.
 
 ### ObjectPutRange (raw body)
 

@@ -44,6 +44,17 @@ Canonical string:
 
 Every successful mutating write creates an immutable `seq` (uint64). Responses include `x-aios-version: {seq}`. Tip GET/HEAD/DELETE (without `version`) operate on the highest non-deleted tip, or a delete-marker tip after `DELETE`. Large (FS) versions use clone/COW (`FICLONE` / `clonefile`); set `clone_required: false` to allow full-copy fallback. Config: `max_versions` (default 16).
 
+### Redirects
+
+Create or replace an object as a pointer to another oid:
+
+```
+PUT /o/{oid}
+x-aios-redirect: {target_oid}
+```
+
+Body must be empty (no `Content-Range`). Creates a new version with no body. `GET`/`HEAD` on a redirect tip returns `307 Temporary Redirect` with `Location: /o/{target}` and `x-aios-redirect: {target}`. A normal `PUT` with a body replaces the redirect with a real object. Self-redirects are rejected.
+
 ### Attrs
 
 Request/response: `x-aios-attr-<key>: <value>`

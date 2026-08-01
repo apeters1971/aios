@@ -229,7 +229,8 @@ ObjectRpcResult object_install_remote(
       {"attrs", attrs_j},
       {"role", "replica"},
   };
-  if (!v.is_delete) {
+  if (!v.redirect_oid.empty()) body["redirect"] = v.redirect_oid;
+  if (!v.is_delete && v.redirect_oid.empty()) {
     body["data_b64"] = base64_encode(data, len);
   }
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
