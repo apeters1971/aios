@@ -42,5 +42,51 @@ int test_http_auth() {
   auto bad = http_auth_verify("PUT", "/o/foo", headers, "UNSIGNED-PAYLOAD", key, 60000);
   expect(!bad.ok, "bad sig rejected");
 
+  // Wrong method → fail
+  headers["authorization"] =
+      "AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=" + signed_headers +
+      ", Signature=" + sig;
+  auto wrong_method =
+      http_auth_verify("GET", "/o/foo", headers, "UNSIGNED-PAYLOAD", key, 60000);
+  expect(!wrong_method.ok, "wrong method rejected");
+
+  // Skew: stale date
+  {
+    std::unordered_map<std::string, std::string> h = {
+        {"x-aios-date", std::to_string(now_ms() - 3600'000)},
+        {"x-aios-content-sha256", "UNSIGNED-PAYLOAD"},
+    };
+    const auto c = http_canonical("PUT", "/o/foo", h["x-aios-date"], signed_headers, h,
+                                  "UNSIGNED-PAYLOAD");
+    h["authorization"] = "AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=" + signed_headers +
+                         ", Signature=" + http_sign(key, c);
+    auto skew = http_auth_verify("PUT", "/o/foo", h, "UNSIGNED-PAYLOAD", key, 1000);
+    expect(!skew.ok, "skew rejected");
+  }
+
+  // header_get helper
+  expect(header_get({{"Foo", "1"}, {"x-aios-date", "9"}}, "x-aios-date") == "9",
+         "header_get");
+  expect(header_get({{"Foo", "1"}}, "missing").empty(), "header_get missing");
+
+  // Hashed payload path (non UNSIGNED)
+  {
+    const std::string hash =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";  // sha256("")
+    const std::string d = std::to_string(now_ms());
+    std::unordered_map<std::string, std::string> h = {
+        {"x-aios-date", d},
+        {"x-aios-content-sha256", hash},
+    };
+    const std::string sh = "x-aios-content-sha256;x-aios-date";
+    const auto c = http_canonical("GET", "/map", d, sh, h, hash);
+    h["authorization"] =
+        "AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=" + sh + ", Signature=" + http_sign(key, c);
+    auto ok2 = http_auth_verify("GET", "/map", h, hash, key, 60000);
+    expect(ok2.ok, "hashed payload verify");
+    auto mismatch = http_auth_verify("GET", "/map", h, "UNSIGNED-PAYLOAD", key, 60000);
+    expect(!mismatch.ok, "payload hash mismatch");
+  }
+
   return failures;
 }

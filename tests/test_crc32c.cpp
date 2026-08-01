@@ -88,6 +88,34 @@ int test_crc32c() {
   expect(store.recompute_crc32c("x", recomputed, err), "recompute");
   expect(recomputed == st->crc32c, "recompute matches");
 
+  // Empty body CRC
+  expect(crc32c(nullptr, 0) == crc32c_update(0, nullptr, 0), "empty crc");
+  expect(store.put("empty", std::string(), {}, true, err), "put empty");
+  st = store.stat("empty", err);
+  expect(st && st->crc32c == crc32c(nullptr, 0), "empty object crc");
+
+  // Expected CRC success path
+  const std::string okb = "ok-crc";
+  const auto okc = crc32c(reinterpret_cast<const std::uint8_t*>(okb.data()), okb.size());
+  expect(store.put("z", reinterpret_cast<const std::uint8_t*>(okb.data()), okb.size(), {},
+                   true, std::optional<std::uint32_t>(okc), err),
+         "put with matching crc");
+
+  // Combine empty B
+  expect(crc32c_combine(ca, 0, 0) == ca, "combine empty B");
+
+  // Combine with zeros suffix
+  const auto c_prefix = crc32c(reinterpret_cast<const std::uint8_t*>("AB"), 2);
+  const auto c_full =
+      crc32c(reinterpret_cast<const std::uint8_t*>("AB\0\0\0\0"), 6);
+  expect(crc32c_combine(c_prefix, crc32c_update_zeros(0, 4), 4) == c_full,
+         "combine zeros suffix");
+
+  // Large zero span
+  expect(crc32c_update_zeros(0, 100000) == crc32c(std::vector<std::uint8_t>(100000, 0).data(),
+                                                  100000),
+         "large zeros");
+
   fs::remove_all(root);
   return failures;
 }

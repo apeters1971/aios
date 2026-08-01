@@ -94,14 +94,21 @@ target_link_libraries(aios-bench PRIVATE aios_core)
 enable_testing()
 add_executable(aios_tests
   tests/test_framing.cpp
+  tests/test_framing_raw.cpp
   tests/test_aios_scan.cpp
   tests/test_auth.cpp
+  tests/test_fs_clone.cpp
   tests/test_object_store.cpp
   tests/test_cluster_map.cpp
   tests/test_object_rpc.cpp
+  tests/test_object_rpc_advanced.cpp
+  tests/test_object_service_advanced.cpp
   tests/test_store_range.cpp
+  tests/test_store_advanced.cpp
   tests/test_http_auth.cpp
   tests/test_http_api.cpp
+  tests/test_http_wire.cpp
+  tests/test_mini_cluster.cpp
   tests/test_crc32c.cpp
   tests/test_versions.cpp
   tests/test_main.cpp
