@@ -526,13 +526,36 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
     f.body["code"] = "redirect";
     return f;
   }
+  auto f = reply_ok(map_.epoch);
+  f.body["seq"] = st->seq;
+  f.body["size"] = st->size;
+  if (st->crc32c_known) f.body["crc32c"] = st->crc32c;
+
+  // Optional ranged raw get (avoids base64 / full-object buffer on wire).
+  if (body.contains("offset")) {
+    const auto offset = body.value("offset", static_cast<std::uint64_t>(0));
+    const auto len = body.value("length", static_cast<std::uint64_t>(0));
+    if (len == 0 || len > kMaxBodySize) {
+      return reply_err(map_.epoch, "bad_request", "invalid get length");
+    }
+    auto data = store->get_range(oid, seq, offset, static_cast<std::size_t>(len), err);
+    if (!data) {
+      if (err == "range unsatisfiable") {
+        return reply_err(map_.epoch, "range_unsatisfiable", err);
+      }
+      return reply_err(map_.epoch, "not_found", err);
+    }
+    f.body["offset"] = offset;
+    f.body["length"] = data->size();
+    f.flags |= kFlagRawBody;
+    f.raw = std::move(*data);
+    return f;
+  }
+
   auto data = store->get(oid, seq, err);
   if (!data) return reply_err(map_.epoch, "not_found", err);
-  auto f = reply_ok(map_.epoch);
   f.body["data_b64"] = base64_encode(*data);
   f.body["size"] = data->size();
-  f.body["seq"] = st->seq;
-  if (st->crc32c_known) f.body["crc32c"] = st->crc32c;
   return f;
 }
 

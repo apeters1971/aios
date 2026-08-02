@@ -42,7 +42,7 @@ Maximum frame body size: 16 MiB (object payloads may exceed this via staging).
 
 HTTP front-end (external clients): [`http.md`](http.md).
 
-Maximum **frame** body remains 16 MiB; object bodies may be larger via HTTP streaming and `ObjectStage*` chunks.
+Maximum **frame** body remains 16 MiB; object bodies may be larger via HTTP streaming and `ObjectStage*` chunks. `ObjectGet` with `offset`/`length` returns a raw trailer (no base64) for ranged pulls.
 
 ## Cluster authentication
 

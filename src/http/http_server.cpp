@@ -554,8 +554,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (sub == "versions" && method == "GET") {
         auto r = objects_.api_list_versions(oid);
         if (!r.ok) {
-          write_json(*sock, status_for(r), "Error",
-                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          write_api_error(*sock, r, target, keep_alive);
           continue;
         }
         nlohmann::json arr = nlohmann::json::array();
@@ -584,8 +583,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         auto r = objects_.api_trim_versions(oid, keep);
         if (!r.ok) {
-          write_json(*sock, status_for(r), "Error",
-                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          write_api_error(*sock, r, target, keep_alive);
           continue;
         }
         write_response(*sock, 204, "No Content",
@@ -627,12 +625,26 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           r = objects_.api_put_redirect(oid, redirect_to, attrs, true, preds);
         } else if (!cr.empty()) {
           if (!upload_path.empty()) {
+            // Load staged range patch (capped at frame/object chunk size).
+            if (content_length > kMaxBodySize) {
+              std::error_code rec;
+              fs::remove(upload_path, rec);
+              upload_path.clear();
+              write_json(*sock, 413, "Payload Too Large",
+                         {{"error", "ranged PUT patch too large"}}, keep_alive);
+              continue;
+            }
+            std::ifstream in(upload_path, std::ios::binary);
+            body.resize(content_length);
+            in.read(reinterpret_cast<char*>(body.data()),
+                    static_cast<std::streamsize>(content_length));
             std::error_code rec;
             fs::remove(upload_path, rec);
             upload_path.clear();
-            write_json(*sock, 413, "Payload Too Large",
-                       {{"error", "ranged PUT exceeds in-memory limit"}}, keep_alive);
-            continue;
+            if (!in) {
+              write_json(*sock, 500, "Error", {{"error", "read upload temp"}}, keep_alive);
+              continue;
+            }
           }
           std::uint64_t start = 0, end = 0;
           std::string perr;
@@ -771,8 +783,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
           auto r = objects_.api_purge_version(oid, *ver, /*allow_tip=*/false);
           if (!r.ok) {
-            write_json(*sock, status_for(r), "Error",
-                       {{"error", r.error}, {"code", r.code}}, keep_alive);
+            write_api_error(*sock, r, target, keep_alive);
             continue;
           }
           write_response(*sock, 204, "No Content",
@@ -782,8 +793,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         auto r = objects_.api_del(oid, preds);
         if (!r.ok) {
-          write_json(*sock, status_for(r), "Error",
-                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          write_api_error(*sock, r, target, keep_alive);
           continue;
         }
         std::unordered_map<std::string, std::string> rh = {

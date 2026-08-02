@@ -9,6 +9,7 @@
 
 #include <boost/asio.hpp>
 
+#include <algorithm>
 #include <fstream>
 
 namespace aios {
@@ -91,6 +92,7 @@ ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& loca
   }
 
   result.body = reply.body;
+  result.raw = std::move(reply.raw);
   result.ok = reply.body.value("ok", false);
   result.error = reply.body.value("error", "");
   result.code = reply.body.value("code", result.ok ? "" : "error");
@@ -100,6 +102,9 @@ ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& loca
   if (reply.body.contains("crc32c") && !reply.body["crc32c"].is_null()) {
     result.crc32c = reply.body.value("crc32c", 0u);
     result.crc32c_known = true;
+  }
+  if (!result.raw.empty() && !result.data) {
+    result.data = result.raw;
   }
   if (reply.body.contains("data_b64") && reply.body["data_b64"].is_string()) {
     std::vector<std::uint8_t> data;
@@ -490,6 +495,81 @@ ObjectRpcResult object_list_remote(const std::string& peer_addr,
   };
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
                     MsgType::ObjectList, std::move(body));
+}
+
+ObjectRpcResult object_get_range_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    std::uint64_t offset, std::size_t len, std::optional<std::uint64_t> seq) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"offset", offset},
+      {"length", len},
+  };
+  if (seq.has_value()) body["seq"] = *seq;
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectGet, std::move(body));
+}
+
+ObjectRpcResult object_get_file_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    const std::string& abs_out_path) {
+  auto st = object_stat_remote(peer_addr, local_node_id, local_listen, cluster_key,
+                               auth_skew_ms, epoch, aios_path, oid);
+  if (!st.ok) return st;
+  const auto total = st.size;
+  const auto seq = st.body.value("seq", static_cast<std::uint64_t>(0));
+
+  std::ofstream out(abs_out_path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    ObjectRpcResult r;
+    r.error = "cannot create " + abs_out_path;
+    r.code = "io";
+    return r;
+  }
+
+  std::uint64_t offset = 0;
+  while (offset < total) {
+    const auto n = static_cast<std::size_t>(
+        std::min<std::uint64_t>(kStageChunkSize, total - offset));
+    auto chunk =
+        object_get_range_remote(peer_addr, local_node_id, local_listen, cluster_key,
+                                auth_skew_ms, epoch, aios_path, oid, offset, n, seq);
+    if (!chunk.ok) return chunk;
+    const auto& bytes = !chunk.raw.empty() ? chunk.raw : (chunk.data ? *chunk.data : chunk.raw);
+    if (bytes.size() != n && offset + bytes.size() != total && bytes.empty()) {
+      ObjectRpcResult r;
+      r.ok = false;
+      r.error = "empty get range";
+      r.code = "io";
+      return r;
+    }
+    if (!bytes.empty()) {
+      out.write(reinterpret_cast<const char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+      offset += bytes.size();
+    } else {
+      break;
+    }
+  }
+  out.close();
+  ObjectRpcResult r;
+  r.ok = (offset == total);
+  r.epoch = st.epoch;
+  r.size = total;
+  r.crc32c = st.crc32c;
+  r.crc32c_known = st.crc32c_known;
+  r.body = st.body;
+  if (!r.ok) {
+    r.error = "short read";
+    r.code = "io";
+  }
+  return r;
 }
 
 }  // namespace aios

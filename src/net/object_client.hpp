@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+// ObjectListResult / PreparedVersion via object_store.hpp
+
 namespace aios {
 
 struct ObjectRpcResult {
@@ -22,6 +24,7 @@ struct ObjectRpcResult {
   std::uint32_t crc32c{0};
   bool crc32c_known{false};
   ObjectListResult list;
+  std::vector<std::uint8_t> raw;  // ObjectReply kFlagRawBody trailer
   nlohmann::json body = nlohmann::json::object();
 };
 
@@ -102,6 +105,20 @@ ObjectRpcResult object_get_remote(const std::string& peer_addr,
                                   const std::string& cluster_key, int auth_skew_ms,
                                   std::uint64_t epoch, const std::string& aios_path,
                                   const std::string& oid);
+
+// Range get with raw trailer (no base64). Prefer for large bodies.
+ObjectRpcResult object_get_range_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    std::uint64_t offset, std::size_t len, std::optional<std::uint64_t> seq = std::nullopt);
+
+// Stream full object to a local file via ranged gets (works for large remote bodies).
+ObjectRpcResult object_get_file_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    const std::string& abs_out_path);
 
 ObjectRpcResult object_del_remote(const std::string& peer_addr,
                                   const std::string& local_node_id,

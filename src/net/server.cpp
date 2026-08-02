@@ -66,7 +66,9 @@ bool is_object_req(MsgType t) {
   return t == MsgType::ObjectPut || t == MsgType::ObjectGet || t == MsgType::ObjectDel ||
          t == MsgType::ObjectStat || t == MsgType::ObjectPutRange ||
          t == MsgType::ObjectPublishTip || t == MsgType::ObjectAbortVersion ||
-         t == MsgType::ObjectListVersions || t == MsgType::ObjectPurgeVersions;
+         t == MsgType::ObjectListVersions || t == MsgType::ObjectPurgeVersions ||
+         t == MsgType::ObjectStageBegin || t == MsgType::ObjectStageData ||
+         t == MsgType::ObjectStageCommit || t == MsgType::ObjectList;
 }
 
 }  // namespace
@@ -127,43 +129,50 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
   auth_sign(hello_reply.body, MsgType::Hello, handlers_.cluster_key);
   if (!write_frame(*sock, hello_reply, err, ec)) return;
 
-  Frame req;
-  if (!read_frame(*sock, req, err, ec)) {
-    AIOS_LOG_DEBUG("inbound request read failed: ", err);
-    return;
-  }
-  if (req.type == MsgType::Ping) {
-    Frame pong;
-    pong.type = MsgType::Pong;
-    write_frame(*sock, pong, err, ec);
-    return;
-  }
-  if (req.type == MsgType::Gossip) {
-    if (!handlers_.on_gossip) return;
-    if (!auth_verify(req.body, MsgType::Gossip, handlers_.cluster_key,
-                     handlers_.auth_skew_ms, err)) {
-      AIOS_LOG_WARN("reject gossip auth from ", peer_id, ": ", err);
+  // Allow multiple object RPCs per connection (e.g. ObjectStageBegin/Data/Commit).
+  for (;;) {
+    Frame req;
+    if (!read_frame(*sock, req, err, ec)) {
+      if (ec && ec != boost::asio::error::eof) {
+        AIOS_LOG_DEBUG("inbound request read failed: ", err);
+      }
       return;
     }
-    auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, req);
-    if (!gossip_reply) return;
-    auth_sign(gossip_reply->body, MsgType::Gossip, handlers_.cluster_key);
-    write_frame(*sock, *gossip_reply, err, ec);
-    return;
-  }
-  if (is_object_req(req.type)) {
-    if (!handlers_.on_object) return;
-    if (!auth_verify(req.body, req.type, handlers_.cluster_key, handlers_.auth_skew_ms,
-                     err)) {
-      AIOS_LOG_WARN("reject object auth from ", peer_id, ": ", err);
-      return;
+    if (req.type == MsgType::Ping) {
+      Frame pong;
+      pong.type = MsgType::Pong;
+      write_frame(*sock, pong, err, ec);
+      continue;
     }
-    Frame reply = handlers_.on_object(req);
-    if (reply.type != MsgType::ObjectReply) {
-      reply.type = MsgType::ObjectReply;
+    if (req.type == MsgType::Gossip) {
+      if (!handlers_.on_gossip) return;
+      if (!auth_verify(req.body, MsgType::Gossip, handlers_.cluster_key,
+                       handlers_.auth_skew_ms, err)) {
+        AIOS_LOG_WARN("reject gossip auth from ", peer_id, ": ", err);
+        return;
+      }
+      auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, req);
+      if (!gossip_reply) return;
+      auth_sign(gossip_reply->body, MsgType::Gossip, handlers_.cluster_key);
+      write_frame(*sock, *gossip_reply, err, ec);
+      return;  // gossip sessions are one-shot
     }
-    auth_sign(reply.body, MsgType::ObjectReply, handlers_.cluster_key);
-    write_frame(*sock, reply, err, ec);
+    if (is_object_req(req.type)) {
+      if (!handlers_.on_object) return;
+      if (!auth_verify(req.body, req.type, handlers_.cluster_key, handlers_.auth_skew_ms,
+                       err)) {
+        AIOS_LOG_WARN("reject object auth from ", peer_id, ": ", err);
+        return;
+      }
+      Frame reply = handlers_.on_object(req);
+      if (reply.type != MsgType::ObjectReply) {
+        reply.type = MsgType::ObjectReply;
+      }
+      auth_sign(reply.body, MsgType::ObjectReply, handlers_.cluster_key);
+      if (!write_frame(*sock, reply, err, ec)) return;
+      continue;
+    }
+    AIOS_LOG_DEBUG("unsupported inbound type ", static_cast<int>(req.type));
     return;
   }
 }

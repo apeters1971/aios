@@ -4,6 +4,7 @@
 #include "net/object_client.hpp"
 #include "util/log.hpp"
 
+#include <filesystem>
 #include <fstream>
 #include <unordered_map>
 #include <vector>
@@ -88,16 +89,29 @@ bool push_replica(const Config& cfg, const std::string& advertise, const Cluster
     auto st = object_stat_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
                                  cfg.auth_skew_ms, map.epoch, src.aios_path, oid);
     if (!st.ok) return false;
-    auto g = object_get_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
-                               cfg.auth_skew_ms, map.epoch, src.aios_path, oid);
-    if (!g.ok || !g.data) return false;
-    data = std::move(*g.data);
     pv.oid = oid;
     pv.seq = st.body.value("seq", static_cast<std::uint64_t>(1));
     pv.size = st.size;
     pv.crc32c = st.crc32c;
-    pv.inline_body = pv.size <= 64 * 1024;
+    pv.inline_body = false;
     pv.is_delete = false;
+    // Stream large remote bodies to a temp file; small ones can stay in memory.
+    if (pv.size > 256u * 1024u) {
+      body_path = (std::filesystem::temp_directory_path() /
+                   ("aios-repair-" + oid + "-" + std::to_string(pv.seq)))
+                      .string();
+      auto g = object_get_file_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                      cfg.auth_skew_ms, map.epoch, src.aios_path, oid,
+                                      body_path);
+      if (!g.ok) return false;
+      have_file = true;
+    } else {
+      auto g = object_get_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                 cfg.auth_skew_ms, map.epoch, src.aios_path, oid);
+      if (!g.ok || !g.data) return false;
+      data = std::move(*g.data);
+      pv.inline_body = pv.size <= 64 * 1024;
+    }
   }
 
   if (pv.seq == 0) pv.seq = 1;
@@ -115,30 +129,46 @@ bool push_replica(const Config& cfg, const std::string& advertise, const Cluster
     return r.ok;
   };
 
+  const bool temp_download =
+      have_file && body_path.find("aios-repair-") != std::string::npos;
+  auto cleanup_temp = [&]() {
+    if (!temp_download) return;
+    std::error_code ec;
+    std::filesystem::remove(body_path, ec);
+  };
+
   if (dst.node_id == cfg.node_id) {
     auto* store = stores.get(dst.aios_path);
-    if (!store) return false;
+    if (!store) {
+      cleanup_temp();
+      return false;
+    }
     std::string err;
+    bool ok = false;
     if (!pv.redirect_oid.empty()) {
-      if (!store->install_version(pv, nullptr, 0, attrs, err)) return false;
+      ok = store->install_version(pv, nullptr, 0, attrs, err);
     } else if (have_file) {
       std::string staging;
-      if (!store->create_staging_file(oid, staging, err)) return false;
-      {
+      if (store->create_staging_file(oid, staging, err)) {
         std::ifstream in(body_path, std::ios::binary);
         std::ofstream out(staging, std::ios::binary | std::ios::trunc);
-        if (!in || !out) return false;
-        out << in.rdbuf();
+        if (in && out) {
+          out << in.rdbuf();
+          out.close();
+          std::string rel;
+          if (store->place_staging_as_version(oid, pv.seq, staging, rel, err)) {
+            pv.fs_path = rel;
+            pv.inline_body = false;
+            ok = store->install_version(pv, nullptr, 0, attrs, err);
+          }
+        }
       }
-      std::string rel;
-      if (!store->place_staging_as_version(oid, pv.seq, staging, rel, err)) return false;
-      pv.fs_path = rel;
-      pv.inline_body = false;
-      if (!store->install_version(pv, nullptr, 0, attrs, err)) return false;
     } else {
-      if (!store->install_version(pv, data.data(), data.size(), attrs, err)) return false;
+      ok = store->install_version(pv, data.data(), data.size(), attrs, err);
     }
-    return publish_dst();
+    if (ok) ok = publish_dst();
+    cleanup_temp();
+    return ok;
   }
 
   ObjectRpcResult r;
@@ -151,8 +181,9 @@ bool push_replica(const Config& cfg, const std::string& advertise, const Cluster
                               cfg.auth_skew_ms, map.epoch, dst.aios_path, pv, data.data(),
                               data.size(), attrs);
   }
-  if (!r.ok) return false;
-  return publish_dst();
+  const bool ok = r.ok && publish_dst();
+  cleanup_temp();
+  return ok;
 }
 
 bool should_repair(const Config& cfg, const Placement& p, const std::vector<bool>& has) {
