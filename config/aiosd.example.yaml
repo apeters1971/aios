@@ -14,10 +14,13 @@ scan_interval_ms: 5000
 # Server-side redundancy (primary fans out to secondaries).
 replica_count: 3
 # write_quorum: 0          # 0 => same as replica_count (capped by acting set size)
-# durability: replica      # or "ec" for erasure coding
-# ec_k: 2
+# durability: replica      # default layout (alias: default_layout); per-PUT headers may override
+# ec_k: 2                  # default EC k (alias: default_ec_k)
 # ec_m: 1                  # m=1 → XOR; m>1 needs ISA-L (e.g. 4+2)
 # ec_codec:                # empty=auto (xor if m==1 else isal), or "xor" / "isal"
+# max_ec_k: 16
+# max_ec_m: 16
+# max_replica_count: 64
 
 # repair_interval_ms: 30000
 # repair_batch_oids: 256

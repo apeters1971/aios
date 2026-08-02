@@ -4,6 +4,7 @@
 #include "cluster/place.hpp"
 #include "config.hpp"
 #include "net/framing.hpp"
+#include "object/object_layout.hpp"
 #include "store/local_stores.hpp"
 #include "store/object_store.hpp"
 
@@ -47,20 +48,23 @@ class ObjectService {
   ApiResult api_put(const std::string& oid, const std::uint8_t* data, std::size_t len,
                     const std::unordered_map<std::string, std::string>& attrs,
                     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-                    std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+                    std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                    const LayoutRequest& layout = {});
   // Staging file is moved into the store (FS-backed). Prefer for large bodies.
   ApiResult api_put_file(const std::string& oid, const std::string& staging_abs_path,
                          std::uint64_t size, std::uint32_t crc32c_val,
                          const std::unordered_map<std::string, std::string>& attrs,
                          bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-                         std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+                         std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                         const LayoutRequest& layout = {});
   ApiResult api_put_redirect(const std::string& oid, const std::string& target_oid,
                              const std::unordered_map<std::string, std::string>& attrs,
                              bool replace_attrs, const std::vector<AttrPrecondition>& preds);
   ApiResult api_put_range(const std::string& oid, std::uint64_t offset,
                           const std::uint8_t* data, std::size_t len,
                           const std::unordered_map<std::string, std::string>& attrs,
-                          bool replace_attrs, const std::vector<AttrPrecondition>& preds);
+                          bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+                          const LayoutRequest& layout = {});
   ApiResult api_get(const std::string& oid, std::optional<std::uint64_t> offset,
                     std::optional<std::uint64_t> end_inclusive,
                     const std::vector<AttrPrecondition>& preds,
@@ -177,7 +181,8 @@ class ObjectService {
   ApiResult commit_ec_put(ObjectStore* store, const Placement& placement, const std::string& oid,
                           const std::uint8_t* data, std::size_t len,
                           const std::unordered_map<std::string, std::string>& attrs,
-                          bool replace_attrs, std::optional<std::uint32_t> expected_crc32c);
+                          bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
+                          const ObjectLayout& layout);
   // Gather shards from acting set and decode (any node with cluster access).
   ApiResult reconstruct_ec_object(const Placement& placement, const std::string& oid,
                                   std::optional<std::uint64_t> seq,

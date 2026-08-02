@@ -55,9 +55,16 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["replica_count"]) cfg.replica_count = root["replica_count"].as<int>();
     if (root["write_quorum"]) cfg.write_quorum = root["write_quorum"].as<int>();
     if (root["durability"]) cfg.durability = root["durability"].as<std::string>();
+    if (root["default_layout"]) cfg.durability = root["default_layout"].as<std::string>();
     if (root["ec_k"]) cfg.ec_k = root["ec_k"].as<int>();
     if (root["ec_m"]) cfg.ec_m = root["ec_m"].as<int>();
     if (root["ec_codec"]) cfg.ec_codec = root["ec_codec"].as<std::string>();
+    if (root["default_ec_k"]) cfg.ec_k = root["default_ec_k"].as<int>();
+    if (root["default_ec_m"]) cfg.ec_m = root["default_ec_m"].as<int>();
+    if (root["default_ec_codec"]) cfg.ec_codec = root["default_ec_codec"].as<std::string>();
+    if (root["max_ec_k"]) cfg.max_ec_k = root["max_ec_k"].as<int>();
+    if (root["max_ec_m"]) cfg.max_ec_m = root["max_ec_m"].as<int>();
+    if (root["max_replica_count"]) cfg.max_replica_count = root["max_replica_count"].as<int>();
     if (root["repair_interval_ms"])
       cfg.repair_interval_ms = root["repair_interval_ms"].as<int>();
     if (root["repair_batch_oids"])

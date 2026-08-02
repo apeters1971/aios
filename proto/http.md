@@ -50,9 +50,19 @@ Canonical string:
 
 Coordinator is the primary for object `txn/{id}`. Prepare installs a new version on each oid’s primary/replicas but leaves the tip unchanged, so tip GET cannot see ops until commit. Commit publishes tips in **oid-sorted** order; a publish failure aborts remaining ops and marks the txn `aborted` (already-published tips stay visible — v1 torn window). Large staged PUTs in a txn require the request to land on the oid primary (same node as coordinator when that oid is local). Wrong coordinator → **307** like other mutating APIs.
 
-### Erasure coding
+### Erasure coding / layout
 
 When the daemon runs with `durability: ec`, ordinary `PUT /o/{oid}` stripes the object across the acting set. `GET`/`HEAD` return the **reconstructed full object** (`Content-Length` / `x-aios-size` are the logical size). EC metadata appears as `x-aios-attr-aios.ec.*`. Partial `PUT` with `Content-Range` is rejected (`400`). Partial `GET` with `Range` is supported (reconstruct then slice). Transactions (`/txn`) work on EC clusters; prepared txn objects use full-copy install until publish (readable as non-EC tips).
+
+**Per-object layout:** on `PUT /o/{oid}`, optional headers select durability for that version:
+
+| Header | Role |
+|--------|------|
+| `x-aios-layout: replica \| ec` | Select layout; omit → cluster `durability` default |
+| `x-aios-ec-k`, `x-aios-ec-m` | EC params; omit → cluster `ec_k` / `ec_m` |
+| `x-aios-ec-codec: xor \| isal` | Omit → auto (`xor` if `m==1`, else `isal`) |
+
+Layout is stored on the version (`x-aios-attr-aios.layout`, etc.). Same oid may use different layouts across versions. See [`layout.md`](layout.md).
 
 ### Large objects
 

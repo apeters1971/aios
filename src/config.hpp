@@ -22,13 +22,18 @@ struct Config {
   int replica_count{3};
   // Successful copies required for Put/Del ACK (including primary). 0 => replica_count.
   int write_quorum{0};
-  // Durability profile: "replica" (default) or "ec" (erasure coding).
+  // Default layout when a PUT omits x-aios-layout ("replica" or "ec").
+  // Alias name in docs: default_layout; YAML/CLI still use `durability`.
   std::string durability{"replica"};
-  // EC parameters (used when durability == "ec").
+  // Default EC parameters when layout is ec (request may override).
   int ec_k{2};
   int ec_m{1};
   // EC codec: "" (auto: xor if m==1 else isal), "xor", or "isal".
   std::string ec_codec;
+  // Safety caps for per-request layout (0 = no cap).
+  int max_ec_k{16};
+  int max_ec_m{16};
+  int max_replica_count{64};
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};

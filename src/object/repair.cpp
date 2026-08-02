@@ -4,6 +4,7 @@
 #include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
 #include "net/object_client.hpp"
+#include "object/object_layout.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
 
@@ -357,7 +358,7 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
     }
     for (const auto& oid : oids) {
       ++stats.oids_scanned;
-      const auto p = place(oid, map);
+      auto p = place(oid, map);
       if (p.acting_set.empty()) continue;
 
       bool local_in_set = false;
@@ -368,6 +369,18 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         }
       }
       if (!local_in_set) continue;
+
+      // Widen placement from tip attrs when this version uses a larger n (e.g. EC k+m).
+      {
+        auto* local = stores.get(path);
+        std::unordered_map<std::string, std::string> local_attrs;
+        if (local) local_attrs = local->list_attrs(oid, err);
+        const int n = placement_n_for_attrs(local_attrs, map.replica_count);
+        if (n != static_cast<int>(p.acting_set.size())) {
+          auto widened = place(oid, map, n);
+          if (!widened.acting_set.empty()) p = std::move(widened);
+        }
+      }
 
       std::vector<TargetObjState> states(p.acting_set.size());
       std::vector<bool> has(p.acting_set.size(), false);
@@ -400,7 +413,7 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
 
       const auto auth_attrs =
           load_attrs_from_target(cfg, advertise, map, stores, p.acting_set[auth], oid);
-      const bool is_ec = cfg.durability == "ec" || attrs_are_ec(auth_attrs);
+      const bool is_ec = attrs_are_ec(auth_attrs);
 
       std::vector<bool> needs_fix(p.acting_set.size(), false);
       bool any_fix = false;

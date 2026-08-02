@@ -4,6 +4,7 @@
 #include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
 #include "net/object_client.hpp"
+#include "object/object_layout.hpp"
 #include "util/base64.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
@@ -258,6 +259,7 @@ ApiResult ObjectService::install_prepared(
   r.epoch = map_.epoch;
   r.replicas = total_ok;
   r.placement = placement;
+  r.attrs = attrs;
   r.info = ObjectInfo{};
   r.info->oid = pv.oid;
   r.info->seq = pv.seq;
@@ -801,9 +803,9 @@ ApiResult ObjectService::commit_ec_put(
     ObjectStore* store, const Placement& placement, const std::string& oid,
     const std::uint8_t* data, std::size_t len,
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
-    std::optional<std::uint32_t> expected_crc32c) {
+    std::optional<std::uint32_t> expected_crc32c, const ObjectLayout& layout) {
   std::string err;
-  auto codec = make_erasure_codec(cfg_.ec_k, cfg_.ec_m, cfg_.ec_codec, err);
+  auto codec = make_erasure_codec(layout.ec_k, layout.ec_m, layout.ec_codec, err);
   if (!codec) return fail("bad_request", err);
   if (static_cast<int>(placement.acting_set.size()) < codec->shard_count()) {
     return fail("no_targets", "acting set smaller than k+m");
@@ -819,6 +821,7 @@ ApiResult ObjectService::commit_ec_put(
   }
 
   std::unordered_map<std::string, std::string> base = attrs;
+  apply_layout_attrs(base, layout);
   set_ec_attrs(base, codec->k(), codec->m(), 0, codec->name(), len, full_crc);
 
   auto shard_attrs = [&](int i) {
@@ -969,56 +972,68 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
                                 const std::unordered_map<std::string, std::string>& attrs,
                                 bool replace_attrs,
                                 const std::vector<AttrPrecondition>& preds,
-                                std::optional<std::uint32_t> expected_crc32c) {
+                                std::optional<std::uint32_t> expected_crc32c,
+                                const LayoutRequest& layout_req) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  ObjectLayout layout;
+  std::string err;
+  if (!resolve_object_layout(cfg_, layout_req, layout, err)) {
+    return fail("bad_request", err);
+  }
+  auto placement = place(oid, map_, layout.n);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
     r.placement = placement;
     return r;
   }
-  std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   auto pr = check_preds_on(store, oid, preds, err);
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
-  if (cfg_.durability == "ec") {
+  if (layout.is_ec()) {
     return commit_ec_put(store, placement, oid, data, len, attrs, replace_attrs,
-                         expected_crc32c);
+                         expected_crc32c, layout);
   }
 
+  auto put_attrs = attrs;
+  apply_layout_attrs(put_attrs, layout);
   PreparedVersion pv;
-  if (!store->prepare_put(oid, data, len, attrs, replace_attrs, expected_crc32c, pv, err)) {
+  if (!store->prepare_put(oid, data, len, put_attrs, replace_attrs, expected_crc32c, pv,
+                          err)) {
     if (err == "crc32c mismatch") return fail("crc_mismatch", err);
     return fail("store_error", err);
   }
-  return commit_prepared(store, placement, pv, data, len, attrs);
+  return commit_prepared(store, placement, pv, data, len, put_attrs);
 }
 
 ApiResult ObjectService::api_put_file(
     const std::string& oid, const std::string& staging_abs_path, std::uint64_t size,
     std::uint32_t crc32c_val, const std::unordered_map<std::string, std::string>& attrs,
     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-    std::optional<std::uint32_t> expected_crc32c) {
+    std::optional<std::uint32_t> expected_crc32c, const LayoutRequest& layout_req) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  ObjectLayout layout;
+  std::string err;
+  if (!resolve_object_layout(cfg_, layout_req, layout, err)) {
+    return fail("bad_request", err);
+  }
+  auto placement = place(oid, map_, layout.n);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
     r.placement = placement;
     return r;
   }
-  std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   auto pr = check_preds_on(store, oid, preds, err);
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
-  if (cfg_.durability == "ec") {
+  if (layout.is_ec()) {
     constexpr std::uint64_t kEcMemLimit = 16ull * 1024ull * 1024ull;
     if (size > kEcMemLimit) {
       return fail("bad_request", "ec v1 supports objects up to 16 MiB");
@@ -1033,16 +1048,18 @@ ApiResult ObjectService::api_put_file(
       }
     }
     return commit_ec_put(store, placement, oid, buf.data(), buf.size(), attrs, replace_attrs,
-                         expected_crc32c.value_or(crc32c_val));
+                         expected_crc32c.value_or(crc32c_val), layout);
   }
 
+  auto put_attrs = attrs;
+  apply_layout_attrs(put_attrs, layout);
   PreparedVersion pv;
-  if (!store->prepare_put_file(oid, staging_abs_path, size, crc32c_val, attrs, replace_attrs,
-                               expected_crc32c, pv, err)) {
+  if (!store->prepare_put_file(oid, staging_abs_path, size, crc32c_val, put_attrs,
+                               replace_attrs, expected_crc32c, pv, err)) {
     if (err == "crc32c mismatch") return fail("crc_mismatch", err);
     return fail("store_error", err);
   }
-  return commit_prepared(store, placement, pv, nullptr, 0, attrs);
+  return commit_prepared(store, placement, pv, nullptr, 0, put_attrs);
 }
 
 ApiResult ObjectService::api_put_redirect(
@@ -1076,28 +1093,40 @@ ApiResult ObjectService::api_put_redirect(
 ApiResult ObjectService::api_put_range(
     const std::string& oid, std::uint64_t offset, const std::uint8_t* data, std::size_t len,
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
-    const std::vector<AttrPrecondition>& preds) {
+    const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  ObjectLayout layout;
+  std::string err;
+  if (!resolve_object_layout(cfg_, layout_req, layout, err)) {
+    return fail("bad_request", err);
+  }
+  if (layout.is_ec()) {
+    return fail("bad_request", "ranged put not supported for erasure-coded objects");
+  }
+  auto placement = place(oid, map_, layout.n);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
     r.placement = placement;
     return r;
   }
-  std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   auto pr = check_preds_on(store, oid, preds, err);
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
-  if (cfg_.durability == "ec") {
-    return fail("bad_request", "ranged put not supported for erasure-coded objects");
+  {
+    auto tip_attrs = store->list_attrs(oid, err);
+    if (attrs_are_ec(tip_attrs)) {
+      return fail("bad_request", "ranged put not supported for erasure-coded objects");
+    }
   }
 
+  auto put_attrs = attrs;
+  apply_layout_attrs(put_attrs, layout);
   PreparedVersion pv;
-  if (!store->prepare_put_range(oid, offset, data, len, attrs, replace_attrs, pv, err)) {
+  if (!store->prepare_put_range(oid, offset, data, len, put_attrs, replace_attrs, pv, err)) {
     return fail("store_error", err);
   }
   auto full = store->get(oid, pv.seq, err);
@@ -1107,7 +1136,7 @@ ApiResult ObjectService::api_put_range(
   }
   PreparedVersion install = pv;
   install.inline_body = false;
-  return commit_prepared(store, placement, install, full->data(), full->size(), attrs);
+  return commit_prepared(store, placement, install, full->data(), full->size(), put_attrs);
 }
 
 ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint64_t> offset,
@@ -1143,8 +1172,8 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
   }
 
-  // EC degraded read: no local tip — pull attrs from a remote shard.
-  if (!info && cfg_.durability == "ec") {
+  // Degraded read: no local tip — pull attrs from a remote acting-set member.
+  if (!info) {
     for (const auto& t : placement.acting_set) {
       if (t.node_id == cfg_.node_id) continue;
       auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
@@ -1180,8 +1209,11 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   }
 
   // EC objects carry aios.ec.* attrs. Non-EC tips (e.g. txn-prepared full copies) still
-  // use the normal local read path even when the cluster durability profile is ec.
+  // use the normal local read path even when the cluster default layout is ec.
   if (attrs_are_ec(attrs)) {
+    const int n = placement_n_for_attrs(attrs, map_.replica_count);
+    placement = place(oid, map_, n);
+    if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
     auto rec = reconstruct_ec_object(placement, oid, seq, attrs);
     if (!rec.ok) return rec;
     rec.info->seq = info->seq;
@@ -1702,7 +1734,8 @@ ApiResult ObjectService::save_txn_state(const std::string& txn_id, const nlohman
   const auto body = state.dump();
   return api_put(oid, reinterpret_cast<const std::uint8_t*>(body.data()), body.size(),
                  {{"aios.txn", "1"}}, true, {},
-                 crc32c(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
+                 crc32c(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()),
+                 layout_request_replica());
 }
 
 ApiResult ObjectService::require_txn_primary(const std::string& txn_id,
@@ -1739,7 +1772,8 @@ ApiResult ObjectService::api_txn_begin() {
     auto saved =
         api_put(oid, reinterpret_cast<const std::uint8_t*>(body.data()), body.size(),
                 {{"aios.txn", "1"}}, true, create_preds,
-                crc32c(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
+                crc32c(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()),
+                layout_request_replica());
     if (!saved.ok) {
       if (saved.code == "precondition_failed") continue;
       return saved;

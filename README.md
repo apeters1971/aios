@@ -63,7 +63,9 @@ Placement is deterministic: `place(oid, cluster_map) → acting_set` (primary = 
 - **`durability: replica` (default):** primary writes the full object and fans out identical copies; ACK when `write_quorum` copies succeed.
 - **`durability: ec`:** Primary stripes into `ec_k + ec_m` shards (one per acting-set target). GET reconstructs from any `k` shards; repair rebuilds missing shards. Codec is auto-selected (`xor` when `ec_m=1`, else `isal` / Reed–Solomon via Intel ISA-L). Build with `AIOS_WITH_ISAL=ON` (default) and install `libisal` (e.g. `brew install isa-l`) for `m>1`. Ranged PUT is rejected; staged PUT capped at 16 MiB for now.
 
-See [`proto/README.md`](proto/README.md).
+**Per-object layout** (no pools/PGs): PUT may override via `x-aios-layout` / `x-aios-ec-*` headers; `durability` / `ec_*` are cluster defaults. See [`proto/layout.md`](proto/layout.md).
+
+See [`proto/README.md`](proto/README.md) and [`proto/http.md`](proto/http.md).
 
 ### Cluster key
 

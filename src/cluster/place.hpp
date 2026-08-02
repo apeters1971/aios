@@ -14,8 +14,13 @@ struct Placement {
 };
 
 // Deterministic placement: SHA-256(oid) picks a start index into the sorted
-// target ring, then walks preferring distinct node_ids until replica_count
-// targets are chosen (falling back to same-node mounts if needed).
+// target ring, then walks preferring distinct node_ids until `n` targets are
+// chosen (falling back to same-node mounts if needed).
+// If n > map.targets.size() (or n < 1), returns an empty acting set — callers
+// treat that as no_targets (no silent under-protection).
+Placement place(const std::string& oid, const ClusterMap& map, int n);
+
+// Compat: place(oid, map) == place(oid, map, map.replica_count).
 Placement place(const std::string& oid, const ClusterMap& map);
 
 // True if `candidate` is acting_set[0] under the given map/oid.

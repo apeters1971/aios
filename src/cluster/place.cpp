@@ -2,7 +2,6 @@
 
 #include <openssl/evp.h>
 
-#include <algorithm>
 #include <unordered_set>
 
 namespace aios {
@@ -21,15 +20,15 @@ std::uint64_t sha256_u64(const std::string& s) {
 
 }  // namespace
 
-Placement place(const std::string& oid, const ClusterMap& map) {
+Placement place(const std::string& oid, const ClusterMap& map, int n) {
   Placement p;
   p.epoch = map.epoch;
-  if (map.targets.empty() || map.replica_count <= 0) return p;
+  if (map.targets.empty() || n < 1) return p;
+  if (static_cast<std::size_t>(n) > map.targets.size()) return p;
 
-  const std::size_t n = map.targets.size();
-  const std::size_t want =
-      static_cast<std::size_t>(std::min<int>(map.replica_count, static_cast<int>(n)));
-  const std::size_t start = static_cast<std::size_t>(sha256_u64(oid) % n);
+  const std::size_t ring = map.targets.size();
+  const std::size_t want = static_cast<std::size_t>(n);
+  const std::size_t start = static_cast<std::size_t>(sha256_u64(oid) % ring);
 
   std::unordered_set<std::string> used_keys;
   std::unordered_set<std::string> used_nodes;
@@ -44,14 +43,18 @@ Placement place(const std::string& oid, const ClusterMap& map) {
   };
 
   // Pass 1: distinct nodes.
-  for (std::size_t i = 0; i < n && p.acting_set.size() < want; ++i) {
-    try_add(map.targets[(start + i) % n], /*require_new_node=*/true);
+  for (std::size_t i = 0; i < ring && p.acting_set.size() < want; ++i) {
+    try_add(map.targets[(start + i) % ring], /*require_new_node=*/true);
   }
   // Pass 2: fill remaining with any unused targets (same-node mounts ok).
-  for (std::size_t i = 0; i < n && p.acting_set.size() < want; ++i) {
-    try_add(map.targets[(start + i) % n], /*require_new_node=*/false);
+  for (std::size_t i = 0; i < ring && p.acting_set.size() < want; ++i) {
+    try_add(map.targets[(start + i) % ring], /*require_new_node=*/false);
   }
   return p;
+}
+
+Placement place(const std::string& oid, const ClusterMap& map) {
+  return place(oid, map, map.replica_count);
 }
 
 bool is_primary_for(const std::string& oid, const ClusterMap& map,

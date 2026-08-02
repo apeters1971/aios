@@ -2,6 +2,7 @@
 
 #include "http/http_auth.hpp"
 #include "net/framing.hpp"
+#include "object/object_layout.hpp"
 #include "util/auth.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
@@ -717,6 +718,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             continue;
           }
         }
+        const LayoutRequest layout_req = layout_request_from_headers(headers);
         ApiResult r;
         if (!redirect_to.empty()) {
           if (!cr.empty()) {
@@ -771,16 +773,16 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             continue;
           }
           r = objects_.api_put_range(oid, start, body.data(), body.size(), attrs, false,
-                                     preds);
+                                     preds, layout_req);
         } else if (!upload_path.empty()) {
           r = objects_.api_put_file(oid, upload_path, content_length, upload_crc, attrs, true,
-                                    preds, expected_crc);
+                                    preds, expected_crc, layout_req);
           std::error_code rec;
           fs::remove(upload_path, rec);
           upload_path.clear();
         } else {
           r = objects_.api_put(oid, body.data(), body.size(), attrs, true, preds,
-                               expected_crc);
+                               expected_crc, layout_req);
         }
         if (!r.ok) {
           if (!upload_path.empty()) {
