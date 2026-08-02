@@ -206,6 +206,7 @@ int status_for(const ApiResult& r) {
   if (r.code == "no_targets") return 503;
   if (r.code == "quorum_failed") return 503;
   if (r.code == "bad_request") return 400;
+  if (r.code == "conflict") return 409;
   return 500;
 }
 
@@ -483,6 +484,112 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
 
     if (method == "GET" && path == "/map") {
       write_json(*sock, 200, "OK", objects_.map().to_json(), keep_alive);
+      continue;
+    }
+
+    // Cross-object transactions: /txn, /txn/{id}, /txn/{id}/commit|abort, /txn/{id}/o/{oid}
+    if (path == "/txn" && method == "POST") {
+      auto r = objects_.api_txn_begin();
+      if (!r.ok) {
+        write_api_error(*sock, r, target, keep_alive);
+        continue;
+      }
+      nlohmann::json body = nlohmann::json::parse(
+          std::string(r.data->begin(), r.data->end()));
+      write_json(*sock, 201, "Created", body, keep_alive);
+      continue;
+    }
+    if (path.rfind("/txn/", 0) == 0) {
+      const std::string rest = path.substr(5);
+      std::string txn_id = rest;
+      std::string txn_sub;
+      const auto slash = rest.find('/');
+      if (slash != std::string::npos) {
+        txn_id = rest.substr(0, slash);
+        txn_sub = rest.substr(slash + 1);
+      }
+      if (txn_id.empty()) {
+        write_json(*sock, 404, "Not Found", {{"error", "not found"}}, keep_alive);
+        continue;
+      }
+
+      if (txn_sub.empty() && method == "GET") {
+        auto r = objects_.api_txn_get(txn_id);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK",
+                   nlohmann::json::parse(std::string(r.data->begin(), r.data->end())),
+                   keep_alive);
+        continue;
+      }
+      if (txn_sub == "commit" && method == "POST") {
+        auto r = objects_.api_txn_commit(txn_id);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK",
+                   nlohmann::json::parse(std::string(r.data->begin(), r.data->end())),
+                   keep_alive);
+        continue;
+      }
+      if (txn_sub == "abort" && method == "POST") {
+        auto r = objects_.api_txn_abort(txn_id);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK",
+                   nlohmann::json::parse(std::string(r.data->begin(), r.data->end())),
+                   keep_alive);
+        continue;
+      }
+      if (txn_sub.rfind("o/", 0) == 0) {
+        const std::string oid = url_decode(txn_sub.substr(2));
+        if (oid.empty()) {
+          write_json(*sock, 400, "Bad Request", {{"error", "empty oid"}}, keep_alive);
+          continue;
+        }
+        if (method == "PUT") {
+          ApiResult r;
+          if (!upload_path.empty()) {
+            r = objects_.api_txn_prepare_put_file(txn_id, oid, upload_path, content_length,
+                                                  upload_crc, attrs, preds, std::nullopt);
+            std::error_code rec;
+            fs::remove(upload_path, rec);
+            upload_path.clear();
+          } else {
+            r = objects_.api_txn_prepare_put(txn_id, oid, body.data(), body.size(), attrs,
+                                             preds, std::nullopt);
+          }
+          if (!r.ok) {
+            write_api_error(*sock, r, target, keep_alive);
+            continue;
+          }
+          nlohmann::json resp = {{"txn_id", txn_id},
+                                 {"oid", oid},
+                                 {"seq", r.info ? r.info->seq : 0},
+                                 {"epoch", r.epoch}};
+          write_json(*sock, 200, "OK", resp, keep_alive);
+          continue;
+        }
+        if (method == "DELETE") {
+          auto r = objects_.api_txn_prepare_delete(txn_id, oid, preds);
+          if (!r.ok) {
+            write_api_error(*sock, r, target, keep_alive);
+            continue;
+          }
+          nlohmann::json resp = {{"txn_id", txn_id},
+                                 {"oid", oid},
+                                 {"seq", r.info ? r.info->seq : 0},
+                                 {"epoch", r.epoch}};
+          write_json(*sock, 200, "OK", resp, keep_alive);
+          continue;
+        }
+      }
+      write_json(*sock, 404, "Not Found", {{"error", "not found"}}, keep_alive);
       continue;
     }
 

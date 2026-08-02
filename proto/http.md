@@ -39,6 +39,16 @@ Canonical string:
 | `POST` | `/o/{oid}/purge?keep={n}` | Keep newest `n` versions (default `max_versions`) |
 | `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1&scope=` | LIST tip objects (default **cluster** scatter-gather; `scope=local` for this node) |
 | `GET` | `/map` | Cluster map JSON (targets include `http_addr`) |
+| `POST` | `/txn` | Begin cross-object txn → JSON `{txn_id,state,ops}` (201) |
+| `GET` | `/txn/{id}` | Txn coordinator state JSON |
+| `PUT` | `/txn/{id}/o/{oid}` | Prepare put (install without tip publish) |
+| `DELETE` | `/txn/{id}/o/{oid}` | Prepare delete-marker (unpublished) |
+| `POST` | `/txn/{id}/commit` | Publish prepared tips in oid-sorted order |
+| `POST` | `/txn/{id}/abort` | Abort prepared versions; mark txn aborted |
+
+### Cross-object transactions
+
+Coordinator is the primary for object `txn/{id}`. Prepare installs a new version on each oid’s primary/replicas but leaves the tip unchanged, so tip GET cannot see ops until commit. Commit publishes tips in **oid-sorted** order; a publish failure aborts remaining ops and marks the txn `aborted` (already-published tips stay visible — v1 torn window). Large staged PUTs in a txn require the request to land on the oid primary (same node as coordinator when that oid is local). Wrong coordinator → **307** like other mutating APIs.
 
 ### Large objects
 

@@ -236,5 +236,47 @@ int test_object_service_advanced() {
   expect(svc.api_get("adv/nope", std::nullopt, std::nullopt, {}).code == "not_found",
          "missing get");
 
+  // Cross-object txn: prepare two puts, commit → tips visible; abort path hides tips.
+  {
+    auto begin = svc.api_txn_begin();
+    expect(begin.ok && begin.data.has_value(), "txn begin");
+    auto st = nlohmann::json::parse(begin.data->begin(), begin.data->end());
+    const std::string txn_id = st.value("txn_id", "");
+    expect(!txn_id.empty(), "txn id");
+
+    const std::string a = "txn-obj/a";
+    const std::string b = "txn-obj/b";
+    const auto* pa = reinterpret_cast<const std::uint8_t*>("alpha");
+    const auto* pb = reinterpret_cast<const std::uint8_t*>("bravo");
+    auto pa_r = svc.api_txn_prepare_put(txn_id, a, pa, 5, {{"t", "1"}}, {});
+    expect(pa_r.ok && pa_r.info && pa_r.info->seq > 0, "txn prepare a");
+    auto pb_r = svc.api_txn_prepare_put(txn_id, b, pb, 5, {{"t", "1"}}, {});
+    expect(pb_r.ok && pb_r.info && pb_r.info->seq > 0, "txn prepare b");
+
+    // Unpublished: tip GET must miss until commit.
+    expect(svc.api_get(a, std::nullopt, std::nullopt, {}).code == "not_found",
+           "txn a invisible before commit");
+    expect(svc.api_get(b, std::nullopt, std::nullopt, {}).code == "not_found",
+           "txn b invisible before commit");
+
+    auto committed = svc.api_txn_commit(txn_id);
+    expect(committed.ok, "txn commit");
+    auto ga = svc.api_get(a, std::nullopt, std::nullopt, {});
+    auto gb = svc.api_get(b, std::nullopt, std::nullopt, {});
+    expect(ga.ok && std::string(ga.data->begin(), ga.data->end()) == "alpha", "txn a tip");
+    expect(gb.ok && std::string(gb.data->begin(), gb.data->end()) == "bravo", "txn b tip");
+
+    auto begin2 = svc.api_txn_begin();
+    expect(begin2.ok && begin2.data.has_value(), "txn2 begin");
+    auto st2 = nlohmann::json::parse(begin2.data->begin(), begin2.data->end());
+    const std::string txn2 = st2.value("txn_id", "");
+    const auto* pc = reinterpret_cast<const std::uint8_t*>("charlie");
+    expect(svc.api_txn_prepare_put(txn2, a, pc, 7, {}, {}).ok, "txn2 prepare");
+    expect(svc.api_txn_abort(txn2).ok, "txn2 abort");
+    auto ga2 = svc.api_get(a, std::nullopt, std::nullopt, {});
+    expect(ga2.ok && std::string(ga2.data->begin(), ga2.data->end()) == "alpha",
+           "txn2 abort keeps old tip");
+  }
+
   return failures();
 }

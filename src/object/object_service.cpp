@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <fstream>
 #include <mutex>
+#include <random>
+#include <sstream>
 #include <unordered_set>
 
 namespace aios {
@@ -230,7 +232,7 @@ void ObjectService::replicate_abort(const Placement& placement, const std::strin
   }
 }
 
-ApiResult ObjectService::commit_prepared(
+ApiResult ObjectService::install_prepared(
     ObjectStore* store, const Placement& placement, PreparedVersion& pv,
     const std::uint8_t* data, std::size_t len,
     const std::unordered_map<std::string, std::string>& attrs,
@@ -248,6 +250,35 @@ ApiResult ObjectService::commit_prepared(
     replicate_abort(placement, pv.oid, pv.seq);
     return fail("quorum_failed", "quorum failed");
   }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.replicas = total_ok;
+  r.placement = placement;
+  r.info = ObjectInfo{};
+  r.info->oid = pv.oid;
+  r.info->seq = pv.seq;
+  r.info->size = pv.size;
+  r.info->crc32c = pv.crc32c;
+  r.info->crc32c_known = true;
+  r.info->is_delete = pv.is_delete;
+  r.info->redirect_oid = pv.redirect_oid;
+  r.info->inline_body = pv.inline_body;
+  r.info->fs_path = pv.fs_path;
+  if (!pv.redirect_oid.empty()) {
+    r.redirect_oid = pv.redirect_oid;
+    r.code = "redirect";
+  }
+  return r;
+}
+
+ApiResult ObjectService::commit_prepared(
+    ObjectStore* store, const Placement& placement, PreparedVersion& pv,
+    const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs,
+    const std::string& abs_body_path) {
+  auto r = install_prepared(store, placement, pv, data, len, attrs, abs_body_path);
+  if (!r.ok) return r;
   std::string err;
   if (!store->publish_tip(pv.oid, pv.seq, err)) {
     store->abort_version(pv.oid, pv.seq, err);
@@ -256,11 +287,6 @@ ApiResult ObjectService::commit_prepared(
   }
   replicate_publish(placement, pv.oid, pv.seq);
 
-  ApiResult r;
-  r.ok = true;
-  r.epoch = map_.epoch;
-  r.replicas = total_ok;
-  r.placement = placement;
   if (auto st = store->stat(pv.oid, err)) {
     r.info = st;
     if (!st->redirect_oid.empty()) {
@@ -268,7 +294,6 @@ ApiResult ObjectService::commit_prepared(
       r.code = "redirect";
     }
   } else if (!pv.redirect_oid.empty()) {
-    // Tip may be redirect; stat succeeds for redirects (unlike delete markers).
     r.redirect_oid = pv.redirect_oid;
     r.code = "redirect";
   }
@@ -427,11 +452,16 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     if (err == "crc32c mismatch") return reply_err(map_.epoch, "crc_mismatch", err);
     return reply_err(map_.epoch, "store_error", err);
   }
-  auto r = commit_prepared(store, placement, pv, data.data(), data.size(), attrs);
+  const bool do_publish = body.value("publish", true);
+  ApiResult r = do_publish ? commit_prepared(store, placement, pv, data.data(), data.size(), attrs)
+                           : install_prepared(store, placement, pv, data.data(), data.size(),
+                                              attrs);
   if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
   auto f = reply_ok(map_.epoch);
   f.body["replicas"] = r.replicas;
   f.body["seq"] = pv.seq;
+  f.body["prev_tip"] = pv.prev_tip;
+  f.body["published"] = do_publish;
   if (!pv.redirect_oid.empty()) f.body["redirect"] = pv.redirect_oid;
   return f;
 }
@@ -615,11 +645,15 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
     if (err == "object not found") return reply_err(map_.epoch, "not_found", err);
     return reply_err(map_.epoch, "store_error", err);
   }
-  auto r = commit_prepared(store, placement, pv, nullptr, 0, {});
+  const bool do_publish = body.value("publish", true);
+  ApiResult r = do_publish ? commit_prepared(store, placement, pv, nullptr, 0, {})
+                           : install_prepared(store, placement, pv, nullptr, 0, {});
   if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
   auto f = reply_ok(map_.epoch);
   f.body["replicas"] = r.replicas;
   f.body["seq"] = pv.seq;
+  f.body["prev_tip"] = pv.prev_tip;
+  f.body["published"] = do_publish;
   return f;
 }
 
@@ -659,8 +693,14 @@ Frame ObjectService::handle_publish_tip(const nlohmann::json& body) {
   const std::string oid = body.value("oid", "");
   const std::string aios_path = body.value("aios_path", "");
   const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
+  const std::string role = body.value("role", "replica");
   if (oid.empty() || aios_path.empty() || seq == 0) {
     return reply_err(map_.epoch, "bad_request", "oid, aios_path, seq required");
+  }
+  if (role == "primary") {
+    auto r = api_publish_version(oid, seq);
+    if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
+    return reply_ok(map_.epoch);
   }
   if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set");
@@ -678,8 +718,14 @@ Frame ObjectService::handle_abort_version(const nlohmann::json& body) {
   const std::string oid = body.value("oid", "");
   const std::string aios_path = body.value("aios_path", "");
   const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
+  const std::string role = body.value("role", "replica");
   if (oid.empty() || aios_path.empty() || seq == 0) {
     return reply_err(map_.epoch, "bad_request", "oid, aios_path, seq required");
+  }
+  if (role == "primary") {
+    auto r = api_abort_prepared(oid, seq);
+    if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
+    return reply_ok(map_.epoch);
   }
   if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set");
@@ -1244,6 +1290,469 @@ Frame ObjectService::handle_list(const nlohmann::json& body) {
   f.body["objects"] = std::move(arr);
   f.body["next_cursor"] = r.list.next_cursor;
   return f;
+}
+
+namespace {
+
+std::string make_txn_id() {
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  std::ostringstream os;
+  os << std::hex << aios::now_ms() << "-" << rng();
+  return os.str();
+}
+
+std::string txn_oid(const std::string& txn_id) { return "txn/" + txn_id; }
+
+}  // namespace
+
+ApiResult ObjectService::api_prepare_put(
+    const std::string& oid, const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
+    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return fail("not_found", err);
+  if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+  PreparedVersion pv;
+  if (!store->prepare_put(oid, data, len, attrs, replace_attrs, expected_crc32c, pv, err)) {
+    if (err == "crc32c mismatch") return fail("crc_mismatch", err);
+    return fail("store_error", err);
+  }
+  return install_prepared(store, placement, pv, data, len, attrs);
+}
+
+ApiResult ObjectService::api_prepare_put_file(
+    const std::string& oid, const std::string& staging_abs_path, std::uint64_t size,
+    std::uint32_t crc32c_val, const std::unordered_map<std::string, std::string>& attrs,
+    bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+    std::optional<std::uint32_t> expected_crc32c) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return fail("not_found", err);
+  if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+  PreparedVersion pv;
+  if (!store->prepare_put_file(oid, staging_abs_path, size, crc32c_val, attrs, replace_attrs,
+                               expected_crc32c, pv, err)) {
+    if (err == "crc32c mismatch") return fail("crc_mismatch", err);
+    return fail("store_error", err);
+  }
+  return install_prepared(store, placement, pv, nullptr, 0, attrs);
+}
+
+ApiResult ObjectService::api_prepare_delete(const std::string& oid,
+                                           const std::vector<AttrPrecondition>& preds) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return fail("not_found", err);
+  if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+  PreparedVersion pv;
+  if (!store->prepare_delete(oid, pv, err)) {
+    if (err == "object not found") return fail("not_found", err);
+    return fail("store_error", err);
+  }
+  return install_prepared(store, placement, pv, nullptr, 0, {});
+}
+
+ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64_t seq) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  if (!store->publish_tip(oid, seq, err)) return fail("store_error", err);
+  replicate_publish(placement, oid, seq);
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  if (auto st = store->stat(oid, err)) r.info = st;
+  return r;
+}
+
+ApiResult ObjectService::api_abort_prepared(const std::string& oid, std::uint64_t seq) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  if (!store->abort_version(oid, seq, err)) return fail("store_error", err);
+  replicate_abort(placement, oid, seq);
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  return r;
+}
+
+ApiResult ObjectService::load_txn_state(const std::string& txn_id, nlohmann::json& state_out) {
+  const auto oid = txn_oid(txn_id);
+  auto got = api_get(oid, std::nullopt, std::nullopt, {}, std::nullopt);
+  if (!got.ok) return got;
+  if (got.data->empty()) return fail("bad_request", "empty txn state");
+  try {
+    state_out = nlohmann::json::parse(got.data->begin(), got.data->end());
+  } catch (const std::exception& e) {
+    return fail("bad_request", std::string("bad txn json: ") + e.what());
+  }
+  return got;
+}
+
+ApiResult ObjectService::save_txn_state(const std::string& txn_id, const nlohmann::json& state) {
+  const auto oid = txn_oid(txn_id);
+  const auto body = state.dump();
+  return api_put(oid, reinterpret_cast<const std::uint8_t*>(body.data()), body.size(),
+                 {{"aios.txn", "1"}}, true, {},
+                 crc32c(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
+}
+
+ApiResult ObjectService::require_txn_primary(const std::string& txn_id,
+                                             nlohmann::json& state_out) {
+  const auto oid = txn_oid(txn_id);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not txn coordinator");
+    r.placement = placement;
+    return r;
+  }
+  auto loaded = load_txn_state(txn_id, state_out);
+  if (!loaded.ok) return loaded;
+  loaded.placement = placement;
+  return loaded;
+}
+
+ApiResult ObjectService::api_txn_begin() {
+  std::lock_guard lock(mu_);
+  // Pick a txn id whose primary is this node (coordinator = primary for txn/<id>).
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    const auto id = make_txn_id();
+    const auto oid = txn_oid(id);
+    auto placement = place(oid, map_);
+    if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+    if (placement.acting_set[0].node_id != cfg_.node_id) continue;
+    nlohmann::json state = {{"txn_id", id},
+                            {"state", "open"},
+                            {"ops", nlohmann::json::array()}};
+    const auto body = state.dump();
+    std::vector<AttrPrecondition> create_preds = {
+        {AttrPrecondition::Kind::MustNotExist, {}, {}}};
+    auto saved =
+        api_put(oid, reinterpret_cast<const std::uint8_t*>(body.data()), body.size(),
+                {{"aios.txn", "1"}}, true, create_preds,
+                crc32c(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
+    if (!saved.ok) {
+      if (saved.code == "precondition_failed") continue;
+      return saved;
+    }
+    ApiResult r;
+    r.ok = true;
+    r.epoch = map_.epoch;
+    r.placement = placement;
+    r.attrs["txn_id"] = id;
+    // Stash JSON in body for HTTP.
+    const auto s = state.dump();
+    r.data = std::vector<std::uint8_t>(s.begin(), s.end());
+    return r;
+  }
+  return fail("store_error", "could not allocate txn id");
+}
+
+ApiResult ObjectService::api_txn_get(const std::string& txn_id) {
+  std::lock_guard lock(mu_);
+  nlohmann::json state;
+  auto r = require_txn_primary(txn_id, state);
+  if (!r.ok) return r;
+  const auto s = state.dump();
+  r.data = std::vector<std::uint8_t>(s.begin(), s.end());
+  r.attrs["txn_id"] = txn_id;
+  return r;
+}
+
+ApiResult ObjectService::api_txn_prepare_put(
+    const std::string& txn_id, const std::string& oid, const std::uint8_t* data,
+    std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
+    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c) {
+  std::lock_guard lock(mu_);
+  nlohmann::json state;
+  auto tr = require_txn_primary(txn_id, state);
+  if (!tr.ok) return tr;
+  if (state.value("state", "") != "open") return fail("conflict", "txn not open");
+
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+
+  std::unordered_map<std::string, std::string> put_attrs = attrs;
+  put_attrs["aios.txn"] = txn_id;
+
+  ApiResult prep;
+  if (placement.acting_set[0].node_id == cfg_.node_id) {
+    prep = api_prepare_put(oid, data, len, put_attrs, true, preds, expected_crc32c);
+  } else {
+    auto remote = object_prepare_put_remote(
+        placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+        cfg_.auth_skew_ms, map_.epoch, placement.acting_set[0].aios_path, oid, data, len,
+        put_attrs);
+    if (!remote.ok) {
+      auto r = fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
+      r.placement = placement;
+      return r;
+    }
+    prep.ok = true;
+    prep.epoch = remote.epoch;
+    prep.placement = placement;
+    prep.info = ObjectInfo{};
+    prep.info->oid = oid;
+    prep.info->seq = remote.body.value("seq", static_cast<std::uint64_t>(0));
+  }
+  if (!prep.ok) return prep;
+  if (!prep.info || prep.info->seq == 0) return fail("store_error", "prepare missing seq");
+
+  state["ops"].push_back({{"oid", oid},
+                          {"seq", prep.info->seq},
+                          {"kind", "put"},
+                          {"primary", placement.acting_set[0].node_id},
+                          {"addr", placement.acting_set[0].addr},
+                          {"aios_path", placement.acting_set[0].aios_path}});
+  auto saved = save_txn_state(txn_id, state);
+  if (!saved.ok) {
+    // Best-effort abort prepared version.
+    if (placement.acting_set[0].node_id == cfg_.node_id) {
+      api_abort_prepared(oid, prep.info->seq);
+    } else {
+      object_abort_prepared_remote(placement.acting_set[0].addr, cfg_.node_id, advertise_,
+                                   cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
+                                   placement.acting_set[0].aios_path, oid, prep.info->seq);
+    }
+    return saved;
+  }
+  prep.attrs["txn_id"] = txn_id;
+  return prep;
+}
+
+ApiResult ObjectService::api_txn_prepare_put_file(
+    const std::string& txn_id, const std::string& oid, const std::string& staging_abs_path,
+    std::uint64_t size, std::uint32_t crc32c_val,
+    const std::unordered_map<std::string, std::string>& attrs,
+    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c) {
+  std::lock_guard lock(mu_);
+  nlohmann::json state;
+  auto tr = require_txn_primary(txn_id, state);
+  if (!tr.ok) return tr;
+  if (state.value("state", "") != "open") return fail("conflict", "txn not open");
+
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  // Large file prepare currently requires local primary (staging path is local).
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "large txn put requires oid primary as coordinator host");
+    r.placement = placement;
+    return r;
+  }
+  std::unordered_map<std::string, std::string> put_attrs = attrs;
+  put_attrs["aios.txn"] = txn_id;
+  auto prep = api_prepare_put_file(oid, staging_abs_path, size, crc32c_val, put_attrs, true,
+                                   preds, expected_crc32c);
+  if (!prep.ok) return prep;
+  state["ops"].push_back({{"oid", oid},
+                          {"seq", prep.info->seq},
+                          {"kind", "put"},
+                          {"primary", cfg_.node_id},
+                          {"addr", advertise_},
+                          {"aios_path", placement.acting_set[0].aios_path}});
+  auto saved = save_txn_state(txn_id, state);
+  if (!saved.ok) {
+    api_abort_prepared(oid, prep.info->seq);
+    return saved;
+  }
+  prep.attrs["txn_id"] = txn_id;
+  return prep;
+}
+
+ApiResult ObjectService::api_txn_prepare_delete(const std::string& txn_id, const std::string& oid,
+                                              const std::vector<AttrPrecondition>& preds) {
+  std::lock_guard lock(mu_);
+  nlohmann::json state;
+  auto tr = require_txn_primary(txn_id, state);
+  if (!tr.ok) return tr;
+  if (state.value("state", "") != "open") return fail("conflict", "txn not open");
+
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+
+  ApiResult prep;
+  if (placement.acting_set[0].node_id == cfg_.node_id) {
+    prep = api_prepare_delete(oid, preds);
+  } else {
+    auto remote = object_prepare_delete_remote(
+        placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+        cfg_.auth_skew_ms, map_.epoch, placement.acting_set[0].aios_path, oid);
+    if (!remote.ok) {
+      return fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
+    }
+    prep.ok = true;
+    prep.epoch = remote.epoch;
+    prep.placement = placement;
+    prep.info = ObjectInfo{};
+    prep.info->oid = oid;
+    prep.info->seq = remote.body.value("seq", static_cast<std::uint64_t>(0));
+    prep.info->is_delete = true;
+  }
+  if (!prep.ok) return prep;
+  state["ops"].push_back({{"oid", oid},
+                          {"seq", prep.info->seq},
+                          {"kind", "delete"},
+                          {"primary", placement.acting_set[0].node_id},
+                          {"addr", placement.acting_set[0].addr},
+                          {"aios_path", placement.acting_set[0].aios_path}});
+  auto saved = save_txn_state(txn_id, state);
+  if (!saved.ok) {
+    if (placement.acting_set[0].node_id == cfg_.node_id) {
+      api_abort_prepared(oid, prep.info->seq);
+    } else {
+      object_abort_prepared_remote(placement.acting_set[0].addr, cfg_.node_id, advertise_,
+                                   cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
+                                   placement.acting_set[0].aios_path, oid, prep.info->seq);
+    }
+    return saved;
+  }
+  return prep;
+}
+
+ApiResult ObjectService::api_txn_commit(const std::string& txn_id) {
+  std::lock_guard lock(mu_);
+  nlohmann::json state;
+  auto tr = require_txn_primary(txn_id, state);
+  if (!tr.ok) return tr;
+  if (state.value("state", "") != "open") return fail("conflict", "txn not open");
+  state["state"] = "committing";
+  auto mid = save_txn_state(txn_id, state);
+  if (!mid.ok) return mid;
+
+  std::vector<nlohmann::json> ops = state.value("ops", nlohmann::json::array());
+  std::sort(ops.begin(), ops.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+    return a.value("oid", "") < b.value("oid", "");
+  });
+
+  std::vector<nlohmann::json> published;
+  for (const auto& op : ops) {
+    const auto oid = op.value("oid", "");
+    const auto seq = op.value("seq", static_cast<std::uint64_t>(0));
+    const auto primary = op.value("primary", "");
+    const auto addr = op.value("addr", "");
+    const auto aios_path = op.value("aios_path", "");
+    bool ok = false;
+    if (primary == cfg_.node_id) {
+      ok = api_publish_version(oid, seq).ok;
+    } else {
+      ok = object_publish_prepared_remote(addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                          cfg_.auth_skew_ms, map_.epoch, aios_path, oid, seq)
+               .ok;
+    }
+    if (!ok) {
+      // Abort remaining (including failed) prepared versions.
+      for (const auto& mop : ops) {
+        bool already = false;
+        for (const auto& p : published) {
+          if (p.value("oid", "") == mop.value("oid", "")) {
+            already = true;
+            break;
+          }
+        }
+        if (already) continue;
+        const auto moid = mop.value("oid", "");
+        const auto mseq = mop.value("seq", static_cast<std::uint64_t>(0));
+        if (mop.value("primary", "") == cfg_.node_id) {
+          api_abort_prepared(moid, mseq);
+        } else {
+          object_abort_prepared_remote(mop.value("addr", ""), cfg_.node_id, advertise_,
+                                       cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
+                                       mop.value("aios_path", ""), moid, mseq);
+        }
+      }
+      state["state"] = "aborted";
+      state["error"] = "publish failed for " + oid;
+      save_txn_state(txn_id, state);
+      return fail("quorum_failed", "txn commit failed");
+    }
+    published.push_back(op);
+  }
+
+  state["state"] = "committed";
+  state["ops"] = ops;
+  auto saved = save_txn_state(txn_id, state);
+  if (!saved.ok) return saved;
+  const auto s = state.dump();
+  saved.data = std::vector<std::uint8_t>(s.begin(), s.end());
+  saved.attrs["txn_id"] = txn_id;
+  return saved;
+}
+
+ApiResult ObjectService::api_txn_abort(const std::string& txn_id) {
+  std::lock_guard lock(mu_);
+  nlohmann::json state;
+  auto tr = require_txn_primary(txn_id, state);
+  if (!tr.ok) return tr;
+  const auto cur = state.value("state", "");
+  if (cur == "committed") return fail("conflict", "txn already committed");
+  for (const auto& op : state.value("ops", nlohmann::json::array())) {
+    const auto oid = op.value("oid", "");
+    const auto seq = op.value("seq", static_cast<std::uint64_t>(0));
+    if (op.value("primary", "") == cfg_.node_id) {
+      api_abort_prepared(oid, seq);
+    } else {
+      object_abort_prepared_remote(op.value("addr", ""), cfg_.node_id, advertise_,
+                                   cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
+                                   op.value("aios_path", ""), oid, seq);
+    }
+  }
+  state["state"] = "aborted";
+  auto saved = save_txn_state(txn_id, state);
+  if (!saved.ok) return saved;
+  const auto s = state.dump();
+  saved.data = std::vector<std::uint8_t>(s.begin(), s.end());
+  return saved;
 }
 
 }  // namespace aios

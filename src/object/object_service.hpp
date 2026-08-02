@@ -7,6 +7,8 @@
 #include "store/local_stores.hpp"
 #include "store/object_store.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <mutex>
 #include <optional>
 #include <string>
@@ -74,9 +76,45 @@ class ObjectService {
   ApiResult api_purge_version(const std::string& oid, std::uint64_t seq, bool allow_tip);
   ApiResult api_trim_versions(const std::string& oid, int keep);
 
+  // Prepare + quorum install without publishing tip (for cross-object txns).
+  ApiResult api_prepare_put(const std::string& oid, const std::uint8_t* data, std::size_t len,
+                            const std::unordered_map<std::string, std::string>& attrs,
+                            bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+                            std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+  ApiResult api_prepare_put_file(const std::string& oid, const std::string& staging_abs_path,
+                                 std::uint64_t size, std::uint32_t crc32c_val,
+                                 const std::unordered_map<std::string, std::string>& attrs,
+                                 bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+                                 std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+  ApiResult api_prepare_delete(const std::string& oid,
+                               const std::vector<AttrPrecondition>& preds);
+  ApiResult api_publish_version(const std::string& oid, std::uint64_t seq);
+  ApiResult api_abort_prepared(const std::string& oid, std::uint64_t seq);
+
+  // Cross-object transactions (coordinator = primary for txn/<id>).
+  ApiResult api_txn_begin();
+  ApiResult api_txn_get(const std::string& txn_id);
+  ApiResult api_txn_prepare_put(const std::string& txn_id, const std::string& oid,
+                                const std::uint8_t* data, std::size_t len,
+                                const std::unordered_map<std::string, std::string>& attrs,
+                                const std::vector<AttrPrecondition>& preds,
+                                std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+  ApiResult api_txn_prepare_put_file(const std::string& txn_id, const std::string& oid,
+                                     const std::string& staging_abs_path, std::uint64_t size,
+                                     std::uint32_t crc32c_val,
+                                     const std::unordered_map<std::string, std::string>& attrs,
+                                     const std::vector<AttrPrecondition>& preds,
+                                     std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+  ApiResult api_txn_prepare_delete(const std::string& txn_id, const std::string& oid,
+                                   const std::vector<AttrPrecondition>& preds);
+  ApiResult api_txn_commit(const std::string& txn_id);
+  ApiResult api_txn_abort(const std::string& txn_id);
+
   ClusterMap& map() { return map_; }
   const ClusterMap& map() const { return map_; }
   LocalStores& stores() { return stores_; }
+  const Config& cfg() const { return cfg_; }
+  const std::string& advertise() const { return advertise_; }
 
  private:
   Frame reply_ok(std::uint64_t epoch) const;
@@ -129,6 +167,15 @@ class ObjectService {
                             PreparedVersion& pv, const std::uint8_t* data, std::size_t len,
                             const std::unordered_map<std::string, std::string>& attrs,
                             const std::string& abs_body_path = {});
+  // prepare → install quorum only (tip unchanged).
+  ApiResult install_prepared(ObjectStore* store, const Placement& placement,
+                             PreparedVersion& pv, const std::uint8_t* data, std::size_t len,
+                             const std::unordered_map<std::string, std::string>& attrs,
+                             const std::string& abs_body_path = {});
+
+  ApiResult require_txn_primary(const std::string& txn_id, nlohmann::json& state_out);
+  ApiResult save_txn_state(const std::string& txn_id, const nlohmann::json& state);
+  ApiResult load_txn_state(const std::string& txn_id, nlohmann::json& state_out);
 
   Config cfg_;
   ClusterMap& map_;

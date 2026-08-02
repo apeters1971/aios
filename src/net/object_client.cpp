@@ -476,6 +476,75 @@ ObjectRpcResult object_install_file_remote(
                  auth_skew_ms);
 }
 
+ObjectRpcResult object_prepare_put_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs) {
+  nlohmann::json attrs_j = nlohmann::json::object();
+  for (const auto& [k, v] : attrs) attrs_j[k] = v;
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"data_b64", base64_encode(data, len)},
+      {"attrs", attrs_j},
+      {"crc32c", crc32c(data, len)},
+      {"role", "primary"},
+      {"publish", false},
+  };
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectPut, std::move(body));
+}
+
+ObjectRpcResult object_prepare_delete_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"role", "primary"},
+      {"publish", false},
+  };
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectDel, std::move(body));
+}
+
+ObjectRpcResult object_publish_prepared_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    std::uint64_t seq) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"seq", seq},
+      {"role", "primary"},
+  };
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectPublishTip, std::move(body));
+}
+
+ObjectRpcResult object_abort_prepared_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    std::uint64_t seq) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", oid},
+      {"seq", seq},
+      {"role", "primary"},
+  };
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectAbortVersion, std::move(body));
+}
+
 ObjectRpcResult object_list_remote(const std::string& peer_addr,
                                    const std::string& local_node_id,
                                    const std::string& local_listen,
