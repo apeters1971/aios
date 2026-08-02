@@ -122,6 +122,10 @@ Clients compute `place(oid)` from the cluster map and send mutating ops to the *
   "attrs": { "k": "v" },
   "crc32c": 123456789,
   "role": "primary",
+  "layout": "replica",
+  "ec_k": 2,
+  "ec_m": 1,
+  "ec_codec": "xor",
   "ts": 0,
   "sig": "..."
 }
@@ -129,6 +133,7 @@ Clients compute `place(oid)` from the cluster map and send mutating ops to the *
 
 `role` is `primary` (prepare → quorum install → publish) or `replica` with `seq` (install unpublished version only). Replica install fields: `seq`, `base_seq`, `size`, `inline_body`, `fs_path`, `is_delete`, `redirect`, `crc32c`.
 Optional `crc32c` is verified against the body before accept; replicas should send it.
+Optional `layout` / `ec_k` / `ec_m` / `ec_codec` select per-version durability (same semantics as HTTP `x-aios-*` headers; omit → cluster defaults). See [`layout.md`](layout.md).
 Reply may include `seq`. Set `"redirect":"other-oid"` (no `data_b64`) to create a redirect version.
 
 ### ObjectPutRange (raw body)
@@ -139,9 +144,10 @@ When `flags & 0x0001` is set, the frame body is:
 [u32be json_len][json bytes][raw octets]
 ```
 
-JSON fields: `epoch`, `aios_path`, `oid`, `offset`, `attrs`, `replace_attrs`, `range_crc32c`, `role`, `ts`, `sig`.
+JSON fields: `epoch`, `aios_path`, `oid`, `offset`, `attrs`, `replace_attrs`, `range_crc32c`, `role`, `layout`, `ec_*`, `ts`, `sig`.
 Raw octets are the range payload (not base64). HMAC covers JSON only.
 `range_crc32c` is CRC32C of the raw range bytes; the store recomputes the **whole-object** CRC after applying the overwrite.
+Ranged PUT requires replica layout (EC tips / `layout=ec` → error).
 
 ### ObjectGet / ObjectDel / ObjectStat
 

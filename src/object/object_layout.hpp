@@ -3,6 +3,8 @@
 #include "config.hpp"
 #include "ec/ec_attrs.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -41,6 +43,12 @@ void apply_layout_attrs(std::unordered_map<std::string, std::string>& attrs,
 // Parse x-aios-layout / x-aios-ec-* (header names expected lowercased).
 LayoutRequest layout_request_from_headers(
     const std::unordered_map<std::string, std::string>& headers);
+
+// Parse ObjectPut / ObjectPutRange JSON fields: layout, ec_k, ec_m, ec_codec.
+LayoutRequest layout_request_from_json(const nlohmann::json& body);
+
+// Emit the same fields onto a TCP++ request body (omit unset overrides).
+void apply_layout_request_to_json(nlohmann::json& body, const LayoutRequest& req);
 
 // Force replica layout (txn control-plane objects).
 LayoutRequest layout_request_replica();

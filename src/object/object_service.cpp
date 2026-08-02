@@ -434,6 +434,42 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     return reply_ok(map_.epoch);
   }
 
+  // Full primary PUT with layout (replica or EC). Redirects keep the legacy path.
+  if (!is_delete && !is_redirect) {
+    const LayoutRequest layout_req = layout_request_from_json(body);
+    const bool do_publish = body.value("publish", true);
+    if (do_publish) {
+      auto r = api_put(oid, data.data(), data.size(), attrs, true, {}, expected_crc, layout_req);
+      if (!r.ok) {
+        auto f = reply_err(map_.epoch, r.code, r.error);
+        if (r.code == "not_primary") {
+          f.body["acting_set"] = nlohmann::json::array();
+          for (const auto& t : r.placement.acting_set) {
+            f.body["acting_set"].push_back(
+                {{"node_id", t.node_id}, {"addr", t.addr}, {"aios_path", t.aios_path}});
+          }
+        }
+        return f;
+      }
+      auto f = reply_ok(map_.epoch);
+      f.body["replicas"] = r.replicas;
+      if (r.info) f.body["seq"] = r.info->seq;
+      f.body["published"] = true;
+      return f;
+    }
+    // prepare-only (publish=false): replica layout only for now.
+    ObjectLayout layout;
+    std::string lerr;
+    if (!resolve_object_layout(cfg_, layout_req, layout, lerr)) {
+      return reply_err(map_.epoch, "bad_request", lerr);
+    }
+    if (layout.is_ec()) {
+      return reply_err(map_.epoch, "bad_request",
+                       "ec layout not supported for unpublished ObjectPut");
+    }
+    apply_layout_attrs(attrs, layout);
+  }
+
   if (!is_primary_for(oid, map_, cfg_.node_id, aios_path)) {
     auto f = reply_err(map_.epoch, "not_primary", "this node/target is not primary");
     f.body["acting_set"] = nlohmann::json::array();
@@ -496,41 +532,18 @@ Frame ObjectService::handle_put_range(const Frame& req) {
     }
   }
 
-  const auto placement = place(oid, map_);
-  if (placement.acting_set.empty()) {
-    return reply_err(map_.epoch, "no_targets", "no storage targets");
-  }
-
   if (role == "replica") {
     // Range replicas are installed as full versions via ObjectPut+seq.
     return reply_err(map_.epoch, "bad_request",
                      "use ObjectPut with seq to install prepared range versions");
   }
 
-  if (!is_primary_for(oid, map_, cfg_.node_id, aios_path)) {
-    return reply_err(map_.epoch, "not_primary", "not primary");
-  }
-
-  auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
-  std::string err;
-  PreparedVersion pv;
-  if (!store->prepare_put_range(oid, offset, data, len, attrs, replace_attrs, pv, err)) {
-    return reply_err(map_.epoch, "store_error", err);
-  }
-  auto full = store->get(oid, pv.seq, err);
-  if (!full) {
-    store->abort_version(oid, pv.seq, err);
-    return reply_err(map_.epoch, "store_error", err);
-  }
-  // Replicate as full-body install (same seq).
-  PreparedVersion install = pv;
-  install.inline_body = false;  // range versions are FS-backed
-  auto r = commit_prepared(store, placement, install, full->data(), full->size(), attrs);
+  const LayoutRequest layout_req = layout_request_from_json(body);
+  auto r = api_put_range(oid, offset, data, len, attrs, replace_attrs, {}, layout_req);
   if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
   auto f = reply_ok(map_.epoch);
   f.body["replicas"] = r.replicas;
-  f.body["seq"] = pv.seq;
+  if (r.info) f.body["seq"] = r.info->seq;
   return f;
 }
 

@@ -38,6 +38,11 @@ struct BenchArgs {
   bool do_read{true};
   bool cleanup{true};
   bool json{false};
+  // Per-PUT layout headers (empty = cluster default).
+  std::string layout;  // replica | ec
+  int ec_k{0};         // 0 = omit (use server default)
+  int ec_m{0};
+  std::string ec_codec;
 };
 
 void usage() {
@@ -54,10 +59,23 @@ void usage() {
       << "  --sizes LIST           comma list: 1k,4k,64k,256k,1M,4M,16M (default all)\n"
       << "  --ops-mix LIST         create,update,read (default all three)\n"
       << "  --prefix STR           oid prefix (default bench)\n"
+      << "  --layout replica|ec    per-PUT x-aios-layout (default: cluster)\n"
+      << "  --ec-k N               x-aios-ec-k when --layout=ec\n"
+      << "  --ec-m N               x-aios-ec-m when --layout=ec\n"
+      << "  --ec-codec xor|isal    x-aios-ec-codec when --layout=ec\n"
       << "  --no-cleanup          leave objects after the run\n"
       << "  --json                machine-readable summary\n"
       << "\n"
       << "Reports IOPS, bandwidth, and latency p50/p95/p99 per size and op.\n";
+}
+
+std::unordered_map<std::string, std::string> layout_headers(const BenchArgs& a) {
+  std::unordered_map<std::string, std::string> h;
+  if (!a.layout.empty()) h["x-aios-layout"] = a.layout;
+  if (a.ec_k > 0) h["x-aios-ec-k"] = std::to_string(a.ec_k);
+  if (a.ec_m > 0) h["x-aios-ec-m"] = std::to_string(a.ec_m);
+  if (!a.ec_codec.empty()) h["x-aios-ec-codec"] = a.ec_codec;
+  return h;
 }
 
 std::size_t parse_size(const std::string& s) {
@@ -185,6 +203,35 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
           return false;
         }
       }
+      continue;
+    }
+    if (arg == "--layout") {
+      const char* v = need("--layout");
+      if (!v) return false;
+      a.layout = v;
+      for (char& c : a.layout) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (a.layout != "replica" && a.layout != "ec") {
+        std::cerr << "--layout must be replica or ec\n";
+        return false;
+      }
+      continue;
+    }
+    if (arg == "--ec-k") {
+      const char* v = need("--ec-k");
+      if (!v) return false;
+      a.ec_k = std::stoi(v);
+      continue;
+    }
+    if (arg == "--ec-m") {
+      const char* v = need("--ec-m");
+      if (!v) return false;
+      a.ec_m = std::stoi(v);
+      continue;
+    }
+    if (arg == "--ec-codec") {
+      const char* v = need("--ec-codec");
+      if (!v) return false;
+      a.ec_codec = v;
       continue;
     }
     if (arg == "--no-cleanup") {
@@ -495,13 +542,15 @@ PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::str
         HttpResp resp;
         const auto s0 = std::chrono::steady_clock::now();
         if (op == OpKind::Create) {
-          std::unordered_map<std::string, std::string> h{{"if-none-match", "*"}};
+          auto h = layout_headers(a);
+          h["if-none-match"] = "*";
           resp = sess.request("PUT", target, buf.data(), buf.size(), h);
         } else if (op == OpKind::Update) {
-          std::unordered_map<std::string, std::string> h{{"if-match", "*"}};
+          auto h = layout_headers(a);
+          h["if-match"] = "*";
           resp = sess.request("PUT", target, buf.data(), buf.size(), h);
         } else if (op == OpKind::Put) {
-          resp = sess.request("PUT", target, buf.data(), buf.size(), {});
+          resp = sess.request("PUT", target, buf.data(), buf.size(), layout_headers(a));
         } else if (op == OpKind::Read) {
           resp = sess.request("GET", target, nullptr, 0, {});
         } else {

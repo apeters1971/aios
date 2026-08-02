@@ -4,8 +4,10 @@
 #include "ec/ec_attrs.hpp"
 #include "http/http_auth.hpp"
 #include "http/http_server.hpp"
+#include "net/framing.hpp"
 #include "object/object_layout.hpp"
 #include "object/repair.hpp"
+#include "util/base64.hpp"
 #include "util/log.hpp"
 
 #include <boost/asio.hpp>
@@ -271,6 +273,40 @@ int test_layout() {
     expect(eg2.ok && eg2.data &&
                std::string(eg2.data->begin(), eg2.data->end()) == "ec-body-payload",
            "ec get after repair");
+  }
+
+  // TCP++ ObjectPut with layout fields
+  {
+    MixedLayoutFixture fx;
+    const std::string oid = "layout/tcp-ec";
+    auto pl = place(oid, fx.map, 3);
+    expect(!pl.acting_set.empty(), "tcp place");
+    const auto& primary = pl.acting_set[0];
+
+    Frame put;
+    put.type = MsgType::ObjectPut;
+    put.body = {
+        {"epoch", fx.map.epoch},
+        {"aios_path", primary.aios_path},
+        {"oid", oid},
+        {"data_b64", base64_encode(std::string("tcp-ec-body!"))},
+        {"attrs", nlohmann::json::object()},
+        {"role", "primary"},
+        {"layout", "ec"},
+        {"ec_k", 2},
+        {"ec_m", 1},
+        {"ec_codec", "xor"},
+    };
+    auto reply = fx.svc->handle(put);
+    expect(reply.body.value("ok", false), "TCP EC ObjectPut ok");
+
+    auto g = fx.svc->api_get(oid, std::nullopt, std::nullopt, {});
+    expect(g.ok && g.data &&
+               std::string(g.data->begin(), g.data->end()) == "tcp-ec-body!",
+           "TCP EC ObjectPut readable via api_get");
+    expect(attrs_are_ec(g.attrs) && g.attrs.count(kLayoutAttr) &&
+               g.attrs.at(kLayoutAttr) == "ec",
+           "TCP EC layout attrs");
   }
 
   // HTTP headers round-trip on replica-default cluster

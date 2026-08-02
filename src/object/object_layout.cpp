@@ -129,6 +129,38 @@ LayoutRequest layout_request_from_headers(
   return req;
 }
 
+LayoutRequest layout_request_from_json(const nlohmann::json& body) {
+  LayoutRequest req;
+  if (body.contains("layout") && body["layout"].is_string()) {
+    req.layout = lower_copy(body["layout"].get<std::string>());
+  }
+  if (body.contains("ec_k") && !body["ec_k"].is_null()) {
+    try {
+      req.ec_k = body["ec_k"].get<int>();
+    } catch (...) {
+      req.ec_k = -1;
+    }
+  }
+  if (body.contains("ec_m") && !body["ec_m"].is_null()) {
+    try {
+      req.ec_m = body["ec_m"].get<int>();
+    } catch (...) {
+      req.ec_m = -1;
+    }
+  }
+  if (body.contains("ec_codec") && body["ec_codec"].is_string()) {
+    req.ec_codec = lower_copy(body["ec_codec"].get<std::string>());
+  }
+  return req;
+}
+
+void apply_layout_request_to_json(nlohmann::json& body, const LayoutRequest& req) {
+  if (req.layout) body["layout"] = *req.layout;
+  if (req.ec_k) body["ec_k"] = *req.ec_k;
+  if (req.ec_m) body["ec_m"] = *req.ec_m;
+  if (req.ec_codec) body["ec_codec"] = *req.ec_codec;
+}
+
 LayoutRequest layout_request_replica() {
   LayoutRequest req;
   req.layout = "replica";

@@ -148,7 +148,7 @@ ObjectRpcResult object_put_remote(const std::string& peer_addr,
                                   const std::string& oid, const std::uint8_t* data,
                                   std::size_t len,
                                   const std::unordered_map<std::string, std::string>& attrs,
-                                  bool as_replica) {
+                                  bool as_replica, const LayoutRequest& layout) {
   nlohmann::json attrs_j = nlohmann::json::object();
   for (const auto& [k, v] : attrs) attrs_j[k] = v;
   nlohmann::json body = {
@@ -160,6 +160,7 @@ ObjectRpcResult object_put_remote(const std::string& peer_addr,
       {"crc32c", crc32c(data, len)},
       {"role", as_replica ? "replica" : "primary"},
   };
+  apply_layout_request_to_json(body, layout);
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
                     MsgType::ObjectPut, std::move(body));
 }

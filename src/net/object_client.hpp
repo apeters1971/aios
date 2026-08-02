@@ -1,6 +1,7 @@
 #pragma once
 
 #include "net/framing.hpp"
+#include "object/object_layout.hpp"
 #include "store/object_store.hpp"
 
 #include <cstdint>
@@ -50,7 +51,7 @@ ObjectRpcResult object_put_remote(const std::string& peer_addr,
                                   const std::string& oid, const std::uint8_t* data,
                                   std::size_t len,
                                   const std::unordered_map<std::string, std::string>& attrs,
-                                  bool as_replica);
+                                  bool as_replica, const LayoutRequest& layout = {});
 
 ObjectRpcResult object_install_remote(const std::string& peer_addr,
                                       const std::string& local_node_id,
