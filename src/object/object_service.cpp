@@ -1179,6 +1179,8 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     return r;
   }
 
+  // EC objects carry aios.ec.* attrs. Non-EC tips (e.g. txn-prepared full copies) still
+  // use the normal local read path even when the cluster durability profile is ec.
   if (attrs_are_ec(attrs)) {
     auto rec = reconstruct_ec_object(placement, oid, seq, attrs);
     if (!rec.ok) return rec;
@@ -1195,9 +1197,6 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
                                     rec.data->begin() + static_cast<std::ptrdiff_t>(end + 1));
     rec.data = std::move(slice);
     return rec;
-  }
-  if (cfg_.durability == "ec") {
-    return fail("not_found", "ec object attrs missing");
   }
 
   ApiResult r;

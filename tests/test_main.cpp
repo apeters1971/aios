@@ -13,6 +13,7 @@ int test_store_advanced();
 int test_http_auth();
 int test_http_api();
 int test_http_wire();
+int test_http_ec();
 int test_crc32c();
 int test_versions();
 int test_object_service_advanced();
@@ -39,6 +40,7 @@ int main() {
   failures += test_http_auth();
   failures += test_http_api();
   failures += test_http_wire();
+  failures += test_http_ec();
   failures += test_mini_cluster();
   failures += test_ec();
   if (failures == 0) {

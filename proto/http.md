@@ -50,6 +50,10 @@ Canonical string:
 
 Coordinator is the primary for object `txn/{id}`. Prepare installs a new version on each oid’s primary/replicas but leaves the tip unchanged, so tip GET cannot see ops until commit. Commit publishes tips in **oid-sorted** order; a publish failure aborts remaining ops and marks the txn `aborted` (already-published tips stay visible — v1 torn window). Large staged PUTs in a txn require the request to land on the oid primary (same node as coordinator when that oid is local). Wrong coordinator → **307** like other mutating APIs.
 
+### Erasure coding
+
+When the daemon runs with `durability: ec`, ordinary `PUT /o/{oid}` stripes the object across the acting set. `GET`/`HEAD` return the **reconstructed full object** (`Content-Length` / `x-aios-size` are the logical size). EC metadata appears as `x-aios-attr-aios.ec.*`. Partial `PUT` with `Content-Range` is rejected (`400`). Partial `GET` with `Range` is supported (reconstruct then slice). Transactions (`/txn`) work on EC clusters; prepared txn objects use full-copy install until publish (readable as non-EC tips).
+
 ### Large objects
 
 Full PUT/GET bodies are streamed to/from filesystem staging when larger than 256 KiB (no full-object RAM buffer on the server). Cap with config `max_object_bytes` (default 64 GiB). TCP++ frame size remains 16 MiB; replicas use chunked `ObjectStage*` messages.

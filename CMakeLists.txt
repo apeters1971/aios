@@ -151,6 +151,7 @@ add_executable(aios_tests
   tests/test_http_auth.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
+  tests/test_http_ec.cpp
   tests/test_mini_cluster.cpp
   tests/test_crc32c.cpp
   tests/test_versions.cpp

@@ -6,6 +6,8 @@
 #include "object/repair.hpp"
 #include "util/crc32c.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <span>
@@ -317,6 +319,73 @@ int test_ec() {
     auto got = fx.svc->api_get("ec/obj-isal", std::nullopt, std::nullopt, {});
     expect(got.ok && got.attrs.count("aios.ec.codec") && got.attrs.at("aios.ec.codec") == "isal",
            "isal attr after repair");
+
+    // Full 4+2 service path on six local targets: put, dual-loss GET, repair.
+    {
+      auto root = aios::test::temp_root("aios-ec-6");
+      MembershipTable membership;
+      FsTable fs_table;
+      membership.set_local("node-a", "127.0.0.1:7400");
+      std::vector<AiosTarget> local;
+      std::vector<std::string> paths;
+      for (int i = 1; i <= 6; ++i) {
+        auto p = (root / ("t" + std::to_string(i)) / "aios").string();
+        std::filesystem::create_directories(p);
+        paths.push_back(p);
+        AiosTarget t;
+        t.mount = p;
+        t.target_path = p;
+        t.aios_path = p;
+        t.usable = true;
+        t.bavail = 1000;
+        local.push_back(t);
+      }
+      fs_table.set_local("node-a", local);
+      Config cfg;
+      cfg.node_id = "node-a";
+      cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+      cfg.durability = "ec";
+      cfg.ec_k = 4;
+      cfg.ec_m = 2;
+      cfg.ec_codec = "isal";
+      cfg.clone_required = false;
+      expect(normalize_config(cfg, err), "normalize 4+2");
+      auto map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+      LocalStores stores;
+      ObjectStoreOptions opts;
+      opts.shard_count = 4;
+      opts.clone_required = false;
+      opts.max_versions = 16;
+      stores.sync_paths(paths, opts);
+      ObjectService svc(cfg, map, stores);
+      svc.set_advertise("127.0.0.1:7400");
+
+      const std::string oid = "ec/four-plus-two";
+      const std::string payload = "0123456789abcdef-4plus2-payload!!";
+      auto put = svc.api_put(oid, reinterpret_cast<const std::uint8_t*>(payload.data()),
+                             payload.size(), {}, true, {});
+      expect(put.ok && put.replicas == 6, "4+2 put");
+      auto pl = place(oid, map);
+      expect(pl.acting_set.size() == 6, "4+2 acting");
+
+      // Drop two shards; GET must still reconstruct.
+      expect(purge_shard_tip(stores.get(pl.acting_set[1].aios_path), oid), "4+2 purge1");
+      expect(purge_shard_tip(stores.get(pl.acting_set[5].aios_path), oid), "4+2 purge2");
+      auto deg = svc.api_get(oid, std::nullopt, std::nullopt, {});
+      expect(deg.ok && deg.data &&
+                 std::string(deg.data->begin(), deg.data->end()) == payload,
+             "4+2 dual-loss get");
+
+      auto stats = run_repair(cfg, "127.0.0.1:7400", map, stores, 256);
+      expect(stats.repaired >= 1, "4+2 repair");
+      int present = 0;
+      for (const auto& t : pl.acting_set) {
+        if (stores.get(t.aios_path)->stat(oid, err)) ++present;
+      }
+      expect(present == 6, "4+2 all shards after repair");
+      std::error_code ec;
+      std::filesystem::remove_all(root, ec);
+    }
   } else {
     std::string err;
     expect(make_erasure_codec(4, 2, "isal", err) == nullptr, "isal unavailable without lib");
@@ -325,6 +394,26 @@ int test_ec() {
     c.ec_k = 4;
     c.ec_m = 2;
     expect(!normalize_config(c, err), "normalize isal without lib fails");
+  }
+
+  // EC cluster + cross-object txn (prepare uses full-copy install; tip GET still works).
+  {
+    TripleStoreFixture fx;
+    auto begin = fx.svc->api_txn_begin();
+    expect(begin.ok && begin.data, "ec txn begin");
+    auto st = nlohmann::json::parse(begin.data->begin(), begin.data->end());
+    const std::string txn_id = st.value("txn_id", "");
+    const auto* a = reinterpret_cast<const std::uint8_t*>("txn-a");
+    const auto* b = reinterpret_cast<const std::uint8_t*>("txn-b");
+    expect(fx.svc->api_txn_prepare_put(txn_id, "ec-txn/a", a, 5, {}, {}).ok, "ec txn prep a");
+    expect(fx.svc->api_txn_prepare_put(txn_id, "ec-txn/b", b, 5, {}, {}).ok, "ec txn prep b");
+    expect(fx.svc->api_get("ec-txn/a", std::nullopt, std::nullopt, {}).code == "not_found",
+           "ec txn hidden");
+    expect(fx.svc->api_txn_commit(txn_id).ok, "ec txn commit");
+    auto ga = fx.svc->api_get("ec-txn/a", std::nullopt, std::nullopt, {});
+    auto gb = fx.svc->api_get("ec-txn/b", std::nullopt, std::nullopt, {});
+    expect(ga.ok && std::string(ga.data->begin(), ga.data->end()) == "txn-a", "ec txn a");
+    expect(gb.ok && std::string(gb.data->begin(), gb.data->end()) == "txn-b", "ec txn b");
   }
 
   return failures();
