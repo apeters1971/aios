@@ -68,6 +68,7 @@ add_library(aios_core STATIC
   src/store/local_stores.cpp
   src/cluster/cluster_map.cpp
   src/cluster/place.cpp
+  src/ec/xor_parity.cpp
   src/object/object_service.cpp
   src/object/repair.cpp
   src/http/http_auth.cpp
@@ -117,6 +118,7 @@ add_executable(aios_tests
   tests/test_mini_cluster.cpp
   tests/test_crc32c.cpp
   tests/test_versions.cpp
+  tests/test_ec.cpp
   tests/test_main.cpp
 )
 target_link_libraries(aios_tests PRIVATE aios_core)

@@ -18,6 +18,7 @@ int test_versions();
 int test_object_service_advanced();
 int test_fs_clone();
 int test_mini_cluster();
+int test_ec();
 
 int main() {
   int failures = 0;
@@ -39,6 +40,7 @@ int main() {
   failures += test_http_api();
   failures += test_http_wire();
   failures += test_mini_cluster();
+  failures += test_ec();
   if (failures == 0) {
     std::cout << "all tests passed\n";
     return 0;

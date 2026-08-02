@@ -22,6 +22,11 @@ struct Config {
   int replica_count{3};
   // Successful copies required for Put/Del ACK (including primary). 0 => replica_count.
   int write_quorum{0};
+  // Durability profile: "replica" (default) or "ec" (erasure coding).
+  std::string durability{"replica"};
+  // EC parameters (used when durability == "ec"). v1: XOR parity requires m == 1.
+  int ec_k{2};
+  int ec_m{1};
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};
@@ -45,6 +50,9 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err);
 
 // Apply argv overrides. Returns false on bad args / --help.
 bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help);
+
+// Validate durability/EC knobs and derive replica_count for EC profiles.
+bool normalize_config(Config& cfg, std::string& err);
 
 // Split "host:port" into host and port. IPv6 not supported in v0 (host may not contain ':').
 bool split_host_port(const std::string& addr, std::string& host, std::string& port);

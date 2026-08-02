@@ -1,6 +1,8 @@
 #include "object/object_service.hpp"
 
 #include "cluster/place.hpp"
+#include "ec/ec_attrs.hpp"
+#include "ec/xor_parity.hpp"
 #include "net/object_client.hpp"
 #include "util/base64.hpp"
 #include "util/crc32c.hpp"
@@ -10,6 +12,7 @@
 #include <fstream>
 #include <mutex>
 #include <random>
+#include <span>
 #include <sstream>
 #include <unordered_set>
 
@@ -684,6 +687,9 @@ Frame ObjectService::handle_stat(const nlohmann::json& body) {
   f.body["is_delete"] = info->is_delete;
   if (!info->redirect_oid.empty()) f.body["redirect"] = info->redirect_oid;
   if (info->crc32c_known) f.body["crc32c"] = info->crc32c;
+  nlohmann::json attrs_j = nlohmann::json::object();
+  for (const auto& [k, v] : store->list_attrs(oid, err)) attrs_j[k] = v;
+  f.body["attrs"] = std::move(attrs_j);
   return f;
 }
 
@@ -791,6 +797,173 @@ Frame ObjectService::handle_purge_versions(const nlohmann::json& body) {
   return reply_ok(map_.epoch);
 }
 
+ApiResult ObjectService::commit_ec_put(
+    ObjectStore* store, const Placement& placement, const std::string& oid,
+    const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
+    std::optional<std::uint32_t> expected_crc32c) {
+  std::string err;
+  auto codec = make_xor_parity_codec(cfg_.ec_k, err);
+  if (!codec) return fail("bad_request", err);
+  if (static_cast<int>(placement.acting_set.size()) < codec->shard_count()) {
+    return fail("no_targets", "acting set smaller than k+m");
+  }
+  const std::uint32_t full_crc = crc32c(data, len);
+  if (expected_crc32c && *expected_crc32c != full_crc) {
+    return fail("crc_mismatch", "crc32c mismatch");
+  }
+
+  std::vector<std::vector<std::uint8_t>> shards;
+  if (!codec->encode(std::span<const std::uint8_t>(data, len), shards, err)) {
+    return fail("store_error", err);
+  }
+
+  std::unordered_map<std::string, std::string> base = attrs;
+  set_ec_attrs(base, codec->k(), codec->m(), 0, codec->name(), len, full_crc);
+
+  auto shard_attrs = [&](int i) {
+    auto a = base;
+    a[kEcAttrI] = std::to_string(i);
+    return a;
+  };
+
+  PreparedVersion pv;
+  const auto a0 = shard_attrs(0);
+  if (!store->prepare_put(oid, shards[0].data(), shards[0].size(), a0, replace_attrs,
+                          std::nullopt, pv, err)) {
+    return fail("store_error", err);
+  }
+
+  int total_ok = 1;
+  for (int i = 1; i < codec->shard_count(); ++i) {
+    const auto& t = placement.acting_set[static_cast<std::size_t>(i)];
+    PreparedVersion sv = pv;
+    sv.size = shards[static_cast<std::size_t>(i)].size();
+    sv.crc32c = crc32c(shards[static_cast<std::size_t>(i)].data(),
+                       shards[static_cast<std::size_t>(i)].size());
+    sv.inline_body = sv.size <= 64 * 1024;
+    sv.fs_path.clear();
+    const auto ai = shard_attrs(i);
+    const auto* sd = shards[static_cast<std::size_t>(i)].data();
+    const auto sl = shards[static_cast<std::size_t>(i)].size();
+    bool done = false;
+    if (t.node_id == cfg_.node_id) {
+      done = local_install(t.aios_path, sv, sd, sl, ai, err);
+    } else {
+      auto r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                     cfg_.auth_skew_ms, placement.epoch, t.aios_path, sv, sd,
+                                     sl, ai);
+      done = r.ok;
+      if (!done) err = r.error;
+    }
+    if (done) ++total_ok;
+    else
+      AIOS_LOG_WARN("ec shard install failed i=", i, " ", err);
+  }
+
+  if (total_ok < quorum_need(placement)) {
+    store->abort_version(oid, pv.seq, err);
+    replicate_abort(placement, oid, pv.seq);
+    return fail("quorum_failed", "ec shard quorum failed");
+  }
+
+  if (!store->publish_tip(oid, pv.seq, err)) {
+    store->abort_version(oid, pv.seq, err);
+    replicate_abort(placement, oid, pv.seq);
+    return fail("store_error", err);
+  }
+  replicate_publish(placement, oid, pv.seq);
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.replicas = total_ok;
+  r.placement = placement;
+  r.attrs = a0;
+  r.info = ObjectInfo{};
+  r.info->oid = oid;
+  r.info->seq = pv.seq;
+  r.info->size = len;
+  r.info->crc32c = full_crc;
+  r.info->crc32c_known = true;
+  return r;
+}
+
+ApiResult ObjectService::reconstruct_ec_object(
+    const Placement& placement, const std::string& oid, std::optional<std::uint64_t> seq,
+    const std::unordered_map<std::string, std::string>& tip_attrs) {
+  auto meta = parse_ec_attrs(tip_attrs);
+  if (!meta) return fail("store_error", "missing ec attrs");
+  std::string err;
+  auto codec = make_xor_parity_codec(meta->k, err);
+  if (!codec || codec->m() != meta->m) return fail("store_error", "unsupported ec profile");
+  if (static_cast<int>(placement.acting_set.size()) < codec->shard_count()) {
+    return fail("no_targets", "acting set smaller than k+m");
+  }
+
+  std::vector<std::optional<std::vector<std::uint8_t>>> shards(
+      static_cast<std::size_t>(codec->shard_count()));
+  int got = 0;
+  for (int i = 0; i < codec->shard_count(); ++i) {
+    const auto& t = placement.acting_set[static_cast<std::size_t>(i)];
+    if (t.node_id == cfg_.node_id) {
+      auto* s = stores_.get(t.aios_path);
+      if (!s) continue;
+      auto data = s->get(oid, seq, err);
+      if (!data) continue;
+      shards[static_cast<std::size_t>(i)] = std::move(*data);
+      ++got;
+    } else {
+      ObjectRpcResult r;
+      if (seq.has_value()) {
+        // Versioned remote get via ranged full read when seq set.
+        auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                     cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+        if (!st.ok) continue;
+        r = object_get_range_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                    cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid, 0,
+                                    static_cast<std::size_t>(st.size), seq);
+        if (r.ok && !r.raw.empty()) {
+          shards[static_cast<std::size_t>(i)] = std::move(r.raw);
+          ++got;
+        } else if (r.ok && r.data) {
+          shards[static_cast<std::size_t>(i)] = std::move(*r.data);
+          ++got;
+        }
+      } else {
+        r = object_get_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                              cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+        if (!r.ok || !r.data) continue;
+        shards[static_cast<std::size_t>(i)] = std::move(*r.data);
+        ++got;
+      }
+    }
+  }
+  if (got < meta->k) return fail("quorum_failed", "not enough ec shards to reconstruct");
+
+  std::vector<std::uint8_t> full;
+  if (!codec->decode(shards, static_cast<std::size_t>(meta->full_size), full, err)) {
+    return fail("store_error", err);
+  }
+  if (meta->full_crc_known && crc32c(full.data(), full.size()) != meta->full_crc) {
+    return fail("crc_mismatch", "reconstructed object crc mismatch");
+  }
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.attrs = tip_attrs;
+  r.data = std::move(full);
+  r.info = ObjectInfo{};
+  r.info->oid = oid;
+  r.info->size = meta->full_size;
+  r.info->crc32c = meta->full_crc;
+  r.info->crc32c_known = meta->full_crc_known;
+  if (seq.has_value()) r.info->seq = *seq;
+  return r;
+}
+
 ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* data,
                                 std::size_t len,
                                 const std::unordered_map<std::string, std::string>& attrs,
@@ -811,6 +984,11 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   auto pr = check_preds_on(store, oid, preds, err);
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+
+  if (cfg_.durability == "ec") {
+    return commit_ec_put(store, placement, oid, data, len, attrs, replace_attrs,
+                         expected_crc32c);
+  }
 
   PreparedVersion pv;
   if (!store->prepare_put(oid, data, len, attrs, replace_attrs, expected_crc32c, pv, err)) {
@@ -839,6 +1017,24 @@ ApiResult ObjectService::api_put_file(
   auto pr = check_preds_on(store, oid, preds, err);
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+
+  if (cfg_.durability == "ec") {
+    constexpr std::uint64_t kEcMemLimit = 16ull * 1024ull * 1024ull;
+    if (size > kEcMemLimit) {
+      return fail("bad_request", "ec v1 supports objects up to 16 MiB");
+    }
+    std::ifstream in(staging_abs_path, std::ios::binary);
+    if (!in) return fail("store_error", "cannot open staging file");
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(size));
+    if (size > 0) {
+      in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(size));
+      if (static_cast<std::uint64_t>(in.gcount()) != size) {
+        return fail("store_error", "short read of staging file");
+      }
+    }
+    return commit_ec_put(store, placement, oid, buf.data(), buf.size(), attrs, replace_attrs,
+                         expected_crc32c.value_or(crc32c_val));
+  }
 
   PreparedVersion pv;
   if (!store->prepare_put_file(oid, staging_abs_path, size, crc32c_val, attrs, replace_attrs,
@@ -896,6 +1092,10 @@ ApiResult ObjectService::api_put_range(
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
+  if (cfg_.durability == "ec") {
+    return fail("bad_request", "ranged put not supported for erasure-coded objects");
+  }
+
   PreparedVersion pv;
   if (!store->prepare_put_range(oid, offset, data, len, attrs, replace_attrs, pv, err)) {
     return fail("store_error", err);
@@ -917,36 +1117,95 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
-  ObjectStore* store = nullptr;
+
   std::string err;
+  ObjectStore* store = nullptr;
+  std::optional<ObjectInfo> info;
+  std::unordered_map<std::string, std::string> attrs;
   for (const auto& t : placement.acting_set) {
     if (t.node_id != cfg_.node_id) continue;
-    store = stores_.get(t.aios_path);
-    if (store) break;
+    auto* s = stores_.get(t.aios_path);
+    if (!s) continue;
+    if (!store) store = s;  // remember a local store for pred checks / non-EC path
+    auto st = s->stat(oid, seq, err);
+    if (!st) continue;
+    if (st->is_delete && !seq.has_value()) continue;
+    store = s;
+    info = st;
+    attrs = s->list_attrs(oid, err);
+    break;
   }
   if (!store) return fail("not_local", "no local replica for oid");
-  // Preconditions apply to tip unless a version is selected.
+
   if (!seq.has_value()) {
     auto pr = check_preds_on(store, oid, preds, err);
     if (pr == PrecondResult::NotFound) return fail("not_found", err);
     if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
   }
 
-  auto info = store->stat(oid, seq, err);
-  if (!info) return fail("not_found", err);
+  // EC degraded read: no local tip — pull attrs from a remote shard.
+  if (!info && cfg_.durability == "ec") {
+    for (const auto& t : placement.acting_set) {
+      if (t.node_id == cfg_.node_id) continue;
+      auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                   cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+      if (!st.ok) continue;
+      if (st.body.contains("attrs") && st.body["attrs"].is_object()) {
+        for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
+          if (it.value().is_string()) attrs[it.key()] = it.value().get<std::string>();
+        }
+      }
+      if (attrs_are_ec(attrs)) {
+        info = ObjectInfo{};
+        info->oid = oid;
+        info->seq = st.body.value("seq", static_cast<std::uint64_t>(0));
+        break;
+      }
+    }
+  }
+
+  if (!info) return fail("not_found", "object not found");
   if (info->is_delete && !seq.has_value()) return fail("not_found", "object not found");
+
+  if (!info->redirect_oid.empty()) {
+    ApiResult r;
+    r.ok = true;
+    r.epoch = map_.epoch;
+    r.info = info;
+    r.attrs = attrs;
+    r.placement = placement;
+    r.redirect_oid = info->redirect_oid;
+    r.code = "redirect";
+    return r;
+  }
+
+  if (attrs_are_ec(attrs)) {
+    auto rec = reconstruct_ec_object(placement, oid, seq, attrs);
+    if (!rec.ok) return rec;
+    rec.info->seq = info->seq;
+    rec.info->mtime_ms = info->mtime_ms;
+    rec.info->ctime_ms = info->ctime_ms;
+    if (!offset.has_value()) return rec;
+    if (!rec.data) return fail("store_error", "ec reconstruct produced no data");
+    if (*offset >= rec.data->size()) return fail("range_unsatisfiable", "range unsatisfiable");
+    std::uint64_t end = end_inclusive.value_or(rec.data->size() - 1);
+    if (end >= rec.data->size()) end = rec.data->size() - 1;
+    if (end < *offset) return fail("range_unsatisfiable", "range unsatisfiable");
+    std::vector<std::uint8_t> slice(rec.data->begin() + static_cast<std::ptrdiff_t>(*offset),
+                                    rec.data->begin() + static_cast<std::ptrdiff_t>(end + 1));
+    rec.data = std::move(slice);
+    return rec;
+  }
+  if (cfg_.durability == "ec") {
+    return fail("not_found", "ec object attrs missing");
+  }
 
   ApiResult r;
   r.ok = true;
   r.epoch = map_.epoch;
   r.info = info;
-  if (!seq.has_value()) r.attrs = store->list_attrs(oid, err);
+  r.attrs = attrs;
   r.placement = placement;
-  if (!info->redirect_oid.empty()) {
-    r.redirect_oid = info->redirect_oid;
-    r.code = "redirect";
-    return r;
-  }
 
   if (!offset.has_value()) {
     constexpr std::uint64_t kStreamThreshold = 256u * 1024u;

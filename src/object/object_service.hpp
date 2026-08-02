@@ -173,6 +173,16 @@ class ObjectService {
                              const std::unordered_map<std::string, std::string>& attrs,
                              const std::string& abs_body_path = {});
 
+  // Erasure-coded put: stripe → per-target shard install → publish tips.
+  ApiResult commit_ec_put(ObjectStore* store, const Placement& placement, const std::string& oid,
+                          const std::uint8_t* data, std::size_t len,
+                          const std::unordered_map<std::string, std::string>& attrs,
+                          bool replace_attrs, std::optional<std::uint32_t> expected_crc32c);
+  // Gather shards from acting set and decode (any node with cluster access).
+  ApiResult reconstruct_ec_object(const Placement& placement, const std::string& oid,
+                                  std::optional<std::uint64_t> seq,
+                                  const std::unordered_map<std::string, std::string>& tip_attrs);
+
   ApiResult require_txn_primary(const std::string& txn_id, nlohmann::json& state_out);
   ApiResult save_txn_state(const std::string& txn_id, const nlohmann::json& state);
   ApiResult load_txn_state(const std::string& txn_id, nlohmann::json& state_out);

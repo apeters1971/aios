@@ -53,6 +53,9 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["auth_skew_ms"]) cfg.auth_skew_ms = root["auth_skew_ms"].as<int>();
     if (root["replica_count"]) cfg.replica_count = root["replica_count"].as<int>();
     if (root["write_quorum"]) cfg.write_quorum = root["write_quorum"].as<int>();
+    if (root["durability"]) cfg.durability = root["durability"].as<std::string>();
+    if (root["ec_k"]) cfg.ec_k = root["ec_k"].as<int>();
+    if (root["ec_m"]) cfg.ec_m = root["ec_m"].as<int>();
     if (root["repair_interval_ms"])
       cfg.repair_interval_ms = root["repair_interval_ms"].as<int>();
     if (root["repair_batch_oids"])
@@ -140,6 +143,24 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       cfg.write_quorum = std::stoi(v);
       continue;
     }
+    if (arg == "--durability") {
+      const char* v = need("--durability");
+      if (!v) return false;
+      cfg.durability = v;
+      continue;
+    }
+    if (arg == "--ec-k") {
+      const char* v = need("--ec-k");
+      if (!v) return false;
+      cfg.ec_k = std::stoi(v);
+      continue;
+    }
+    if (arg == "--ec-m") {
+      const char* v = need("--ec-m");
+      if (!v) return false;
+      cfg.ec_m = std::stoi(v);
+      continue;
+    }
     if (arg == "--http-listen") {
       const char* v = need("--http-listen");
       if (!v) return false;
@@ -159,6 +180,29 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
     err = "cluster_key is required (--cluster-key or config cluster_key)";
     return false;
   }
+  return normalize_config(cfg, err);
+}
+
+bool normalize_config(Config& cfg, std::string& err) {
+  if (cfg.durability.empty() || cfg.durability == "replica") {
+    cfg.durability = "replica";
+    return true;
+  }
+  if (cfg.durability != "ec") {
+    err = "durability must be 'replica' or 'ec'";
+    return false;
+  }
+  if (cfg.ec_k < 1 || cfg.ec_m < 1) {
+    err = "ec_k and ec_m must be >= 1";
+    return false;
+  }
+  // v1: XOR parity only (m == 1).
+  if (cfg.ec_m != 1) {
+    err = "ec v1 supports only m=1 (XOR parity); use ISA-L RS later for m>1";
+    return false;
+  }
+  cfg.replica_count = cfg.ec_k + cfg.ec_m;
+  if (cfg.write_quorum == 0) cfg.write_quorum = cfg.replica_count;
   return true;
 }
 
