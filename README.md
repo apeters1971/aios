@@ -34,7 +34,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Binaries: `build/aiosd`, `build/aios-bench`
+Binaries: `build/aiosd`, `build/aios-bench`, `build/aios-store-bench`
 
 ## Configuration
 
@@ -126,12 +126,24 @@ aios/
 - **Filesystem**: body as a file under the shard; metadata/attrs always in SQLite
 - Arbitrary object attrs in table `attrs(oid,key,value)`
 
-### Benchmark both paths
+### Client benchmark (`aios-bench`)
+
+Multithreaded HTTP create/update/read across object sizes (default 1 KiB … 16 MiB). Reports IOPS, MiB/s, and latency p50/p95/p99.
 
 ```bash
-./build/aios-bench --root /tmp/aios-bench --mode both --shards 16 --count 1000
-./build/aios-bench --root /tmp/aios-bench --mode inline --small-size 256 --count 5000
-./build/aios-bench --root /tmp/aios-bench --mode fs --large-size 262144 --count 200 --keep
+# against a running aiosd with http_listen and matching cluster_key
+./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
+  --threads 16 --ops 200
+./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
+  --sizes 1k,64k,1M --ops-mix create,read --json
+```
+
+### Local store microbench (`aios-store-bench`)
+
+```bash
+./build/aios-store-bench --root /tmp/aios-bench --mode both --shards 16 --count 1000
+./build/aios-store-bench --root /tmp/aios-bench --mode inline --small-size 256 --count 5000
+./build/aios-store-bench --root /tmp/aios-bench --mode fs --large-size 262144 --count 200 --keep
 ```
 
 ## Logging

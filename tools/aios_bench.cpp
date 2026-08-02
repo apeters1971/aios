@@ -1,48 +1,116 @@
-#include "store/object_store.hpp"
+#include "http/http_auth.hpp"
 #include "util/log.hpp"
 
+#include <boost/asio.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
+#include <cstring>
+#include <iomanip>
 #include <iostream>
-#include <stdexcept>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
-namespace fs = std::filesystem;
+namespace asio = boost::asio;
+using tcp = asio::ip::tcp;
 
 namespace {
 
 struct BenchArgs {
-  std::string root;
-  std::string mode{"both"};  // inline | fs | both
-  std::uint32_t shards{16};
-  std::size_t count{1000};
-  std::size_t small_size{256};
-  std::size_t large_size{256 * 1024};
-  std::size_t inline_max{64 * 1024};
-  bool keep{false};
+  std::string endpoint{"127.0.0.1:7480"};
+  std::string cluster_key;
+  unsigned threads{0};  // 0 = hardware_concurrency
+  std::size_t ops{200};
+  std::size_t warmup{10};
+  std::string prefix{"bench"};
+  std::vector<std::size_t> sizes;  // bytes
+  bool do_create{true};
+  bool do_update{true};
+  bool do_read{true};
+  bool cleanup{true};
+  bool json{false};
 };
 
 void usage() {
   std::cout
-      << "usage: aios-bench --root DIR [options]\n"
+      << "usage: aios-bench --cluster-key KEY [options]\n"
       << "\n"
-      << "Benchmark AIOS hybrid object store (SQLite inline vs filesystem bodies).\n"
+      << "Multithreaded HTTP client benchmark (create / update / read).\n"
       << "\n"
-      << "  --root DIR          working directory (created; contains aios/)\n"
-      << "  --mode inline|fs|both   which path to measure (default both)\n"
-      << "  --shards N          shard count, power of two (default 16)\n"
-      << "  --count N           objects per mode (default 1000)\n"
-      << "  --small-size N      inline object bytes (default 256)\n"
-      << "  --large-size N      filesystem object bytes (default 262144)\n"
-      << "  --inline-max N      store inline_max_bytes (default 65536)\n"
-      << "  --keep              do not delete the bench directory\n";
+      << "  --endpoint HOST:PORT   HTTP API (default 127.0.0.1:7480)\n"
+      << "  --cluster-key KEY      required shared secret\n"
+      << "  --threads N            worker threads (default: hardware concurrency)\n"
+      << "  --ops N                operations per size per phase (default 200)\n"
+      << "  --warmup N             discarded ops per size per phase (default 10)\n"
+      << "  --sizes LIST           comma list: 1k,4k,64k,256k,1M,4M,16M (default all)\n"
+      << "  --ops-mix LIST         create,update,read (default all three)\n"
+      << "  --prefix STR           oid prefix (default bench)\n"
+      << "  --no-cleanup          leave objects after the run\n"
+      << "  --json                machine-readable summary\n"
+      << "\n"
+      << "Reports IOPS, bandwidth, and latency p50/p95/p99 per size and op.\n";
+}
+
+std::size_t parse_size(const std::string& s) {
+  if (s.empty()) throw std::runtime_error("empty size");
+  char* end = nullptr;
+  const double n = std::strtod(s.c_str(), &end);
+  if (end == s.c_str()) throw std::runtime_error("bad size: " + s);
+  std::string u = end;
+  for (char& c : u) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  double mul = 1.0;
+  if (u.empty() || u == "b") mul = 1.0;
+  else if (u == "k" || u == "kb" || u == "kib") mul = 1024.0;
+  else if (u == "m" || u == "mb" || u == "mib") mul = 1024.0 * 1024.0;
+  else if (u == "g" || u == "gb" || u == "gib") mul = 1024.0 * 1024.0 * 1024.0;
+  else throw std::runtime_error("bad size unit: " + s);
+  if (n < 0) throw std::runtime_error("negative size");
+  return static_cast<std::size_t>(n * mul + 0.5);
+}
+
+std::vector<std::string> split_csv(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ',') {
+      if (!cur.empty()) out.push_back(cur);
+      cur.clear();
+    } else if (c != ' ' && c != '\t') {
+      cur.push_back(c);
+    }
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
+}
+
+std::string format_size(std::size_t n) {
+  const char* suf[] = {"B", "KiB", "MiB", "GiB"};
+  double v = static_cast<double>(n);
+  int i = 0;
+  while (v >= 1024.0 && i < 3) {
+    v /= 1024.0;
+    ++i;
+  }
+  std::ostringstream os;
+  if (i == 0 || std::fabs(v - std::round(v)) < 1e-9) {
+    os << static_cast<long long>(std::llround(v)) << suf[i];
+  } else {
+    os << std::fixed << std::setprecision(1) << v << suf[i];
+  }
+  return os.str();
 }
 
 bool parse_args(int argc, char** argv, BenchArgs& a) {
+  a.sizes = {1024, 4096, 65536, 262144, 1048576, 4194304, 16777216};
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto need = [&](const char* name) -> const char* {
@@ -56,133 +124,482 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       usage();
       std::exit(0);
     }
-    if (arg == "--root") {
-      const char* v = need("--root");
+    if (arg == "--endpoint") {
+      const char* v = need("--endpoint");
       if (!v) return false;
-      a.root = v;
+      a.endpoint = v;
       continue;
     }
-    if (arg == "--mode") {
-      const char* v = need("--mode");
+    if (arg == "--cluster-key") {
+      const char* v = need("--cluster-key");
       if (!v) return false;
-      a.mode = v;
+      a.cluster_key = v;
       continue;
     }
-    if (arg == "--shards") {
-      const char* v = need("--shards");
+    if (arg == "--threads") {
+      const char* v = need("--threads");
       if (!v) return false;
-      a.shards = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+      a.threads = static_cast<unsigned>(std::strtoul(v, nullptr, 10));
       continue;
     }
-    if (arg == "--count") {
-      const char* v = need("--count");
+    if (arg == "--ops") {
+      const char* v = need("--ops");
       if (!v) return false;
-      a.count = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+      a.ops = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
       continue;
     }
-    if (arg == "--small-size") {
-      const char* v = need("--small-size");
+    if (arg == "--warmup") {
+      const char* v = need("--warmup");
       if (!v) return false;
-      a.small_size = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+      a.warmup = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
       continue;
     }
-    if (arg == "--large-size") {
-      const char* v = need("--large-size");
+    if (arg == "--prefix") {
+      const char* v = need("--prefix");
       if (!v) return false;
-      a.large_size = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+      a.prefix = v;
       continue;
     }
-    if (arg == "--inline-max") {
-      const char* v = need("--inline-max");
+    if (arg == "--sizes") {
+      const char* v = need("--sizes");
       if (!v) return false;
-      a.inline_max = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+      a.sizes.clear();
+      try {
+        for (const auto& tok : split_csv(v)) a.sizes.push_back(parse_size(tok));
+      } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return false;
+      }
       continue;
     }
-    if (arg == "--keep") {
-      a.keep = true;
+    if (arg == "--ops-mix") {
+      const char* v = need("--ops-mix");
+      if (!v) return false;
+      a.do_create = a.do_update = a.do_read = false;
+      for (const auto& tok : split_csv(v)) {
+        if (tok == "create") a.do_create = true;
+        else if (tok == "update") a.do_update = true;
+        else if (tok == "read") a.do_read = true;
+        else {
+          std::cerr << "unknown op in --ops-mix: " << tok << "\n";
+          return false;
+        }
+      }
+      continue;
+    }
+    if (arg == "--no-cleanup") {
+      a.cleanup = false;
+      continue;
+    }
+    if (arg == "--json") {
+      a.json = true;
       continue;
     }
     std::cerr << "unknown arg: " << arg << "\n";
     return false;
   }
-  if (a.root.empty()) {
-    std::cerr << "--root is required\n";
+  if (a.cluster_key.empty()) {
+    std::cerr << "--cluster-key is required\n";
     return false;
   }
-  if (a.mode != "inline" && a.mode != "fs" && a.mode != "both") {
-    std::cerr << "--mode must be inline|fs|both\n";
+  if (a.sizes.empty()) {
+    std::cerr << "no sizes specified\n";
     return false;
+  }
+  if (!a.do_create && !a.do_update && !a.do_read) {
+    std::cerr << "no operations in --ops-mix\n";
+    return false;
+  }
+  if ((a.do_update || a.do_read) && !a.do_create && a.ops > 0) {
+    // update/read need objects; allow if user only wants those after prior run with --no-cleanup
+  }
+  if (a.threads == 0) {
+    a.threads = std::max(1u, std::thread::hardware_concurrency());
   }
   return true;
 }
 
-struct Timing {
-  double put_s{0};
-  double get_s{0};
-  double del_s{0};
-  std::size_t ops{0};
-  std::size_t bytes{0};
-};
-
-void print_timing(const char* label, const Timing& t) {
-  const double put_ops = t.ops / t.put_s;
-  const double get_ops = t.ops / t.get_s;
-  const double put_mibs = (t.bytes / (1024.0 * 1024.0)) / t.put_s;
-  const double get_mibs = (t.bytes / (1024.0 * 1024.0)) / t.get_s;
-  std::cout << label << ":\n"
-            << "  put  " << t.put_s << " s  " << put_ops << " ops/s  " << put_mibs
-            << " MiB/s\n"
-            << "  get  " << t.get_s << " s  " << get_ops << " ops/s  " << get_mibs
-            << " MiB/s\n"
-            << "  del  " << t.del_s << " s  " << (t.ops / t.del_s) << " ops/s\n";
+void parse_endpoint(const std::string& ep, std::string& host, std::string& port) {
+  auto colon = ep.rfind(':');
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= ep.size()) {
+    throw std::runtime_error("endpoint must be HOST:PORT");
+  }
+  host = ep.substr(0, colon);
+  port = ep.substr(colon + 1);
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+    host = host.substr(1, host.size() - 2);
+  }
 }
 
-Timing run_mode(aios::ObjectStore& store, const std::string& prefix, std::size_t count,
-                std::size_t obj_size) {
-  Timing t;
-  t.ops = count;
-  t.bytes = count * obj_size;
-
-  std::vector<std::uint8_t> buf(obj_size);
-  for (std::size_t i = 0; i < obj_size; ++i) {
-    buf[i] = static_cast<std::uint8_t>(i & 0xff);
-  }
-  std::unordered_map<std::string, std::string> attrs{{"bench", "1"}, {"prefix", prefix}};
-
-  std::string err;
-  const auto t0 = std::chrono::steady_clock::now();
-  for (std::size_t i = 0; i < count; ++i) {
-    const std::string oid = prefix + "-" + std::to_string(i);
-    // Vary payload slightly so FS/content isn't identical compress-wise.
-    if (!buf.empty()) buf[0] = static_cast<std::uint8_t>(i & 0xff);
-    if (!store.put(oid, buf.data(), buf.size(), attrs, true, err)) {
-      throw std::runtime_error("put failed: " + err);
+std::string url_encode_oid(const std::string& oid) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(oid.size() * 3);
+  for (unsigned char c : oid) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(hex[c >> 4]);
+      out.push_back(hex[c & 0xf]);
     }
   }
+  return out;
+}
+
+struct HttpResp {
+  int status{-1};
+  std::string body;
+  std::string error;
+};
+
+class HttpSession {
+ public:
+  HttpSession(std::string host, std::string port, std::string cluster_key)
+      : host_(std::move(host)),
+        port_(std::move(port)),
+        cluster_key_(std::move(cluster_key)),
+        resolver_(ioc_),
+        sock_(ioc_) {}
+
+  bool ensure_connected(std::string& err) {
+    if (sock_.is_open()) return true;
+    boost::system::error_code ec;
+    auto endpoints = resolver_.resolve(host_, port_, ec);
+    if (ec) {
+      err = "resolve: " + ec.message();
+      return false;
+    }
+    asio::connect(sock_, endpoints, ec);
+    if (ec) {
+      err = "connect: " + ec.message();
+      close();
+      return false;
+    }
+    return true;
+  }
+
+  void close() {
+    boost::system::error_code ec;
+    sock_.shutdown(tcp::socket::shutdown_both, ec);
+    sock_.close(ec);
+  }
+
+  HttpResp request(const std::string& method, const std::string& target,
+                   const std::uint8_t* body, std::size_t body_len,
+                   const std::unordered_map<std::string, std::string>& extra_headers) {
+    HttpResp resp;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      std::string err;
+      if (!ensure_connected(err)) {
+        resp.error = err;
+        resp.status = -1;
+        close();
+        continue;
+      }
+      resp = do_request(method, target, body, body_len, extra_headers);
+      if (resp.status >= 0) return resp;
+      close();
+    }
+    return resp;
+  }
+
+ private:
+  void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
+                const std::string& target) {
+    const std::string date = std::to_string(aios::now_ms());
+    headers["x-aios-date"] = date;
+    headers["x-aios-content-sha256"] = "UNSIGNED-PAYLOAD";
+    const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
+    const auto canon =
+        aios::http_canonical(method, target, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
+    const auto sig = aios::http_sign(cluster_key_, canon);
+    headers["authorization"] = "AIOS-HMAC-SHA256 Credential=bench, SignedHeaders=" +
+                               signed_headers + ", Signature=" + sig;
+  }
+
+  HttpResp do_request(const std::string& method, const std::string& target,
+                      const std::uint8_t* body, std::size_t body_len,
+                      const std::unordered_map<std::string, std::string>& extra_headers) {
+    HttpResp resp;
+    std::unordered_map<std::string, std::string> headers = extra_headers;
+    headers["content-length"] = std::to_string(body_len);
+    add_auth(headers, method, target);
+
+    std::ostringstream req;
+    req << method << ' ' << target << " HTTP/1.1\r\n";
+    req << "Host: " << host_ << ':' << port_ << "\r\n";
+    req << "Connection: keep-alive\r\n";
+    for (const auto& [k, v] : headers) {
+      req << k << ": " << v << "\r\n";
+    }
+    req << "\r\n";
+    const auto head = req.str();
+
+    boost::system::error_code ec;
+    asio::write(sock_, asio::buffer(head), ec);
+    if (!ec && body_len > 0) {
+      asio::write(sock_, asio::buffer(body, body_len), ec);
+    }
+    if (ec) {
+      resp.status = -1;
+      resp.error = "write: " + ec.message();
+      return resp;
+    }
+
+    asio::streambuf buf;
+    asio::read_until(sock_, buf, "\r\n\r\n", ec);
+    if (ec && ec != asio::error::eof) {
+      resp.status = -1;
+      resp.error = "read headers: " + ec.message();
+      return resp;
+    }
+
+    std::istream is(&buf);
+    std::string status_line;
+    std::getline(is, status_line);
+    if (!status_line.empty() && status_line.back() == '\r') status_line.pop_back();
+    {
+      std::istringstream ss(status_line);
+      std::string http_ver, reason;
+      ss >> http_ver >> resp.status;
+      std::getline(ss, reason);
+    }
+
+    std::string line;
+    std::size_t content_length = 0;
+    bool close_conn = false;
+    while (std::getline(is, line)) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) break;
+      auto colon = line.find(':');
+      if (colon == std::string::npos) continue;
+      auto name = line.substr(0, colon);
+      auto value = line.substr(colon + 1);
+      while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.erase(value.begin());
+      }
+      for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (name == "content-length") {
+        content_length = static_cast<std::size_t>(std::strtoull(value.c_str(), nullptr, 10));
+      } else if (name == "connection") {
+        for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (value == "close") close_conn = true;
+      }
+    }
+
+    resp.body.resize(content_length);
+    std::size_t have = buf.size();
+    if (have > content_length) have = content_length;
+    if (have > 0) {
+      is.read(resp.body.data(), static_cast<std::streamsize>(have));
+    }
+    std::size_t need = content_length - have;
+    while (need > 0) {
+      const auto n = asio::read(sock_, asio::buffer(resp.body.data() + (content_length - need), need),
+                                asio::transfer_at_least(1), ec);
+      if (ec) {
+        resp.status = -1;
+        resp.error = "read body: " + ec.message();
+        return resp;
+      }
+      need -= n;
+    }
+
+    if (close_conn) close();
+    return resp;
+  }
+
+  std::string host_;
+  std::string port_;
+  std::string cluster_key_;
+  asio::io_context ioc_;
+  tcp::resolver resolver_;
+  tcp::socket sock_;
+};
+
+enum class OpKind { Create, Update, Put, Read, Delete };
+
+const char* op_name(OpKind k) {
+  switch (k) {
+    case OpKind::Create:
+      return "create";
+    case OpKind::Update:
+      return "update";
+    case OpKind::Put:
+      return "put";
+    case OpKind::Read:
+      return "read";
+    case OpKind::Delete:
+      return "delete";
+  }
+  return "?";
+}
+
+struct Sample {
+  double ms{0};
+  bool ok{false};
+};
+
+struct PhaseStats {
+  OpKind op{OpKind::Create};
+  std::size_t size{0};
+  std::vector<double> lat_ms;
+  std::size_t ok{0};
+  std::size_t err{0};
+  std::uint64_t bytes{0};
+  double wall_s{0};
+};
+
+std::string oid_for(const BenchArgs& a, std::size_t size, std::size_t idx) {
+  return a.prefix + "/" + std::to_string(size) + "/" + std::to_string(idx);
+}
+
+PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::string& port,
+                     OpKind op, std::size_t size, std::size_t total_ops, bool measure) {
+  PhaseStats st;
+  st.op = op;
+  st.size = size;
+
+  const std::size_t nthreads = std::min<std::size_t>(a.threads, std::max<std::size_t>(1, total_ops));
+  std::atomic<std::size_t> next{0};
+  std::mutex mu;
+  std::vector<double> lats;
+  lats.reserve(total_ops);
+  std::atomic<std::size_t> ok{0};
+  std::atomic<std::size_t> err{0};
+  std::atomic<std::uint64_t> bytes{0};
+
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<std::thread> workers;
+  workers.reserve(nthreads);
+
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    workers.emplace_back([&, t]() {
+      HttpSession sess(host, port, a.cluster_key);
+      std::vector<std::uint8_t> buf(size);
+      for (std::size_t i = 0; i < size; ++i) {
+        buf[i] = static_cast<std::uint8_t>((i + t) & 0xff);
+      }
+
+      for (;;) {
+        const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= total_ops) break;
+
+        const std::string oid = oid_for(a, size, idx);
+        const std::string target = "/o/" + url_encode_oid(oid);
+        if (!buf.empty()) {
+          buf[0] = static_cast<std::uint8_t>((idx + static_cast<std::size_t>(op)) & 0xff);
+        }
+
+        HttpResp resp;
+        const auto s0 = std::chrono::steady_clock::now();
+        if (op == OpKind::Create) {
+          std::unordered_map<std::string, std::string> h{{"if-none-match", "*"}};
+          resp = sess.request("PUT", target, buf.data(), buf.size(), h);
+        } else if (op == OpKind::Update) {
+          std::unordered_map<std::string, std::string> h{{"if-match", "*"}};
+          resp = sess.request("PUT", target, buf.data(), buf.size(), h);
+        } else if (op == OpKind::Put) {
+          resp = sess.request("PUT", target, buf.data(), buf.size(), {});
+        } else if (op == OpKind::Read) {
+          resp = sess.request("GET", target, nullptr, 0, {});
+        } else {
+          resp = sess.request("DELETE", target, nullptr, 0, {});
+        }
+        const auto s1 = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(s1 - s0).count();
+
+        bool success = false;
+        if (op == OpKind::Create || op == OpKind::Update || op == OpKind::Put) {
+          success = (resp.status == 204);
+        } else if (op == OpKind::Read) {
+          success = (resp.status == 200 && resp.body.size() == size);
+        } else {
+          success = (resp.status == 204 || resp.status == 404);
+        }
+
+        if (success) {
+          ok.fetch_add(1, std::memory_order_relaxed);
+          if (op == OpKind::Read) {
+            bytes.fetch_add(size, std::memory_order_relaxed);
+          } else if (op == OpKind::Create || op == OpKind::Update) {
+            bytes.fetch_add(size, std::memory_order_relaxed);
+          }
+        } else {
+          err.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (measure) {
+          std::lock_guard<std::mutex> lock(mu);
+          lats.push_back(ms);
+        }
+      }
+      sess.close();
+    });
+  }
+
+  for (auto& w : workers) w.join();
   const auto t1 = std::chrono::steady_clock::now();
 
-  for (std::size_t i = 0; i < count; ++i) {
-    const std::string oid = prefix + "-" + std::to_string(i);
-    auto data = store.get(oid, err);
-    if (!data || data->size() != obj_size) {
-      throw std::runtime_error("get failed: " + err);
-    }
-  }
-  const auto t2 = std::chrono::steady_clock::now();
+  st.ok = ok.load();
+  st.err = err.load();
+  st.bytes = bytes.load();
+  st.wall_s = std::chrono::duration<double>(t1 - t0).count();
+  st.lat_ms = std::move(lats);
+  return st;
+}
 
-  for (std::size_t i = 0; i < count; ++i) {
-    const std::string oid = prefix + "-" + std::to_string(i);
-    if (!store.del(oid, err)) {
-      throw std::runtime_error("del failed: " + err);
-    }
-  }
-  const auto t3 = std::chrono::steady_clock::now();
+struct Summary {
+  double p50{0};
+  double p95{0};
+  double p99{0};
+  double avg{0};
+  double iops{0};
+  double mib_s{0};
+};
 
-  using sec = std::chrono::duration<double>;
-  t.put_s = sec(t1 - t0).count();
-  t.get_s = sec(t2 - t1).count();
-  t.del_s = sec(t3 - t2).count();
-  return t;
+Summary summarize(const PhaseStats& st) {
+  Summary s;
+  auto lats = st.lat_ms;
+  if (!lats.empty()) {
+    std::sort(lats.begin(), lats.end());
+    auto pct = [&](double p) {
+      const double idx = p * static_cast<double>(lats.size() - 1);
+      const std::size_t lo = static_cast<std::size_t>(idx);
+      const std::size_t hi = std::min(lo + 1, lats.size() - 1);
+      const double frac = idx - static_cast<double>(lo);
+      return lats[lo] * (1.0 - frac) + lats[hi] * frac;
+    };
+    s.p50 = pct(0.50);
+    s.p95 = pct(0.95);
+    s.p99 = pct(0.99);
+    for (double x : lats) s.avg += x;
+    s.avg /= static_cast<double>(lats.size());
+  }
+  s.iops = st.wall_s > 0 ? static_cast<double>(st.ok) / st.wall_s : 0;
+  s.mib_s =
+      st.wall_s > 0 ? (static_cast<double>(st.bytes) / (1024.0 * 1024.0)) / st.wall_s : 0;
+  return s;
+}
+
+void print_human(const PhaseStats& st) {
+  const auto s = summarize(st);
+  std::cout << std::left << std::setw(8) << format_size(st.size) << std::setw(8) << op_name(st.op)
+            << std::right << std::setw(8) << st.ok << std::setw(6) << st.err << std::setw(10)
+            << std::fixed << std::setprecision(1) << s.iops << std::setw(10) << std::setprecision(2)
+            << s.mib_s << std::setw(10) << std::setprecision(3) << s.p50 << std::setw(10) << s.p95
+            << std::setw(10) << s.p99 << std::setw(10) << s.avg << "\n";
+}
+
+void print_json_row(std::ostream& os, const PhaseStats& st, bool first) {
+  const auto s = summarize(st);
+  if (!first) os << ",\n";
+  os << "  {\"size\":" << st.size << ",\"op\":\"" << op_name(st.op) << "\",\"ok\":" << st.ok
+     << ",\"err\":" << st.err << ",\"wall_s\":" << st.wall_s << ",\"iops\":" << s.iops
+     << ",\"mib_s\":" << s.mib_s << ",\"p50_ms\":" << s.p50 << ",\"p95_ms\":" << s.p95
+     << ",\"p99_ms\":" << s.p99 << ",\"avg_ms\":" << s.avg << ",\"bytes\":" << st.bytes << "}";
 }
 
 }  // namespace
@@ -194,59 +611,86 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  const fs::path work = fs::path(args.root) / "aios";
-  std::error_code ec;
-  fs::remove_all(args.root, ec);
-  fs::create_directories(work, ec);
-
+  std::string host, port;
   try {
-    if (args.mode == "inline" || args.mode == "both") {
-      aios::ObjectStoreOptions opts;
-      opts.shard_count = args.shards;
-      opts.inline_max_bytes = args.inline_max;
-      opts.force_mode = "inline";
-
-      aios::ObjectStore store;
-      std::string err;
-      // Separate subdir so force_mode/layout don't clash with fs run.
-      const fs::path root = work / "bench-inline";
-      fs::create_directories(root, ec);
-      if (!store.open(root.string(), opts, err)) {
-        std::cerr << "open inline store: " << err << "\n";
-        return 1;
-      }
-      std::cout << "=== inline (SQLite BLOB) size=" << args.small_size
-                << " count=" << args.count << " shards=" << args.shards << " ===\n";
-      print_timing("inline", run_mode(store, "inl", args.count, args.small_size));
-    }
-
-    if (args.mode == "fs" || args.mode == "both") {
-      aios::ObjectStoreOptions opts;
-      opts.shard_count = args.shards;
-      opts.inline_max_bytes = args.inline_max;
-      opts.force_mode = "fs";
-
-      aios::ObjectStore store;
-      std::string err;
-      const fs::path root = work / "bench-fs";
-      fs::create_directories(root, ec);
-      if (!store.open(root.string(), opts, err)) {
-        std::cerr << "open fs store: " << err << "\n";
-        return 1;
-      }
-      std::cout << "=== filesystem bodies size=" << args.large_size
-                << " count=" << args.count << " shards=" << args.shards << " ===\n";
-      print_timing("fs", run_mode(store, "fs", args.count, args.large_size));
-    }
+    parse_endpoint(args.endpoint, host, port);
   } catch (const std::exception& e) {
-    std::cerr << "bench error: " << e.what() << "\n";
-    return 1;
+    std::cerr << e.what() << "\n";
+    return 2;
   }
 
-  if (!args.keep) {
-    fs::remove_all(args.root, ec);
-  } else {
-    std::cout << "kept " << args.root << "\n";
+  // Probe connectivity (404 on missing oid is fine).
+  {
+    HttpSession probe(host, port, args.cluster_key);
+    auto r = probe.request("GET", "/o/" + url_encode_oid(args.prefix + "/probe"), nullptr, 0, {});
+    if (r.status < 0) {
+      std::cerr << "cannot reach " << args.endpoint << ": " << r.error << "\n";
+      return 1;
+    }
+    probe.close();
   }
-  return 0;
+
+  if (!args.json) {
+    std::cout << "aios-bench endpoint=" << args.endpoint << " threads=" << args.threads
+              << " ops=" << args.ops << " warmup=" << args.warmup << "\n";
+    std::cout << std::left << std::setw(8) << "size" << std::setw(8) << "op" << std::right
+              << std::setw(8) << "ok" << std::setw(6) << "err" << std::setw(10) << "iops"
+              << std::setw(10) << "MiB/s" << std::setw(10) << "p50_ms" << std::setw(10) << "p95_ms"
+              << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms" << "\n";
+  }
+
+  std::vector<PhaseStats> results;
+  results.reserve(args.sizes.size() * 3);
+
+  for (std::size_t size : args.sizes) {
+    // Warmup against real paths, then delete so create measures If-None-Match cleanly.
+    if (args.warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
+      run_phase(args, host, port, OpKind::Put, size, args.warmup, false);
+      if (args.do_update) {
+        run_phase(args, host, port, OpKind::Update, size, args.warmup, false);
+      }
+      if (args.do_read) {
+        run_phase(args, host, port, OpKind::Read, size, args.warmup, false);
+      }
+      run_phase(args, host, port, OpKind::Delete, size, args.warmup, false);
+    }
+
+    if (args.do_create) {
+      auto st = run_phase(args, host, port, OpKind::Create, size, args.ops, true);
+      if (!args.json) print_human(st);
+      results.push_back(std::move(st));
+    } else if (args.do_update || args.do_read) {
+      // Seed objects for update/read-only runs (unconditional PUT).
+      run_phase(args, host, port, OpKind::Put, size, args.ops, false);
+    }
+
+    if (args.do_update) {
+      auto st = run_phase(args, host, port, OpKind::Update, size, args.ops, true);
+      if (!args.json) print_human(st);
+      results.push_back(std::move(st));
+    }
+
+    if (args.do_read) {
+      auto st = run_phase(args, host, port, OpKind::Read, size, args.ops, true);
+      if (!args.json) print_human(st);
+      results.push_back(std::move(st));
+    }
+
+    if (args.cleanup) {
+      run_phase(args, host, port, OpKind::Delete, size, args.ops, false);
+    }
+  }
+
+  if (args.json) {
+    std::cout << "{\n\"endpoint\":\"" << args.endpoint << "\",\"threads\":" << args.threads
+              << ",\"ops\":" << args.ops << ",\"results\":[\n";
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      print_json_row(std::cout, results[i], i == 0);
+    }
+    std::cout << "\n]}\n";
+  }
+
+  std::size_t total_err = 0;
+  for (const auto& r : results) total_err += r.err;
+  return total_err > 0 ? 1 : 0;
 }

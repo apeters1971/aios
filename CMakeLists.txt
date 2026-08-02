@@ -91,6 +91,9 @@ target_link_libraries(aiosd PRIVATE aios_core)
 add_executable(aios-bench tools/aios_bench.cpp)
 target_link_libraries(aios-bench PRIVATE aios_core)
 
+add_executable(aios-store-bench tools/aios_store_bench.cpp)
+target_link_libraries(aios-store-bench PRIVATE aios_core)
+
 enable_testing()
 add_executable(aios_tests
   tests/test_framing.cpp
@@ -116,5 +119,5 @@ add_executable(aios_tests
 target_link_libraries(aios_tests PRIVATE aios_core)
 add_test(NAME aios_tests COMMAND aios_tests)
 
-install(TARGETS aiosd aios-bench RUNTIME DESTINATION bin)
+install(TARGETS aiosd aios-bench aios-store-bench RUNTIME DESTINATION bin)
 install(FILES config/aiosd.example.yaml DESTINATION share/aios)
