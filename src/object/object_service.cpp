@@ -7,7 +7,9 @@
 #include "util/log.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <mutex>
+#include <unordered_set>
 
 namespace aios {
 
@@ -96,6 +98,36 @@ bool ObjectService::local_install(const std::string& aios_path, const PreparedVe
   return store->install_version(v, data, len, attrs, err);
 }
 
+bool ObjectService::local_install_file(
+    const std::string& aios_path, const PreparedVersion& v, const std::string& abs_body_path,
+    const std::unordered_map<std::string, std::string>& attrs, std::string& err) {
+  auto* store = stores_.get(aios_path);
+  if (!store) {
+    err = "no local store for " + aios_path;
+    return false;
+  }
+  PreparedVersion pv = v;
+  std::string rel;
+  if (!v.is_delete && v.redirect_oid.empty() && v.size > 0) {
+    // Always copy — source path is shared across replica installs / primary body.
+    std::string staging;
+    if (!store->create_staging_file(v.oid, staging, err)) return false;
+    {
+      std::ifstream in(abs_body_path, std::ios::binary);
+      std::ofstream out(staging, std::ios::binary | std::ios::trunc);
+      if (!in || !out) {
+        err = "copy staging failed";
+        return false;
+      }
+      out << in.rdbuf();
+    }
+    if (!store->place_staging_as_version(v.oid, v.seq, staging, rel, err)) return false;
+    pv.fs_path = rel;
+    pv.inline_body = false;
+  }
+  return store->install_version(pv, nullptr, 0, attrs, err);
+}
+
 bool ObjectService::local_publish(const std::string& aios_path, const std::string& oid,
                                  std::uint64_t seq, std::string& err) {
   auto* store = stores_.get(aios_path);
@@ -118,23 +150,43 @@ bool ObjectService::local_abort(const std::string& aios_path, const std::string&
 
 int ObjectService::replicate_install(
     const Placement& placement, const PreparedVersion& v, const std::uint8_t* data,
-    std::size_t len, const std::unordered_map<std::string, std::string>& attrs) {
+    std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
+    const std::string& abs_body_path) {
+  const bool use_file =
+      !v.inline_body && !v.is_delete && v.redirect_oid.empty() && v.size > 0 &&
+      (!abs_body_path.empty() || (data == nullptr));
+  // Prefer file streaming when body is large or only a path is available.
+  const bool file_stream =
+      use_file && (abs_body_path.empty() == false) &&
+      (data == nullptr || len > 4u * 1024u * 1024u || v.size > 4u * 1024u * 1024u);
+
   int ok = 0;
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     const auto& t = placement.acting_set[i];
     if (t.node_id == cfg_.node_id) {
       std::string err;
-      if (local_install(t.aios_path, v, data, len, attrs, err)) {
-        ++ok;
+      bool done = false;
+      if (file_stream) {
+        done = local_install_file(t.aios_path, v, abs_body_path, attrs, err);
       } else {
+        done = local_install(t.aios_path, v, data, len, attrs, err);
+      }
+      if (done) ++ok;
+      else
         AIOS_LOG_WARN("local replica install failed ", t.aios_path, " oid=", v.oid, ": ",
                       err);
-      }
       continue;
     }
-    auto r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                   cfg_.auth_skew_ms, placement.epoch, t.aios_path, v, data,
-                                   len, attrs);
+    ObjectRpcResult r;
+    if (file_stream) {
+      r = object_install_file_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                     cfg_.auth_skew_ms, placement.epoch, t.aios_path, v,
+                                     attrs, abs_body_path);
+    } else {
+      r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                cfg_.auth_skew_ms, placement.epoch, t.aios_path, v, data,
+                                len, attrs);
+    }
     if (r.ok) ++ok;
     else
       AIOS_LOG_WARN("remote replica install failed ", t.addr, ": ", r.error);
@@ -181,8 +233,15 @@ void ObjectService::replicate_abort(const Placement& placement, const std::strin
 ApiResult ObjectService::commit_prepared(
     ObjectStore* store, const Placement& placement, PreparedVersion& pv,
     const std::uint8_t* data, std::size_t len,
-    const std::unordered_map<std::string, std::string>& attrs) {
-  const int total_ok = 1 + replicate_install(placement, pv, data, len, attrs);
+    const std::unordered_map<std::string, std::string>& attrs,
+    const std::string& abs_body_path) {
+  std::string body_path = abs_body_path;
+  if (body_path.empty() && !pv.inline_body && !pv.is_delete && pv.redirect_oid.empty() &&
+      pv.size > 0) {
+    std::string err;
+    if (auto p = store->fs_body_path(pv.oid, pv.seq, err)) body_path = *p;
+  }
+  const int total_ok = 1 + replicate_install(placement, pv, data, len, attrs, body_path);
   if (total_ok < quorum_need(placement)) {
     std::string aerr;
     store->abort_version(pv.oid, pv.seq, aerr);
@@ -237,6 +296,14 @@ Frame ObjectService::handle(const Frame& req) {
       return handle_list_versions(req.body);
     case MsgType::ObjectPurgeVersions:
       return handle_purge_versions(req.body);
+    case MsgType::ObjectStageBegin:
+      return handle_stage_begin(req.body);
+    case MsgType::ObjectStageData:
+      return handle_stage_data(req);
+    case MsgType::ObjectStageCommit:
+      return handle_stage_commit(req.body);
+    case MsgType::ObjectList:
+      return handle_list(req.body);
     default:
       return reply_err(map_.epoch, "bad_type", "unsupported object message");
   }
@@ -684,6 +751,35 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   return commit_prepared(store, placement, pv, data, len, attrs);
 }
 
+ApiResult ObjectService::api_put_file(
+    const std::string& oid, const std::string& staging_abs_path, std::uint64_t size,
+    std::uint32_t crc32c_val, const std::unordered_map<std::string, std::string>& attrs,
+    bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+    std::optional<std::uint32_t> expected_crc32c) {
+  std::lock_guard lock(mu_);
+  auto placement = place(oid, map_);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return fail("not_found", err);
+  if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+
+  PreparedVersion pv;
+  if (!store->prepare_put_file(oid, staging_abs_path, size, crc32c_val, attrs, replace_attrs,
+                               expected_crc32c, pv, err)) {
+    if (err == "crc32c mismatch") return fail("crc_mismatch", err);
+    return fail("store_error", err);
+  }
+  return commit_prepared(store, placement, pv, nullptr, 0, attrs);
+}
+
 ApiResult ObjectService::api_put_redirect(
     const std::string& oid, const std::string& target_oid,
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
@@ -784,6 +880,13 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   }
 
   if (!offset.has_value()) {
+    constexpr std::uint64_t kStreamThreshold = 256u * 1024u;
+    if (!info->inline_body && info->size >= kStreamThreshold) {
+      if (auto path = store->fs_body_path(oid, seq, err)) {
+        r.body_path = *path;
+        return r;
+      }
+    }
     r.data = store->get(oid, seq, err);
     if (!r.data) {
       if (info->is_delete) {
@@ -840,29 +943,83 @@ ApiResult ObjectService::api_del(const std::string& oid,
 
 ApiResult ObjectService::api_list(const std::string& prefix, const std::string& attr_eq_key,
                                   const std::string& attr_eq_value, std::size_t limit,
-                                  const std::string& cursor, bool include_attrs) {
+                                  const std::string& cursor, bool include_attrs,
+                                  bool cluster) {
   std::lock_guard lock(mu_);
   ApiResult r;
   r.ok = true;
   r.epoch = map_.epoch;
-  for (const auto& path : stores_.paths()) {
-    auto* store = stores_.get(path);
-    if (!store) continue;
-    std::string err;
-    auto part = store->list(prefix, attr_eq_key, attr_eq_value, limit, cursor, include_attrs,
-                            err);
-    if (!err.empty() && r.list.objects.empty()) {
-      return fail("store_error", err);
-    }
-    for (auto& o : part.objects) {
-      r.list.objects.push_back(std::move(o));
-      if (limit > 0 && r.list.objects.size() >= limit) {
-        r.list.next_cursor = path + "|" + part.next_cursor;
-        return r;
+
+  auto list_local = [&](const std::string& local_cursor) -> ApiResult {
+    ApiResult lr;
+    lr.ok = true;
+    lr.epoch = map_.epoch;
+    for (const auto& path : stores_.paths()) {
+      auto* store = stores_.get(path);
+      if (!store) continue;
+      std::string err;
+      auto part = store->list(prefix, attr_eq_key, attr_eq_value, limit, local_cursor,
+                              include_attrs, err);
+      if (!err.empty() && lr.list.objects.empty()) {
+        return fail("store_error", err);
+      }
+      for (auto& o : part.objects) {
+        lr.list.objects.push_back(std::move(o));
+        if (limit > 0 && lr.list.objects.size() >= limit) {
+          lr.list.next_cursor = lr.list.objects.back().oid;
+          return lr;
+        }
       }
     }
-    if (!part.next_cursor.empty()) {
-      r.list.next_cursor = path + "|" + part.next_cursor;
+    return lr;
+  };
+
+  if (!cluster) {
+    return list_local(cursor);
+  }
+
+  // Scatter-gather by unique node; merge sorted by oid; cursor = last oid.
+  std::vector<ObjectListEntry> merged;
+  std::unordered_set<std::string> seen_nodes;
+  for (const auto& t : map_.targets) {
+    if (!seen_nodes.insert(t.node_id).second) continue;
+    ObjectListResult part;
+    if (t.node_id == cfg_.node_id) {
+      auto lr = list_local(cursor);
+      if (!lr.ok) return lr;
+      part = std::move(lr.list);
+    } else {
+      auto remote =
+          object_list_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                             cfg_.auth_skew_ms, map_.epoch, prefix, attr_eq_key,
+                             attr_eq_value, limit, cursor, include_attrs);
+      if (!remote.ok) {
+        AIOS_LOG_WARN("cluster list from ", t.addr, " failed: ", remote.error);
+        continue;
+      }
+      part = std::move(remote.list);
+    }
+    for (auto& o : part.objects) {
+      if (!cursor.empty() && o.oid <= cursor) continue;
+      if (!prefix.empty() && o.oid.rfind(prefix, 0) != 0) continue;
+      merged.push_back(std::move(o));
+    }
+  }
+  std::sort(merged.begin(), merged.end(),
+            [](const ObjectListEntry& a, const ObjectListEntry& b) { return a.oid < b.oid; });
+  // Dedup by oid (same object may appear if listed from multiple nodes incorrectly).
+  {
+    std::vector<ObjectListEntry> uniq;
+    for (auto& o : merged) {
+      if (!uniq.empty() && uniq.back().oid == o.oid) continue;
+      uniq.push_back(std::move(o));
+    }
+    merged.swap(uniq);
+  }
+  for (auto& o : merged) {
+    r.list.objects.push_back(std::move(o));
+    if (limit > 0 && r.list.objects.size() >= limit) {
+      r.list.next_cursor = r.list.objects.back().oid;
       return r;
     }
   }
@@ -947,6 +1104,123 @@ ApiResult ObjectService::api_trim_versions(const std::string& oid, int keep) {
   r.ok = true;
   r.epoch = map_.epoch;
   return r;
+}
+
+Frame ObjectService::handle_stage_begin(const nlohmann::json& body) {
+  Frame errf;
+  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string oid = body.value("oid", "");
+  const std::string aios_path = body.value("aios_path", "");
+  const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
+  if (oid.empty() || aios_path.empty() || seq == 0) {
+    return reply_err(map_.epoch, "bad_request", "oid/aios_path/seq required");
+  }
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  std::string path, err;
+  if (!store->stage_path_for(oid, seq, path, err)) {
+    return reply_err(map_.epoch, "store_error", err);
+  }
+  if (!store->stage_truncate(path, err)) {
+    return reply_err(map_.epoch, "store_error", err);
+  }
+  return reply_ok(map_.epoch);
+}
+
+Frame ObjectService::handle_stage_data(const Frame& req) {
+  Frame errf;
+  if (!epoch_ok(req.body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string oid = req.body.value("oid", "");
+  const std::string aios_path = req.body.value("aios_path", "");
+  const auto seq = req.body.value("seq", static_cast<std::uint64_t>(0));
+  const auto offset = req.body.value("offset", static_cast<std::uint64_t>(0));
+  if (oid.empty() || aios_path.empty() || seq == 0) {
+    return reply_err(map_.epoch, "bad_request", "oid/aios_path/seq required");
+  }
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  std::string path, err;
+  if (!store->stage_path_for(oid, seq, path, err)) {
+    return reply_err(map_.epoch, "store_error", err);
+  }
+  if (!store->stage_pwrite(path, offset, req.raw.data(), req.raw.size(), err)) {
+    return reply_err(map_.epoch, "store_error", err);
+  }
+  return reply_ok(map_.epoch);
+}
+
+Frame ObjectService::handle_stage_commit(const nlohmann::json& body) {
+  Frame errf;
+  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string oid = body.value("oid", "");
+  const std::string aios_path = body.value("aios_path", "");
+  if (oid.empty() || aios_path.empty()) {
+    return reply_err(map_.epoch, "bad_request", "oid/aios_path required");
+  }
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+
+  PreparedVersion v;
+  v.oid = oid;
+  v.seq = body.value("seq", static_cast<std::uint64_t>(0));
+  v.prev_tip = body.value("base_seq", static_cast<std::uint64_t>(0));
+  v.size = body.value("size", static_cast<std::uint64_t>(0));
+  v.crc32c = body.value("crc32c", 0u);
+  v.inline_body = false;
+  v.is_delete = body.value("is_delete", false);
+  v.fs_path = body.value("fs_path", "");
+  v.redirect_oid = body.value("redirect", "");
+  if (v.seq == 0) return reply_err(map_.epoch, "bad_request", "seq required");
+
+  auto attrs = parse_attrs_json(body);
+  std::string err;
+  if (!v.is_delete && v.redirect_oid.empty() && v.size > 0) {
+    std::string staging;
+    if (!store->stage_path_for(oid, v.seq, staging, err)) {
+      return reply_err(map_.epoch, "store_error", err);
+    }
+    std::string rel;
+    if (!store->place_staging_as_version(oid, v.seq, staging, rel, err)) {
+      return reply_err(map_.epoch, "store_error", err);
+    }
+    v.fs_path = rel;
+  }
+  if (!store->install_version(v, nullptr, 0, attrs, err)) {
+    return reply_err(map_.epoch, "store_error", err);
+  }
+  return reply_ok(map_.epoch);
+}
+
+Frame ObjectService::handle_list(const nlohmann::json& body) {
+  Frame errf;
+  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  const std::string prefix = body.value("prefix", "");
+  const std::string attr_key = body.value("attr_eq_key", "");
+  const std::string attr_val = body.value("attr_eq_value", "");
+  const std::size_t limit = body.value("limit", static_cast<std::size_t>(1000));
+  const std::string cursor = body.value("cursor", "");
+  const bool include_attrs = body.value("attrs", false);
+
+  // Local-only listing for scatter-gather leaves.
+  auto r = api_list(prefix, attr_key, attr_val, limit, cursor, include_attrs,
+                    /*cluster=*/false);
+  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
+  Frame f = reply_ok(map_.epoch);
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& o : r.list.objects) {
+    nlohmann::json jo = {{"oid", o.oid},
+                         {"seq", o.seq},
+                         {"size", o.size},
+                         {"mtime_ms", o.mtime_ms},
+                         {"crc32c", o.crc32c},
+                         {"is_delete", o.is_delete},
+                         {"redirect_oid", o.redirect_oid}};
+    if (include_attrs) jo["attrs"] = o.attrs;
+    arr.push_back(std::move(jo));
+  }
+  f.body["objects"] = std::move(arr);
+  f.body["next_cursor"] = r.list.next_cursor;
+  return f;
 }
 
 }  // namespace aios

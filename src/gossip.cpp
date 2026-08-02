@@ -67,7 +67,8 @@ void GossipEngine::sync_local_stores() {
 
 void GossipEngine::start() {
   const auto adv = advertise_addr();
-  membership_.set_local(cfg_.node_id, adv);
+  const auto http_adv = derive_http_addr(adv, cfg_.http_listen);
+  membership_.set_local(cfg_.node_id, adv, http_adv);
   for (const auto& p : cfg_.peers) {
     membership_.add_seed(p);
   }
@@ -86,6 +87,7 @@ void GossipEngine::start() {
   RpcHandlers handlers;
   handlers.local_node_id = cfg_.node_id;
   handlers.local_listen = adv;
+  handlers.local_http_addr = http_adv;
   handlers.cluster_key = cfg_.cluster_key;
   handlers.auth_skew_ms = cfg_.auth_skew_ms;
   handlers.on_gossip = [this](const std::string& peer_id, const std::string& peer_listen,
@@ -106,7 +108,7 @@ void GossipEngine::start() {
     for (const auto& p : cfg_.peers) {
       auto r = gossip_with_peer(ioc_, p, cfg_.node_id, advertise_addr(),
                                 cfg_.cluster_key, cfg_.auth_skew_ms, membership_,
-                                fs_table_);
+                                fs_table_, derive_http_addr(advertise_addr(), cfg_.http_listen));
       if (r.ok) {
         AIOS_LOG_INFO("seed gossip ok with ", p, " as ", r.peer_node_id);
         rebuild_cluster_map();
@@ -172,7 +174,8 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
   for (const auto& p : peers) {
     auto r = gossip_with_peer(ioc_, p.addr, cfg_.node_id, advertise_addr(),
                               cfg_.cluster_key, cfg_.auth_skew_ms, membership_,
-                              fs_table_);
+                              fs_table_,
+                              derive_http_addr(advertise_addr(), cfg_.http_listen));
     if (r.ok) {
       AIOS_LOG_DEBUG("gossip ok ", p.addr, " -> ", r.peer_node_id);
     } else {

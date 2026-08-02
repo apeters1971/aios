@@ -32,6 +32,7 @@ nlohmann::json ClusterMap::to_json() const {
     arr.push_back({
         {"node_id", t.node_id},
         {"addr", t.addr},
+        {"http_addr", t.http_addr},
         {"aios_path", t.aios_path},
         {"mount", t.mount},
         {"bavail", t.bavail},
@@ -55,6 +56,7 @@ ClusterMap ClusterMap::from_json(const nlohmann::json& j) {
     StorageTarget t;
     t.node_id = e.value("node_id", "");
     t.addr = e.value("addr", "");
+    t.http_addr = e.value("http_addr", "");
     t.aios_path = e.value("aios_path", "");
     t.mount = e.value("mount", "");
     t.bavail = e.value("bavail", static_cast<std::uint64_t>(0));
@@ -86,6 +88,7 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
     StorageTarget t;
     t.node_id = e.node_id;
     t.addr = it->second.addr;
+    t.http_addr = it->second.http_addr;
     t.aios_path = e.aios_path;
     t.mount = e.mount;
     t.bavail = e.bavail;

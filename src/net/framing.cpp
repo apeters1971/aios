@@ -41,6 +41,14 @@ const char* msg_type_name(MsgType t) {
       return "ObjectListVersions";
     case MsgType::ObjectPurgeVersions:
       return "ObjectPurgeVersions";
+    case MsgType::ObjectStageBegin:
+      return "ObjectStageBegin";
+    case MsgType::ObjectStageData:
+      return "ObjectStageData";
+    case MsgType::ObjectStageCommit:
+      return "ObjectStageCommit";
+    case MsgType::ObjectList:
+      return "ObjectList";
   }
   return "Unknown";
 }

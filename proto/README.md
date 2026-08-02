@@ -13,7 +13,7 @@ Not protobuf — fixed binary header + UTF-8 JSON body.
 | 8      | 4    | length  | big-endian body length |
 | 12     | N    | body    | UTF-8 JSON |
 
-Maximum body size: 16 MiB.
+Maximum frame body size: 16 MiB (object payloads may exceed this via staging).
 
 ## Message types
 
@@ -35,8 +35,14 @@ Maximum body size: 16 MiB.
 | 14   | ObjectAbortVersion | drop unpublished / non-tip `seq` |
 | 15   | ObjectListVersions | list versions for oid |
 | 16   | ObjectPurgeVersions | trim (`keep`) or purge one `seq` |
+| 17   | ObjectStageBegin | start FS body staging for replica install |
+| 18   | ObjectStageData | raw chunk (`kFlagRawBody`); JSON has `offset` |
+| 19   | ObjectStageCommit | place staged file → `install_version` |
+| 20   | ObjectList | list tip objects on one node (scatter-gather leaf) |
 
 HTTP front-end (external clients): [`http.md`](http.md).
+
+Maximum **frame** body remains 16 MiB; object bodies may be larger via HTTP streaming and `ObjectStage*` chunks.
 
 ## Cluster authentication
 

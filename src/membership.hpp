@@ -33,20 +33,22 @@ inline MemberState member_state_from_string(const std::string& s) {
 
 struct Member {
   std::string node_id;
-  std::string addr;  // host:port for dialing
+  std::string addr;       // host:port TCP++ dial
+  std::string http_addr;  // host:port HTTP API (may be empty)
   MemberState state{MemberState::Alive};
   std::int64_t last_seen_ms{0};
 };
 
 class MembershipTable {
  public:
-  void set_local(const std::string& node_id, const std::string& advertise_addr);
+  void set_local(const std::string& node_id, const std::string& advertise_addr,
+                 const std::string& http_addr = {});
 
   // Upsert seed peer address (unknown node_id uses addr as provisional key until Hello).
   void add_seed(const std::string& addr);
 
-  void mark_alive(const std::string& node_id, const std::string& addr,
-                  std::int64_t now);
+  void mark_alive(const std::string& node_id, const std::string& addr, std::int64_t now,
+                  const std::string& http_addr = {});
 
   // Merge remote members. Prefer fresher last_seen; never demote local node.
   void merge(const std::vector<Member>& remote, std::int64_t now);

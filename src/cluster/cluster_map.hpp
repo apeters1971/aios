@@ -14,7 +14,8 @@ namespace aios {
 // One usable object-storage target on an alive node (placement OSD).
 struct StorageTarget {
   std::string node_id;
-  std::string addr;       // host:port for dialing the owning node
+  std::string addr;       // host:port for dialing the owning node (TCP++)
+  std::string http_addr;  // host:port HTTP API (may be empty)
   std::string aios_path;  // absolute .../aios path on that node
   std::string mount;
   std::uint64_t bavail{0};

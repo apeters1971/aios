@@ -8,12 +8,14 @@
 namespace aios {
 
 void MembershipTable::set_local(const std::string& node_id,
-                                const std::string& advertise_addr) {
+                                const std::string& advertise_addr,
+                                const std::string& http_addr) {
   std::lock_guard lock(mu_);
   local_id_ = node_id;
   Member m;
   m.node_id = node_id;
   m.addr = advertise_addr;
+  m.http_addr = http_addr;
   m.state = MemberState::Alive;
   m.last_seen_ms = now_ms();
   members_[node_id] = std::move(m);
@@ -35,8 +37,8 @@ void MembershipTable::add_seed(const std::string& addr) {
   members_[key] = std::move(m);
 }
 
-void MembershipTable::mark_alive(const std::string& node_id,
-                                 const std::string& addr, std::int64_t now) {
+void MembershipTable::mark_alive(const std::string& node_id, const std::string& addr,
+                                 std::int64_t now, const std::string& http_addr) {
   std::lock_guard lock(mu_);
   // Drop provisional seed entries that match this addr.
   for (auto it = members_.begin(); it != members_.end();) {
@@ -50,6 +52,7 @@ void MembershipTable::mark_alive(const std::string& node_id,
   Member& m = members_[node_id];
   m.node_id = node_id;
   if (!addr.empty()) m.addr = addr;
+  if (!http_addr.empty()) m.http_addr = http_addr;
   m.state = MemberState::Alive;
   m.last_seen_ms = now;
 }
@@ -67,8 +70,10 @@ void MembershipTable::merge(const std::vector<Member>& remote, std::int64_t now)
     }
     if (r.last_seen_ms >= it->second.last_seen_ms) {
       auto keep_addr = it->second.addr;
+      auto keep_http = it->second.http_addr;
       it->second = r;
       if (it->second.addr.empty()) it->second.addr = keep_addr;
+      if (it->second.http_addr.empty()) it->second.http_addr = keep_http;
     }
   }
 }
@@ -163,6 +168,7 @@ nlohmann::json MembershipTable::to_json() const {
     members.push_back({
         {"node_id", m.node_id},
         {"addr", m.addr},
+        {"http_addr", m.http_addr},
         {"state", member_state_name(m.state)},
         {"last_seen_ms", m.last_seen_ms},
     });
@@ -178,6 +184,7 @@ std::vector<Member> MembershipTable::from_json(const nlohmann::json& j) {
     Member m;
     m.node_id = e.value("node_id", "");
     m.addr = e.value("addr", "");
+    m.http_addr = e.value("http_addr", "");
     m.state = member_state_from_string(e.value("state", "alive"));
     m.last_seen_ms = e.value("last_seen_ms", std::int64_t{0});
     if (!m.node_id.empty()) out.push_back(std::move(m));

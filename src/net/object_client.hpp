@@ -21,6 +21,7 @@ struct ObjectRpcResult {
   std::int64_t mtime_ms{0};
   std::uint32_t crc32c{0};
   bool crc32c_known{false};
+  ObjectListResult list;
   nlohmann::json body = nlohmann::json::object();
 };
 
@@ -56,6 +57,23 @@ ObjectRpcResult object_install_remote(const std::string& peer_addr,
                                       const PreparedVersion& v, const std::uint8_t* data,
                                       std::size_t len,
                                       const std::unordered_map<std::string, std::string>& attrs);
+
+// Stream FS body to peer via ObjectStageBegin/Data/Commit (no full-object RAM copy).
+ObjectRpcResult object_install_file_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
+    const std::unordered_map<std::string, std::string>& attrs,
+    const std::string& abs_body_path);
+
+ObjectRpcResult object_list_remote(const std::string& peer_addr,
+                                   const std::string& local_node_id,
+                                   const std::string& local_listen,
+                                   const std::string& cluster_key, int auth_skew_ms,
+                                   std::uint64_t epoch, const std::string& prefix,
+                                   const std::string& attr_eq_key,
+                                   const std::string& attr_eq_value, std::size_t limit,
+                                   const std::string& cursor, bool include_attrs);
 
 ObjectRpcResult object_publish_tip_remote(const std::string& peer_addr,
                                           const std::string& local_node_id,

@@ -34,7 +34,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Binaries: `build/aiosd`, `build/aios-bench`, `build/aios-store-bench`
+Binaries: `build/aiosd`, `build/aios`, `build/aios-bench`, `build/aios-store-bench`
 
 ## Configuration
 
@@ -125,6 +125,19 @@ aios/
 - **Inline** (`size ≤ inline_max_bytes`, default 64 KiB): body BLOB in that shard’s SQLite
 - **Filesystem**: body as a file under the shard; metadata/attrs always in SQLite
 - Arbitrary object attrs in table `attrs(oid,key,value)`
+
+### Client CLI (`aios`)
+
+Placement-aware HTTP client (follows `307` redirects to the primary):
+
+```bash
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" put myoid ./file.bin
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" get myoid -o ./out.bin
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" list --prefix my
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" map
+```
+
+Objects larger than 256 KiB are streamed to disk on the server (default max 64 GiB via `max_object_bytes`). `GET /o` lists cluster-wide (scatter-gather); use `?scope=local` for this node only.
 
 ### Client benchmark (`aios-bench`)
 

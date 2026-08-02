@@ -18,6 +18,20 @@ bool split_host_port(const std::string& addr, std::string& host, std::string& po
   return !host.empty() && !port.empty();
 }
 
+std::string derive_http_addr(const std::string& advertise_tcp, const std::string& http_listen) {
+  if (http_listen.empty()) return {};
+  std::string adv_host, adv_port, http_host, http_port;
+  if (!split_host_port(http_listen, http_host, http_port)) return {};
+  if (!advertise_tcp.empty() && split_host_port(advertise_tcp, adv_host, adv_port) &&
+      !adv_host.empty() && adv_host != "0.0.0.0" && adv_host != "::") {
+    return adv_host + ":" + http_port;
+  }
+  if (http_host == "0.0.0.0" || http_host == "::") {
+    return "127.0.0.1:" + http_port;
+  }
+  return http_host + ":" + http_port;
+}
+
 bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
   try {
     YAML::Node root = YAML::LoadFile(path);
@@ -48,6 +62,8 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
       cfg.http_body_sync = root["http_body_sync"].as<std::string>();
     if (root["max_versions"]) cfg.max_versions = root["max_versions"].as<int>();
     if (root["clone_required"]) cfg.clone_required = root["clone_required"].as<bool>();
+    if (root["max_object_bytes"])
+      cfg.max_object_bytes = root["max_object_bytes"].as<std::uint64_t>();
     if (root["peers"]) {
       cfg.peers.clear();
       for (const auto& p : root["peers"]) {

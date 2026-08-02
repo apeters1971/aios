@@ -23,6 +23,7 @@ GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
                                       const std::string& local_node_id,
                                       const std::string& local_listen,
                                       const std::string& cluster_key, int auth_skew_ms,
-                                      MembershipTable& membership, FsTable& fs_table);
+                                      MembershipTable& membership, FsTable& fs_table,
+                                      const std::string& local_http_addr = {});
 
 }  // namespace aios

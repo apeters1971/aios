@@ -25,12 +25,18 @@ enum class MsgType : std::uint8_t {
   ObjectAbortVersion = 14,
   ObjectListVersions = 15,
   ObjectPurgeVersions = 16,
+  ObjectStageBegin = 17,   // start FS body staging for install
+  ObjectStageData = 18,    // raw chunk (kFlagRawBody)
+  ObjectStageCommit = 19,  // finalize staged file → install_version
+  ObjectList = 20,         // list tip objects on a node (local stores)
 };
 
 constexpr std::uint8_t kProtoVersion = 1;
 constexpr char kMagic[4] = {'A', 'I', 'O', 'S'};
 constexpr std::size_t kHeaderSize = 12;
+// Max TCP++ frame body (JSON or json+raw chunk). Object bodies may be larger via staging.
 constexpr std::size_t kMaxBodySize = 16u * 1024u * 1024u;
+constexpr std::size_t kStageChunkSize = 4u * 1024u * 1024u;
 // flags bit0: body is [u32be json_len][json][raw]
 constexpr std::uint16_t kFlagRawBody = 0x0001;
 

@@ -667,5 +667,35 @@ int test_store_advanced() {
     expect(err == "object is delete marker", "delmark: get err");
   }
 
+  // -------------------------------------------------------------------------
+  // 13. prepare_put_file / staging stream path
+  // -------------------------------------------------------------------------
+  {
+    const auto root = temp_root("aios-adv-stage");
+    ObjectStore store;
+    ObjectStoreOptions opts = default_opts();
+    opts.force_mode = "fs";
+    expect(store.open(root.string(), opts, err), "stage: open");
+    std::string staging;
+    expect(store.create_staging_file("big", staging, err), "stage: create");
+    std::vector<std::uint8_t> payload(300 * 1024);
+    for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<std::uint8_t>(i);
+    {
+      std::ofstream out(staging, std::ios::binary | std::ios::trunc);
+      out.write(reinterpret_cast<const char*>(payload.data()),
+                static_cast<std::streamsize>(payload.size()));
+    }
+    const auto crc = aios::crc32c(payload.data(), payload.size());
+    PreparedVersion pv;
+    expect(store.prepare_put_file("big", staging, payload.size(), crc, {{"k", "v"}}, true,
+                                  crc, pv, err),
+           "stage: prepare_put_file");
+    expect(store.publish_tip("big", pv.seq, err), "stage: publish");
+    auto got = store.get("big", err);
+    expect(got && *got == payload, "stage: get matches");
+    auto path = store.fs_body_path("big", err);
+    expect(path.has_value(), "stage: fs path");
+  }
+
   return failures();
 }

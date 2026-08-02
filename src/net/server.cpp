@@ -122,6 +122,7 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
   hello_reply.body = {
       {"node_id", handlers_.local_node_id},
       {"listen", handlers_.local_listen},
+      {"http_addr", handlers_.local_http_addr},
   };
   auth_sign(hello_reply.body, MsgType::Hello, handlers_.cluster_key);
   if (!write_frame(*sock, hello_reply, err, ec)) return;

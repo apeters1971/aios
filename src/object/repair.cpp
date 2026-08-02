@@ -4,6 +4,7 @@
 #include "net/object_client.hpp"
 #include "util/log.hpp"
 
+#include <fstream>
 #include <unordered_map>
 #include <vector>
 
@@ -15,6 +16,7 @@ struct TargetObjState {
   std::uint64_t size{0};
   std::uint32_t crc32c{0};
   bool crc_known{false};
+  std::uint64_t seq{0};
 };
 
 TargetObjState target_object_state(const Config& cfg, const std::string& advertise,
@@ -31,6 +33,7 @@ TargetObjState target_object_state(const Config& cfg, const std::string& adverti
     st.size = info->size;
     st.crc32c = info->crc32c;
     st.crc_known = info->crc32c_known;
+    st.seq = info->seq;
     return st;
   }
   auto r = object_stat_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key,
@@ -40,43 +43,118 @@ TargetObjState target_object_state(const Config& cfg, const std::string& adverti
   st.size = r.size;
   st.crc32c = r.crc32c;
   st.crc_known = r.crc32c_known;
+  st.seq = r.body.value("seq", static_cast<std::uint64_t>(0));
   return st;
 }
 
 bool push_replica(const Config& cfg, const std::string& advertise, const ClusterMap& map,
                   LocalStores& stores, const StorageTarget& src, const StorageTarget& dst,
                   const std::string& oid) {
-  std::vector<std::uint8_t> data;
   std::unordered_map<std::string, std::string> attrs;
+  PreparedVersion pv;
+  std::string body_path;
+  std::vector<std::uint8_t> data;
+  bool have_file = false;
 
   if (src.node_id == cfg.node_id) {
     auto* store = stores.get(src.aios_path);
     if (!store) return false;
     std::string err;
-    auto got = store->get(oid, err);
-    if (!got) return false;
-    data = std::move(*got);
+    auto info = store->stat(oid, err);
+    if (!info || info->is_delete) return false;
     attrs = store->list_attrs(oid, err);
+    pv.oid = oid;
+    pv.seq = info->seq;
+    pv.size = info->size;
+    pv.crc32c = info->crc32c;
+    pv.inline_body = info->inline_body;
+    pv.fs_path = info->fs_path;
+    pv.is_delete = false;
+    pv.redirect_oid = info->redirect_oid;
+    if (!info->redirect_oid.empty() || info->is_delete) {
+      // Install empty/redirect version.
+    } else if (!info->inline_body) {
+      if (auto p = store->fs_body_path(oid, info->seq, err)) {
+        body_path = *p;
+        have_file = true;
+      }
+    }
+    if (!have_file && info->redirect_oid.empty()) {
+      auto got = store->get(oid, err);
+      if (!got) return false;
+      data = std::move(*got);
+    }
   } else {
-    auto r = object_get_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
+    auto st = object_stat_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                 cfg.auth_skew_ms, map.epoch, src.aios_path, oid);
+    if (!st.ok) return false;
+    auto g = object_get_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
                                cfg.auth_skew_ms, map.epoch, src.aios_path, oid);
-    if (!r.ok || !r.data) return false;
-    data = std::move(*r.data);
+    if (!g.ok || !g.data) return false;
+    data = std::move(*g.data);
+    pv.oid = oid;
+    pv.seq = st.body.value("seq", static_cast<std::uint64_t>(1));
+    pv.size = st.size;
+    pv.crc32c = st.crc32c;
+    pv.inline_body = pv.size <= 64 * 1024;
+    pv.is_delete = false;
   }
+
+  if (pv.seq == 0) pv.seq = 1;
+
+  auto publish_dst = [&]() -> bool {
+    if (dst.node_id == cfg.node_id) {
+      auto* store = stores.get(dst.aios_path);
+      if (!store) return false;
+      std::string err;
+      return store->publish_tip(oid, pv.seq, err);
+    }
+    auto r = object_publish_tip_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                       cfg.auth_skew_ms, map.epoch, dst.aios_path, oid,
+                                       pv.seq);
+    return r.ok;
+  };
 
   if (dst.node_id == cfg.node_id) {
     auto* store = stores.get(dst.aios_path);
     if (!store) return false;
     std::string err;
-    return store->put(oid, data.data(), data.size(), attrs, true, err);
+    if (!pv.redirect_oid.empty()) {
+      if (!store->install_version(pv, nullptr, 0, attrs, err)) return false;
+    } else if (have_file) {
+      std::string staging;
+      if (!store->create_staging_file(oid, staging, err)) return false;
+      {
+        std::ifstream in(body_path, std::ios::binary);
+        std::ofstream out(staging, std::ios::binary | std::ios::trunc);
+        if (!in || !out) return false;
+        out << in.rdbuf();
+      }
+      std::string rel;
+      if (!store->place_staging_as_version(oid, pv.seq, staging, rel, err)) return false;
+      pv.fs_path = rel;
+      pv.inline_body = false;
+      if (!store->install_version(pv, nullptr, 0, attrs, err)) return false;
+    } else {
+      if (!store->install_version(pv, data.data(), data.size(), attrs, err)) return false;
+    }
+    return publish_dst();
   }
-  auto r = object_put_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
-                             cfg.auth_skew_ms, map.epoch, dst.aios_path, oid, data.data(),
-                             data.size(), attrs, /*as_replica=*/true);
-  return r.ok;
+
+  ObjectRpcResult r;
+  if (have_file) {
+    r = object_install_file_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                   cfg.auth_skew_ms, map.epoch, dst.aios_path, pv, attrs,
+                                   body_path);
+  } else {
+    r = object_install_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
+                              cfg.auth_skew_ms, map.epoch, dst.aios_path, pv, data.data(),
+                              data.size(), attrs);
+  }
+  if (!r.ok) return false;
+  return publish_dst();
 }
 
-// Prefer primary; else lowest node_id among acting targets that currently hold the object.
 bool should_repair(const Config& cfg, const Placement& p, const std::vector<bool>& has) {
   if (p.acting_set.empty()) return false;
   if (p.acting_set[0].node_id == cfg.node_id && has[0]) return true;
@@ -116,7 +194,6 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
       const auto p = place(oid, map);
       if (p.acting_set.empty()) continue;
 
-      // Only consider oids for which this local path is in the acting set.
       bool local_in_set = false;
       for (const auto& t : p.acting_set) {
         if (t.node_id == cfg.node_id && t.aios_path == path) {
@@ -134,7 +211,6 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         has[i] = states[i].present;
       }
 
-      // Choose authoritative copy: primary if present, else first present.
       std::size_t auth = p.acting_set.size();
       if (!p.acting_set.empty() && has[0]) auth = 0;
       else {
@@ -147,7 +223,6 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
       }
       if (auth == p.acting_set.size()) continue;
 
-      // Ensure local authoritative CRC is known (recompute legacy rows).
       if (p.acting_set[auth].node_id == cfg.node_id && !states[auth].crc_known) {
         auto* s = stores.get(p.acting_set[auth].aios_path);
         std::uint32_t c = 0;
@@ -174,6 +249,10 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
           needs_fix[i] = true;
           any_fix = true;
           AIOS_LOG_WARN("crc32c mismatch oid=", oid, " target=", p.acting_set[i].node_id);
+        } else if (states[auth].seq > 0 && states[i].seq > 0 &&
+                   states[i].seq != states[auth].seq) {
+          needs_fix[i] = true;
+          any_fix = true;
         }
       }
       if (!any_fix) continue;
@@ -182,7 +261,6 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
       if (!should_repair(cfg, p, has)) continue;
 
       std::size_t src_idx = auth;
-      // Prefer a local source when available and matching auth digest.
       for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
         if (!has[i] || p.acting_set[i].node_id != cfg.node_id) continue;
         if (!states[auth].crc_known || !states[i].crc_known ||

@@ -1011,6 +1011,214 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
   return true;
 }
 
+bool ObjectStore::create_staging_file(const std::string& oid, std::string& abs_path_out,
+                                     std::string& err) {
+  abs_path_out.clear();
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  const auto name = "upload-" + std::to_string(now_ms()) + "-" +
+                    std::to_string(shard_of_oid(oid, opts_.shard_count));
+  const fs::path tmp = fs::path(sp->dir) / "tmp" / name;
+  std::error_code ec;
+  fs::create_directories(tmp.parent_path(), ec);
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      err = "cannot create staging file";
+      return false;
+    }
+  }
+  abs_path_out = tmp.string();
+  return true;
+}
+
+bool ObjectStore::stage_path_for(const std::string& oid, std::uint64_t seq,
+                                std::string& abs_path_out, std::string& err) {
+  abs_path_out.clear();
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  const fs::path tmp = fs::path(sp->dir) / "tmp" / ("stage-" + std::to_string(seq));
+  std::error_code ec;
+  fs::create_directories(tmp.parent_path(), ec);
+  abs_path_out = tmp.string();
+  return true;
+}
+
+bool ObjectStore::stage_truncate(const std::string& abs_path, std::string& err) {
+  std::ofstream out(abs_path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    err = "cannot truncate staging file";
+    return false;
+  }
+  return true;
+}
+
+bool ObjectStore::stage_pwrite(const std::string& abs_path, std::uint64_t offset,
+                               const std::uint8_t* data, std::size_t len, std::string& err) {
+  FILE* f = std::fopen(abs_path.c_str(), "r+b");
+  if (!f) {
+    f = std::fopen(abs_path.c_str(), "w+b");
+  }
+  if (!f) {
+    err = "cannot open staging file";
+    return false;
+  }
+  if (fseeko(f, static_cast<off_t>(offset), SEEK_SET) != 0) {
+    std::fclose(f);
+    err = "seek failed";
+    return false;
+  }
+  if (len > 0 && std::fwrite(data, 1, len, f) != len) {
+    std::fclose(f);
+    err = "write failed";
+    return false;
+  }
+  std::fflush(f);
+  std::fclose(f);
+  return true;
+}
+
+bool ObjectStore::place_staging_as_version(const std::string& oid, std::uint64_t seq,
+                                          const std::string& staging_abs_path,
+                                          std::string& relpath_out, std::string& err) {
+  relpath_out.clear();
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  const std::string rel = version_relpath(oid, seq);
+  const fs::path final_path = fs::path(sp->dir) / rel;
+  std::error_code ec;
+  fs::create_directories(final_path.parent_path(), ec);
+  fs::rename(staging_abs_path, final_path, ec);
+  if (ec) {
+    // Cross-device rename may fail; fall back to copy+remove.
+    ec.clear();
+    fs::copy_file(staging_abs_path, final_path, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+      err = "place staging: " + ec.message();
+      return false;
+    }
+    fs::remove(staging_abs_path, ec);
+  }
+  {
+    FILE* f = std::fopen(final_path.c_str(), "rb");
+    if (f) {
+      fflush(f);
+      fsync(fileno(f));
+      std::fclose(f);
+    }
+  }
+  relpath_out = rel;
+  return true;
+}
+
+bool ObjectStore::prepare_put_file(const std::string& oid, const std::string& staging_abs_path,
+                                   std::uint64_t size, std::uint32_t crc32c_val,
+                                   const std::unordered_map<std::string, std::string>& attrs,
+                                   bool replace_attrs,
+                                   std::optional<std::uint32_t> expected_crc32c,
+                                   PreparedVersion& out, std::string& err) {
+  out = PreparedVersion{};
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  if (oid.empty()) {
+    err = "empty oid";
+    return false;
+  }
+  if (expected_crc32c.has_value() && *expected_crc32c != crc32c_val) {
+    err = "crc32c mismatch";
+    return false;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  Shard& s = *sp;
+
+  if (!begin(s, err)) return false;
+
+  std::uint64_t tip = 0;
+  if (!tip_seq_locked(s, oid, tip, err)) {
+    rollback(s);
+    return false;
+  }
+
+  std::unordered_map<std::string, std::string> merged;
+  if (replace_attrs) {
+    merged = attrs;
+  } else if (tip > 0) {
+    ObjectInfo tip_info;
+    std::string lerr;
+    if (load_version_locked(s, oid, tip, tip_info, lerr) && !tip_info.is_delete) {
+      if (!load_attrs_for_seq(s.db, oid, tip, merged, err)) {
+        rollback(s);
+        return false;
+      }
+      for (const auto& [k, v] : attrs) merged[k] = v;
+    } else {
+      merged = attrs;
+    }
+  } else {
+    merged = attrs;
+  }
+
+  std::uint64_t seq = 0;
+  if (!next_seq_locked(s, oid, seq, err)) {
+    rollback(s);
+    return false;
+  }
+
+  PreparedVersion pv;
+  pv.oid = oid;
+  pv.seq = seq;
+  pv.prev_tip = tip;
+  pv.size = size;
+  pv.crc32c = crc32c_val;
+  pv.inline_body = false;
+  pv.is_delete = false;
+
+  std::string rel;
+  if (!place_staging_as_version(oid, seq, staging_abs_path, rel, err)) {
+    rollback(s);
+    return false;
+  }
+  pv.fs_path = rel;
+
+  if (!insert_version_locked(s, pv, nullptr, 0, merged, err)) {
+    std::string rm_err;
+    remove_fs_object(s, pv.fs_path, rm_err);
+    rollback(s);
+    return false;
+  }
+  if (!commit(s, err)) {
+    std::string rm_err;
+    remove_fs_object(s, pv.fs_path, rm_err);
+    rollback(s);
+    return false;
+  }
+  out = std::move(pv);
+  return true;
+}
+
 bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset,
                                     const std::uint8_t* data, std::size_t len,
                                     const std::unordered_map<std::string, std::string>& attrs,

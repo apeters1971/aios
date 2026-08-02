@@ -37,8 +37,20 @@ Canonical string:
 | `DELETE` | `/o/{oid}?version={seq}` | Purge one non-tip version |
 | `GET` | `/o/{oid}/versions` | List versions newest first (`seq,size,crc32c,ctime_ms,is_delete`) |
 | `POST` | `/o/{oid}/purge?keep={n}` | Keep newest `n` versions (default `max_versions`) |
-| `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1` | LIST tip objects (local stores) |
-| `GET` | `/map` | Cluster map JSON |
+| `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1&scope=` | LIST tip objects (default **cluster** scatter-gather; `scope=local` for this node) |
+| `GET` | `/map` | Cluster map JSON (targets include `http_addr`) |
+
+### Large objects
+
+Full PUT/GET bodies are streamed to/from filesystem staging when larger than 256 KiB (no full-object RAM buffer on the server). Cap with config `max_object_bytes` (default 64 GiB). TCP++ frame size remains 16 MiB; replicas use chunked `ObjectStage*` messages.
+
+### Wrong-node routing
+
+Mutating requests on a non-primary return **307** with:
+
+- `Location: http://{primary.http_addr}/o/{oid}…`
+- `x-aios-primary`, `x-aios-acting-set` (JSON)
+- JSON body `{ code: "not_primary", acting_set, epoch }`
 
 ### Versions
 

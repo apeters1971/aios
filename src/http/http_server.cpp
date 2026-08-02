@@ -12,11 +12,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 namespace aios {
 namespace {
@@ -231,6 +235,89 @@ void write_json(tcp::socket& sock, int status, const std::string& reason,
                  reinterpret_cast<const std::uint8_t*>(body.data()), body.size(), keep_alive);
 }
 
+void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
+                       const ApiResult& r, bool keep_alive) {
+  nlohmann::json acting = nlohmann::json::array();
+  std::string location;
+  if (!r.placement.acting_set.empty()) {
+    const auto& p = r.placement.acting_set[0];
+    if (!p.http_addr.empty()) {
+      location = "http://" + p.http_addr + path_with_query;
+    }
+    for (const auto& t : r.placement.acting_set) {
+      acting.push_back({{"node_id", t.node_id},
+                        {"addr", t.addr},
+                        {"http_addr", t.http_addr},
+                        {"aios_path", t.aios_path}});
+    }
+  }
+  nlohmann::json body = {{"error", r.error},
+                         {"code", "not_primary"},
+                         {"epoch", r.epoch},
+                         {"acting_set", acting}};
+  const auto body_s = body.dump();
+  std::unordered_map<std::string, std::string> headers = {
+      {"Content-Type", "application/json"},
+      {"x-aios-acting-set", acting.dump()},
+  };
+  if (!location.empty()) {
+    headers["Location"] = location;
+    if (!r.placement.acting_set.empty()) {
+      headers["x-aios-primary"] = r.placement.acting_set[0].node_id;
+    }
+  }
+  write_response(sock, 307, "Temporary Redirect", headers,
+                 reinterpret_cast<const std::uint8_t*>(body_s.data()), body_s.size(),
+                 keep_alive);
+}
+
+bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
+                     std::unordered_map<std::string, std::string> headers,
+                     const std::string& path, std::uint64_t size, bool head_only,
+                     bool keep_alive) {
+  headers["Content-Length"] = std::to_string(size);
+  headers["Connection"] = keep_alive ? "keep-alive" : "close";
+  std::ostringstream oss;
+  oss << "HTTP/1.1 " << status << ' ' << reason << "\r\n";
+  for (const auto& [k, v] : headers) {
+    if (k == "Content-Length" || k == "Connection") continue;
+    oss << k << ": " << v << "\r\n";
+  }
+  oss << "Content-Length: " << size << "\r\n";
+  oss << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
+  oss << "\r\n";
+  const auto head = oss.str();
+  boost::system::error_code ec;
+  boost::asio::write(sock, boost::asio::buffer(head), ec);
+  if (ec || head_only || size == 0) return !ec;
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  std::vector<char> buf(256 * 1024);
+  std::uint64_t left = size;
+  while (left > 0 && in) {
+    const auto chunk = static_cast<std::streamsize>(
+        std::min<std::uint64_t>(left, static_cast<std::uint64_t>(buf.size())));
+    in.read(buf.data(), chunk);
+    const auto n = in.gcount();
+    if (n <= 0) break;
+    boost::asio::write(sock, boost::asio::buffer(buf.data(), static_cast<std::size_t>(n)),
+                       ec);
+    if (ec) return false;
+    left -= static_cast<std::uint64_t>(n);
+  }
+  return left == 0;
+}
+
+void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& path_q,
+                     bool keep_alive) {
+  if (r.code == "not_primary") {
+    write_not_primary(sock, path_q, r, keep_alive);
+    return;
+  }
+  write_json(sock, status_for(r), "Error",
+             {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
+}
+
 bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& ec) {
   line.clear();
   char c;
@@ -322,13 +409,44 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
       }
     }
-    if (content_length > kMaxBodySize) {
+    if (content_length > cfg_.max_object_bytes) {
       write_json(*sock, 413, "Payload Too Large", {{"error", "body too large"}}, false);
       return;
     }
 
-    std::vector<std::uint8_t> body(content_length);
-    if (content_length > 0) {
+    constexpr std::size_t kMemThreshold = 256u * 1024u;
+    std::vector<std::uint8_t> body;
+    std::string upload_path;
+    std::uint32_t upload_crc = 0;
+    if (content_length > 0 && content_length > kMemThreshold) {
+      upload_path =
+          (fs::temp_directory_path() / ("aios-upload-" + std::to_string(aios::now_ms())))
+              .string();
+      std::ofstream out(upload_path, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        write_json(*sock, 500, "Error", {{"error", "cannot create upload temp"}}, false);
+        return;
+      }
+      std::vector<std::uint8_t> buf(256 * 1024);
+      std::size_t left = content_length;
+      upload_crc = 0;
+      std::uint32_t crc = 0;
+      while (left > 0) {
+        const auto n = std::min(left, buf.size());
+        boost::asio::read(*sock, boost::asio::buffer(buf.data(), n), ec);
+        if (ec) {
+          out.close();
+          fs::remove(upload_path);
+          return;
+        }
+        out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(n));
+        crc = crc32c_update(crc, buf.data(), n);
+        left -= n;
+      }
+      out.close();
+      upload_crc = crc;
+    } else if (content_length > 0) {
+      body.resize(content_length);
       boost::asio::read(*sock, boost::asio::buffer(body), ec);
       if (ec) return;
     }
@@ -388,7 +506,13 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
       const auto cursor = qmap.count("cursor") ? qmap["cursor"] : "";
       const bool include_attrs = qmap.count("attrs") && qmap["attrs"] == "1";
-      auto r = objects_.api_list(prefix, attr_key, attr_val, limit, cursor, include_attrs);
+      const bool cluster = !(qmap.count("scope") && qmap["scope"] == "local");
+      auto r =
+          objects_.api_list(prefix, attr_key, attr_val, limit, cursor, include_attrs, cluster);
+      if (!r.ok) {
+        write_api_error(*sock, r, target, keep_alive);
+        continue;
+      }
       nlohmann::json arr = nlohmann::json::array();
       for (const auto& o : r.list.objects) {
         nlohmann::json jo = {{"oid", o.oid}, {"size", o.size}, {"mtime_ms", o.mtime_ms}};
@@ -502,6 +626,14 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
           r = objects_.api_put_redirect(oid, redirect_to, attrs, true, preds);
         } else if (!cr.empty()) {
+          if (!upload_path.empty()) {
+            std::error_code rec;
+            fs::remove(upload_path, rec);
+            upload_path.clear();
+            write_json(*sock, 413, "Payload Too Large",
+                       {{"error", "ranged PUT exceeds in-memory limit"}}, keep_alive);
+            continue;
+          }
           std::uint64_t start = 0, end = 0;
           std::string perr;
           if (!parse_content_range(cr, start, end, perr)) {
@@ -521,13 +653,22 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
           r = objects_.api_put_range(oid, start, body.data(), body.size(), attrs, false,
                                      preds);
+        } else if (!upload_path.empty()) {
+          r = objects_.api_put_file(oid, upload_path, content_length, upload_crc, attrs, true,
+                                    preds, expected_crc);
+          std::error_code rec;
+          fs::remove(upload_path, rec);
+          upload_path.clear();
         } else {
           r = objects_.api_put(oid, body.data(), body.size(), attrs, true, preds,
                                expected_crc);
         }
         if (!r.ok) {
-          write_json(*sock, status_for(r), "Error",
-                     {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
+          if (!upload_path.empty()) {
+            std::error_code rec;
+            fs::remove(upload_path, rec);
+          }
+          write_api_error(*sock, r, target, keep_alive);
           continue;
         }
         std::unordered_map<std::string, std::string> rh = {
@@ -568,8 +709,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         auto r = objects_.api_get(oid, off, end, preds, ver);
         if (!r.ok) {
-          write_json(*sock, status_for(r), "Error",
-                     {{"error", r.error}, {"code", r.code}}, keep_alive);
+          write_api_error(*sock, r, target, keep_alive);
           continue;
         }
         if (!r.redirect_oid.empty()) {
@@ -611,6 +751,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             write_response(*sock, 206, "Partial Content", rh, r.data->data(), r.data->size(),
                            keep_alive);
           }
+        } else if (!r.body_path.empty() && r.info) {
+          write_file_body(*sock, 200, "OK", rh, r.body_path, r.info->size, method == "HEAD",
+                          keep_alive);
         } else {
           const auto* p = (method == "HEAD" || !r.data) ? nullptr : r.data->data();
           const auto n = r.data ? r.data->size() : 0;

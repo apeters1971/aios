@@ -141,6 +141,25 @@ class ObjectStore {
                    const std::unordered_map<std::string, std::string>& attrs,
                    bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
                    PreparedVersion& out, std::string& err);
+  // FS-backed prepare from a completed staging file (moved into place). Always non-inline.
+  bool prepare_put_file(const std::string& oid, const std::string& staging_abs_path,
+                        std::uint64_t size, std::uint32_t crc32c_val,
+                        const std::unordered_map<std::string, std::string>& attrs,
+                        bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
+                        PreparedVersion& out, std::string& err);
+
+  // Streaming upload helpers (shard tmp → version path).
+  bool create_staging_file(const std::string& oid, std::string& abs_path_out,
+                           std::string& err);
+  // Deterministic replica staging path for oid@seq (under shard tmp/).
+  bool stage_path_for(const std::string& oid, std::uint64_t seq, std::string& abs_path_out,
+                      std::string& err);
+  bool stage_truncate(const std::string& abs_path, std::string& err);
+  bool stage_pwrite(const std::string& abs_path, std::uint64_t offset, const std::uint8_t* data,
+                    std::size_t len, std::string& err);
+  bool place_staging_as_version(const std::string& oid, std::uint64_t seq,
+                                const std::string& staging_abs_path, std::string& relpath_out,
+                                std::string& err);
   bool prepare_put_range(const std::string& oid, std::uint64_t offset,
                          const std::uint8_t* data, std::size_t len,
                          const std::unordered_map<std::string, std::string>& attrs,

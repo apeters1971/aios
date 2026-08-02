@@ -22,6 +22,7 @@ bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
 struct RpcHandlers {
   std::string local_node_id;
   std::string local_listen;  // advertise address host:port
+  std::string local_http_addr;  // host:port HTTP (optional)
   std::string cluster_key;
   int auth_skew_ms{60000};
 

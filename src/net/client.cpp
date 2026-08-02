@@ -13,8 +13,8 @@ GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
                                       const std::string& local_node_id,
                                       const std::string& local_listen,
                                       const std::string& cluster_key, int auth_skew_ms,
-                                      MembershipTable& membership,
-                                      FsTable& fs_table) {
+                                      MembershipTable& membership, FsTable& fs_table,
+                                      const std::string& local_http_addr) {
   GossipExchangeResult result;
   std::string host, port;
   if (!split_host_port(peer_addr, host, port)) {
@@ -40,7 +40,9 @@ GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
   std::string err;
   Frame hello;
   hello.type = MsgType::Hello;
-  hello.body = {{"node_id", local_node_id}, {"listen", local_listen}};
+  hello.body = {{"node_id", local_node_id},
+                {"listen", local_listen},
+                {"http_addr", local_http_addr}};
   auth_sign(hello.body, MsgType::Hello, cluster_key);
   if (!write_frame(sock, hello, err, ec)) {
     result.error = "hello write: " + err;
@@ -59,6 +61,7 @@ GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
   result.peer_node_id = hello_reply.body.value("node_id", "");
   result.peer_listen = hello_reply.body.value("listen", peer_addr);
   if (result.peer_listen.empty()) result.peer_listen = peer_addr;
+  const std::string peer_http = hello_reply.body.value("http_addr", "");
 
   // cluster_map is rebuilt locally from membership + fs_table; gossip carries
   // only those sources. Peers may optionally echo cluster_map in replies.
@@ -88,7 +91,7 @@ GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
 
   const auto now = now_ms();
   if (!result.peer_node_id.empty()) {
-    membership.mark_alive(result.peer_node_id, result.peer_listen, now);
+    membership.mark_alive(result.peer_node_id, result.peer_listen, now, peer_http);
   }
   if (gossip_reply.body.contains("membership")) {
     membership.merge(MembershipTable::from_json(gossip_reply.body["membership"]),
