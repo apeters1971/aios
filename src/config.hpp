@@ -24,9 +24,11 @@ struct Config {
   int write_quorum{0};
   // Durability profile: "replica" (default) or "ec" (erasure coding).
   std::string durability{"replica"};
-  // EC parameters (used when durability == "ec"). v1: XOR parity requires m == 1.
+  // EC parameters (used when durability == "ec").
   int ec_k{2};
   int ec_m{1};
+  // EC codec: "" (auto: xor if m==1 else isal), "xor", or "isal".
+  std::string ec_codec;
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};

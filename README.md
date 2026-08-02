@@ -10,7 +10,7 @@ This repository currently ships **`aiosd`**: a standalone C++20 daemon that
 4. Prepares `…/aios/` object-storage target directories
 5. Gossips `statvfs` capacity for usable targets
 6. Builds a **cluster map** (epoch + targets) and serves object **Put/Get/Del/Stat** RPCs
-7. Performs **server-side primary replication** (`replica_count`) or optional **XOR erasure coding** (`durability: ec`, v1 `2+1`) with a background repair loop
+7. Performs **server-side primary replication** (`replica_count`) or optional **erasure coding** (`durability: ec`: XOR `2+1`, or ISA-L Reed–Solomon e.g. `4+2` when libisal is available) with a background repair loop
 8. Exposes an **HTTP object API** (`http_listen`, default `:7480`) with ranged PUT/GET, attr preconditions, LIST, DELETE, and cross-object transactions (`/txn`)
 
 Plus a local **hybrid object store** library and **`aios-bench`**. Clients are thin and placement-aware: they contact the primary (HTTP or TCP++); the primary fans out replicas. See [`proto/http.md`](proto/http.md).
@@ -28,8 +28,9 @@ Requirements:
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH"   # macOS Homebrew
+# Optional for Reed–Solomon EC (m>1): brew install isa-l
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_PREFIX_PATH="/opt/homebrew;/opt/homebrew/opt/sqlite;/opt/homebrew/opt/openssl@3"
+  -DCMAKE_PREFIX_PATH="/opt/homebrew;/opt/homebrew/opt/sqlite;/opt/homebrew/opt/openssl@3;/opt/homebrew/opt/isa-l"
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
@@ -60,7 +61,7 @@ CLI overrides: `--cluster-key`, `--config`, `--listen`, `--peer` (repeatable), `
 Placement is deterministic: `place(oid, cluster_map) → acting_set` (primary = `[0]`).
 
 - **`durability: replica` (default):** primary writes the full object and fans out identical copies; ACK when `write_quorum` copies succeed.
-- **`durability: ec` (v1):** XOR `ec_k + ec_m` with `m=1` (typical `2+1`). Primary stripes the object, installs one shard per acting-set target, and publishes tips together. GET reconstructs from any `k` shards; repair rebuilds a missing shard. Ranged PUT is rejected; objects larger than 16 MiB via staging are rejected in v1.
+- **`durability: ec`:** Primary stripes into `ec_k + ec_m` shards (one per acting-set target). GET reconstructs from any `k` shards; repair rebuilds missing shards. Codec is auto-selected (`xor` when `ec_m=1`, else `isal` / Reed–Solomon via Intel ISA-L). Build with `AIOS_WITH_ISAL=ON` (default) and install `libisal` (e.g. `brew install isa-l`) for `m>1`. Ranged PUT is rejected; staged PUT capped at 16 MiB for now.
 
 See [`proto/README.md`](proto/README.md).
 

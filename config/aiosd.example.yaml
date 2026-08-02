@@ -14,9 +14,10 @@ scan_interval_ms: 5000
 # Server-side redundancy (primary fans out to secondaries).
 replica_count: 3
 # write_quorum: 0          # 0 => same as replica_count (capped by acting set size)
-# durability: replica      # or "ec" for XOR erasure coding (v1: ec_k + ec_m shards)
+# durability: replica      # or "ec" for erasure coding
 # ec_k: 2
-# ec_m: 1                  # v1 requires m=1 (XOR parity)
+# ec_m: 1                  # m=1 → XOR; m>1 needs ISA-L (e.g. 4+2)
+# ec_codec:                # empty=auto (xor if m==1 else isal), or "xor" / "isal"
 
 # repair_interval_ms: 30000
 # repair_batch_oids: 256

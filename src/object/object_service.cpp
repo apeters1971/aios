@@ -1,8 +1,8 @@
 #include "object/object_service.hpp"
 
 #include "cluster/place.hpp"
+#include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
-#include "ec/xor_parity.hpp"
 #include "net/object_client.hpp"
 #include "util/base64.hpp"
 #include "util/crc32c.hpp"
@@ -803,7 +803,7 @@ ApiResult ObjectService::commit_ec_put(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     std::optional<std::uint32_t> expected_crc32c) {
   std::string err;
-  auto codec = make_xor_parity_codec(cfg_.ec_k, err);
+  auto codec = make_erasure_codec(cfg_.ec_k, cfg_.ec_m, cfg_.ec_codec, err);
   if (!codec) return fail("bad_request", err);
   if (static_cast<int>(placement.acting_set.size()) < codec->shard_count()) {
     return fail("no_targets", "acting set smaller than k+m");
@@ -895,7 +895,7 @@ ApiResult ObjectService::reconstruct_ec_object(
   auto meta = parse_ec_attrs(tip_attrs);
   if (!meta) return fail("store_error", "missing ec attrs");
   std::string err;
-  auto codec = make_xor_parity_codec(meta->k, err);
+  auto codec = make_erasure_codec(meta->k, meta->m, meta->codec, err);
   if (!codec || codec->m() != meta->m) return fail("store_error", "unsupported ec profile");
   if (static_cast<int>(placement.acting_set.size()) < codec->shard_count()) {
     return fail("no_targets", "acting set smaller than k+m");

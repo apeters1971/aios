@@ -1,8 +1,8 @@
 #include "object/repair.hpp"
 
 #include "cluster/place.hpp"
+#include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
-#include "ec/xor_parity.hpp"
 #include "net/object_client.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
@@ -295,7 +295,7 @@ bool repair_ec_object(const Config& cfg, const std::string& advertise, const Clu
   if (!meta) return false;
 
   std::string err;
-  auto codec = make_xor_parity_codec(meta->k, err);
+  auto codec = make_erasure_codec(meta->k, meta->m, meta->codec, err);
   if (!codec || codec->m() != meta->m) return false;
   if (static_cast<int>(p.acting_set.size()) < codec->shard_count()) return false;
 

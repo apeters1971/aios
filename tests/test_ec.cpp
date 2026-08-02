@@ -1,5 +1,6 @@
 #include "test_helpers.hpp"
 
+#include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
 #include "ec/xor_parity.hpp"
 #include "object/repair.hpp"
@@ -105,6 +106,57 @@ int test_ec() {
       expect(std::string(out.begin(), out.end()) == payload,
              "payload match missing " + std::to_string(missing));
     }
+  }
+
+  // ISA-L Reed–Solomon 4+2 (skipped when libisal not linked).
+  if (isal_ec_available()) {
+    std::string err;
+    auto codec = make_erasure_codec(4, 2, "isal", err);
+    expect(codec != nullptr, "make isal 4+2");
+    const std::string payload =
+        "isal-reed-solomon-payload-abcdefghijklmnopqrstuvwxyz-0123456789";
+    std::vector<std::vector<std::uint8_t>> shards;
+    expect(codec->encode(std::span<const std::uint8_t>(
+                             reinterpret_cast<const std::uint8_t*>(payload.data()),
+                             payload.size()),
+                         shards, err),
+           "isal encode");
+    expect(shards.size() == 6, "isal 6 shards");
+
+    // Drop two shards (data + parity).
+    {
+      std::vector<std::optional<std::vector<std::uint8_t>>> in(6);
+      for (int i = 0; i < 6; ++i) {
+        if (i == 1 || i == 5) continue;
+        in[static_cast<std::size_t>(i)] = shards[static_cast<std::size_t>(i)];
+      }
+      std::vector<std::uint8_t> out;
+      expect(codec->decode(in, payload.size(), out, err), "isal decode 2 missing");
+      expect(std::string(out.begin(), out.end()) == payload, "isal payload match");
+    }
+
+    // Service path with isal 2+1 on three local targets.
+    {
+      TripleStoreFixture fx;
+      fx.cfg.ec_codec = "isal";
+      fx.svc = std::make_unique<ObjectService>(fx.cfg, fx.map, fx.stores);
+      fx.svc->set_advertise("127.0.0.1:7400");
+      const std::string oid = "ec/isal-2+1";
+      const auto* body = reinterpret_cast<const std::uint8_t*>("isal-two-plus-one!");
+      const std::size_t len = 18;
+      auto put = fx.svc->api_put(oid, body, len, {}, true, {});
+      expect(put.ok, "isal service put");
+      auto got = fx.svc->api_get(oid, std::nullopt, std::nullopt, {});
+      expect(got.ok && got.data.has_value(), "isal service get");
+      expect(std::string(got.data->begin(), got.data->end()) ==
+                 std::string(reinterpret_cast<const char*>(body), len),
+             "isal service body");
+      expect(got.attrs.count("aios.ec.codec") && got.attrs.at("aios.ec.codec") == "isal",
+             "isal attr");
+    }
+  } else {
+    std::string err;
+    expect(make_erasure_codec(4, 2, "isal", err) == nullptr, "isal unavailable without lib");
   }
 
   TripleStoreFixture fx;

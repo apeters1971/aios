@@ -9,7 +9,7 @@
 
 namespace aios {
 
-// Thin codec interface. v1: XOR parity (m=1). Later: ISA-L Reed–Solomon.
+// Thin codec interface: XOR parity (m=1) and optional ISA-L Reed–Solomon.
 struct ErasureCodec {
   virtual ~ErasureCodec() = default;
 

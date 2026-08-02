@@ -1,5 +1,6 @@
 #include "config.hpp"
 
+#include "ec/codec_factory.hpp"
 #include "node_id.hpp"
 
 #include <yaml-cpp/yaml.h>
@@ -56,6 +57,7 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["durability"]) cfg.durability = root["durability"].as<std::string>();
     if (root["ec_k"]) cfg.ec_k = root["ec_k"].as<int>();
     if (root["ec_m"]) cfg.ec_m = root["ec_m"].as<int>();
+    if (root["ec_codec"]) cfg.ec_codec = root["ec_codec"].as<std::string>();
     if (root["repair_interval_ms"])
       cfg.repair_interval_ms = root["repair_interval_ms"].as<int>();
     if (root["repair_batch_oids"])
@@ -161,6 +163,12 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       cfg.ec_m = std::stoi(v);
       continue;
     }
+    if (arg == "--ec-codec") {
+      const char* v = need("--ec-codec");
+      if (!v) return false;
+      cfg.ec_codec = v;
+      continue;
+    }
     if (arg == "--http-listen") {
       const char* v = need("--http-listen");
       if (!v) return false;
@@ -196,11 +204,23 @@ bool normalize_config(Config& cfg, std::string& err) {
     err = "ec_k and ec_m must be >= 1";
     return false;
   }
-  // v1: XOR parity only (m == 1).
-  if (cfg.ec_m != 1) {
-    err = "ec v1 supports only m=1 (XOR parity); use ISA-L RS later for m>1";
+  std::string codec = cfg.ec_codec;
+  if (codec.empty()) codec = (cfg.ec_m == 1) ? "xor" : "isal";
+  if (codec == "xor") {
+    if (cfg.ec_m != 1) {
+      err = "ec_codec=xor requires ec_m=1";
+      return false;
+    }
+  } else if (codec == "isal" || codec == "rs") {
+    if (!isal_ec_available()) {
+      err = "ec_codec=isal requires a build with ISA-L (AIOS_WITH_ISAL + libisal)";
+      return false;
+    }
+  } else {
+    err = "ec_codec must be empty, 'xor', or 'isal'";
     return false;
   }
+  cfg.ec_codec = codec;
   cfg.replica_count = cfg.ec_k + cfg.ec_m;
   if (cfg.write_quorum == 0) cfg.write_quorum = cfg.replica_count;
   return true;

@@ -47,6 +47,31 @@ FetchContent_Declare(
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+# Optional Intel ISA-L for Reed–Solomon EC (m>1). XOR (m=1) always available.
+option(AIOS_WITH_ISAL "Enable Intel ISA-L Reed-Solomon erasure coding when found" ON)
+set(AIOS_HAVE_ISAL OFF)
+if(AIOS_WITH_ISAL)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(ISAL QUIET IMPORTED_TARGET libisal)
+  endif()
+  if(TARGET PkgConfig::ISAL)
+    set(AIOS_HAVE_ISAL ON)
+    message(STATUS "ISA-L: enabled (pkg-config)")
+  else()
+    find_path(ISAL_INCLUDE_DIR NAMES isa-l.h
+      PATHS /opt/homebrew/include /usr/local/include /usr/include)
+    find_library(ISAL_LIBRARY NAMES isal
+      PATHS /opt/homebrew/lib /usr/local/lib /usr/lib)
+    if(ISAL_INCLUDE_DIR AND ISAL_LIBRARY)
+      set(AIOS_HAVE_ISAL ON)
+      message(STATUS "ISA-L: enabled (${ISAL_LIBRARY})")
+    else()
+      message(STATUS "ISA-L: not found (EC m>1 disabled; XOR m=1 still available)")
+    endif()
+  endif()
+endif()
+
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(aios_core STATIC
@@ -69,6 +94,8 @@ add_library(aios_core STATIC
   src/cluster/cluster_map.cpp
   src/cluster/place.cpp
   src/ec/xor_parity.cpp
+  src/ec/isal_rs.cpp
+  src/ec/codec_factory.cpp
   src/object/object_service.cpp
   src/object/repair.cpp
   src/http/http_auth.cpp
@@ -85,6 +112,15 @@ target_link_libraries(aios_core PUBLIC
   yaml-cpp
   nlohmann_json::nlohmann_json
 )
+if(AIOS_HAVE_ISAL)
+  target_compile_definitions(aios_core PUBLIC AIOS_HAVE_ISAL=1)
+  if(TARGET PkgConfig::ISAL)
+    target_link_libraries(aios_core PUBLIC PkgConfig::ISAL)
+  else()
+    target_include_directories(aios_core PUBLIC ${ISAL_INCLUDE_DIR})
+    target_link_libraries(aios_core PUBLIC ${ISAL_LIBRARY})
+  endif()
+endif()
 
 add_executable(aiosd src/main.cpp)
 target_link_libraries(aiosd PRIVATE aios_core)
