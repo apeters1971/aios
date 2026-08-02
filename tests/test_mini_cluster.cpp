@@ -3,12 +3,14 @@
 #include "cluster/cluster_map.hpp"
 #include "cluster/place.hpp"
 #include "config.hpp"
+#include "ec/ec_attrs.hpp"
 #include "fs/aios_scan.hpp"
 #include "fs/fs_table.hpp"
 #include "membership.hpp"
 #include "net/object_client.hpp"
 #include "net/server.hpp"
 #include "object/object_service.hpp"
+#include "object/repair.hpp"
 #include "store/local_stores.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
@@ -43,6 +45,9 @@ struct MiniNode {
   bool running{false};
 
   void start(aios::ClusterMap& map) {
+    if (running) return;
+    ioc.restart();
+
     aios::ObjectStoreOptions opts;
     opts.shard_count = 4;
     opts.clone_required = false;
@@ -95,7 +100,9 @@ struct MiniCluster {
   std::vector<std::unique_ptr<MiniNode>> nodes;
   std::string cluster_key{"550e8400-e29b-41d4-a716-446655440000"};
 
-  explicit MiniCluster(int n, int replica_count, int write_quorum) {
+  explicit MiniCluster(int n, int replica_count, int write_quorum,
+                       const std::string& durability = "replica", int ec_k = 2, int ec_m = 1,
+                       const std::string& ec_codec = "") {
     root = temp_root("aios-mini-cluster");
     const int base_port = 19100 + static_cast<int>(::getpid() % 400);
 
@@ -116,9 +123,17 @@ struct MiniCluster {
       node->cfg.cluster_key = cluster_key;
       node->cfg.replica_count = replica_count;
       node->cfg.write_quorum = write_quorum;
+      node->cfg.durability = durability;
+      node->cfg.ec_k = ec_k;
+      node->cfg.ec_m = ec_m;
+      node->cfg.ec_codec = ec_codec;
       node->cfg.auth_skew_ms = 60000;
       node->cfg.clone_required = false;
       node->cfg.max_versions = 16;
+      if (durability == "ec") {
+        std::string err;
+        expect(aios::normalize_config(node->cfg, err), "normalize mini ec " + node->id);
+      }
 
       if (i == 0) {
         membership.set_local(node->id, node->addr);
@@ -144,7 +159,9 @@ struct MiniCluster {
       nodes.push_back(std::move(node));
     }
     fs_table.merge(remotes);
-    map = aios::ClusterMap::build(membership, fs_table, replica_count);
+    const int map_replicas =
+        (durability == "ec" && !nodes.empty()) ? nodes[0]->cfg.replica_count : replica_count;
+    map = aios::ClusterMap::build(membership, fs_table, map_replicas);
 
     for (auto& node : nodes) node->start(map);
   }
@@ -337,6 +354,62 @@ int test_mini_cluster() {
                                60000, cluster.map.epoch, secondary->aios_path, oid);
     expect(g.ok && g.data && std::string(g.data->begin(), g.data->end()) == "ab",
            "2-node tcp get");
+  }
+
+  // --- EC XOR 2+1 across 3 nodes: degraded GET + repair after peer kill ---
+  {
+    MiniCluster cluster(3, /*replica_count=*/3, /*write_quorum=*/3, "ec", 2, 1, "xor");
+    const std::string oid = "cluster/ec-xor";
+    auto placement = place(oid, cluster.map);
+    expect(placement.acting_set.size() == 3, "ec acting 3");
+    auto* primary = cluster.by_id(placement.acting_set[0].node_id);
+    auto* shard1 = cluster.by_id(placement.acting_set[1].node_id);
+    auto* shard2 = cluster.by_id(placement.acting_set[2].node_id);
+    expect(primary && shard1 && shard2, "ec nodes");
+
+    const auto* payload = reinterpret_cast<const std::uint8_t*>("cross-node-ec!!");
+    const std::size_t len = 15;
+    auto put = primary->svc->api_put(oid, payload, len, {}, true, {});
+    expect(put.ok && put.replicas == 3, "ec cross-node put");
+
+    // All three nodes hold a shard tip.
+    std::string err;
+    for (const auto& t : placement.acting_set) {
+      auto* n = cluster.by_id(t.node_id);
+      expect(n && n->stores.get(t.aios_path)->stat(oid, err), "ec shard present " + t.node_id);
+      auto attrs = n->stores.get(t.aios_path)->list_attrs(oid, err);
+      expect(attrs_are_ec(attrs), "ec attrs on " + t.node_id);
+    }
+
+    // Kill one shard holder; primary reconstructs via remote GETs.
+    shard2->stop();
+    auto degraded = primary->svc->api_get(oid, std::nullopt, std::nullopt, {});
+    expect(degraded.ok && degraded.data &&
+               std::string(degraded.data->begin(), degraded.data->end()) ==
+                   std::string(reinterpret_cast<const char*>(payload), len),
+           "ec degraded get across nodes");
+
+    // Restart victim empty (new store dir already purged by stop leaving data — node still has
+    // disk). Clear its local tip then repair from primary.
+    shard2->start(cluster.map);
+    {
+      auto* store = shard2->stores.get(placement.acting_set[2].aios_path);
+      expect(store != nullptr, "restarted store");
+      auto st = store->stat(oid, err);
+      if (st) expect(store->purge_version(oid, st->seq, true, err), "clear shard2 tip");
+      expect(!store->stat(oid, err), "shard2 empty before repair");
+    }
+    auto stats =
+        run_repair(primary->cfg, primary->addr, cluster.map, primary->stores, 256);
+    expect(stats.under_replicated >= 1 && stats.repaired >= 1, "ec cross-node repair");
+    expect(shard2->stores.get(placement.acting_set[2].aios_path)->stat(oid, err).has_value(),
+           "shard2 restored");
+
+    auto healthy = primary->svc->api_get(oid, std::nullopt, std::nullopt, {});
+    expect(healthy.ok && healthy.data &&
+               std::string(healthy.data->begin(), healthy.data->end()) ==
+                   std::string(reinterpret_cast<const char*>(payload), len),
+           "ec get after repair");
   }
 
   return failures();
