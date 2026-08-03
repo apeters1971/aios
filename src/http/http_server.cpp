@@ -3,7 +3,9 @@
 #include "http/http_auth.hpp"
 #include "net/framing.hpp"
 #include "object/object_layout.hpp"
+#include "object/pubsub.hpp"
 #include "util/auth.hpp"
+#include "util/base64.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
 
@@ -210,6 +212,8 @@ int status_for(const ApiResult& r) {
   if (r.code == "bad_request") return 400;
   if (r.code == "conflict") return 409;
   if (r.code == "lock_held") return 409;
+  if (r.code == "mode_mismatch") return 409;
+  if (r.code == "payload_too_large") return 413;
   return 500;
 }
 
@@ -529,6 +533,163 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_json(*sock_ptr, 200, "OK", {{"events", arr}}, false);
       }).detach();
       return;
+    }
+
+    // Pub/sub: /pubsub/{topic}, /pubsub/{topic}/publish, /pubsub/{topic}/subscribe
+    if (path.rfind("/pubsub/", 0) == 0) {
+      const std::string rest = path.substr(8);
+      std::string topic_raw = rest;
+      std::string sub;
+      if (rest.size() >= 8 && rest.compare(rest.size() - 8, 8, "/publish") == 0) {
+        topic_raw = rest.substr(0, rest.size() - 8);
+        sub = "publish";
+      } else if (rest.size() >= 10 && rest.compare(rest.size() - 10, 10, "/subscribe") == 0) {
+        topic_raw = rest.substr(0, rest.size() - 10);
+        sub = "subscribe";
+      }
+      const std::string topic = url_decode(topic_raw);
+      if (topic.empty()) {
+        write_json(*sock, 400, "Bad Request", {{"error", "empty topic"}}, keep_alive);
+        continue;
+      }
+
+      auto parse_delivery = [&]() -> std::optional<DeliveryMode> {
+        if (!qmap.count("delivery")) return std::nullopt;
+        return parse_delivery_mode(qmap.at("delivery"));
+      };
+      auto parse_capacity = [&]() -> std::optional<std::size_t> {
+        if (!qmap.count("capacity")) return std::nullopt;
+        try {
+          const auto v = static_cast<std::size_t>(std::stoull(qmap.at("capacity")));
+          return v;
+        } catch (...) {
+          return std::nullopt;
+        }
+      };
+
+      if (sub.empty() && method == "PUT") {
+        auto mode = parse_delivery();
+        if (!mode) {
+          if (qmap.count("delivery")) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad delivery"}}, keep_alive);
+            continue;
+          }
+          mode = DeliveryMode::Buffered;
+        }
+        std::size_t capacity = TopicHub::kDefaultCapacity;
+        if (auto c = parse_capacity()) {
+          capacity = *c;
+        } else if (qmap.count("capacity")) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad capacity"}}, keep_alive);
+          continue;
+        }
+        auto r = objects_.api_pubsub_create(topic, *mode, capacity);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 201, "Created", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+
+      if (sub.empty() && method == "GET") {
+        auto r = objects_.api_pubsub_stat(topic);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+
+      if (sub == "publish" && method == "POST") {
+        if (!upload_path.empty() || body.size() > TopicHub::kMaxMessageBytes ||
+            content_length > TopicHub::kMaxMessageBytes) {
+          if (!upload_path.empty()) {
+            std::error_code rec;
+            fs::remove(upload_path, rec);
+            upload_path.clear();
+          }
+          write_json(*sock, 413, "Payload Too Large",
+                     {{"error", "message exceeds 1 MiB"}, {"code", "payload_too_large"}},
+                     keep_alive);
+          continue;
+        }
+        std::optional<DeliveryMode> mode = parse_delivery();
+        if (qmap.count("delivery") && !mode) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad delivery"}}, keep_alive);
+          continue;
+        }
+        std::size_t capacity = TopicHub::kDefaultCapacity;
+        if (auto c = parse_capacity()) {
+          capacity = *c;
+        } else if (qmap.count("capacity")) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad capacity"}}, keep_alive);
+          continue;
+        }
+        const std::string ct = header_get(headers, "content-type");
+        auto r = objects_.api_pubsub_publish(topic, body.data(), body.size(), ct, mode, capacity);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 201, "Created", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+
+      if (sub == "subscribe" && method == "GET") {
+        int timeout_ms = 30000;
+        if (qmap.count("timeout_ms")) {
+          try {
+            timeout_ms = std::stoi(qmap["timeout_ms"]);
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad timeout_ms"}}, keep_alive);
+            continue;
+          }
+        }
+        timeout_ms = std::max(1, std::min(timeout_ms, 120000));
+        std::uint64_t after_id = 0;
+        bool after_set = false;
+        if (qmap.count("after_id")) {
+          try {
+            after_id = static_cast<std::uint64_t>(std::stoull(qmap["after_id"]));
+            after_set = true;
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad after_id"}}, keep_alive);
+            continue;
+          }
+        }
+        auto sock_ptr = sock;
+        const std::string target_copy = target;
+        ObjectService* svc = &objects_;
+        std::thread([sock_ptr, svc, topic, after_id, after_set, timeout_ms, target_copy]() {
+          auto r = svc->api_pubsub_subscribe(topic, after_id, after_set, timeout_ms);
+          if (!r.ok) {
+            write_api_error(*sock_ptr, r, target_copy, false);
+            return;
+          }
+          if (r.code == "timeout") {
+            write_response(*sock_ptr, 204, "No Content",
+                           {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
+            return;
+          }
+          nlohmann::json arr = nlohmann::json::array();
+          for (const auto& m : r.pub_messages) {
+            arr.push_back({{"id", m.id},
+                           {"ts_ms", m.ts_ms},
+                           {"content_type", m.content_type},
+                           {"data_b64", base64_encode(m.data)}});
+          }
+          write_json(*sock_ptr, 200, "OK", {{"topic", topic}, {"messages", arr}}, false);
+        }).detach();
+        return;
+      }
+
+      write_json(*sock, 404, "Not Found", {{"error", "not found"}}, keep_alive);
+      continue;
     }
 
     // Cross-object transactions: /txn, /txn/{id}, /txn/{id}/commit|abort, /txn/{id}/o/{oid}

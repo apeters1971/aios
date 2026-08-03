@@ -43,6 +43,10 @@ Canonical string:
 | `GET` | `/o/{oid}/lock` | Stat held lock (no token in response) or `404` |
 | `GET` | `/o/{oid}/watch` | Long-poll tip change (`timeout_ms`, `after_seq`) → event or `204` |
 | `GET` | `/watch?prefix=` | Long-poll events for oids this node is primary for under `prefix` |
+| `PUT` | `/pubsub/{topic}?delivery=&capacity=` | Create/configure topic (`ephemeral`\|`buffered`\|`durable`) |
+| `GET` | `/pubsub/{topic}` | Topic stat `{topic,delivery,next_id,buffered,capacity}` |
+| `POST` | `/pubsub/{topic}/publish` | Publish raw body (≤1 MiB) → `201` `{topic,id,delivery,ts_ms}` |
+| `GET` | `/pubsub/{topic}/subscribe` | Long-poll (`timeout_ms`, `after_id`) → messages or `204` |
 | `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1&scope=` | LIST tip objects (default **cluster** scatter-gather; `scope=local` for this node) |
 | `GET` | `/map` | Cluster map JSON (targets include `http_addr`) |
 | `POST` | `/txn` | Begin cross-object txn → JSON `{txn_id,state,ops}` (201) |
@@ -129,6 +133,23 @@ Wrong coordinator → **307** like other mutating APIs.
 - `GET /watch?prefix=foo/&timeout_ms=30000` — events for oids **this node commits as primary** under `prefix` (not a cluster-wide stream)
 
 Long-polls run on worker threads so they do not block the daemon accept loop.
+
+### Pub/sub (HTTP long-poll)
+
+Coordinator is the primary for object `pubsub/{topic}` (wrong node → **307**). Delivery mode is sticky per topic (set on create or first publish; conflicting `delivery` → **409** `mode_mismatch`).
+
+| `delivery` | Behavior |
+|------------|----------|
+| `ephemeral` | Fanout to current subscribers only; no backlog (in-memory; lost on restart) |
+| `buffered` | In-memory ring (default `capacity=256`, max `4096`); catch up via `after_id` |
+| `durable` | Messages stored as objects `pubsub/{topic}/m/{id}` + meta tip `pubsub/{topic}`; survives restart |
+
+- `PUT /pubsub/{topic}?delivery=buffered&capacity=256` — create/configure → `201` stat JSON
+- `POST /pubsub/{topic}/publish?delivery=` — raw body (≤1 MiB; larger → **413**); optional `delivery` only if topic unset (default `buffered`)
+- `GET /pubsub/{topic}/subscribe?timeout_ms=30000&after_id=N` — wait for messages with `id > after_id` (default: current tip = next message); `200` `{"topic","messages":[{"id","ts_ms","content_type","data_b64"},...]}` or **204** on timeout
+- `GET /pubsub/{topic}` — stat
+
+Subscribe long-polls use worker threads (same as watches).
 
 ### Preconditions (412 on failure)
 

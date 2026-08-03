@@ -98,6 +98,7 @@ add_library(aios_core STATIC
   src/ec/codec_factory.cpp
   src/object/object_layout.cpp
   src/object/locks_watches.cpp
+  src/object/pubsub.cpp
   src/object/object_service.cpp
   src/object/repair.cpp
   src/http/http_auth.cpp
@@ -160,6 +161,7 @@ add_executable(aios_tests
   tests/test_ec.cpp
   tests/test_layout.cpp
   tests/test_locks_watches.cpp
+  tests/test_pubsub.cpp
   tests/test_main.cpp
 )
 target_link_libraries(aios_tests PRIVATE aios_core)

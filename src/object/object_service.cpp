@@ -2258,5 +2258,322 @@ ApiResult ObjectService::api_watch_prefix(const std::string& prefix, int timeout
   return r;
 }
 
+ApiResult ObjectService::load_pubsub_meta(const std::string& topic, DeliveryMode& mode_out,
+                                         std::uint64_t& next_id_out) {
+  const std::string oid = pubsub_meta_oid(topic);
+  auto gr = api_get(oid, std::nullopt, std::nullopt, {});
+  if (!gr.ok) return gr;
+  if (!gr.data || gr.data->empty()) return fail("bad_request", "empty pubsub meta");
+  try {
+    const auto j = nlohmann::json::parse(gr.data->begin(), gr.data->end());
+    const auto mode_s = j.value("delivery", "");
+    auto mode = parse_delivery_mode(mode_s);
+    if (!mode || *mode != DeliveryMode::Durable) {
+      return fail("bad_request", "invalid durable pubsub meta");
+    }
+    mode_out = DeliveryMode::Durable;
+    next_id_out = j.value("next_id", static_cast<std::uint64_t>(1));
+    if (next_id_out == 0) next_id_out = 1;
+    ApiResult ok;
+    ok.ok = true;
+    ok.epoch = map_.epoch;
+    return ok;
+  } catch (...) {
+    return fail("bad_request", "invalid pubsub meta json");
+  }
+}
+
+ApiResult ObjectService::save_pubsub_meta(const std::string& topic, DeliveryMode mode,
+                                         std::uint64_t next_id) {
+  const nlohmann::json j = {{"delivery", delivery_mode_name(mode)}, {"next_id", next_id}};
+  const auto s = j.dump();
+  const auto* p = reinterpret_cast<const std::uint8_t*>(s.data());
+  return api_put(pubsub_meta_oid(topic), p, s.size(), {{"content-type", "application/json"}},
+                 true, {});
+}
+
+ApiResult ObjectService::ensure_pubsub_topic(const std::string& topic,
+                                             std::optional<DeliveryMode> mode,
+                                             std::size_t capacity, DeliveryMode& mode_out) {
+  auto ok_res = [&] {
+    ApiResult r;
+    r.ok = true;
+    r.epoch = map_.epoch;
+    return r;
+  };
+
+  TopicStat st;
+  if (pubsub_.stat(topic, st)) {
+    if (mode && *mode != st.delivery) {
+      return fail("mode_mismatch", "topic delivery mode mismatch");
+    }
+    mode_out = st.delivery;
+    return ok_res();
+  }
+
+  // Try durable meta on disk.
+  DeliveryMode disk_mode = DeliveryMode::Durable;
+  std::uint64_t next_id = 1;
+  auto lr = load_pubsub_meta(topic, disk_mode, next_id);
+  if (lr.ok) {
+    if (mode && *mode != DeliveryMode::Durable) {
+      return fail("mode_mismatch", "topic delivery mode mismatch");
+    }
+    std::string code, err;
+    if (!pubsub_.ensure_durable(topic, next_id, code, err)) {
+      return fail(code.empty() ? "conflict" : code, err);
+    }
+    mode_out = DeliveryMode::Durable;
+    return ok_res();
+  }
+  if (lr.code != "not_found") return lr;
+
+  const DeliveryMode use = mode.value_or(DeliveryMode::Buffered);
+  std::string code, err;
+  if (!pubsub_.create(topic, use, capacity, code, err)) {
+    return fail(code.empty() ? "bad_request" : code, err);
+  }
+  if (use == DeliveryMode::Durable) {
+    auto sr = save_pubsub_meta(topic, DeliveryMode::Durable, 1);
+    if (!sr.ok) return sr;
+  }
+  mode_out = use;
+  return ok_res();
+}
+
+ApiResult ObjectService::api_pubsub_create(const std::string& topic, DeliveryMode mode,
+                                          std::size_t capacity) {
+  if (topic.empty()) return fail("bad_request", "empty topic");
+  Placement placement;
+  {
+    std::lock_guard lock(mu_);
+    auto pr = require_primary(pubsub_meta_oid(topic), placement);
+    if (!pr.ok) return pr;
+  }
+
+  TopicStat existing;
+  if (pubsub_.stat(topic, existing)) {
+    if (existing.delivery != mode) {
+      return fail("mode_mismatch", "topic delivery mode mismatch");
+    }
+  } else {
+    DeliveryMode disk_mode = DeliveryMode::Durable;
+    std::uint64_t next_id = 1;
+    auto lr = load_pubsub_meta(topic, disk_mode, next_id);
+    if (lr.ok) {
+      if (mode != DeliveryMode::Durable) {
+        return fail("mode_mismatch", "topic delivery mode mismatch");
+      }
+      std::string code, err;
+      if (!pubsub_.ensure_durable(topic, next_id, code, err)) {
+        return fail(code.empty() ? "conflict" : code, err);
+      }
+    } else if (lr.code == "not_found") {
+      std::string code, err;
+      if (!pubsub_.create(topic, mode, capacity, code, err)) {
+        return fail(code.empty() ? "bad_request" : code, err);
+      }
+      if (mode == DeliveryMode::Durable) {
+        auto sr = save_pubsub_meta(topic, DeliveryMode::Durable, 1);
+        if (!sr.ok) return sr;
+      }
+    } else {
+      return lr;
+    }
+  }
+
+  TopicStat st;
+  pubsub_.stat(topic, st);
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.json_body = {{"topic", topic},
+                 {"delivery", delivery_mode_name(st.delivery)},
+                 {"next_id", st.next_id},
+                 {"buffered", st.buffered},
+                 {"capacity", st.capacity}};
+  return r;
+}
+
+ApiResult ObjectService::api_pubsub_stat(const std::string& topic) {
+  if (topic.empty()) return fail("bad_request", "empty topic");
+  Placement placement;
+  {
+    std::lock_guard lock(mu_);
+    auto pr = require_primary(pubsub_meta_oid(topic), placement);
+    if (!pr.ok) return pr;
+  }
+
+  TopicStat st;
+  if (!pubsub_.stat(topic, st)) {
+    DeliveryMode disk_mode = DeliveryMode::Durable;
+    std::uint64_t next_id = 1;
+    auto lr = load_pubsub_meta(topic, disk_mode, next_id);
+    if (!lr.ok) {
+      if (lr.code == "not_found") return fail("not_found", "topic not found");
+      return lr;
+    }
+    std::string code, err;
+    pubsub_.ensure_durable(topic, next_id, code, err);
+    pubsub_.stat(topic, st);
+  }
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.json_body = {{"topic", topic},
+                 {"delivery", delivery_mode_name(st.delivery)},
+                 {"next_id", st.next_id},
+                 {"buffered", st.buffered},
+                 {"capacity", st.capacity}};
+  return r;
+}
+
+ApiResult ObjectService::api_pubsub_publish(const std::string& topic, const std::uint8_t* data,
+                                           std::size_t len, const std::string& content_type,
+                                           std::optional<DeliveryMode> mode,
+                                           std::size_t capacity) {
+  if (topic.empty()) return fail("bad_request", "empty topic");
+  if (len > TopicHub::kMaxMessageBytes) {
+    return fail("payload_too_large", "message exceeds 1 MiB");
+  }
+
+  Placement placement;
+  {
+    std::lock_guard lock(mu_);
+    auto pr = require_primary(pubsub_meta_oid(topic), placement);
+    if (!pr.ok) return pr;
+  }
+
+  DeliveryMode mode_out = DeliveryMode::Buffered;
+  auto er = ensure_pubsub_topic(topic, mode, capacity, mode_out);
+  if (!er.ok) return er;
+
+  PubMessage msg;
+  if (mode_out == DeliveryMode::Durable) {
+    std::string code, err;
+    if (!pubsub_.reserve_durable(topic, data, len, content_type, msg, code, err)) {
+      return fail(code.empty() ? "bad_request" : code, err);
+    }
+    // Persist message object + meta tip.
+    std::unordered_map<std::string, std::string> attrs;
+    if (!content_type.empty()) attrs["content-type"] = content_type;
+    attrs["aios.pubsub.id"] = std::to_string(msg.id);
+    attrs["aios.pubsub.ts_ms"] = std::to_string(msg.ts_ms);
+    auto put_msg = api_put(pubsub_msg_oid(topic, msg.id), data, len, attrs, true, {});
+    if (!put_msg.ok) return put_msg;
+    TopicStat st;
+    pubsub_.stat(topic, st);
+    auto put_meta = save_pubsub_meta(topic, DeliveryMode::Durable, st.next_id);
+    if (!put_meta.ok) return put_meta;
+    pubsub_.commit_durable(topic, msg);
+  } else {
+    DeliveryMode published_mode = mode_out;
+    std::string code, err;
+    if (!pubsub_.publish_memory(topic, mode, capacity, data, len, content_type, msg,
+                                published_mode, code, err)) {
+      return fail(code.empty() ? "bad_request" : code, err);
+    }
+    mode_out = published_mode;
+  }
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.json_body = {{"topic", topic},
+                 {"id", msg.id},
+                 {"delivery", delivery_mode_name(mode_out)},
+                 {"ts_ms", msg.ts_ms}};
+  return r;
+}
+
+ApiResult ObjectService::api_pubsub_subscribe(const std::string& topic, std::uint64_t after_id,
+                                             bool after_id_set, int timeout_ms) {
+  if (topic.empty()) return fail("bad_request", "empty topic");
+  Placement placement;
+  {
+    std::lock_guard lock(mu_);
+    auto pr = require_primary(pubsub_meta_oid(topic), placement);
+    if (!pr.ok) return pr;
+  }
+
+  TopicStat st;
+  bool known = pubsub_.stat(topic, st);
+  if (!known) {
+    DeliveryMode disk_mode = DeliveryMode::Durable;
+    std::uint64_t next_id = 1;
+    auto lr = load_pubsub_meta(topic, disk_mode, next_id);
+    if (lr.ok) {
+      std::string code, err;
+      pubsub_.ensure_durable(topic, next_id, code, err);
+      known = pubsub_.stat(topic, st);
+    } else if (lr.code != "not_found") {
+      return lr;
+    }
+  }
+  if (!known) {
+    // Allow waiting for first publish on this primary.
+    if (!after_id_set) after_id = 0;
+  } else if (!after_id_set) {
+    after_id = st.next_id > 0 ? st.next_id - 1 : 0;
+  }
+
+  std::vector<PubMessage> messages;
+
+  // Durable catch-up from object store.
+  if (known && st.delivery == DeliveryMode::Durable) {
+    const std::uint64_t tip = st.next_id > 0 ? st.next_id - 1 : 0;
+    for (std::uint64_t id = after_id + 1; id <= tip; ++id) {
+      auto gr = api_get(pubsub_msg_oid(topic, id), std::nullopt, std::nullopt, {});
+      if (!gr.ok) {
+        if (gr.code == "not_found") continue;
+        return gr;
+      }
+      PubMessage m;
+      m.id = id;
+      m.ts_ms = 0;
+      if (gr.attrs.count("aios.pubsub.ts_ms")) {
+        try {
+          m.ts_ms = std::stoll(gr.attrs.at("aios.pubsub.ts_ms"));
+        } catch (...) {
+        }
+      }
+      if (gr.attrs.count("content-type")) m.content_type = gr.attrs.at("content-type");
+      if (gr.data) m.data = *gr.data;
+      messages.push_back(std::move(m));
+    }
+    if (!messages.empty()) {
+      ApiResult r;
+      r.ok = true;
+      r.epoch = map_.epoch;
+      r.placement = placement;
+      r.pub_messages = std::move(messages);
+      r.json_body = {{"topic", topic}};
+      return r;
+    }
+  }
+
+  // Buffered catch-up / wait (and ephemeral/durable wait for next).
+  if (!pubsub_.subscribe(topic, after_id, timeout_ms, messages)) {
+    ApiResult r;
+    r.ok = true;
+    r.code = "timeout";
+    r.epoch = map_.epoch;
+    r.placement = placement;
+    return r;
+  }
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.pub_messages = std::move(messages);
+  r.json_body = {{"topic", topic}};
+  return r;
+}
+
 }  // namespace aios
 

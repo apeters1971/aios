@@ -6,6 +6,7 @@
 #include "net/framing.hpp"
 #include "object/locks_watches.hpp"
 #include "object/object_layout.hpp"
+#include "object/pubsub.hpp"
 #include "store/local_stores.hpp"
 #include "store/object_store.hpp"
 
@@ -39,6 +40,7 @@ struct ApiResult {
   std::optional<nlohmann::json> json_body;
   std::optional<WatchEvent> watch_event;
   std::vector<WatchEvent> watch_events;
+  std::vector<PubMessage> pub_messages;
 };
 
 // Handles object RPC + primary replication (prepare → quorum install → publish tip).
@@ -95,6 +97,19 @@ class ObjectService {
   ApiResult api_watch_oid(const std::string& oid, std::uint64_t after_seq, int timeout_ms);
   // Prefix watch: events for oids this node commits as primary under prefix.
   ApiResult api_watch_prefix(const std::string& prefix, int timeout_ms);
+
+  // Topic pub/sub (coordinator = primary for pubsub/{topic}). Subscribe blocks.
+  ApiResult api_pubsub_create(const std::string& topic, DeliveryMode mode,
+                              std::size_t capacity = TopicHub::kDefaultCapacity);
+  ApiResult api_pubsub_stat(const std::string& topic);
+  ApiResult api_pubsub_publish(const std::string& topic, const std::uint8_t* data,
+                               std::size_t len, const std::string& content_type,
+                               std::optional<DeliveryMode> mode = std::nullopt,
+                               std::size_t capacity = TopicHub::kDefaultCapacity);
+  // after_id_set=false → wait for next message after current tip.
+  ApiResult api_pubsub_subscribe(const std::string& topic, std::uint64_t after_id,
+                                 bool after_id_set, int timeout_ms);
+
   // cluster=true scatter-gathers ObjectList across nodes; false = local stores only.
   ApiResult api_list(const std::string& prefix, const std::string& attr_eq_key,
                      const std::string& attr_eq_value, std::size_t limit,
@@ -225,6 +240,13 @@ class ObjectService {
   ApiResult enforce_lock(const std::string& oid, const std::optional<std::string>& token);
   void signal_watch(const std::string& oid, std::uint64_t seq, const std::string& op);
 
+  ApiResult load_pubsub_meta(const std::string& topic, DeliveryMode& mode_out,
+                             std::uint64_t& next_id_out);
+  ApiResult save_pubsub_meta(const std::string& topic, DeliveryMode mode,
+                             std::uint64_t next_id);
+  ApiResult ensure_pubsub_topic(const std::string& topic, std::optional<DeliveryMode> mode,
+                                std::size_t capacity, DeliveryMode& mode_out);
+
   Config cfg_;
   ClusterMap& map_;
   LocalStores& stores_;
@@ -232,6 +254,7 @@ class ObjectService {
   mutable std::recursive_mutex mu_;
   LockTable locks_;
   WatchHub watches_;
+  TopicHub pubsub_;
 };
 
 }  // namespace aios
