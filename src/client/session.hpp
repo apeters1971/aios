@@ -39,6 +39,17 @@ struct AppendResult {
   std::uint64_t epoch{0};
 };
 
+struct ListObject {
+  std::string oid;
+  std::uint64_t size{0};
+  std::int64_t mtime_ms{0};
+};
+
+struct ListResult {
+  std::vector<ListObject> objects;
+  std::string next_cursor;
+};
+
 // Placement-aware HTTP session (HMAC + 307 follow).
 class Session {
  public:
@@ -66,6 +77,24 @@ class Session {
                            const std::string& stl_type, std::uint64_t expected_cas,
                            const std::optional<std::string>& lock_token = std::nullopt,
                            int stl_v = 1);
+
+  // Generic full PUT. If expected_cas has_value, uses attr aios.posix.cas:
+  // nullopt = unconditional; 0 = create-if-absent; N = require cas==N, write N+1.
+  // Returns new cas (0 if CAS not used).
+  std::uint64_t put_bytes(const std::string& oid, const std::string& body,
+                          const std::unordered_map<std::string, std::string>& attrs = {},
+                          std::optional<std::uint64_t> expected_cas = std::nullopt,
+                          const std::optional<std::string>& lock_token = std::nullopt);
+
+  // Partial PUT via Content-Range (replica tips only on server).
+  void put_range(const std::string& oid, std::uint64_t offset, const std::string& data,
+                 const std::optional<std::string>& lock_token = std::nullopt);
+
+  void delete_object(const std::string& oid,
+                     const std::optional<std::string>& lock_token = std::nullopt);
+
+  ListResult list_prefix(const std::string& prefix, std::size_t limit = 256,
+                         const std::string& cursor = {});
 
   // Atomic append (follows 307). Returns allocated offset + new size/seq.
   AppendResult append(const std::string& oid, const std::string& data,

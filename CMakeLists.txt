@@ -152,6 +152,39 @@ target_link_libraries(aios_client PUBLIC
 )
 target_link_libraries(aios_client PUBLIC aios_core)
 
+add_library(aios_posix STATIC
+  src/posix/posix_fs.cpp
+)
+target_include_directories(aios_posix PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(aios_posix PUBLIC aios_client)
+
+# Optional FUSE3 mount helper.
+option(AIOS_WITH_FUSE "Build aios-fuse when libfuse3 is available" ON)
+set(AIOS_HAVE_FUSE OFF)
+if(AIOS_WITH_FUSE)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
+  endif()
+  if(TARGET PkgConfig::FUSE3)
+    set(AIOS_HAVE_FUSE ON)
+    message(STATUS "FUSE3: enabled (pkg-config)")
+  else()
+    find_path(FUSE3_INCLUDE_DIR NAMES fuse3/fuse.h
+      PATHS /opt/homebrew/include /usr/local/include /usr/include)
+    find_library(FUSE3_LIBRARY NAMES fuse3
+      PATHS /opt/homebrew/lib /usr/local/lib /usr/lib)
+    if(FUSE3_INCLUDE_DIR AND FUSE3_LIBRARY)
+      set(AIOS_HAVE_FUSE ON)
+      message(STATUS "FUSE3: enabled (${FUSE3_LIBRARY})")
+    else()
+      message(STATUS "FUSE3: not found (aios-fuse disabled)")
+    endif()
+  endif()
+endif()
+
 add_executable(aiosd src/main.cpp)
 target_link_libraries(aiosd PRIVATE aios_core)
 
@@ -163,6 +196,21 @@ target_link_libraries(aios-store-bench PRIVATE aios_core)
 
 add_executable(aios tools/aios.cpp)
 target_link_libraries(aios PRIVATE aios_core)
+
+if(AIOS_HAVE_FUSE)
+  add_executable(aios-fuse
+    tools/aios_fuse.cpp
+    src/posix/fuse3_ops.cpp
+  )
+  target_link_libraries(aios-fuse PRIVATE aios_posix)
+  if(TARGET PkgConfig::FUSE3)
+    target_link_libraries(aios-fuse PRIVATE PkgConfig::FUSE3)
+  else()
+    target_include_directories(aios-fuse PRIVATE ${FUSE3_INCLUDE_DIR})
+    target_link_libraries(aios-fuse PRIVATE ${FUSE3_LIBRARY})
+  endif()
+  install(TARGETS aios-fuse RUNTIME DESTINATION bin)
+endif()
 
 enable_testing()
 add_executable(aios_tests
@@ -193,11 +241,13 @@ add_executable(aios_tests
   tests/test_stl_client.cpp
   tests/test_append.cpp
   tests/test_admin.cpp
+  tests/test_posix_fs.cpp
   tests/test_main.cpp
 )
-target_link_libraries(aios_tests PRIVATE aios_client)
+target_link_libraries(aios_tests PRIVATE aios_client aios_posix)
 add_test(NAME aios_tests COMMAND aios_tests)
 
 install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION bin)
-install(TARGETS aios_client ARCHIVE DESTINATION lib)
+install(TARGETS aios_client aios_posix ARCHIVE DESTINATION lib)
+install(FILES src/posix/aios_posix.h DESTINATION include/aios)
 install(FILES config/aiosd.example.yaml DESTINATION share/aios)

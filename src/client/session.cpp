@@ -267,6 +267,106 @@ ObjectSnapshot Session::get_range(const std::string& oid, std::uint64_t start,
   return parse_object_meta(resp, true);
 }
 
+std::uint64_t Session::put_bytes(const std::string& oid, const std::string& body,
+                                 const std::unordered_map<std::string, std::string>& attrs,
+                                 std::optional<std::uint64_t> expected_cas,
+                                 const std::optional<std::string>& lock_token) {
+  if (body.size() > kMaxBodyBytes) {
+    throw client_error("payload_too_large", "put_bytes exceeds 16 MiB");
+  }
+  std::unordered_map<std::string, std::string> headers;
+  headers["content-type"] = "application/octet-stream";
+  for (const auto& [k, v] : attrs) {
+    headers["x-aios-attr-" + k] = v;
+  }
+  std::uint64_t new_cas = 0;
+  if (expected_cas.has_value()) {
+    new_cas = *expected_cas + 1;
+    headers["x-aios-attr-aios.posix.cas"] = std::to_string(new_cas);
+    if (*expected_cas == 0) {
+      auto head = head_object(oid);
+      if (!head.exists) {
+        headers["if-none-match"] = "*";
+      } else {
+        auto it = head.attrs.find("aios.posix.cas");
+        if (it == head.attrs.end()) {
+          headers["if-match"] = "*";
+          headers["x-aios-if-attr-absent"] = "aios.posix.cas";
+        } else {
+          throw client_error("conflict", "posix cas mismatch (expected 0)");
+        }
+      }
+    } else {
+      headers["if-match"] = "*";
+      headers["x-aios-if-attr-eq"] = "aios.posix.cas=" + std::to_string(*expected_cas);
+    }
+  }
+  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  const auto path = "/o/" + url_encode_oid(oid);
+  auto resp = request("PUT", path, headers, body);
+  if (resp.status != 204 && resp.status != 200 && resp.status != 201) {
+    throw_http(resp, "put_bytes");
+  }
+  return new_cas;
+}
+
+void Session::put_range(const std::string& oid, std::uint64_t offset, const std::string& data,
+                        const std::optional<std::string>& lock_token) {
+  if (data.empty()) return;
+  if (data.size() > kMaxBodyBytes) {
+    throw client_error("payload_too_large", "put_range exceeds 16 MiB");
+  }
+  const std::uint64_t end = offset + static_cast<std::uint64_t>(data.size()) - 1;
+  std::unordered_map<std::string, std::string> headers;
+  headers["content-type"] = "application/octet-stream";
+  headers["content-range"] =
+      "bytes " + std::to_string(offset) + "-" + std::to_string(end) + "/*";
+  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  const auto path = "/o/" + url_encode_oid(oid);
+  auto resp = request("PUT", path, headers, data);
+  if (resp.status != 204 && resp.status != 200 && resp.status != 201) {
+    throw_http(resp, "put_range");
+  }
+}
+
+void Session::delete_object(const std::string& oid,
+                            const std::optional<std::string>& lock_token) {
+  std::unordered_map<std::string, std::string> headers;
+  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  const auto path = "/o/" + url_encode_oid(oid);
+  auto resp = request("DELETE", path, headers);
+  if (resp.status == 404) return;
+  if (resp.status != 204 && resp.status != 200) throw_http(resp, "delete_object");
+}
+
+ListResult Session::list_prefix(const std::string& prefix, std::size_t limit,
+                                const std::string& cursor) {
+  std::string target = "/o?limit=" + std::to_string(limit > 0 ? limit : 256);
+  if (!prefix.empty()) target += "&prefix=" + url_encode_oid(prefix);
+  if (!cursor.empty()) target += "&cursor=" + url_encode_oid(cursor);
+  auto resp = request("GET", target);
+  if (resp.status != 200) throw_http(resp, "list_prefix");
+  ListResult out;
+  try {
+    auto j = nlohmann::json::parse(resp.body);
+    out.next_cursor = j.value("next_cursor", "");
+    if (j.contains("objects") && j["objects"].is_array()) {
+      for (const auto& o : j["objects"]) {
+        ListObject e;
+        e.oid = o.value("oid", "");
+        e.size = o.value("size", static_cast<std::uint64_t>(0));
+        e.mtime_ms = o.value("mtime_ms", static_cast<std::int64_t>(0));
+        if (!e.oid.empty()) out.objects.push_back(std::move(e));
+      }
+    }
+  } catch (const client_error&) {
+    throw;
+  } catch (...) {
+    throw client_error("http", "bad list response");
+  }
+  return out;
+}
+
 std::uint64_t Session::put_object(const std::string& oid, const std::string& body,
                                   const std::string& stl_type, std::uint64_t expected_cas,
                                   const std::optional<std::string>& lock_token, int stl_v) {

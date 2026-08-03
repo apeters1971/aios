@@ -11,8 +11,10 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios-bench` | Multithreaded HTTP create/update/read benchmark |
 | `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
+| `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
+| `aios-fuse` | FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
 ---
 
@@ -29,6 +31,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 - [Local object store](#local-object-store)
 - [Tools](#tools)
 - [STL-like C++ client](#stl-like-c-client)
+- [POSIX filesystem + FUSE3](#posix-filesystem--fuse3)
 - [Authentication](#authentication)
 - [Logging](#logging)
 - [Documentation](#documentation)
@@ -459,6 +462,25 @@ Wire format, append, and API notes: [`proto/stl_client.md`](proto/stl_client.md)
 
 ---
 
+## POSIX filesystem + FUSE3
+
+`libaios_posix` implements a hierarchical filesystem on AIOS objects with a **C ABI** ([`src/posix/aios_posix.h`](src/posix/aios_posix.h)) aimed at a future kernel port:
+
+- **Inode 1** is `/`
+- Directories use an append-only **dentry changelog**
+- File data is **chunk-striped** (`posix/{vol}/data/{ino}/c/{chunk}`, default 1 MiB chunks, parallel PUTs bounded by `stripe_width`)
+
+Cross-directory `rename` is best-effort (not multi-object atomic). Details: [`proto/posix_fuse.md`](proto/posix_fuse.md).
+
+When CMake finds **libfuse3**, it builds `aios-fuse`:
+
+```bash
+aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
+# or: AIOS_ENDPOINT / AIOS_CLUSTER_KEY
+```
+
+---
+
 ## Authentication
 
 Every daemon and HTTP client in a cluster must share `cluster_key`.
@@ -489,6 +511,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
+| [`proto/posix_fuse.md`](proto/posix_fuse.md) | POSIX C ABI, striping, FUSE3 mount |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 
 Run the unit suite after changes:
