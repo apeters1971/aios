@@ -65,9 +65,18 @@ aios::mutex mx(sess, "users");
 - Oids use `/` separators; the client URL-encodes them as `%2F` so `/o/{oid}/lock` routing stays unambiguous.
 - `aios_client` links `aios_core` for shared HTTP HMAC helpers (and so tests can host `HttpServer`).
 
+## Benchmark
+
+`aios-bench --mode stl` exercises the client types (see `--stl-types`, `--stl-sync`):
+
+```bash
+./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
+  --mode stl --stl-sync both --ops 100
+```
+
 ## Build
 
 ```bash
-cmake --build build --target aios_client
+cmake --build build --target aios_client aios-bench
 ./build/aios_tests
 ```

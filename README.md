@@ -292,15 +292,25 @@ Objects larger than 256 KiB are streamed to disk on the HTTP path (default max 6
 
 Follows `307` redirects. Put/get stream file bytes (no full-object client buffer).
 
-### `aios-bench` — HTTP benchmark
+### `aios-bench` — HTTP / STL benchmark
 
-Reports IOPS, MiB/s, and latency p50/p95/p99. Optional `--layout ec` for per-PUT layout headers.
+**Object mode** (default): raw PUT/GET create/update/read. Reports IOPS, MiB/s, latency p50/p95/p99. Optional `--layout ec`.
+
+**STL mode** (`--mode stl`): benchmarks `aios_client` types (`string`, `map`, `unordered_map`, `set`, `list`, `deque`) in SYNC and/or ASYNC. `--sizes` is string byte length or entry count (default `16,64,256,1k,4k`).
 
 ```bash
+# Object store
 ./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
   --threads 16 --ops 200
 ./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
   --sizes 1k,64k,1M --ops-mix create,read --json
+
+# STL client
+./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
+  --mode stl --stl-sync both --ops 100 --threads 8
+./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
+  --mode stl --stl-types string,map --stl-sync async \
+  --sizes 64,256,1k --ops-mix create,read --json
 ```
 
 ### `aios-store-bench` — local store microbench
@@ -315,26 +325,70 @@ Reports IOPS, MiB/s, and latency p50/p95/p99. Optional `--layout ec` for per-PUT
 
 ## STL-like C++ client
 
-Library **`aios_client`** maps named STL-style objects to HTTP tips under `stl/{type}/{name}`:
+Library **`aios_client`** (`#include "client/stl.hpp"`) maps **named** STL-style objects onto the HTTP object API. Each named value is a JSON tip at oid `stl/{type}/{name}` (e.g. `stl/map/users`). Element/value type in v1 is `std::string`. Max document size: 16 MiB.
 
-| Type | Modes |
-|------|--------|
-| `aios::string`, `aios::map`, `aios::unordered_map`, `aios::set`, `aios::list`, `aios::deque` | **SYNC** (each mutate persists) or **ASYNC** (`load()` / `flush()` snapshots) |
-| `aios::mutex` | Cluster-shared lease via `/o/…/lock` (`BasicLockable`) |
+| Class | Role |
+|-------|------|
+| `aios::string` | Persistent string |
+| `aios::map` | Ordered `string → string` map |
+| `aios::unordered_map` | Hash `string → string` map |
+| `aios::set` | Ordered unique strings |
+| `aios::list` / `aios::deque` | Sequence of strings |
+| `aios::mutex` | Cluster-shared mutex (`BasicLockable` / `std::lock_guard`) |
+
+### SYNC vs ASYNC
+
+Containers (not mutex) take a `aios::sync_mode` (default **ASYNC**):
+
+| Mode | Behavior |
+|------|----------|
+| **SYNC** | Every mutating call (`push_back`, `operator[]` assign, …) immediately PUTs a new tip. Readers always fetch the latest tip. Changes are visible to other clients as soon as the write succeeds. |
+| **ASYNC** | Mutations stay local (`dirty`). **`load()`** atomically replaces local state from the store; **`flush()`** atomically writes the local snapshot. No background push/pull. |
+
+Mode switch: `set_mode(sync)` while dirty fails until `flush()` or `discard()`. Dirty `load()` also fails. ASYNC destructors flush by default (`flush_on_destroy`).
+
+Writes use optimistic concurrency (`aios.stl.cas` attr). Stale flush/put → `aios::client_error` with `code() == "conflict"`.
+
+`aios::mutex` uses HTTP object locks on `stl/mutex/{name}` (TTL lease, default 30s). Containers do **not** take it automatically—compose with `std::lock_guard` for critical sections.
+
+### Example
 
 ```cpp
 #include "client/stl.hpp"
 
 aios::Session sess({"127.0.0.1:7480", key});
+
+// ASYNC: edit locally, then atomic publish
 aios::string s(sess, "greeting", aios::sync_mode::async);
 s.assign("hello");
 s.flush();
 
+// SYNC: each mutate is cluster-visible immediately
 aios::map m(sess, "users", aios::sync_mode::sync);
 m["alice"] = "1";
+
+aios::unordered_map u(sess, "cache", aios::sync_mode::async);
+u["k"] = "v";
+u.flush();
+
+aios::set tags(sess, "tags", aios::sync_mode::sync);
+tags.insert("red");
+
+aios::mutex mx(sess, "users");
+{
+  std::lock_guard lock(mx);
+  // exclusive section across processes/nodes
+}
 ```
 
-Details: [`proto/stl_client.md`](proto/stl_client.md).
+### Build / link
+
+```bash
+cmake --build build --target aios_client
+# link: aios_client (pulls aios_core for HTTP HMAC helpers)
+```
+
+Wire format, CAS, and API notes: [`proto/stl_client.md`](proto/stl_client.md).
 
 ---
 

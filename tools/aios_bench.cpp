@@ -1,3 +1,4 @@
+#include "client/stl.hpp"
 #include "http/http_auth.hpp"
 #include "util/log.hpp"
 
@@ -32,41 +33,48 @@ struct BenchArgs {
   std::size_t ops{200};
   std::size_t warmup{10};
   std::string prefix{"bench"};
-  std::vector<std::size_t> sizes;  // bytes
+  std::vector<std::size_t> sizes;  // object bytes, or STL string bytes / entry count
+  bool sizes_set{false};
   bool do_create{true};
   bool do_update{true};
   bool do_read{true};
   bool cleanup{true};
   bool json{false};
-  // Per-PUT layout headers (empty = cluster default).
+  // Per-PUT layout headers (empty = cluster default). Object mode only.
   std::string layout;  // replica | ec
   int ec_k{0};         // 0 = omit (use server default)
   int ec_m{0};
   std::string ec_codec;
+  // object (raw HTTP PUT/GET) or stl (aios_client containers)
+  std::string mode{"object"};
+  std::vector<std::string> stl_types;  // empty = all
+  std::string stl_sync{"both"};       // sync | async | both
 };
 
 void usage() {
   std::cout
       << "usage: aios-bench --cluster-key KEY [options]\n"
       << "\n"
-      << "Multithreaded HTTP client benchmark (create / update / read).\n"
+      << "Multithreaded HTTP client benchmark.\n"
       << "\n"
       << "  --endpoint HOST:PORT   HTTP API (default 127.0.0.1:7480)\n"
       << "  --cluster-key KEY      required shared secret\n"
+      << "  --mode object|stl      object = raw PUT/GET (default); stl = aios_client types\n"
       << "  --threads N            worker threads (default: hardware concurrency)\n"
       << "  --ops N                operations per size per phase (default 200)\n"
       << "  --warmup N             discarded ops per size per phase (default 10)\n"
-      << "  --sizes LIST           comma list: 1k,4k,64k,256k,1M,4M,16M (default all)\n"
+      << "  --sizes LIST           object mode: 1k,4k,… (default 1k..16M)\n"
+      << "                        stl mode: string bytes or entry counts (default 16,64,256,1k,4k)\n"
       << "  --ops-mix LIST         create,update,read (default all three)\n"
-      << "  --prefix STR           oid prefix (default bench)\n"
-      << "  --layout replica|ec    per-PUT x-aios-layout (default: cluster)\n"
-      << "  --ec-k N               x-aios-ec-k when --layout=ec\n"
-      << "  --ec-m N               x-aios-ec-m when --layout=ec\n"
-      << "  --ec-codec xor|isal    x-aios-ec-codec when --layout=ec\n"
+      << "  --prefix STR           oid / stl name prefix (default bench)\n"
+      << "  --layout replica|ec    object mode: per-PUT x-aios-layout\n"
+      << "  --ec-k N / --ec-m N / --ec-codec xor|isal\n"
+      << "  --stl-types LIST       stl mode: string,map,unordered_map,set,list,deque (default all)\n"
+      << "  --stl-sync sync|async|both   stl mode delivery (default both)\n"
       << "  --no-cleanup          leave objects after the run\n"
       << "  --json                machine-readable summary\n"
       << "\n"
-      << "Reports IOPS, bandwidth, and latency p50/p95/p99 per size and op.\n";
+      << "Reports IOPS, bandwidth (object mode), and latency p50/p95/p99.\n";
 }
 
 std::unordered_map<std::string, std::string> layout_headers(const BenchArgs& a) {
@@ -128,7 +136,6 @@ std::string format_size(std::size_t n) {
 }
 
 bool parse_args(int argc, char** argv, BenchArgs& a) {
-  a.sizes = {1024, 4096, 65536, 262144, 1048576, 4194304, 16777216};
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto need = [&](const char* name) -> const char* {
@@ -152,6 +159,17 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       const char* v = need("--cluster-key");
       if (!v) return false;
       a.cluster_key = v;
+      continue;
+    }
+    if (arg == "--mode") {
+      const char* v = need("--mode");
+      if (!v) return false;
+      a.mode = v;
+      for (char& c : a.mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (a.mode != "object" && a.mode != "stl") {
+        std::cerr << "--mode must be object or stl\n";
+        return false;
+      }
       continue;
     }
     if (arg == "--threads") {
@@ -182,6 +200,7 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       const char* v = need("--sizes");
       if (!v) return false;
       a.sizes.clear();
+      a.sizes_set = true;
       try {
         for (const auto& tok : split_csv(v)) a.sizes.push_back(parse_size(tok));
       } catch (const std::exception& e) {
@@ -234,6 +253,32 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       a.ec_codec = v;
       continue;
     }
+    if (arg == "--stl-types") {
+      const char* v = need("--stl-types");
+      if (!v) return false;
+      a.stl_types.clear();
+      for (const auto& tok : split_csv(v)) {
+        if (tok != "string" && tok != "map" && tok != "unordered_map" && tok != "set" &&
+            tok != "list" && tok != "deque") {
+          std::cerr << "unknown --stl-types entry: " << tok << "\n";
+          return false;
+        }
+        a.stl_types.push_back(tok);
+      }
+      continue;
+    }
+    if (arg == "--stl-sync") {
+      const char* v = need("--stl-sync");
+      if (!v) return false;
+      a.stl_sync = v;
+      for (char& c : a.stl_sync)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (a.stl_sync != "sync" && a.stl_sync != "async" && a.stl_sync != "both") {
+        std::cerr << "--stl-sync must be sync, async, or both\n";
+        return false;
+      }
+      continue;
+    }
     if (arg == "--no-cleanup") {
       a.cleanup = false;
       continue;
@@ -249,6 +294,13 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
     std::cerr << "--cluster-key is required\n";
     return false;
   }
+  if (!a.sizes_set) {
+    if (a.mode == "stl") {
+      a.sizes = {16, 64, 256, 1024, 4096};
+    } else {
+      a.sizes = {1024, 4096, 65536, 262144, 1048576, 4194304, 16777216};
+    }
+  }
   if (a.sizes.empty()) {
     std::cerr << "no sizes specified\n";
     return false;
@@ -257,8 +309,8 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
     std::cerr << "no operations in --ops-mix\n";
     return false;
   }
-  if ((a.do_update || a.do_read) && !a.do_create && a.ops > 0) {
-    // update/read need objects; allow if user only wants those after prior run with --no-cleanup
+  if (a.stl_types.empty()) {
+    a.stl_types = {"string", "map", "unordered_map", "set", "list", "deque"};
   }
   if (a.threads == 0) {
     a.threads = std::max(1u, std::thread::hardware_concurrency());
@@ -491,6 +543,8 @@ struct Sample {
 struct PhaseStats {
   OpKind op{OpKind::Create};
   std::size_t size{0};
+  std::string stl_type;  // empty in object mode
+  std::string stl_sync;  // sync|async or empty
   std::vector<double> lat_ms;
   std::size_t ok{0};
   std::size_t err{0};
@@ -635,6 +689,14 @@ Summary summarize(const PhaseStats& st) {
 
 void print_human(const PhaseStats& st) {
   const auto s = summarize(st);
+  if (!st.stl_type.empty()) {
+    std::cout << std::left << std::setw(14) << st.stl_type << std::setw(7) << st.stl_sync
+              << std::setw(8) << format_size(st.size) << std::setw(8) << op_name(st.op) << std::right
+              << std::setw(8) << st.ok << std::setw(6) << st.err << std::setw(10) << std::fixed
+              << std::setprecision(1) << s.iops << std::setw(10) << std::setprecision(3) << s.p50
+              << std::setw(10) << s.p95 << std::setw(10) << s.p99 << std::setw(10) << s.avg << "\n";
+    return;
+  }
   std::cout << std::left << std::setw(8) << format_size(st.size) << std::setw(8) << op_name(st.op)
             << std::right << std::setw(8) << st.ok << std::setw(6) << st.err << std::setw(10)
             << std::fixed << std::setprecision(1) << s.iops << std::setw(10) << std::setprecision(2)
@@ -648,7 +710,335 @@ void print_json_row(std::ostream& os, const PhaseStats& st, bool first) {
   os << "  {\"size\":" << st.size << ",\"op\":\"" << op_name(st.op) << "\",\"ok\":" << st.ok
      << ",\"err\":" << st.err << ",\"wall_s\":" << st.wall_s << ",\"iops\":" << s.iops
      << ",\"mib_s\":" << s.mib_s << ",\"p50_ms\":" << s.p50 << ",\"p95_ms\":" << s.p95
-     << ",\"p99_ms\":" << s.p99 << ",\"avg_ms\":" << s.avg << ",\"bytes\":" << st.bytes << "}";
+     << ",\"p99_ms\":" << s.p99 << ",\"avg_ms\":" << s.avg << ",\"bytes\":" << st.bytes;
+  if (!st.stl_type.empty()) {
+    os << ",\"stl_type\":\"" << st.stl_type << "\",\"stl_sync\":\"" << st.stl_sync << "\"";
+  }
+  os << "}";
+}
+
+std::string stl_name_for(const BenchArgs& a, const std::string& type, const std::string& sync,
+                         std::size_t size, std::size_t idx) {
+  return a.prefix + "/" + type + "/" + sync + "/" + std::to_string(size) + "/" +
+         std::to_string(idx);
+}
+
+std::string make_payload(std::size_t n, char fill) {
+  return std::string(n, fill);
+}
+
+// Populate / mutate / read one STL object. Returns approx logical bytes touched.
+std::uint64_t stl_do_op(aios::Session& sess, const std::string& type, aios::sync_mode mode,
+                        OpKind op, const std::string& name, std::size_t size) {
+  const bool async = (mode == aios::sync_mode::async);
+  if (type == "string") {
+    aios::string s(sess, name, mode, /*flush_on_destroy=*/false);
+    if (op == OpKind::Create || op == OpKind::Put) {
+      s.assign(make_payload(size, 'a'));
+      if (async) s.flush();
+    } else if (op == OpKind::Update) {
+      if (async) s.load();
+      s.assign(make_payload(size, 'b'));
+      if (async) s.flush();
+    } else if (op == OpKind::Read) {
+      if (async) s.load();
+      else
+        (void)s.size();
+    }
+    return size;
+  }
+  if (type == "map") {
+    aios::map m(sess, name, mode, false);
+    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
+      if (op == OpKind::Update && async) m.load();
+      if (op == OpKind::Update) m.clear();
+      for (std::size_t i = 0; i < size; ++i) {
+        m.insert_or_assign("k" + std::to_string(i), "v" + std::to_string(i));
+      }
+      if (async) m.flush();
+    } else if (op == OpKind::Read) {
+      if (async) m.load();
+      else
+        (void)m.size();
+    }
+    return size;
+  }
+  if (type == "unordered_map") {
+    aios::unordered_map m(sess, name, mode, false);
+    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
+      if (op == OpKind::Update && async) m.load();
+      if (op == OpKind::Update) m.clear();
+      for (std::size_t i = 0; i < size; ++i) {
+        m.insert_or_assign("k" + std::to_string(i), "v" + std::to_string(i));
+      }
+      if (async) m.flush();
+    } else if (op == OpKind::Read) {
+      if (async) m.load();
+      else
+        (void)m.size();
+    }
+    return size;
+  }
+  if (type == "set") {
+    aios::set s(sess, name, mode, false);
+    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
+      if (op == OpKind::Update && async) s.load();
+      if (op == OpKind::Update) s.clear();
+      for (std::size_t i = 0; i < size; ++i) s.insert("k" + std::to_string(i));
+      if (async) s.flush();
+    } else if (op == OpKind::Read) {
+      if (async) s.load();
+      else
+        (void)s.size();
+    }
+    return size;
+  }
+  if (type == "list") {
+    aios::list l(sess, name, mode, false);
+    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
+      if (op == OpKind::Update && async) l.load();
+      if (op == OpKind::Update) l.clear();
+      for (std::size_t i = 0; i < size; ++i) l.push_back("v" + std::to_string(i));
+      if (async) l.flush();
+    } else if (op == OpKind::Read) {
+      if (async) l.load();
+      else
+        (void)l.size();
+    }
+    return size;
+  }
+  if (type == "deque") {
+    aios::deque d(sess, name, mode, false);
+    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
+      if (op == OpKind::Update && async) d.load();
+      if (op == OpKind::Update) d.clear();
+      for (std::size_t i = 0; i < size; ++i) d.push_back("v" + std::to_string(i));
+      if (async) d.flush();
+    } else if (op == OpKind::Read) {
+      if (async) d.load();
+      else
+        (void)d.size();
+    }
+    return size;
+  }
+  throw std::runtime_error("unknown stl type: " + type);
+}
+
+void stl_delete_one(aios::Session& sess, const std::string& type, const std::string& name) {
+  const std::string oid = aios::Session::stl_oid(type, name);
+  const std::string path = "/o/" + aios::Session::url_encode_oid(oid);
+  try {
+    sess.request("DELETE", path);
+  } catch (...) {
+  }
+}
+
+PhaseStats run_stl_phase(const BenchArgs& a, const std::string& type, aios::sync_mode mode,
+                         OpKind op, std::size_t size, std::size_t total_ops, bool measure) {
+  PhaseStats st;
+  st.op = op;
+  st.size = size;
+  st.stl_type = type;
+  st.stl_sync = (mode == aios::sync_mode::sync) ? "sync" : "async";
+
+  const std::size_t nthreads = std::min<std::size_t>(a.threads, std::max<std::size_t>(1, total_ops));
+  std::atomic<std::size_t> next{0};
+  std::mutex mu;
+  std::vector<double> lats;
+  lats.reserve(total_ops);
+  std::atomic<std::size_t> ok{0};
+  std::atomic<std::size_t> err{0};
+  std::atomic<std::uint64_t> bytes{0};
+
+  aios::SessionConfig cfg{a.endpoint, a.cluster_key};
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<std::thread> workers;
+  workers.reserve(nthreads);
+
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    workers.emplace_back([&, t]() {
+      (void)t;
+      aios::Session sess(cfg);
+      for (;;) {
+        const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= total_ops) break;
+        const std::string name = stl_name_for(a, type, st.stl_sync, size, idx);
+        const auto s0 = std::chrono::steady_clock::now();
+        bool success = false;
+        std::uint64_t touched = 0;
+        try {
+          if (op == OpKind::Delete) {
+            stl_delete_one(sess, type, name);
+            success = true;
+          } else {
+            touched = stl_do_op(sess, type, mode, op, name, size);
+            success = true;
+          }
+        } catch (...) {
+          success = false;
+        }
+        const auto s1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
+        if (success) {
+          ok.fetch_add(1, std::memory_order_relaxed);
+          bytes.fetch_add(touched, std::memory_order_relaxed);
+        } else {
+          err.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (measure) {
+          std::lock_guard<std::mutex> lock(mu);
+          lats.push_back(ms);
+        }
+      }
+    });
+  }
+
+  for (auto& w : workers) w.join();
+  const auto t1 = std::chrono::steady_clock::now();
+  st.ok = ok.load();
+  st.err = err.load();
+  st.bytes = bytes.load();
+  st.wall_s = std::chrono::duration<double>(t1 - t0).count();
+  st.lat_ms = std::move(lats);
+  return st;
+}
+
+int run_object_bench(const BenchArgs& args, const std::string& host, const std::string& port) {
+  if (!args.json) {
+    std::cout << "aios-bench mode=object endpoint=" << args.endpoint
+              << " threads=" << args.threads << " ops=" << args.ops << " warmup=" << args.warmup
+              << "\n";
+    std::cout << std::left << std::setw(8) << "size" << std::setw(8) << "op" << std::right
+              << std::setw(8) << "ok" << std::setw(6) << "err" << std::setw(10) << "iops"
+              << std::setw(10) << "MiB/s" << std::setw(10) << "p50_ms" << std::setw(10) << "p95_ms"
+              << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms" << "\n";
+  }
+
+  std::vector<PhaseStats> results;
+  results.reserve(args.sizes.size() * 3);
+
+  for (std::size_t size : args.sizes) {
+    if (args.warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
+      run_phase(args, host, port, OpKind::Put, size, args.warmup, false);
+      if (args.do_update) {
+        run_phase(args, host, port, OpKind::Update, size, args.warmup, false);
+      }
+      if (args.do_read) {
+        run_phase(args, host, port, OpKind::Read, size, args.warmup, false);
+      }
+      run_phase(args, host, port, OpKind::Delete, size, args.warmup, false);
+    }
+
+    if (args.do_create) {
+      auto st = run_phase(args, host, port, OpKind::Create, size, args.ops, true);
+      if (!args.json) print_human(st);
+      results.push_back(std::move(st));
+    } else if (args.do_update || args.do_read) {
+      run_phase(args, host, port, OpKind::Put, size, args.ops, false);
+    }
+
+    if (args.do_update) {
+      auto st = run_phase(args, host, port, OpKind::Update, size, args.ops, true);
+      if (!args.json) print_human(st);
+      results.push_back(std::move(st));
+    }
+
+    if (args.do_read) {
+      auto st = run_phase(args, host, port, OpKind::Read, size, args.ops, true);
+      if (!args.json) print_human(st);
+      results.push_back(std::move(st));
+    }
+
+    if (args.cleanup) {
+      run_phase(args, host, port, OpKind::Delete, size, args.ops, false);
+    }
+  }
+
+  if (args.json) {
+    std::cout << "{\n\"mode\":\"object\",\"endpoint\":\"" << args.endpoint
+              << "\",\"threads\":" << args.threads << ",\"ops\":" << args.ops << ",\"results\":[\n";
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      print_json_row(std::cout, results[i], i == 0);
+    }
+    std::cout << "\n]}\n";
+  }
+
+  std::size_t total_err = 0;
+  for (const auto& r : results) total_err += r.err;
+  return total_err > 0 ? 1 : 0;
+}
+
+int run_stl_bench(const BenchArgs& args) {
+  std::vector<aios::sync_mode> modes;
+  if (args.stl_sync == "sync" || args.stl_sync == "both") modes.push_back(aios::sync_mode::sync);
+  if (args.stl_sync == "async" || args.stl_sync == "both") modes.push_back(aios::sync_mode::async);
+
+  if (!args.json) {
+    std::cout << "aios-bench mode=stl endpoint=" << args.endpoint << " threads=" << args.threads
+              << " ops=" << args.ops << " warmup=" << args.warmup
+              << " stl-sync=" << args.stl_sync << "\n";
+    std::cout << std::left << std::setw(14) << "type" << std::setw(7) << "sync" << std::setw(8)
+              << "size" << std::setw(8) << "op" << std::right << std::setw(8) << "ok"
+              << std::setw(6) << "err" << std::setw(10) << "iops" << std::setw(10) << "p50_ms"
+              << std::setw(10) << "p95_ms" << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms"
+              << "\n";
+  }
+
+  std::vector<PhaseStats> results;
+
+  for (const auto& type : args.stl_types) {
+    for (aios::sync_mode mode : modes) {
+      for (std::size_t size : args.sizes) {
+        if (args.warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
+          run_stl_phase(args, type, mode, OpKind::Put, size, args.warmup, false);
+          if (args.do_update) {
+            run_stl_phase(args, type, mode, OpKind::Update, size, args.warmup, false);
+          }
+          if (args.do_read) {
+            run_stl_phase(args, type, mode, OpKind::Read, size, args.warmup, false);
+          }
+          run_stl_phase(args, type, mode, OpKind::Delete, size, args.warmup, false);
+        }
+
+        if (args.do_create) {
+          auto st = run_stl_phase(args, type, mode, OpKind::Create, size, args.ops, true);
+          if (!args.json) print_human(st);
+          results.push_back(std::move(st));
+        } else if (args.do_update || args.do_read) {
+          run_stl_phase(args, type, mode, OpKind::Put, size, args.ops, false);
+        }
+
+        if (args.do_update) {
+          auto st = run_stl_phase(args, type, mode, OpKind::Update, size, args.ops, true);
+          if (!args.json) print_human(st);
+          results.push_back(std::move(st));
+        }
+
+        if (args.do_read) {
+          auto st = run_stl_phase(args, type, mode, OpKind::Read, size, args.ops, true);
+          if (!args.json) print_human(st);
+          results.push_back(std::move(st));
+        }
+
+        if (args.cleanup) {
+          run_stl_phase(args, type, mode, OpKind::Delete, size, args.ops, false);
+        }
+      }
+    }
+  }
+
+  if (args.json) {
+    std::cout << "{\n\"mode\":\"stl\",\"endpoint\":\"" << args.endpoint
+              << "\",\"threads\":" << args.threads << ",\"ops\":" << args.ops << ",\"results\":[\n";
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      print_json_row(std::cout, results[i], i == 0);
+    }
+    std::cout << "\n]}\n";
+  }
+
+  std::size_t total_err = 0;
+  for (const auto& r : results) total_err += r.err;
+  return total_err > 0 ? 1 : 0;
 }
 
 }  // namespace
@@ -679,67 +1069,6 @@ int main(int argc, char** argv) {
     probe.close();
   }
 
-  if (!args.json) {
-    std::cout << "aios-bench endpoint=" << args.endpoint << " threads=" << args.threads
-              << " ops=" << args.ops << " warmup=" << args.warmup << "\n";
-    std::cout << std::left << std::setw(8) << "size" << std::setw(8) << "op" << std::right
-              << std::setw(8) << "ok" << std::setw(6) << "err" << std::setw(10) << "iops"
-              << std::setw(10) << "MiB/s" << std::setw(10) << "p50_ms" << std::setw(10) << "p95_ms"
-              << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms" << "\n";
-  }
-
-  std::vector<PhaseStats> results;
-  results.reserve(args.sizes.size() * 3);
-
-  for (std::size_t size : args.sizes) {
-    // Warmup against real paths, then delete so create measures If-None-Match cleanly.
-    if (args.warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
-      run_phase(args, host, port, OpKind::Put, size, args.warmup, false);
-      if (args.do_update) {
-        run_phase(args, host, port, OpKind::Update, size, args.warmup, false);
-      }
-      if (args.do_read) {
-        run_phase(args, host, port, OpKind::Read, size, args.warmup, false);
-      }
-      run_phase(args, host, port, OpKind::Delete, size, args.warmup, false);
-    }
-
-    if (args.do_create) {
-      auto st = run_phase(args, host, port, OpKind::Create, size, args.ops, true);
-      if (!args.json) print_human(st);
-      results.push_back(std::move(st));
-    } else if (args.do_update || args.do_read) {
-      // Seed objects for update/read-only runs (unconditional PUT).
-      run_phase(args, host, port, OpKind::Put, size, args.ops, false);
-    }
-
-    if (args.do_update) {
-      auto st = run_phase(args, host, port, OpKind::Update, size, args.ops, true);
-      if (!args.json) print_human(st);
-      results.push_back(std::move(st));
-    }
-
-    if (args.do_read) {
-      auto st = run_phase(args, host, port, OpKind::Read, size, args.ops, true);
-      if (!args.json) print_human(st);
-      results.push_back(std::move(st));
-    }
-
-    if (args.cleanup) {
-      run_phase(args, host, port, OpKind::Delete, size, args.ops, false);
-    }
-  }
-
-  if (args.json) {
-    std::cout << "{\n\"endpoint\":\"" << args.endpoint << "\",\"threads\":" << args.threads
-              << ",\"ops\":" << args.ops << ",\"results\":[\n";
-    for (std::size_t i = 0; i < results.size(); ++i) {
-      print_json_row(std::cout, results[i], i == 0);
-    }
-    std::cout << "\n]}\n";
-  }
-
-  std::size_t total_err = 0;
-  for (const auto& r : results) total_err += r.err;
-  return total_err > 0 ? 1 : 0;
+  if (args.mode == "stl") return run_stl_bench(args);
+  return run_object_bench(args, host, port);
 }

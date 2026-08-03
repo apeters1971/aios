@@ -152,7 +152,7 @@ add_executable(aiosd src/main.cpp)
 target_link_libraries(aiosd PRIVATE aios_core)
 
 add_executable(aios-bench tools/aios_bench.cpp)
-target_link_libraries(aios-bench PRIVATE aios_core)
+target_link_libraries(aios-bench PRIVATE aios_client)
 
 add_executable(aios-store-bench tools/aios_store_bench.cpp)
 target_link_libraries(aios-store-bench PRIVATE aios_core)
