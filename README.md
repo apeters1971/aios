@@ -4,14 +4,15 @@ AIOS is a small C++20 **cluster object store**: durable objects on local filesys
 
 Clients talk to the **primary** for an object (HTTP or TCP++); the primary replicates or erasure-codes across the acting set. There are no pools or placement groups—layout is chosen **per object version** at write time.
 
-| Binary | Role |
-|--------|------|
+| Binary / lib | Role |
+|--------------|------|
 | `aiosd` | Cluster daemon (gossip, storage targets, object RPC, HTTP API, repair) |
 | `aios` | Thin HTTP client (put/get/del/stat/list/map; follows `307`) |
 | `aios-bench` | Multithreaded HTTP create/update/read benchmark |
 | `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
+| `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client).
 
 ---
 
@@ -27,6 +28,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/README.md`](p
 - [HTTP object API](#http-object-api)
 - [Local object store](#local-object-store)
 - [Tools](#tools)
+- [STL-like C++ client](#stl-like-c-client)
 - [Authentication](#authentication)
 - [Logging](#logging)
 - [Documentation](#documentation)
@@ -115,7 +117,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Outputs: `build/aiosd`, `build/aios`, `build/aios-bench`, `build/aios-store-bench`, `build/aios_tests`.
+Outputs: `build/aiosd`, `build/aios`, `build/aios-bench`, `build/aios-store-bench`, `build/libaios_client.a`, `build/aios_tests`.
 
 ---
 
@@ -311,6 +313,31 @@ Reports IOPS, MiB/s, and latency p50/p95/p99. Optional `--layout ec` for per-PUT
 
 ---
 
+## STL-like C++ client
+
+Library **`aios_client`** maps named STL-style objects to HTTP tips under `stl/{type}/{name}`:
+
+| Type | Modes |
+|------|--------|
+| `aios::string`, `aios::map`, `aios::unordered_map`, `aios::set`, `aios::list`, `aios::deque` | **SYNC** (each mutate persists) or **ASYNC** (`load()` / `flush()` snapshots) |
+| `aios::mutex` | Cluster-shared lease via `/o/…/lock` (`BasicLockable`) |
+
+```cpp
+#include "client/stl.hpp"
+
+aios::Session sess({"127.0.0.1:7480", key});
+aios::string s(sess, "greeting", aios::sync_mode::async);
+s.assign("hello");
+s.flush();
+
+aios::map m(sess, "users", aios::sync_mode::sync);
+m["alice"] = "1";
+```
+
+Details: [`proto/stl_client.md`](proto/stl_client.md).
+
+---
+
 ## Authentication
 
 Every daemon and HTTP client in a cluster must share `cluster_key`.
@@ -339,6 +366,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
 | [`proto/layout.md`](proto/layout.md) | Per-object layout and prefix rules |
+| [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 
 Run the unit suite after changes:

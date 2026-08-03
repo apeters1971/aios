@@ -125,6 +125,29 @@ if(AIOS_HAVE_ISAL)
   endif()
 endif()
 
+add_library(aios_client STATIC
+  src/client/session.cpp
+  src/client/wire.cpp
+  src/client/string.cpp
+  src/client/map.cpp
+  src/client/unordered_map.cpp
+  src/client/set.cpp
+  src/client/list.cpp
+  src/client/deque.cpp
+  src/client/mutex.cpp
+)
+target_include_directories(aios_client PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+# Auth helpers live in aios_core (http_auth); link aios_core when using aios_client alone.
+target_link_libraries(aios_client PUBLIC
+  Threads::Threads
+  Boost::headers
+  OpenSSL::Crypto
+  nlohmann_json::nlohmann_json
+)
+target_link_libraries(aios_client PUBLIC aios_core)
+
 add_executable(aiosd src/main.cpp)
 target_link_libraries(aiosd PRIVATE aios_core)
 
@@ -162,10 +185,12 @@ add_executable(aios_tests
   tests/test_layout.cpp
   tests/test_locks_watches.cpp
   tests/test_pubsub.cpp
+  tests/test_stl_client.cpp
   tests/test_main.cpp
 )
-target_link_libraries(aios_tests PRIVATE aios_core)
+target_link_libraries(aios_tests PRIVATE aios_client)
 add_test(NAME aios_tests COMMAND aios_tests)
 
 install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION bin)
+install(TARGETS aios_client ARCHIVE DESTINATION lib)
 install(FILES config/aiosd.example.yaml DESTINATION share/aios)
