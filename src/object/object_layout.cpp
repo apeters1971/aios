@@ -12,6 +12,18 @@ std::string lower_copy(std::string s) {
   return s;
 }
 
+bool valid_storage_class(const std::string& s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (char c : s) {
+    if (std::islower(static_cast<unsigned char>(c)) ||
+        std::isdigit(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 bool resolve_codec(int m, std::string codec, std::string& out, std::string& err) {
   if (codec.empty()) codec = (m == 1) ? "xor" : "isal";
   if (codec == "xor") {
@@ -41,7 +53,6 @@ const LayoutRule* find_layout_rule(const Config& cfg, const std::string& oid) {
     if (!best || rule.prefix.size() > best->prefix.size()) {
       best = &rule;
     }
-    // Equal length: keep earlier rule (first in YAML).
   }
   return best;
 }
@@ -50,26 +61,33 @@ const LayoutRule* find_layout_rule(const Config& cfg, const std::string& oid) {
 
 bool resolve_object_layout(const Config& cfg, const std::string& oid, const LayoutRequest& req,
                            ObjectLayout& out, std::string& err) {
-  // Effective defaults: cluster → longest prefix rule → request (field-by-field).
   std::string layout = cfg.durability;
+  std::string storage_class = cfg.default_storage_class;
   int ec_k = cfg.ec_k;
   int ec_m = cfg.ec_m;
   std::string ec_codec = cfg.ec_codec;
 
   if (const LayoutRule* rule = find_layout_rule(cfg, oid)) {
     if (!rule->layout.empty()) layout = rule->layout;
+    if (rule->storage_class) storage_class = *rule->storage_class;
     if (rule->ec_k) ec_k = *rule->ec_k;
     if (rule->ec_m) ec_m = *rule->ec_m;
     if (rule->ec_codec) ec_codec = *rule->ec_codec;
   }
 
   if (req.layout) layout = *req.layout;
+  if (req.storage_class) storage_class = *req.storage_class;
   if (req.ec_k) ec_k = *req.ec_k;
   if (req.ec_m) ec_m = *req.ec_m;
   if (req.ec_codec) ec_codec = *req.ec_codec;
 
   if (layout.empty()) layout = "replica";
   layout = lower_copy(std::move(layout));
+  storage_class = lower_copy(std::move(storage_class));
+  if (!valid_storage_class(storage_class)) {
+    err = "storage_class must match [a-z0-9_-]+";
+    return false;
+  }
 
   if (layout == "replica") {
     const int n = cfg.replica_count;
@@ -84,6 +102,7 @@ bool resolve_object_layout(const Config& cfg, const std::string& oid, const Layo
     out = ObjectLayout{};
     out.kind = ObjectLayout::Kind::Replica;
     out.n = n;
+    out.storage_class = std::move(storage_class);
     return true;
   }
 
@@ -114,6 +133,7 @@ bool resolve_object_layout(const Config& cfg, const std::string& oid, const Layo
   out.ec_m = ec_m;
   out.ec_codec = std::move(codec);
   out.n = ec_k + ec_m;
+  out.storage_class = std::move(storage_class);
   if (cfg.max_replica_count > 0 && out.n > cfg.max_replica_count) {
     err = "k+m exceeds max_replica_count";
     return false;
@@ -125,6 +145,7 @@ void apply_layout_attrs(std::unordered_map<std::string, std::string>& attrs,
                         const ObjectLayout& layout) {
   attrs[kLayoutAttr] = layout.is_ec() ? "ec" : "replica";
   attrs[kLayoutNAttr] = std::to_string(layout.n);
+  attrs[kStorageClassAttr] = layout.storage_class;
 }
 
 LayoutRequest layout_request_from_headers(
@@ -136,12 +157,14 @@ LayoutRequest layout_request_from_headers(
   };
   const auto layout = get("x-aios-layout");
   if (!layout.empty()) req.layout = lower_copy(layout);
+  const auto sc = get("x-aios-storage-class");
+  if (!sc.empty()) req.storage_class = lower_copy(sc);
   const auto k = get("x-aios-ec-k");
   if (!k.empty()) {
     try {
       req.ec_k = std::stoi(k);
     } catch (...) {
-      req.ec_k = -1;  // resolve will reject
+      req.ec_k = -1;
     }
   }
   const auto m = get("x-aios-ec-m");
@@ -161,6 +184,9 @@ LayoutRequest layout_request_from_json(const nlohmann::json& body) {
   LayoutRequest req;
   if (body.contains("layout") && body["layout"].is_string()) {
     req.layout = lower_copy(body["layout"].get<std::string>());
+  }
+  if (body.contains("storage_class") && body["storage_class"].is_string()) {
+    req.storage_class = lower_copy(body["storage_class"].get<std::string>());
   }
   if (body.contains("ec_k") && !body["ec_k"].is_null()) {
     try {
@@ -184,6 +210,7 @@ LayoutRequest layout_request_from_json(const nlohmann::json& body) {
 
 void apply_layout_request_to_json(nlohmann::json& body, const LayoutRequest& req) {
   if (req.layout) body["layout"] = *req.layout;
+  if (req.storage_class) body["storage_class"] = *req.storage_class;
   if (req.ec_k) body["ec_k"] = *req.ec_k;
   if (req.ec_m) body["ec_m"] = *req.ec_m;
   if (req.ec_codec) body["ec_codec"] = *req.ec_codec;
@@ -206,6 +233,22 @@ int placement_n_for_attrs(const std::unordered_map<std::string, std::string>& at
   }
   if (auto meta = parse_ec_attrs(attrs)) return meta->k + meta->m;
   return default_n;
+}
+
+std::string storage_class_for_attrs(const std::unordered_map<std::string, std::string>& attrs,
+                                    const std::string& default_class) {
+  if (auto it = attrs.find(kStorageClassAttr); it != attrs.end() && !it->second.empty()) {
+    return lower_copy(it->second);
+  }
+  return default_class;
+}
+
+std::string storage_class_prev_for_attrs(
+    const std::unordered_map<std::string, std::string>& attrs) {
+  if (auto it = attrs.find(kStorageClassPrevAttr); it != attrs.end() && !it->second.empty()) {
+    return lower_copy(it->second);
+  }
+  return {};
 }
 
 }  // namespace aios

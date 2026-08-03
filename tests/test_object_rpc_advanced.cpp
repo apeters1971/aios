@@ -23,7 +23,7 @@ int test_object_rpc_advanced() {
   auto& map = fx.map;
 
   const std::string oid = "rpc-adv-1";
-  auto placement = place(oid, map);
+  auto placement = place(oid, map, "nvme");
   expect(placement.acting_set.size() == 2, "acting set 2");
   const auto& primary = placement.acting_set[0];
 
@@ -89,7 +89,7 @@ int test_object_rpc_advanced() {
   // Replica install: prepare_put on primary, install on secondary, publish both.
   {
     const std::string roid = "rpc-install";
-    auto pl = place(roid, map);
+    auto pl = place(roid, map, "nvme");
     expect(pl.acting_set.size() == 2, "install acting 2");
     const auto& prim = pl.acting_set[0];
     const auto& sec = pl.acting_set[1];
@@ -155,7 +155,7 @@ int test_object_rpc_advanced() {
   // ObjectAbortVersion: prepare on primary, install on secondary, abort both.
   {
     const std::string aoid = "rpc-abort";
-    auto pl = place(aoid, map);
+    auto pl = place(aoid, map, "nvme");
     const auto& prim = pl.acting_set[0];
     const auto& sec = pl.acting_set[1];
 
@@ -262,7 +262,7 @@ int test_object_rpc_advanced() {
   {
     const std::string target = "rpc-redir-target";
     const std::string alias = "rpc-redir-alias";
-    auto tpl = place(target, map);
+    auto tpl = place(target, map, "nvme");
     Frame tput;
     tput.type = MsgType::ObjectPut;
     tput.body = {
@@ -274,7 +274,7 @@ int test_object_rpc_advanced() {
     };
     expect(svc.handle(tput).body.value("ok", false), "redirect target put");
 
-    auto apl = place(alias, map);
+    auto apl = place(alias, map, "nvme");
     Frame rput;
     rput.type = MsgType::ObjectPut;
     rput.body = {
@@ -304,7 +304,7 @@ int test_object_rpc_advanced() {
   // ObjectPutRange with kFlagRawBody + raw bytes (primary)
   {
     const std::string rid = "rpc-range";
-    auto rpl = place(rid, map);
+    auto rpl = place(rid, map, "nvme");
     Frame full;
     full.type = MsgType::ObjectPut;
     full.body = {

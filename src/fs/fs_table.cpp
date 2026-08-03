@@ -24,6 +24,8 @@ void FsTable::set_local(const std::string& node_id,
     e.mount = t.mount;
     e.target_path = t.target_path;
     e.aios_path = t.aios_path;
+    e.storage_class = t.storage_class;
+    e.weight = t.weight > 0 ? t.weight : 1;
     e.bsize = t.bsize;
     e.blocks = t.blocks;
     e.bfree = t.bfree;
@@ -65,6 +67,8 @@ nlohmann::json FsTable::to_json() const {
         {"mount", e.mount},
         {"target_path", e.target_path},
         {"aios_path", e.aios_path},
+        {"storage_class", e.storage_class},
+        {"weight", e.weight},
         {"bsize", e.bsize},
         {"blocks", e.blocks},
         {"bfree", e.bfree},
@@ -88,6 +92,8 @@ std::vector<FsEntry> FsTable::from_json(const nlohmann::json& j) {
     e.mount = x.value("mount", "");
     e.target_path = x.value("target_path", "");
     e.aios_path = x.value("aios_path", "");
+    e.storage_class = x.value("storage_class", "");
+    e.weight = x.value("weight", 1);
     e.bsize = x.value("bsize", std::uint64_t{0});
     e.blocks = x.value("blocks", std::uint64_t{0});
     e.bfree = x.value("bfree", std::uint64_t{0});

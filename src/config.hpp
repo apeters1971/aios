@@ -11,6 +11,18 @@ namespace aios {
 struct LayoutRule {
   std::string prefix;
   std::string layout;  // required: "replica" | "ec"
+  std::optional<std::string> storage_class;
+  std::optional<int> ec_k;
+  std::optional<int> ec_m;
+  std::optional<std::string> ec_codec;
+};
+
+// Background tip migration between storage classes (prefix match).
+struct TransitionRule {
+  std::string prefix;
+  std::string from;  // source storage_class
+  std::string to;    // destination storage_class
+  std::optional<std::string> layout;  // optional layout change on transition
   std::optional<int> ec_k;
   std::optional<int> ec_m;
   std::optional<std::string> ec_codec;
@@ -33,8 +45,13 @@ struct Config {
   // Successful copies required for Put/Del ACK (including primary). 0 => replica_count.
   int write_quorum{0};
   // Default layout when a PUT omits x-aios-layout ("replica" or "ec").
-  // Alias name in docs: default_layout; YAML/CLI still use `durability`.
   std::string durability{"replica"};
+  // Default storage class for new writes when not overridden.
+  std::string default_storage_class{"nvme"};
+  // Consistent-hash virtual nodes.
+  int vnodes_per_target{128};
+  int min_vnodes{16};
+  int max_vnodes{1024};
   // Default EC parameters when layout is ec (request may override).
   int ec_k{2};
   int ec_m{1};
@@ -44,11 +61,15 @@ struct Config {
   int max_ec_k{16};
   int max_ec_m{16};
   int max_replica_count{64};
-  // Prefix → layout defaults (longest matching prefix; request headers still win).
+  // Prefix → layout / storage_class defaults (longest matching prefix).
   std::vector<LayoutRule> layout_rules;
+  // Prefix → class transition policies.
+  std::vector<TransitionRule> transition_rules;
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};
+  int transition_interval_ms{30000};
+  int transition_batch_oids{64};
   // HTTP object API listen address; empty disables HTTP front-end.
   std::string http_listen{"0.0.0.0:7480"};
   // Body durability for ranged FS puts: none | data | full (informational; store fsyncs).
@@ -62,7 +83,6 @@ struct Config {
   // When true, expose /admin/* and /metrics on the HTTP listener.
   bool admin{false};
   // When true (and admin), GET /metrics skips HMAC so Prometheus can scrape.
-  // Keep the admin HTTP port network-restricted if enabled.
   bool admin_metrics_public{false};
 };
 

@@ -101,6 +101,7 @@ add_library(aios_core STATIC
   src/object/pubsub.cpp
   src/object/object_service.cpp
   src/object/repair.cpp
+  src/object/transition.cpp
   src/http/http_auth.cpp
   src/http/http_server.cpp
   src/metrics/ops_counters.cpp
@@ -172,6 +173,7 @@ add_executable(aios_tests
   tests/test_fs_clone.cpp
   tests/test_object_store.cpp
   tests/test_cluster_map.cpp
+  tests/test_placement.cpp
   tests/test_object_rpc.cpp
   tests/test_object_rpc_advanced.cpp
   tests/test_object_service_advanced.cpp

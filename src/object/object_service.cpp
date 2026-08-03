@@ -54,8 +54,11 @@ ApiResult ObjectService::fail(const std::string& code, const std::string& error)
   return r;
 }
 
-ApiResult ObjectService::require_primary(const std::string& oid, Placement& placement_out) {
-  placement_out = place(oid, map_);
+ApiResult ObjectService::require_primary(const std::string& oid, Placement& placement_out,
+                                         const std::string& storage_class) {
+  const std::string sc =
+      storage_class.empty() ? cfg_.default_storage_class : storage_class;
+  placement_out = place(oid, map_, sc);
   if (placement_out.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement_out.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -424,14 +427,9 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     }
   }
 
-  const auto placement = place(oid, map_);
-  if (placement.acting_set.empty()) {
-    return reply_err(map_.epoch, "no_targets", "no storage targets in cluster map");
-  }
-
   // Replica install of a prepared version (seq present).
   if (role == "replica" && body.contains("seq")) {
-    if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+    if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
     }
     PreparedVersion v;
@@ -459,7 +457,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
 
   if (role == "replica") {
     // Legacy full put (publish immediately) — kept for repair tooling.
-    if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+    if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
     }
     auto* store = stores_.get(aios_path);
@@ -511,7 +509,13 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     apply_layout_attrs(attrs, layout);
   }
 
-  if (!is_primary_for(oid, map_, cfg_.node_id, aios_path)) {
+  const std::string sc_for_primary = storage_class_for_attrs(attrs, cfg_.default_storage_class);
+  const auto placement = place(oid, map_, sc_for_primary);
+  if (placement.acting_set.empty()) {
+    return reply_err(map_.epoch, "no_targets", "no storage targets in cluster map");
+  }
+
+  if (!is_primary_for(oid, map_, sc_for_primary, cfg_.node_id, aios_path)) {
     auto f = reply_err(map_.epoch, "not_primary", "this node/target is not primary");
     f.body["acting_set"] = nlohmann::json::array();
     for (const auto& t : placement.acting_set) {
@@ -596,7 +600,7 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
-  if (!map_.targets.empty() && !in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+  if (!map_.targets.empty() && !in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
   }
   auto* store = stores_.get(aios_path);
@@ -657,14 +661,14 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
-  const auto placement = place(oid, map_);
+  const auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) {
     return reply_err(map_.epoch, "no_targets", "no storage targets");
   }
 
   // Replica install of delete-marker version.
   if (role == "replica" && body.contains("seq")) {
-    if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+    if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set");
     }
     PreparedVersion v;
@@ -681,7 +685,7 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
   }
 
   if (role == "replica") {
-    if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+    if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set");
     }
     auto* store = stores_.get(aios_path);
@@ -693,7 +697,7 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
     return reply_ok(map_.epoch);
   }
 
-  if (!is_primary_for(oid, map_, cfg_.node_id, aios_path)) {
+  if (!is_primary_for(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_primary", "not primary");
   }
   auto* store = stores_.get(aios_path);
@@ -764,7 +768,7 @@ Frame ObjectService::handle_publish_tip(const nlohmann::json& body) {
     if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
     return reply_ok(map_.epoch);
   }
-  if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+  if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set");
   }
   std::string err;
@@ -789,7 +793,7 @@ Frame ObjectService::handle_abort_version(const nlohmann::json& body) {
     if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
     return reply_ok(map_.epoch);
   }
-  if (!in_acting_set(oid, map_, cfg_.node_id, aios_path)) {
+  if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set");
   }
   std::string err;
@@ -1036,7 +1040,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
     return fail("bad_request", err);
   }
-  auto placement = place(oid, map_, layout.n);
+  auto placement = place(oid, map_, layout.n, layout.storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1086,7 +1090,7 @@ ApiResult ObjectService::api_put_file(
   if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
     return fail("bad_request", err);
   }
-  auto placement = place(oid, map_, layout.n);
+  auto placement = place(oid, map_, layout.n, layout.storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1143,7 +1147,7 @@ ApiResult ObjectService::api_put_redirect(
     const std::vector<AttrPrecondition>& preds,
     const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1181,7 +1185,7 @@ ApiResult ObjectService::api_put_range(
   if (layout.is_ec()) {
     return fail("bad_request", "ranged put not supported for erasure-coded objects");
   }
-  auto placement = place(oid, map_, layout.n);
+  auto placement = place(oid, map_, layout.n, layout.storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1236,7 +1240,7 @@ ApiResult ObjectService::api_append(
   if (layout.is_ec()) {
     return fail("bad_request", "append not supported for erasure-coded objects");
   }
-  auto placement = place(oid, map_, layout.n);
+  auto placement = place(oid, map_, layout.n, layout.storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1297,18 +1301,16 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
                                 const std::vector<AttrPrecondition>& preds,
                                 std::optional<std::uint64_t> seq) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
-  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
-
   std::string err;
   ObjectStore* store = nullptr;
   std::optional<ObjectInfo> info;
   std::unordered_map<std::string, std::string> attrs;
-  for (const auto& t : placement.acting_set) {
-    if (t.node_id != cfg_.node_id) continue;
-    auto* s = stores_.get(t.aios_path);
+
+  // Discover tip on any local store first (class-scoped rings may not include us until
+  // we know aios.storage_class from attrs).
+  for (const auto& path : stores_.paths()) {
+    auto* s = stores_.get(path);
     if (!s) continue;
-    if (!store) store = s;  // remember a local store for pred checks / non-EC path
     auto st = s->stat(oid, seq, err);
     if (!st) continue;
     if (st->is_delete && !seq.has_value()) continue;
@@ -1317,9 +1319,49 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     attrs = s->list_attrs(oid, err);
     break;
   }
-  if (!store) return fail("not_local", "no local replica for oid");
 
-  if (!seq.has_value()) {
+  const std::string sc =
+      storage_class_for_attrs(attrs, cfg_.default_storage_class);
+  const std::string sc_prev = storage_class_prev_for_attrs(attrs);
+  const int n = placement_n_for_attrs(attrs, map_.replica_count);
+  auto placement = place(oid, map_, n, sc);
+  if (placement.acting_set.empty() && !sc_prev.empty()) {
+    placement = place(oid, map_, n, sc_prev);
+  }
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+
+  // Prefer a local acting-set member for the chosen class when available.
+  if (info) {
+    for (const auto& t : placement.acting_set) {
+      if (t.node_id != cfg_.node_id) continue;
+      auto* s = stores_.get(t.aios_path);
+      if (!s) continue;
+      auto st = s->stat(oid, seq, err);
+      if (!st) continue;
+      if (st->is_delete && !seq.has_value()) continue;
+      store = s;
+      info = st;
+      attrs = s->list_attrs(oid, err);
+      break;
+    }
+  }
+
+  if (!store) {
+    // No local copy — still allow EC reconstruct / remote attr probe if we are
+    // contacted as a gateway; require at least one local store for non-EC.
+    if (!attrs_are_ec(attrs)) {
+      // Probe remotes for attrs when tip class is known from a prior local miss.
+      for (const auto& t : placement.acting_set) {
+        if (t.node_id == cfg_.node_id) {
+          store = stores_.get(t.aios_path);
+          if (store) break;
+        }
+      }
+      if (!store) return fail("not_local", "no local replica for oid");
+    }
+  }
+
+  if (store && !seq.has_value()) {
     auto pr = check_preds_on(store, oid, preds, err);
     if (pr == PrecondResult::NotFound) return fail("not_found", err);
     if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
@@ -1337,10 +1379,32 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
           if (it.value().is_string()) attrs[it.key()] = it.value().get<std::string>();
         }
       }
-      if (attrs_are_ec(attrs)) {
+      if (attrs_are_ec(attrs) || st.ok) {
         info = ObjectInfo{};
         info->oid = oid;
         info->seq = st.body.value("seq", static_cast<std::uint64_t>(0));
+        if (attrs_are_ec(attrs)) break;
+        if (!info->seq) continue;
+        break;
+      }
+    }
+    // Dual-home: try previous class ring during transition.
+    if (!info && !sc_prev.empty()) {
+      auto prev_p = place(oid, map_, n, sc_prev);
+      for (const auto& t : prev_p.acting_set) {
+        if (t.node_id == cfg_.node_id) continue;
+        auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                     cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+        if (!st.ok) continue;
+        if (st.body.contains("attrs") && st.body["attrs"].is_object()) {
+          for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
+            if (it.value().is_string()) attrs[it.key()] = it.value().get<std::string>();
+          }
+        }
+        info = ObjectInfo{};
+        info->oid = oid;
+        info->seq = st.body.value("seq", static_cast<std::uint64_t>(0));
+        placement = std::move(prev_p);
         break;
       }
     }
@@ -1372,8 +1436,13 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   };
 
   if (attrs_are_ec(attrs)) {
-    const int n = placement_n_for_attrs(attrs, map_.replica_count);
-    placement = place(oid, map_, n);
+    const int en = placement_n_for_attrs(attrs, map_.replica_count);
+    const std::string esc = storage_class_for_attrs(attrs, cfg_.default_storage_class);
+    placement = place(oid, map_, en, esc);
+    if (placement.acting_set.empty()) {
+      const std::string prev = storage_class_prev_for_attrs(attrs);
+      if (!prev.empty()) placement = place(oid, map_, en, prev);
+    }
     if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
     auto rec = reconstruct_ec_object(placement, oid, seq, attrs);
     if (!rec.ok) return rec;
@@ -1454,7 +1523,19 @@ ApiResult ObjectService::api_del(const std::string& oid,
                                 const std::vector<AttrPrecondition>& preds,
                                 const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  std::string tip_class = cfg_.default_storage_class;
+  {
+    std::string err;
+    for (const auto& path : stores_.paths()) {
+      auto* s = stores_.get(path);
+      if (!s) continue;
+      auto st = s->stat(oid, err);
+      if (!st || st->is_delete) continue;
+      tip_class = storage_class_for_attrs(s->list_attrs(oid, err), tip_class);
+      break;
+    }
+  }
+  auto placement = place(oid, map_, tip_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1570,7 +1651,7 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
 
 ApiResult ObjectService::api_list_versions(const std::string& oid) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   ObjectStore* store = nullptr;
   std::string err;
   for (const auto& t : placement.acting_set) {
@@ -1595,7 +1676,7 @@ ApiResult ObjectService::api_list_versions(const std::string& oid) {
 ApiResult ObjectService::api_purge_version(const std::string& oid, std::uint64_t seq,
                                            bool allow_tip) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     return fail("not_primary", "this node is not primary for oid");
@@ -1622,7 +1703,7 @@ ApiResult ObjectService::api_purge_version(const std::string& oid, std::uint64_t
 
 ApiResult ObjectService::api_trim_versions(const std::string& oid, int keep) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     return fail("not_primary", "this node is not primary for oid");
@@ -1784,7 +1865,7 @@ ApiResult ObjectService::api_prepare_put(
     const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c,
     const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1813,7 +1894,7 @@ ApiResult ObjectService::api_prepare_put_file(
     std::optional<std::uint32_t> expected_crc32c,
     const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1840,7 +1921,7 @@ ApiResult ObjectService::api_prepare_delete(const std::string& oid,
                                            const std::vector<AttrPrecondition>& preds,
                                            const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1864,7 +1945,7 @@ ApiResult ObjectService::api_prepare_delete(const std::string& oid,
 
 ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64_t seq) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1891,7 +1972,7 @@ ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64
 
 ApiResult ObjectService::api_abort_prepared(const std::string& oid, std::uint64_t seq) {
   std::lock_guard lock(mu_);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not primary for oid");
@@ -1935,7 +2016,7 @@ ApiResult ObjectService::save_txn_state(const std::string& txn_id, const nlohman
 ApiResult ObjectService::require_txn_primary(const std::string& txn_id,
                                              nlohmann::json& state_out) {
   const auto oid = txn_oid(txn_id);
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     auto r = fail("not_primary", "this node is not txn coordinator");
@@ -1954,7 +2035,7 @@ ApiResult ObjectService::api_txn_begin() {
   for (int attempt = 0; attempt < 64; ++attempt) {
     const auto id = make_txn_id();
     const auto oid = txn_oid(id);
-    auto placement = place(oid, map_);
+    auto placement = place(oid, map_, cfg_.default_storage_class);
     if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
     if (placement.acting_set[0].node_id != cfg_.node_id) continue;
     nlohmann::json state = {{"txn_id", id},
@@ -2007,7 +2088,7 @@ ApiResult ObjectService::api_txn_prepare_put(
   if (!tr.ok) return tr;
   if (state.value("state", "") != "open") return fail("conflict", "txn not open");
 
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
 
   std::unordered_map<std::string, std::string> put_attrs = attrs;
@@ -2070,7 +2151,7 @@ ApiResult ObjectService::api_txn_prepare_put_file(
   if (!tr.ok) return tr;
   if (state.value("state", "") != "open") return fail("conflict", "txn not open");
 
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   // Large file prepare currently requires local primary (staging path is local).
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -2107,7 +2188,7 @@ ApiResult ObjectService::api_txn_prepare_delete(
   if (!tr.ok) return tr;
   if (state.value("state", "") != "open") return fail("conflict", "txn not open");
 
-  auto placement = place(oid, map_);
+  auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
 
   ApiResult prep;

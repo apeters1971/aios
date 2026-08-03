@@ -52,6 +52,7 @@ struct MixedLayoutFixture {
       t.mount = path;
       t.target_path = path;
       t.aios_path = path;
+      t.storage_class = "nvme";
       t.usable = true;
       t.bavail = 1000;
       local.push_back(t);
@@ -68,7 +69,7 @@ struct MixedLayoutFixture {
     cfg.clone_required = false;
     cfg.max_versions = 16;
 
-    map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+    map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
     ObjectStoreOptions opts;
     opts.shard_count = 4;
     opts.clone_required = false;
@@ -272,13 +273,13 @@ int test_layout() {
            "header/request overrides cold/ EC rule");
   }
 
-  // place(oid, map, n) hard-fails when n > targets
+  // place(oid, map, n, "nvme") hard-fails when n > targets
   {
     MixedLayoutFixture fx;
-    auto ok = place("o", fx.map, 3);
+    auto ok = place("o", fx.map, 3, "nvme");
     expect(ok.acting_set.size() == 3, "place n=3");
-    expect(place("o", fx.map, 4).acting_set.empty(), "place n>targets empty");
-    expect(place("o", fx.map).acting_set.size() == 3, "place compat");
+    expect(place("o", fx.map, 4, "nvme").acting_set.empty(), "place n>targets empty");
+    expect(place("o", fx.map, "nvme").acting_set.size() == 3, "place compat");
   }
 
   // Same cluster: replica object + EC object
@@ -318,7 +319,7 @@ int test_layout() {
            "range put on replica tip ok");
 
     // Repair EC object after dropping a shard (attrs-first, not cfg.durability).
-    auto pl = place("layout/ec", fx.map, 3);
+    auto pl = place("layout/ec", fx.map, 3, "nvme");
     std::string err;
     auto* victim = fx.stores.get(pl.acting_set[2].aios_path);
     auto st = victim->stat("layout/ec", err);
@@ -336,7 +337,7 @@ int test_layout() {
   {
     MixedLayoutFixture fx;
     const std::string oid = "layout/tcp-ec";
-    auto pl = place(oid, fx.map, 3);
+    auto pl = place(oid, fx.map, 3, "nvme");
     expect(!pl.acting_set.empty(), "tcp place");
     const auto& primary = pl.acting_set[0];
 

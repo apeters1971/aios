@@ -1,8 +1,8 @@
 # AIOS
 
-AIOS is a small C++20 **cluster object store**: durable objects on local filesystems, gossip membership, deterministic placement, and a placement-aware HTTP API.
+AIOS is a small C++20 **cluster object store**: durable objects on local filesystems, gossip membership, **consistent-hash placement** with storage classes, and a placement-aware HTTP API.
 
-Clients talk to the **primary** for an object (HTTP or TCP++); the primary replicates or erasure-codes across the acting set. There are no pools or placement groups—layout is chosen **per object version** at write time.
+Clients talk to the **primary** for an object (HTTP or TCP++); the primary replicates or erasure-codes across the acting set. There are no pools or placement groups—layout and storage class are chosen **per object version** at write time.
 
 | Binary / lib | Role |
 |--------------|------|
@@ -24,7 +24,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Storage targets (`.aios`)](#storage-targets-aios)
-- [Redundancy and layout](#redundancy-and-layout)
+- [Placement, storage classes, and layout](#placement-storage-classes-and-layout)
 - [HTTP object API](#http-object-api)
 - [Local object store](#local-object-store)
 - [Tools](#tools)
@@ -41,19 +41,21 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 
 - Peer join from config/CLI (empty peer list = bootstrap node)
 - Membership via signed TCP gossip (“TCP++”)
-- Cluster map (epoch + storage targets) rebuilt from gossiped capacity
-- Deterministic placement: `place(oid, map) → acting_set` (primary = first target)
+- Cluster map (epoch + storage targets + classes) rebuilt from gossiped capacity
+- **Consistent hashing with virtual nodes** on a **storage-class** ring: `place(oid, map, n, class) → acting_set` (primary = first target); membership changes remap ~`1/N` of objects
 
 **Storage**
 
-- Discover mounts via top-level `.aios` markers; prepare `…/aios/` targets
+- Discover mounts via top-level `.aios` markers (`storage_class` required); prepare `…/aios/` targets
 - Hybrid local store: SQLite metadata + inline or filesystem bodies, sharded by oid hash
-- Versioned objects (`max_versions`), attrs, ranged PUT/GET, delete markers
+- Versioned objects (`max_versions`), attrs, ranged PUT/GET, delete markers, atomic append
 - Server-side **replica** or **erasure-coded** durability, with background repair
+- **Class transitions** (`transition_rules`): background tip migration between classes (e.g. `nvme` → `hdd`)
 
 **HTTP API** (`http_listen`, default `:7480`)
 
 - Object CRUD, LIST (cluster scatter-gather or local), cluster map
+- Per-PUT layout / storage class headers (`x-aios-layout`, `x-aios-storage-class`, `x-aios-ec-*`)
 - Attr preconditions (`If-Match` / `If-None-Match` / attr predicates)
 - Cross-object transactions (`/txn`)
 - Enforced object locks (TTL leases)
@@ -63,6 +65,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 **Ops**
 
 - Status JSON file, HMAC shared-secret auth on gossip/RPC/HTTP
+- Admin console + Prometheus (`/admin/*`, `/metrics`); application labels for per-workload OPS
 - Optional Intel ISA-L Reed–Solomon for EC with `m > 1`
 
 ---
@@ -77,21 +80,23 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
                            │ HTTP :7480 (HMAC)
               ┌────────────▼────────────┐
               │     primary aiosd       │
-              │  place(oid) → acting set│
+              │  CH place(oid,class,n)  │
               └─────┬──────────┬────────┘
                     │          │ TCP++ object RPC
            ┌────────▼──┐  ┌────▼────────┐
            │ local     │  │ peer aiosd  │
            │ …/aios/   │  │ replicas/EC │
+           │ (nvme/hdd)│  │             │
            └───────────┘  └─────────────┘
                     ▲
                     │ gossip :7400 (membership + fs_table + map)
 ```
 
-1. Daemons gossip membership and `statvfs` for each usable target.
-2. Each node builds the same **cluster map** for a given epoch.
-3. Writes hash the oid to an acting set; the primary installs and publishes the tip, then fans out.
+1. Daemons gossip membership and `statvfs` for each usable target (with `storage_class` / weight).
+2. Each node builds the same **cluster map** for a given epoch (class-scoped vnode rings).
+3. Writes consistent-hash the oid onto the class ring → acting set; the primary installs and publishes the tip, then fans out.
 4. Reads go to the primary (or any node that can reconstruct EC); wrong node → HTTP **307** with `Location`.
+5. Optional **transition** workers move tips between classes under `transition_rules`.
 
 ---
 
@@ -173,6 +178,11 @@ suspect_after_ms: 5000
 dead_after_ms: 15000
 scan_interval_ms: 5000
 replica_count: 3
+default_storage_class: nvme
+placement:
+  vnodes_per_target: 128
+  min_vnodes: 16
+  max_vnodes: 1024
 # durability: replica       # or ec
 # ec_k: 2
 # ec_m: 1                   # m=1 → XOR; m>1 needs ISA-L
@@ -182,10 +192,16 @@ http_listen: "0.0.0.0:7480"
 # layout_rules:
 #   - prefix: "hot/"
 #     layout: replica
+#     storage_class: nvme
 #   - prefix: "cold/"
 #     layout: ec
+#     storage_class: hdd
 #     ec_k: 2
 #     ec_m: 1
+# transition_rules:
+#   - prefix: "cold/"
+#     from: nvme
+#     to: hdd
 status_file: "/tmp/aios-a.json"
 ```
 
@@ -193,7 +209,7 @@ status_file: "/tmp/aios-a.json"
 
 ### Admin & monitoring
 
-Enable on selected nodes with `admin: true` / `--admin`. That exposes `/admin/status|ops|config|cluster` and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers.
+Enable on selected nodes with `admin: true` / `--admin`. That exposes `/admin/status|ops|config|cluster|transitions` and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers. `POST /admin/transitions/run` forces one local class-migration tick.
 
 ```bash
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin status
@@ -208,27 +224,54 @@ Details: [`proto/admin.md`](proto/admin.md).
 
 ## Storage targets (`.aios`)
 
-Place a file named `.aios` in the **top level** of a mounted filesystem the daemon can see.
+Place a file named `.aios` in the **top level** of a mounted filesystem the daemon can see. **`storage_class` is required.**
 
-| Contents | Effect |
-|----------|--------|
-| empty / `{}` / no `targets` | One target → `<mount>/aios/` |
-| `targets: [data, scratch]` | `<mount>/data/aios/` and `<mount>/scratch/aios/` |
+| Field | Effect |
+|-------|--------|
+| `storage_class: nvme` | Placement pool / class-scoped consistent-hash ring (required) |
+| `weight: 2` | Optional vnode weight (default 1) |
+| `targets: [data, scratch]` | `<mount>/data/aios/` and `<mount>/scratch/aios/` (omit → `<mount>/aios/`) |
 
-The daemon creates each `aios/` directory if missing, then requires ownership to match the process **euid/egid**. Mismatches are logged and the target is **not** advertised. Usable targets appear in status JSON under `fs_table` with `statvfs` fields.
+The daemon creates each `aios/` directory if missing, then requires ownership to match the process **euid/egid**. Mismatches are logged and the target is **not** advertised.
 
 ```bash
-# On a mount root you own:
-: > /path/to/mount/.aios
-# or:
-echo 'targets: [data]' > /path/to/mount/.aios
+cat > /path/to/nvme-mount/.aios <<'EOF'
+storage_class: nvme
+targets: [data]
+EOF
+cat > /path/to/hdd-mount/.aios <<'EOF'
+storage_class: hdd
+weight: 1
+EOF
 ```
 
 ---
 
-## Redundancy and layout
+## Placement, storage classes, and layout
 
-Placement is deterministic: `place(oid, cluster_map, n) → acting_set`.
+### Consistent hashing
+
+Each storage class has its own **vnode ring**. Targets advertise a class and optional `weight` in `.aios`; the map expands each target to `clamp(weight × vnodes_per_target, min_vnodes, max_vnodes)` virtual nodes.
+
+```text
+sha256(oid) → start on class ring → walk clockwise
+  → prefer distinct node_id, then fill same-node mounts
+  → acting_set[0] is primary
+```
+
+API: `place(oid, map, n, storage_class)`. If the class has fewer than `n` targets, placement fails with `no_targets` (no silent under-protection). Adding or removing a target remaps roughly **`1/N`** of objects—not a full reshuffle.
+
+### Storage classes
+
+Devices declare a class (convention: `nvme`, `ssd`, `hdd`, … — free-form `[a-z0-9_-]+`). Writes pick a class by:
+
+1. Request: `x-aios-storage-class` / JSON `storage_class`
+2. Longest matching `layout_rules` prefix
+3. Cluster `default_storage_class`
+
+The tip stores `aios.storage_class`. Reads and repair use that attr (attrs win over cluster defaults).
+
+### Durability (replica vs EC)
 
 | Mode | Behavior |
 |------|----------|
@@ -237,7 +280,25 @@ Placement is deterministic: `place(oid, cluster_map, n) → acting_set`.
 
 EC codec is auto-selected (`xor` when `ec_m=1`, else `isal` / Reed–Solomon). Build with ISA-L available for `m>1`. Ranged PUT is rejected under EC; staged PUT is capped (see HTTP docs).
 
-**Per-object layout** (no pools): each PUT may override via headers (`x-aios-layout`, `x-aios-ec-*`). Cluster `durability` / `ec_*` are defaults. Optional YAML `layout_rules` map oid prefixes to defaults (longest match; request headers still win). Details: [`proto/layout.md`](proto/layout.md).
+**Per-object layout** (no pools): each PUT may override via `x-aios-layout` / `x-aios-ec-*`. Cluster `durability` / `ec_*` are defaults. `layout_rules` can set both layout and `storage_class` by oid prefix (longest match; request headers still win).
+
+### Class transitions
+
+Move tips between classes under policy (or with a client PUT that changes class):
+
+```yaml
+transition_rules:
+  - prefix: "cold/"
+    from: nvme
+    to: hdd
+    layout: ec          # optional layout change on migrate
+    ec_k: 2
+    ec_m: 1
+```
+
+The destination primary copies/re-encodes the tip, sets `aios.storage_class_prev` while dual-homed, then drains the source once the destination has quorum. Background interval: `transition_interval_ms`. Admin: `GET /admin/transitions`, `POST /admin/transitions/run`.
+
+Full design: [`proto/layout.md`](proto/layout.md).
 
 ---
 

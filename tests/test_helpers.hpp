@@ -41,6 +41,19 @@ inline std::filesystem::path temp_root(const char* prefix) {
   return p;
 }
 
+inline AiosTarget make_target(const std::string& path, const std::string& storage_class = "nvme",
+                              int weight = 1) {
+  AiosTarget t;
+  t.mount = path;
+  t.target_path = path;
+  t.aios_path = path;
+  t.storage_class = storage_class;
+  t.weight = weight;
+  t.usable = true;
+  t.bavail = 1000;
+  return t;
+}
+
 struct DualStoreFixture {
   std::filesystem::path root;
   std::string p1;
@@ -52,7 +65,8 @@ struct DualStoreFixture {
   LocalStores stores;
   std::unique_ptr<ObjectService> svc;
 
-  DualStoreFixture(const char* prefix, int replica_count = 2, int write_quorum = 2) {
+  DualStoreFixture(const char* prefix, int replica_count = 2, int write_quorum = 2,
+                   const std::string& storage_class = "nvme") {
     root = temp_root(prefix);
     std::filesystem::create_directories(root / "t1" / "aios");
     std::filesystem::create_directories(root / "t2" / "aios");
@@ -60,16 +74,8 @@ struct DualStoreFixture {
     p2 = (root / "t2" / "aios").string();
 
     membership.set_local("node-a", "127.0.0.1:7400");
-    std::vector<AiosTarget> local;
-    for (const auto& path : {p1, p2}) {
-      AiosTarget t;
-      t.mount = path;
-      t.target_path = path;
-      t.aios_path = path;
-      t.usable = true;
-      t.bavail = 1000;
-      local.push_back(t);
-    }
+    std::vector<AiosTarget> local{make_target(p1, storage_class),
+                                  make_target(p2, storage_class)};
     fs_table.set_local("node-a", local);
 
     cfg.node_id = "node-a";
@@ -78,8 +84,16 @@ struct DualStoreFixture {
     cfg.write_quorum = write_quorum;
     cfg.max_versions = 16;
     cfg.clone_required = false;
+    cfg.default_storage_class = storage_class;
+    cfg.vnodes_per_target = 32;
+    cfg.min_vnodes = 8;
+    cfg.max_vnodes = 256;
 
-    map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+    PlacementConfig pc;
+    pc.vnodes_per_target = cfg.vnodes_per_target;
+    pc.min_vnodes = cfg.min_vnodes;
+    pc.max_vnodes = cfg.max_vnodes;
+    map = ClusterMap::build(membership, fs_table, cfg.replica_count, pc);
     ObjectStoreOptions opts;
     opts.shard_count = 4;
     opts.clone_required = false;

@@ -142,6 +142,7 @@ int test_append() {
       t.mount = path;
       t.target_path = path;
       t.aios_path = path;
+      t.storage_class = "nvme";
       t.usable = true;
       t.bavail = 1000;
       local.push_back(t);
@@ -159,7 +160,7 @@ int test_append() {
     cfg.clone_required = false;
     cfg.max_versions = 16;
 
-    ClusterMap map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+    ClusterMap map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
     LocalStores stores;
     ObjectStoreOptions opts;
     opts.shard_count = 4;

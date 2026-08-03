@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -41,61 +42,97 @@ bool under_mount(const std::string& mount, const std::string& path) {
   return false;
 }
 
+std::string lower_copy(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+bool valid_storage_class(const std::string& s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (char c : s) {
+    if (std::islower(static_cast<unsigned char>(c)) ||
+        std::isdigit(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
-std::vector<std::string> parse_aios_targets(const std::string& yaml_text,
-                                            const std::string& mount_root,
-                                            std::string& err) {
+bool parse_aios_marker(const std::string& yaml_text, const std::string& mount_root,
+                       AiosMarker& out, std::string& err) {
   err.clear();
+  out = AiosMarker{};
   std::string trimmed = yaml_text;
-  // Treat whitespace-only as empty config.
   if (trimmed.find_first_not_of(" \t\r\n") == std::string::npos) {
-    return {mount_root};
+    err = "storage_class is required in .aios";
+    return false;
   }
   try {
     YAML::Node root = YAML::Load(yaml_text);
-    if (!root || root.IsNull()) {
-      return {mount_root};
+    if (!root || !root.IsMap()) {
+      err = ".aios must be a YAML mapping with storage_class";
+      return false;
     }
-    if (root.IsMap() && !root["targets"]) {
-      return {mount_root};
+    if (!root["storage_class"]) {
+      err = "storage_class is required in .aios";
+      return false;
     }
-    if (root.IsMap() && root["targets"]) {
-      std::vector<std::string> out;
-      if (root["targets"].IsSequence()) {
-        for (const auto& t : root["targets"]) {
-          const std::string rel = t.as<std::string>();
-          const std::string abs = join_path(mount_root, rel);
-          if (!under_mount(mount_root, abs)) {
-            err = "target escapes mount: " + abs;
-            return {};
-          }
-          out.push_back(abs);
-        }
-      } else if (root["targets"].IsScalar()) {
-        const std::string abs = join_path(mount_root, root["targets"].as<std::string>());
+    out.storage_class = lower_copy(root["storage_class"].as<std::string>());
+    if (!valid_storage_class(out.storage_class)) {
+      err = "storage_class must match [a-z0-9_-]+";
+      return false;
+    }
+    if (root["weight"]) {
+      out.weight = root["weight"].as<int>();
+      if (out.weight < 1) {
+        err = "weight must be >= 1";
+        return false;
+      }
+    }
+    if (!root["targets"]) {
+      out.target_paths = {mount_root};
+      return true;
+    }
+    if (root["targets"].IsSequence()) {
+      for (const auto& t : root["targets"]) {
+        const std::string rel = t.as<std::string>();
+        const std::string abs = join_path(mount_root, rel);
         if (!under_mount(mount_root, abs)) {
           err = "target escapes mount: " + abs;
-          return {};
+          return false;
         }
-        out.push_back(abs);
+        out.target_paths.push_back(abs);
       }
-      if (out.empty()) return {mount_root};
-      return out;
+    } else if (root["targets"].IsScalar()) {
+      const std::string abs = join_path(mount_root, root["targets"].as<std::string>());
+      if (!under_mount(mount_root, abs)) {
+        err = "target escapes mount: " + abs;
+        return false;
+      }
+      out.target_paths.push_back(abs);
+    } else {
+      err = "targets must be a string or sequence";
+      return false;
     }
-    // Non-map unexpected content: treat as whole partition.
-    return {mount_root};
+    if (out.target_paths.empty()) out.target_paths = {mount_root};
+    return true;
   } catch (const std::exception& e) {
     err = e.what();
-    return {};
+    return false;
   }
 }
 
-AiosTarget prepare_target(const std::string& mount, const std::string& target_path) {
+AiosTarget prepare_target(const std::string& mount, const std::string& target_path,
+                          const std::string& storage_class, int weight) {
   AiosTarget t;
   t.mount = mount;
   t.target_path = target_path;
   t.aios_path = (fs::path(target_path) / "aios").string();
+  t.storage_class = storage_class;
+  t.weight = weight > 0 ? weight : 1;
 
   std::error_code ec;
   if (!fs::exists(target_path, ec)) {
@@ -164,14 +201,14 @@ std::vector<AiosTarget> scan_aios_filesystems() {
     }
     std::ostringstream ss;
     ss << in.rdbuf();
+    AiosMarker parsed;
     std::string err;
-    auto targets = parse_aios_targets(ss.str(), m.path, err);
-    if (!err.empty()) {
+    if (!parse_aios_marker(ss.str(), m.path, parsed, err)) {
       AIOS_LOG_ERROR(".aios parse on ", m.path, ": ", err);
       continue;
     }
-    for (const auto& tp : targets) {
-      out.push_back(prepare_target(m.path, tp));
+    for (const auto& tp : parsed.target_paths) {
+      out.push_back(prepare_target(m.path, tp, parsed.storage_class, parsed.weight));
     }
   }
   return out;

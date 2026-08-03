@@ -247,7 +247,8 @@ class ObjectService {
   ApiResult save_txn_state(const std::string& txn_id, const nlohmann::json& state);
   ApiResult load_txn_state(const std::string& txn_id, nlohmann::json& state_out);
 
-  ApiResult require_primary(const std::string& oid, Placement& placement_out);
+  ApiResult require_primary(const std::string& oid, Placement& placement_out,
+                            const std::string& storage_class = {});
   ApiResult enforce_lock(const std::string& oid, const std::optional<std::string>& token);
   void signal_watch(const std::string& oid, std::uint64_t seq, const std::string& op);
 

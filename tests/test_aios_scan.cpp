@@ -25,40 +25,46 @@ int test_aios_scan() {
   using namespace aios;
 
   std::string err;
+  AiosMarker m;
   {
-    auto t = parse_aios_targets("", "/mnt/data", err);
-    expect(err.empty(), "empty yaml no err");
-    expect(t.size() == 1 && t[0] == "/mnt/data", "empty => mount root");
+    expect(!parse_aios_marker("", "/mnt/data", m, err), "empty requires storage_class");
+    expect(!err.empty(), "empty err set");
   }
   {
-    auto t = parse_aios_targets("{}", "/mnt/data", err);
-    expect(err.empty(), "{} no err");
-    expect(t.size() == 1 && t[0] == "/mnt/data", "{} => mount root");
+    expect(!parse_aios_marker("{}", "/mnt/data", m, err), "{} requires storage_class");
   }
   {
-    auto t = parse_aios_targets("targets:\n  - data\n  - scratch\n", "/mnt", err);
-    expect(err.empty(), "targets no err");
-    expect(t.size() == 2, "two targets");
-    expect(t[0] == "/mnt/data", "data path");
-    expect(t[1] == "/mnt/scratch", "scratch path");
+    expect(parse_aios_marker("storage_class: nvme\n", "/mnt/data", m, err), "class only ok");
+    expect(err.empty(), "class only no err");
+    expect(m.storage_class == "nvme", "class nvme");
+    expect(m.target_paths.size() == 1 && m.target_paths[0] == "/mnt/data", "default mount root");
   }
   {
-    auto t = parse_aios_targets("targets:\n  - /elsewhere\n", "/mnt", err);
-    expect(!err.empty() || t.empty(), "escape rejected");
+    expect(parse_aios_marker(
+               "storage_class: hdd\nweight: 2\ntargets:\n  - data\n  - scratch\n", "/mnt", m,
+               err),
+           "full marker ok");
+    expect(m.storage_class == "hdd", "hdd class");
+    expect(m.weight == 2, "weight 2");
+    expect(m.target_paths.size() == 2, "two targets");
+    expect(m.target_paths[0] == "/mnt/data", "data path");
+    expect(m.target_paths[1] == "/mnt/scratch", "scratch path");
+  }
+  {
+    expect(!parse_aios_marker("storage_class: nvme\ntargets:\n  - /elsewhere\n", "/mnt", m, err),
+           "escape rejected");
   }
 
-  // Fixture dir with prepare_target
   const auto base = fs::temp_directory_path() / "aios-test-scan";
   fs::remove_all(base);
   fs::create_directories(base / "data");
   {
-    auto t = prepare_target(base.string(), (base / "data").string());
+    auto t = prepare_target(base.string(), (base / "data").string(), "nvme", 1);
     expect(t.usable, "prepare usable");
+    expect(t.storage_class == "nvme", "prepare class");
     expect(fs::is_directory(base / "data" / "aios"), "aios dir created");
     expect(t.bsize > 0, "statvfs bsize");
   }
-
-  // Ownership mismatch simulation is hard without root; skip.
 
   fs::remove_all(base);
   return failures;

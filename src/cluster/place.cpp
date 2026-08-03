@@ -2,7 +2,10 @@
 
 #include <openssl/evp.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <unordered_set>
+#include <vector>
 
 namespace aios {
 namespace {
@@ -18,22 +21,68 @@ std::uint64_t sha256_u64(const std::string& s) {
   return v;
 }
 
+struct VNode {
+  std::uint64_t hash{0};
+  std::size_t target_index{0};
+};
+
+int vnode_count_for(const StorageTarget& t, const PlacementConfig& pc) {
+  const int w = t.weight > 0 ? t.weight : 1;
+  long long v = static_cast<long long>(w) * pc.vnodes_per_target;
+  if (v < pc.min_vnodes) v = pc.min_vnodes;
+  if (v > pc.max_vnodes) v = pc.max_vnodes;
+  return static_cast<int>(v);
+}
+
+std::vector<VNode> build_ring(const std::vector<StorageTarget>& targets,
+                              const PlacementConfig& pc) {
+  std::vector<VNode> ring;
+  ring.reserve(targets.size() * static_cast<std::size_t>(std::max(1, pc.vnodes_per_target)));
+  for (std::size_t ti = 0; ti < targets.size(); ++ti) {
+    const int vn = vnode_count_for(targets[ti], pc);
+    const std::string base = target_key(targets[ti]);
+    for (int i = 0; i < vn; ++i) {
+      VNode v;
+      v.hash = sha256_u64(base + ":vnode:" + std::to_string(i));
+      v.target_index = ti;
+      ring.push_back(v);
+    }
+  }
+  std::sort(ring.begin(), ring.end(),
+            [](const VNode& a, const VNode& b) {
+              if (a.hash != b.hash) return a.hash < b.hash;
+              return a.target_index < b.target_index;
+            });
+  return ring;
+}
+
 }  // namespace
 
-Placement place(const std::string& oid, const ClusterMap& map, int n) {
+Placement place(const std::string& oid, const ClusterMap& map, int n,
+                const std::string& storage_class) {
   Placement p;
   p.epoch = map.epoch;
-  if (map.targets.empty() || n < 1) return p;
-  if (static_cast<std::size_t>(n) > map.targets.size()) return p;
+  p.storage_class = storage_class;
+  if (map.targets.empty() || n < 1 || storage_class.empty()) return p;
 
-  const std::size_t ring = map.targets.size();
+  const auto pool = map.targets_for_class(storage_class);
+  if (static_cast<std::size_t>(n) > pool.size()) return p;
+
+  const auto ring = build_ring(pool, map.placement);
+  if (ring.empty()) return p;
+
+  const std::uint64_t oid_hash = sha256_u64(oid);
+  auto it = std::lower_bound(ring.begin(), ring.end(), oid_hash,
+                             [](const VNode& v, std::uint64_t h) { return v.hash < h; });
+  std::size_t start = static_cast<std::size_t>(it - ring.begin());
+  if (start >= ring.size()) start = 0;
+
   const std::size_t want = static_cast<std::size_t>(n);
-  const std::size_t start = static_cast<std::size_t>(sha256_u64(oid) % ring);
-
   std::unordered_set<std::string> used_keys;
   std::unordered_set<std::string> used_nodes;
 
-  auto try_add = [&](const StorageTarget& t, bool require_new_node) -> bool {
+  auto try_add = [&](std::size_t ti, bool require_new_node) -> bool {
+    const auto& t = pool[ti];
     if (used_keys.count(target_key(t))) return false;
     if (require_new_node && used_nodes.count(t.node_id)) return false;
     p.acting_set.push_back(t);
@@ -42,31 +91,34 @@ Placement place(const std::string& oid, const ClusterMap& map, int n) {
     return true;
   };
 
-  // Pass 1: distinct nodes.
-  for (std::size_t i = 0; i < ring && p.acting_set.size() < want; ++i) {
-    try_add(map.targets[(start + i) % ring], /*require_new_node=*/true);
+  // Pass 1: distinct nodes, walking the vnode ring clockwise.
+  for (std::size_t i = 0; i < ring.size() && p.acting_set.size() < want; ++i) {
+    try_add(ring[(start + i) % ring.size()].target_index, /*require_new_node=*/true);
   }
-  // Pass 2: fill remaining with any unused targets (same-node mounts ok).
-  for (std::size_t i = 0; i < ring && p.acting_set.size() < want; ++i) {
-    try_add(map.targets[(start + i) % ring], /*require_new_node=*/false);
+  // Pass 2: fill remaining with any unused targets in the pool.
+  for (std::size_t i = 0; i < ring.size() && p.acting_set.size() < want; ++i) {
+    try_add(ring[(start + i) % ring.size()].target_index, /*require_new_node=*/false);
   }
   return p;
 }
 
-Placement place(const std::string& oid, const ClusterMap& map) {
-  return place(oid, map, map.replica_count);
+Placement place(const std::string& oid, const ClusterMap& map,
+                const std::string& storage_class) {
+  return place(oid, map, map.replica_count, storage_class);
 }
 
 bool is_primary_for(const std::string& oid, const ClusterMap& map,
-                    const std::string& node_id, const std::string& aios_path) {
-  const auto p = place(oid, map);
+                    const std::string& storage_class, const std::string& node_id,
+                    const std::string& aios_path) {
+  const auto p = place(oid, map, storage_class);
   if (p.acting_set.empty()) return false;
   return p.acting_set[0].node_id == node_id && p.acting_set[0].aios_path == aios_path;
 }
 
 bool in_acting_set(const std::string& oid, const ClusterMap& map,
-                   const std::string& node_id, const std::string& aios_path) {
-  const auto p = place(oid, map);
+                   const std::string& storage_class, const std::string& node_id,
+                   const std::string& aios_path) {
+  const auto p = place(oid, map, storage_class);
   for (const auto& t : p.acting_set) {
     if (t.node_id == node_id && t.aios_path == aios_path) return true;
   }

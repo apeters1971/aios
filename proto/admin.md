@@ -24,6 +24,8 @@ All admin JSON routes still require the normal AIOS HMAC Authorization header, e
 | `GET /admin/ops` | `{node_id, ops, ops_by_label}` |
 | `GET /admin/config` | Effective config (`cluster_key` → `"***"`). Read-only; changes need restart. |
 | `GET /admin/cluster` | Local status + `admin_peers` (`node_id`, `http_addr`) for cluster scrape |
+| `GET /admin/transitions` | Configured storage-class `transition_rules` + intervals |
+| `POST /admin/transitions/run` | Run one local transition tick; returns `{matched,migrated,drained,failed}` |
 | `GET /metrics` | Prometheus counters (`aios_*_total`) |
 
 ## OPS counters

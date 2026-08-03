@@ -4,6 +4,7 @@
 #include "net/client.hpp"
 #include "node_id.hpp"
 #include "object/repair.hpp"
+#include "object/transition.hpp"
 #include "util/log.hpp"
 
 #include <algorithm>
@@ -25,7 +26,8 @@ GossipEngine::GossipEngine(boost::asio::io_context& ioc, Config cfg,
       gossip_timer_(ioc),
       scan_timer_(ioc),
       status_timer_(ioc),
-      repair_timer_(ioc) {
+      repair_timer_(ioc),
+      transition_timer_(ioc) {
   object_service_ = std::make_unique<ObjectService>(cfg_, cluster_map_, local_stores_);
 }
 
@@ -42,7 +44,11 @@ std::string GossipEngine::advertise_addr() const {
 
 void GossipEngine::rebuild_cluster_map() {
   const auto prev = cluster_map_.epoch;
-  cluster_map_ = ClusterMap::build(membership_, fs_table_, cfg_.replica_count);
+  PlacementConfig pc;
+  pc.vnodes_per_target = cfg_.vnodes_per_target;
+  pc.min_vnodes = cfg_.min_vnodes;
+  pc.max_vnodes = cfg_.max_vnodes;
+  cluster_map_ = ClusterMap::build(membership_, fs_table_, cfg_.replica_count, pc);
   if (cluster_map_.epoch != prev) {
     AIOS_LOG_INFO("cluster map epoch=", cluster_map_.epoch,
                   " targets=", cluster_map_.targets.size(),
@@ -136,6 +142,10 @@ void GossipEngine::start() {
   if (cfg_.repair_interval_ms > 0) {
     repair_timer_.expires_after(std::chrono::milliseconds(cfg_.repair_interval_ms));
     repair_timer_.async_wait([this](auto ec) { on_repair_timer(ec); });
+  }
+  if (cfg_.transition_interval_ms > 0 && !cfg_.transition_rules.empty()) {
+    transition_timer_.expires_after(std::chrono::milliseconds(cfg_.transition_interval_ms));
+    transition_timer_.async_wait([this](auto ec) { on_transition_timer(ec); });
   }
 
   AIOS_LOG_INFO("node ", cfg_.node_id, " advertise=", adv,
@@ -233,6 +243,21 @@ void GossipEngine::on_repair_timer(const boost::system::error_code& ec) {
   }
   repair_timer_.expires_after(std::chrono::milliseconds(cfg_.repair_interval_ms));
   repair_timer_.async_wait([this](auto e) { on_repair_timer(e); });
+}
+
+void GossipEngine::on_transition_timer(const boost::system::error_code& ec) {
+  if (ec) return;
+  rebuild_cluster_map();
+  const auto stats = run_transitions(
+      cfg_, advertise_addr(), cluster_map_, local_stores_,
+      static_cast<std::size_t>(std::max(1, cfg_.transition_batch_oids)));
+  if (stats.matched > 0 || stats.migrated > 0 || stats.drained > 0) {
+    AIOS_LOG_INFO("transition scanned=", stats.oids_scanned, " matched=", stats.matched,
+                  " migrated=", stats.migrated, " drained=", stats.drained,
+                  " failed=", stats.failed);
+  }
+  transition_timer_.expires_after(std::chrono::milliseconds(cfg_.transition_interval_ms));
+  transition_timer_.async_wait([this](auto e) { on_transition_timer(e); });
 }
 
 void GossipEngine::write_status() {

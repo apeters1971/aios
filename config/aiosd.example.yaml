@@ -15,21 +15,39 @@ scan_interval_ms: 5000
 replica_count: 3
 # write_quorum: 0          # 0 => same as replica_count (capped by acting set size)
 # durability: replica      # default layout (alias: default_layout); per-PUT headers may override
+default_storage_class: nvme
+# Consistent-hash virtual nodes (per target, scaled by .aios weight):
+placement:
+  vnodes_per_target: 128
+  min_vnodes: 16
+  max_vnodes: 1024
 # ec_k: 2                  # default EC k (alias: default_ec_k)
 # ec_m: 1                  # m=1 → XOR; m>1 needs ISA-L (e.g. 4+2)
 # ec_codec:                # empty=auto (xor if m==1 else isal), or "xor" / "isal"
 # max_ec_k: 16
 # max_ec_m: 16
 # max_replica_count: 64
-# Prefix → layout defaults (longest matching prefix; per-PUT headers still win):
+# Prefix → layout / storage_class defaults (longest matching prefix; per-PUT headers still win):
 # layout_rules:
 #   - prefix: "hot/"
 #     layout: replica
+#     storage_class: nvme
 #   - prefix: "cold/"
 #     layout: ec
+#     storage_class: hdd
 #     ec_k: 2
 #     ec_m: 1
 #     ec_codec: xor
+# Background tip migration between storage classes:
+# transition_rules:
+#   - prefix: "cold/"
+#     from: nvme
+#     to: hdd
+#     layout: ec
+#     ec_k: 2
+#     ec_m: 1
+# transition_interval_ms: 30000
+# transition_batch_oids: 64
 
 # repair_interval_ms: 30000
 # repair_batch_oids: 256

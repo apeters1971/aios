@@ -50,6 +50,7 @@ int test_object_rpc() {
     t.mount = path;
     t.target_path = path;
     t.aios_path = path;
+      t.storage_class = "nvme";
     t.usable = true;
     t.bavail = 1000;
     local.push_back(t);
@@ -62,7 +63,7 @@ int test_object_rpc() {
   cfg.replica_count = 2;
   cfg.write_quorum = 2;
 
-  ClusterMap map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+  ClusterMap map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
   expect(map.targets.size() == 2, "two local targets");
 
   LocalStores stores;
@@ -76,7 +77,7 @@ int test_object_rpc() {
   svc.set_advertise("127.0.0.1:7400");
 
   const std::string oid = "test-oid-1";
-  auto placement = place(oid, map);
+  auto placement = place(oid, map, "nvme");
   expect(placement.acting_set.size() == 2, "acting set 2");
   const auto& primary = placement.acting_set[0];
 

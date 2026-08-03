@@ -43,6 +43,7 @@ struct TripleStoreFixture {
       t.mount = path;
       t.target_path = path;
       t.aios_path = path;
+      t.storage_class = "nvme";
       t.usable = true;
       t.bavail = 1000;
       local.push_back(t);
@@ -60,7 +61,7 @@ struct TripleStoreFixture {
     cfg.max_versions = 16;
     cfg.clone_required = false;
 
-    map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+    map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
     ObjectStoreOptions opts;
     opts.shard_count = 4;
     opts.clone_required = false;
@@ -118,7 +119,7 @@ void test_service_degraded_and_repair(aios::ObjectService& svc, aios::Config& cf
                  std::string(reinterpret_cast<const char*>(body), len),
          std::string(label) + " get");
 
-  auto pl = place(oid, map);
+  auto pl = place(oid, map, "nvme");
   expect(static_cast<int>(pl.acting_set.size()) >= 3, std::string(label) + " acting");
   auto* victim = stores.get(pl.acting_set[2].aios_path);
   expect(purge_shard_tip(victim, oid), std::string(label) + " purge shard");
@@ -336,6 +337,7 @@ int test_ec() {
         t.mount = p;
         t.target_path = p;
         t.aios_path = p;
+      t.storage_class = "nvme";
         t.usable = true;
         t.bavail = 1000;
         local.push_back(t);
@@ -350,7 +352,7 @@ int test_ec() {
       cfg.ec_codec = "isal";
       cfg.clone_required = false;
       expect(normalize_config(cfg, err), "normalize 4+2");
-      auto map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+      auto map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
       LocalStores stores;
       ObjectStoreOptions opts;
       opts.shard_count = 4;
@@ -365,7 +367,7 @@ int test_ec() {
       auto put = svc.api_put(oid, reinterpret_cast<const std::uint8_t*>(payload.data()),
                              payload.size(), {}, true, {});
       expect(put.ok && put.replicas == 6, "4+2 put");
-      auto pl = place(oid, map);
+      auto pl = place(oid, map, "nvme");
       expect(pl.acting_set.size() == 6, "4+2 acting");
 
       // Drop two shards; GET must still reconstruct.

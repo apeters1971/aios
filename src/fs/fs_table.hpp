@@ -17,6 +17,8 @@ struct FsEntry {
   std::string mount;
   std::string target_path;
   std::string aios_path;
+  std::string storage_class;
+  int weight{1};
   std::uint64_t bsize{0};
   std::uint64_t blocks{0};
   std::uint64_t bfree{0};

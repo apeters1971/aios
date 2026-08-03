@@ -66,6 +66,8 @@ Canonical string:
 | `GET` | `/admin/ops` | **Admin:** `{node_id,ops}` |
 | `GET` | `/admin/config` | **Admin:** effective config (`cluster_key` redacted) |
 | `GET` | `/admin/cluster` | **Admin:** status + list of alive peers with `http_addr` |
+| `GET` | `/admin/transitions` | **Admin:** configured `transition_rules` |
+| `POST` | `/admin/transitions/run` | **Admin:** run one local class-transition tick |
 | `GET` | `/metrics` | **Admin:** Prometheus/OpenMetrics text (optional public scrape) |
 | `POST` | `/txn` | Begin cross-object txn → JSON `{txn_id,state,ops}` (201) |
 | `GET` | `/txn/{id}` | Txn coordinator state JSON |
@@ -87,10 +89,11 @@ When the daemon runs with `durability: ec`, ordinary `PUT /o/{oid}` stripes the 
 | Header | Role |
 |--------|------|
 | `x-aios-layout: replica \| ec` | Select layout; omit → prefix rule / cluster `durability` |
+| `x-aios-storage-class` | Placement pool (e.g. `nvme`, `hdd`); omit → rule / `default_storage_class` |
 | `x-aios-ec-k`, `x-aios-ec-m` | EC params; omit → prefix rule / cluster `ec_k` / `ec_m` |
 | `x-aios-ec-codec: xor \| isal` | Omit → auto (`xor` if `m==1`, else `isal`) |
 
-Layout is stored on the version (`x-aios-attr-aios.layout`, etc.). Optional YAML `layout_rules` set admin defaults by oid prefix. See [`layout.md`](layout.md).
+Layout and class are stored on the version (`x-aios-attr-aios.layout`, `x-aios-attr-aios.storage_class`, etc.). Optional YAML `layout_rules` / `transition_rules` set admin defaults by oid prefix. See [`layout.md`](layout.md).
 
 ### Large objects
 

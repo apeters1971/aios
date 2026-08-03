@@ -10,25 +10,27 @@ namespace aios {
 // Ordered acting set for an object. acting_set[0] is the primary.
 struct Placement {
   std::uint64_t epoch{0};
+  std::string storage_class;
   std::vector<StorageTarget> acting_set;
 };
 
-// Deterministic placement: SHA-256(oid) picks a start index into the sorted
-// target ring, then walks preferring distinct node_ids until `n` targets are
-// chosen (falling back to same-node mounts if needed).
-// If n > map.targets.size() (or n < 1), returns an empty acting set — callers
-// treat that as no_targets (no silent under-protection).
-Placement place(const std::string& oid, const ClusterMap& map, int n);
+// Consistent-hash placement with virtual nodes on the class-scoped ring.
+// Walks the vnode ring clockwise from sha256(oid), preferring distinct
+// node_ids, then filling same-node mounts. Empty acting set if the class
+// has fewer than `n` targets (or n < 1).
+Placement place(const std::string& oid, const ClusterMap& map, int n,
+                const std::string& storage_class);
 
-// Compat: place(oid, map) == place(oid, map, map.replica_count).
-Placement place(const std::string& oid, const ClusterMap& map);
+// place(oid, map, storage_class) == place(oid, map, map.replica_count, storage_class).
+Placement place(const std::string& oid, const ClusterMap& map,
+                const std::string& storage_class);
 
-// True if `candidate` is acting_set[0] under the given map/oid.
 bool is_primary_for(const std::string& oid, const ClusterMap& map,
-                    const std::string& node_id, const std::string& aios_path);
+                    const std::string& storage_class, const std::string& node_id,
+                    const std::string& aios_path);
 
-// True if candidate appears anywhere in the acting set.
 bool in_acting_set(const std::string& oid, const ClusterMap& map,
-                   const std::string& node_id, const std::string& aios_path);
+                   const std::string& storage_class, const std::string& node_id,
+                   const std::string& aios_path);
 
 }  // namespace aios

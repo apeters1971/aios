@@ -116,7 +116,7 @@ int test_object_service_advanced() {
          "real body after replace");
 
   // Empty oid / bad cases via store.
-  auto placement = place(create_oid, fx.map);
+  auto placement = place(create_oid, fx.map, "nvme");
   expect(!placement.acting_set.empty(), "placement");
   auto* store = fx.stores.get(placement.acting_set[0].aios_path);
   expect(store != nullptr, "primary store");
@@ -132,7 +132,7 @@ int test_object_service_advanced() {
     auto put = svc.api_put(abort_oid, reinterpret_cast<const std::uint8_t*>("tip"), 3, {}, true,
                            {});
     expect(put.ok, "abort oid put");
-    auto pl = place(abort_oid, fx.map);
+    auto pl = place(abort_oid, fx.map, "nvme");
     auto* ps = fx.stores.get(pl.acting_set[0].aios_path);
     expect(ps != nullptr, "abort primary store");
     if (ps) {

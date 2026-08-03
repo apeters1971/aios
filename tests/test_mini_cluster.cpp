@@ -141,6 +141,7 @@ struct MiniCluster {
         t.mount = path.string();
         t.target_path = path.string();
         t.aios_path = node->aios_path;
+      t.storage_class = "nvme";
         t.usable = true;
         t.bavail = 1000;
         fs_table.set_local(node->id, {t});
@@ -151,6 +152,8 @@ struct MiniCluster {
         e.mount = path.string();
         e.target_path = path.string();
         e.aios_path = node->aios_path;
+        e.storage_class = "nvme";
+        e.weight = 1;
         e.bavail = 1000;
         e.usable = true;
         e.updated_ms = aios::now_ms();
@@ -161,7 +164,7 @@ struct MiniCluster {
     fs_table.merge(remotes);
     const int map_replicas =
         (durability == "ec" && !nodes.empty()) ? nodes[0]->cfg.replica_count : replica_count;
-    map = aios::ClusterMap::build(membership, fs_table, map_replicas);
+    map = aios::ClusterMap::build(membership, fs_table, map_replicas, aios::PlacementConfig{});
 
     for (auto& node : nodes) node->start(map);
   }
@@ -180,13 +183,13 @@ struct MiniCluster {
   }
 
   MiniNode* primary_for(const std::string& oid) {
-    auto p = aios::place(oid, map);
+    auto p = aios::place(oid, map, "nvme");
     if (p.acting_set.empty()) return nullptr;
     return by_id(p.acting_set[0].node_id);
   }
 
   MiniNode* secondary_for(const std::string& oid) {
-    auto p = aios::place(oid, map);
+    auto p = aios::place(oid, map, "nvme");
     if (p.acting_set.size() < 2) return nullptr;
     return by_id(p.acting_set[1].node_id);
   }
@@ -207,7 +210,7 @@ int test_mini_cluster() {
     const std::string oid = "cluster/obj-1";
     auto* primary = cluster.primary_for(oid);
     expect(primary != nullptr, "primary found");
-    auto placement = place(oid, cluster.map);
+    auto placement = place(oid, cluster.map, "nvme");
     expect(placement.acting_set.size() == 3, "acting set 3 distinct nodes");
     {
       std::unordered_set<std::string> nodes;
@@ -262,7 +265,7 @@ int test_mini_cluster() {
     expect(alias_primary != nullptr, "alias primary");
     auto redir = alias_primary->svc->api_put_redirect(alias, oid, {}, true, {});
     expect(redir.ok && redir.redirect_oid == oid, "cluster redirect");
-    auto alias_place = place(alias, cluster.map);
+    auto alias_place = place(alias, cluster.map, "nvme");
     expect(!alias_place.acting_set.empty(), "alias placement");
     // Find a live replica that is not necessarily primary for TCP get.
     MiniNode* alias_peer = nullptr;
@@ -295,7 +298,7 @@ int test_mini_cluster() {
   {
     MiniCluster cluster(3, /*replica_count=*/3, /*write_quorum=*/3);
     const std::string oid = "cluster/quorum-fail";
-    auto placement = place(oid, cluster.map);
+    auto placement = place(oid, cluster.map, "nvme");
     expect(placement.acting_set.size() == 3, "qf acting 3");
 
     // Stop a non-primary in the acting set.
@@ -319,7 +322,7 @@ int test_mini_cluster() {
   {
     MiniCluster cluster(3, /*replica_count=*/3, /*write_quorum=*/2);
     const std::string oid = "cluster/quorum-ok";
-    auto placement = place(oid, cluster.map);
+    auto placement = place(oid, cluster.map, "nvme");
     auto* primary = cluster.by_id(placement.acting_set[0].node_id);
     auto* victim = cluster.by_id(placement.acting_set[2].node_id);
     expect(primary && victim, "qo nodes");
@@ -360,7 +363,7 @@ int test_mini_cluster() {
   {
     MiniCluster cluster(3, /*replica_count=*/3, /*write_quorum=*/3, "ec", 2, 1, "xor");
     const std::string oid = "cluster/ec-xor";
-    auto placement = place(oid, cluster.map);
+    auto placement = place(oid, cluster.map, "nvme");
     expect(placement.acting_set.size() == 3, "ec acting 3");
     auto* primary = cluster.by_id(placement.acting_set[0].node_id);
     auto* shard1 = cluster.by_id(placement.acting_set[1].node_id);

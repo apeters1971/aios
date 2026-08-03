@@ -158,6 +158,7 @@ struct EcHttpFixture {
       t.mount = path;
       t.target_path = path;
       t.aios_path = path;
+      t.storage_class = "nvme";
       t.usable = true;
       t.bavail = 1000;
       local.push_back(t);
@@ -178,7 +179,7 @@ struct EcHttpFixture {
     port = std::to_string(port_num);
     cfg.http_listen = "127.0.0.1:" + port;
 
-    map = ClusterMap::build(membership, fs_table, cfg.replica_count);
+    map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
     ObjectStoreOptions opts;
     opts.shard_count = 4;
     opts.clone_required = false;
@@ -261,7 +262,7 @@ int test_http_ec() {
 
   // Degraded: purge one shard tip, HTTP GET still works
   {
-    auto pl = place("http-ec-1", fx.map);
+    auto pl = place("http-ec-1", fx.map, "nvme");
     auto* victim = fx.stores.get(pl.acting_set[2].aios_path);
     std::string err;
     auto st = victim->stat("http-ec-1", err);

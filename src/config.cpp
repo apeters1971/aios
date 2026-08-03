@@ -36,11 +36,30 @@ bool validate_ec_codec_choice(int m, std::string& codec, std::string& err) {
   return true;
 }
 
+bool valid_storage_class_name(const std::string& s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (char c : s) {
+    if (std::islower(static_cast<unsigned char>(c)) ||
+        std::isdigit(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 bool validate_layout_rule(LayoutRule& rule, const Config& cfg, std::string& err) {
   rule.layout = lower_copy(rule.layout);
   if (rule.layout != "replica" && rule.layout != "ec") {
     err = "layout_rules entry layout must be 'replica' or 'ec'";
     return false;
+  }
+  if (rule.storage_class) {
+    *rule.storage_class = lower_copy(*rule.storage_class);
+    if (!valid_storage_class_name(*rule.storage_class)) {
+      err = "layout_rules storage_class must match [a-z0-9_-]+";
+      return false;
+    }
   }
   if (rule.layout == "replica") return true;
 
@@ -67,11 +86,36 @@ bool validate_layout_rule(LayoutRule& rule, const Config& cfg, std::string& err)
     err = "layout_rules k+m exceeds max_replica_count";
     return false;
   }
-  // Normalize resolved codec onto the rule when the rule omitted it.
-  if (!rule.ec_codec.has_value()) {
-    // leave unset so resolve can still inherit cluster codec; validation already ok
-  } else {
+  if (rule.ec_codec.has_value()) {
     rule.ec_codec = codec;
+  }
+  return true;
+}
+
+bool validate_transition_rule(TransitionRule& rule, const Config& cfg, std::string& err) {
+  rule.from = lower_copy(rule.from);
+  rule.to = lower_copy(rule.to);
+  if (!valid_storage_class_name(rule.from) || !valid_storage_class_name(rule.to)) {
+    err = "transition_rules from/to must match [a-z0-9_-]+";
+    return false;
+  }
+  if (rule.from == rule.to) {
+    err = "transition_rules from and to must differ";
+    return false;
+  }
+  if (rule.layout) {
+    LayoutRule lr;
+    lr.prefix = rule.prefix;
+    lr.layout = *rule.layout;
+    lr.ec_k = rule.ec_k;
+    lr.ec_m = rule.ec_m;
+    lr.ec_codec = rule.ec_codec;
+    if (!validate_layout_rule(lr, cfg, err)) {
+      err = "transition_rules: " + err;
+      return false;
+    }
+    rule.layout = lr.layout;
+    if (lr.ec_codec) rule.ec_codec = lr.ec_codec;
   }
   return true;
 }
@@ -125,6 +169,17 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["write_quorum"]) cfg.write_quorum = root["write_quorum"].as<int>();
     if (root["durability"]) cfg.durability = root["durability"].as<std::string>();
     if (root["default_layout"]) cfg.durability = root["default_layout"].as<std::string>();
+    if (root["default_storage_class"])
+      cfg.default_storage_class = root["default_storage_class"].as<std::string>();
+    if (root["vnodes_per_target"]) cfg.vnodes_per_target = root["vnodes_per_target"].as<int>();
+    if (root["min_vnodes"]) cfg.min_vnodes = root["min_vnodes"].as<int>();
+    if (root["max_vnodes"]) cfg.max_vnodes = root["max_vnodes"].as<int>();
+    if (root["placement"] && root["placement"].IsMap()) {
+      const auto& p = root["placement"];
+      if (p["vnodes_per_target"]) cfg.vnodes_per_target = p["vnodes_per_target"].as<int>();
+      if (p["min_vnodes"]) cfg.min_vnodes = p["min_vnodes"].as<int>();
+      if (p["max_vnodes"]) cfg.max_vnodes = p["max_vnodes"].as<int>();
+    }
     if (root["ec_k"]) cfg.ec_k = root["ec_k"].as<int>();
     if (root["ec_m"]) cfg.ec_m = root["ec_m"].as<int>();
     if (root["ec_codec"]) cfg.ec_codec = root["ec_codec"].as<std::string>();
@@ -138,6 +193,10 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
       cfg.repair_interval_ms = root["repair_interval_ms"].as<int>();
     if (root["repair_batch_oids"])
       cfg.repair_batch_oids = root["repair_batch_oids"].as<int>();
+    if (root["transition_interval_ms"])
+      cfg.transition_interval_ms = root["transition_interval_ms"].as<int>();
+    if (root["transition_batch_oids"])
+      cfg.transition_batch_oids = root["transition_batch_oids"].as<int>();
     if (root["http_listen"]) cfg.http_listen = root["http_listen"].as<std::string>();
     if (root["http_body_sync"])
       cfg.http_body_sync = root["http_body_sync"].as<std::string>();
@@ -172,10 +231,38 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
         LayoutRule rule;
         rule.prefix = node["prefix"].as<std::string>();
         rule.layout = node["layout"].as<std::string>();
+        if (node["storage_class"])
+          rule.storage_class = node["storage_class"].as<std::string>();
         if (node["ec_k"]) rule.ec_k = node["ec_k"].as<int>();
         if (node["ec_m"]) rule.ec_m = node["ec_m"].as<int>();
         if (node["ec_codec"]) rule.ec_codec = node["ec_codec"].as<std::string>();
         cfg.layout_rules.push_back(std::move(rule));
+      }
+    }
+    if (root["transition_rules"]) {
+      if (!root["transition_rules"].IsSequence()) {
+        err = "transition_rules must be a sequence";
+        return false;
+      }
+      cfg.transition_rules.clear();
+      for (const auto& node : root["transition_rules"]) {
+        if (!node.IsMap()) {
+          err = "transition_rules entries must be mappings";
+          return false;
+        }
+        if (!node["prefix"] || !node["from"] || !node["to"]) {
+          err = "transition_rules entries require prefix, from, and to";
+          return false;
+        }
+        TransitionRule rule;
+        rule.prefix = node["prefix"].as<std::string>();
+        rule.from = node["from"].as<std::string>();
+        rule.to = node["to"].as<std::string>();
+        if (node["layout"]) rule.layout = node["layout"].as<std::string>();
+        if (node["ec_k"]) rule.ec_k = node["ec_k"].as<int>();
+        if (node["ec_m"]) rule.ec_m = node["ec_m"].as<int>();
+        if (node["ec_codec"]) rule.ec_codec = node["ec_codec"].as<std::string>();
+        cfg.transition_rules.push_back(std::move(rule));
       }
     }
   } catch (const std::exception& e) {
@@ -320,8 +407,29 @@ bool normalize_config(Config& cfg, std::string& err) {
     if (cfg.write_quorum == 0) cfg.write_quorum = cfg.replica_count;
   }
 
+  cfg.default_storage_class = lower_copy(cfg.default_storage_class);
+  if (!valid_storage_class_name(cfg.default_storage_class)) {
+    err = "default_storage_class must match [a-z0-9_-]+";
+    return false;
+  }
+  if (cfg.vnodes_per_target < 1) {
+    err = "vnodes_per_target must be >= 1";
+    return false;
+  }
+  if (cfg.min_vnodes < 1) {
+    err = "min_vnodes must be >= 1";
+    return false;
+  }
+  if (cfg.max_vnodes < cfg.min_vnodes) {
+    err = "max_vnodes must be >= min_vnodes";
+    return false;
+  }
+
   for (auto& rule : cfg.layout_rules) {
     if (!validate_layout_rule(rule, cfg, err)) return false;
+  }
+  for (auto& rule : cfg.transition_rules) {
+    if (!validate_transition_rule(rule, cfg, err)) return false;
   }
   return true;
 }

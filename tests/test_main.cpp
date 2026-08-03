@@ -26,6 +26,7 @@ int test_pubsub();
 int test_stl_client();
 int test_append();
 int test_admin();
+int test_placement();
 
 int main() {
   int failures = 0;
@@ -40,6 +41,7 @@ int main() {
   failures += test_versions();
   failures += test_crc32c();
   failures += test_cluster_map();
+  failures += test_placement();
   failures += test_object_rpc();
   failures += test_object_rpc_advanced();
   failures += test_object_service_advanced();

@@ -5,6 +5,7 @@
 #include "net/framing.hpp"
 #include "object/object_layout.hpp"
 #include "object/pubsub.hpp"
+#include "object/transition.hpp"
 #include "util/auth.hpp"
 #include "util/base64.hpp"
 #include "util/crc32c.hpp"
@@ -353,10 +354,20 @@ nlohmann::json HttpServer::admin_config_json() const {
   nlohmann::json rules = nlohmann::json::array();
   for (const auto& r : c.layout_rules) {
     nlohmann::json jr = {{"prefix", r.prefix}, {"layout", r.layout}};
+    if (r.storage_class) jr["storage_class"] = *r.storage_class;
     if (r.ec_k) jr["ec_k"] = *r.ec_k;
     if (r.ec_m) jr["ec_m"] = *r.ec_m;
     if (r.ec_codec) jr["ec_codec"] = *r.ec_codec;
     rules.push_back(std::move(jr));
+  }
+  nlohmann::json transitions = nlohmann::json::array();
+  for (const auto& r : c.transition_rules) {
+    nlohmann::json jr = {{"prefix", r.prefix}, {"from", r.from}, {"to", r.to}};
+    if (r.layout) jr["layout"] = *r.layout;
+    if (r.ec_k) jr["ec_k"] = *r.ec_k;
+    if (r.ec_m) jr["ec_m"] = *r.ec_m;
+    if (r.ec_codec) jr["ec_codec"] = *r.ec_codec;
+    transitions.push_back(std::move(jr));
   }
   return nlohmann::json{
       {"node_id", c.node_id},
@@ -373,6 +384,11 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"replica_count", c.replica_count},
       {"write_quorum", c.write_quorum > 0 ? c.write_quorum : c.replica_count},
       {"durability", c.durability},
+      {"default_storage_class", c.default_storage_class},
+      {"placement",
+       {{"vnodes_per_target", c.vnodes_per_target},
+        {"min_vnodes", c.min_vnodes},
+        {"max_vnodes", c.max_vnodes}}},
       {"ec_k", c.ec_k},
       {"ec_m", c.ec_m},
       {"ec_codec", c.ec_codec},
@@ -380,8 +396,11 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"max_ec_m", c.max_ec_m},
       {"max_replica_count", c.max_replica_count},
       {"layout_rules", std::move(rules)},
+      {"transition_rules", std::move(transitions)},
       {"repair_interval_ms", c.repair_interval_ms},
       {"repair_batch_oids", c.repair_batch_oids},
+      {"transition_interval_ms", c.transition_interval_ms},
+      {"transition_batch_oids", c.transition_batch_oids},
       {"http_body_sync", c.http_body_sync},
       {"max_versions", c.max_versions},
       {"clone_required", c.clone_required},
@@ -623,6 +642,33 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                    {{"node_id", cfg_.node_id},
                     {"status", admin_status_json()},
                     {"admin_peers", peers}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/transitions") {
+        nlohmann::json rules = nlohmann::json::array();
+        for (const auto& r : cfg_.transition_rules) {
+          nlohmann::json jr = {{"prefix", r.prefix}, {"from", r.from}, {"to", r.to}};
+          if (r.layout) jr["layout"] = *r.layout;
+          rules.push_back(std::move(jr));
+        }
+        write_json(*sock, 200, "OK",
+                   {{"transition_rules", rules},
+                    {"transition_interval_ms", cfg_.transition_interval_ms},
+                    {"transition_batch_oids", cfg_.transition_batch_oids}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "POST" && path == "/admin/transitions/run") {
+        const auto stats = run_transitions(
+            cfg_, objects_.advertise(), objects_.map(), objects_.stores(),
+            static_cast<std::size_t>(std::max(1, cfg_.transition_batch_oids)));
+        write_json(*sock, 200, "OK",
+                   {{"oids_scanned", stats.oids_scanned},
+                    {"matched", stats.matched},
+                    {"migrated", stats.migrated},
+                    {"drained", stats.drained},
+                    {"failed", stats.failed}},
                    keep_alive);
         continue;
       }

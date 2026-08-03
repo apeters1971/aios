@@ -358,7 +358,17 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
     }
     for (const auto& oid : oids) {
       ++stats.oids_scanned;
-      auto p = place(oid, map);
+      auto* local = stores.get(path);
+      std::unordered_map<std::string, std::string> local_attrs;
+      if (local) local_attrs = local->list_attrs(oid, err);
+      const int n = placement_n_for_attrs(local_attrs, map.replica_count);
+      const std::string sc =
+          storage_class_for_attrs(local_attrs, cfg.default_storage_class);
+      auto p = place(oid, map, n, sc);
+      if (p.acting_set.empty()) {
+        const std::string prev = storage_class_prev_for_attrs(local_attrs);
+        if (!prev.empty()) p = place(oid, map, n, prev);
+      }
       if (p.acting_set.empty()) continue;
 
       bool local_in_set = false;
@@ -369,18 +379,6 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         }
       }
       if (!local_in_set) continue;
-
-      // Widen placement from tip attrs when this version uses a larger n (e.g. EC k+m).
-      {
-        auto* local = stores.get(path);
-        std::unordered_map<std::string, std::string> local_attrs;
-        if (local) local_attrs = local->list_attrs(oid, err);
-        const int n = placement_n_for_attrs(local_attrs, map.replica_count);
-        if (n != static_cast<int>(p.acting_set.size())) {
-          auto widened = place(oid, map, n);
-          if (!widened.acting_set.empty()) p = std::move(widened);
-        }
-      }
 
       std::vector<TargetObjState> states(p.acting_set.size());
       std::vector<bool> has(p.acting_set.size(), false);
