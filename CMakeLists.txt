@@ -103,6 +103,7 @@ add_library(aios_core STATIC
   src/object/repair.cpp
   src/http/http_auth.cpp
   src/http/http_server.cpp
+  src/metrics/ops_counters.cpp
 )
 target_include_directories(aios_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -128,6 +129,7 @@ endif()
 add_library(aios_client STATIC
   src/client/session.cpp
   src/client/wire.cpp
+  src/client/changelog.cpp
   src/client/string.cpp
   src/client/map.cpp
   src/client/unordered_map.cpp
@@ -186,6 +188,8 @@ add_executable(aios_tests
   tests/test_locks_watches.cpp
   tests/test_pubsub.cpp
   tests/test_stl_client.cpp
+  tests/test_append.cpp
+  tests/test_admin.cpp
   tests/test_main.cpp
 )
 target_link_libraries(aios_tests PRIVATE aios_client)

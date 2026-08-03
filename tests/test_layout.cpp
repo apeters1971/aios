@@ -374,7 +374,7 @@ int test_layout() {
     const std::string port = std::to_string(port_num);
 
     boost::asio::io_context ioc;
-    HttpServer http(ioc, fx.cfg, *fx.svc);
+    HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
     http.start();
     std::thread th([&] { ioc.run(); });
 

@@ -1,31 +1,58 @@
-# STL-like persistent client (v1)
+# STL-like persistent client (v2)
 
 C++ library target **`aios_client`**. Include [`src/client/stl.hpp`](../src/client/stl.hpp).
 
-Named objects are stored as JSON tips under oid `stl/{type}/{name}` via the HTTP API. Each container is either **SYNC** or **ASYNC**.
-
 ## Types
 
-| Class | Oid | Payload |
-|-------|-----|---------|
-| `aios::string` | `stl/string/{name}` | `{"data":"…"}` |
-| `aios::map` | `stl/map/{name}` | `{"entries":[[k,v],…]}` (ordered) |
-| `aios::unordered_map` | `stl/unordered_map/{name}` | `{"entries":[[k,v],…]}` (hash; wire sorted for CAS) |
-| `aios::set` | `stl/set/{name}` | `{"keys":[…]}` (ordered unique) |
-| `aios::list` | `stl/list/{name}` | `{"items":[…]}` |
-| `aios::deque` | `stl/deque/{name}` | `{"items":[…]}` |
-| `aios::mutex` | `stl/mutex/{name}` | HTTP lock API (no body) |
+| Class | Persistence | Notes |
+|-------|-------------|--------|
+| `aios::string` | Whole JSON tip `stl/string/{name}` (`aios_stl: 1`) | Unchanged from v1 |
+| `aios::map` / `unordered_map` / `set` / `list` / `deque` | Append-only **changelog** (below) | `aios_stl: 2` meta |
+| `aios::mutex` | HTTP lock API (no body) | Unchanged |
 
-Envelope fields: `aios_stl: 1`, `type`, `mode_hint`. Attrs: `aios.stl.type`, `aios.stl.v`, `aios.stl.cas` (optimistic concurrency).
+Value type for map/list/deque elements is `std::string`.
 
-Value type for map/list/deque elements is `std::string`. Max document size: 16 MiB.
+## Changelog layout (containers)
+
+Per container name:
+
+| Oid | Role |
+|-----|------|
+| `stl/{type}/{name}` | **Meta** JSON: `aios_stl=2`, `type`, `next_op`, `log_bytes`, `snapshot_op`, `snapshot_oid` |
+| `stl/{type}/{name}/log` | Opaque framed op log (atomic `POST /o/{oid}/append`) |
+| `stl/{type}/{name}/snap` | Compacted snapshot (same JSON shape as v1 payload: `entries` / `keys` / `items`) |
+
+### Record framing (little-endian)
+
+```text
+u32 magic = 'AOPk' (0x6b504f41)
+u32 header_len
+u64 op_id
+u32 op
+u32 payload_len
+u8  payload[payload_len]   # length-prefixed UTF-8 strings (u32 len + bytes)
+```
+
+Ops: map/unordered_map `Put`/`Erase`/`Clear`; set `Insert`/`Erase`/`Clear`; list/deque `PushBack`/`PushFront`/`PopBack`/`PopFront`/`Insert`/`EraseAt`/`SetAt`/`Clear`; plus `Compact` fence.
+
+### Client path
+
+- Local materialized state + `applied_op` cursor
+- **SYNC** mutate: append one framed record, apply locally
+- **ASYNC** mutate: local + pending ops; `flush()` batch-appends; `load()` pulls meta/snap/log
+- **Follow**: each SYNC read (and ASYNC `load`) range-gets new log bytes and applies
+- **`compact()`**: write snapshot, truncate log (`log_bytes=0`), keep `next_op` monotonic; also auto when log exceeds ~1 MiB
+
+### Compat
+
+Opening a v1 whole-document tip (`aios_stl: 1`) **migrates on open**: seed snap from the body, empty log, rewrite meta as v2.
 
 ## SYNC vs ASYNC
 
 | Mode | Mutate | Read | Persist |
 |------|--------|------|---------|
-| **SYNC** | Immediate PUT (CAS on `aios.stl.cas`) | Fetch tip (or use just-written local) | Every mutating call |
-| **ASYNC** | Local only (`dirty`) | Local after `load()` | `flush()` atomic snapshot; `load()` atomic pull |
+| **SYNC** | Immediate append (+ follow on next read) | Pull log from cursor | Every mutating call |
+| **ASYNC** | Local only (`dirty`) | Local after `load()` | `flush()` batch append; `load()` pull |
 
 Default mode on construct: **ASYNC**.
 
@@ -33,7 +60,7 @@ Default mode on construct: **ASYNC**.
 - `load()` while dirty → error.
 - Destructor: ASYNC dirty objects `flush()` by default (`flush_on_destroy`).
 
-Conflict on stale CAS → `aios::client_error` with `code() == "conflict"`.
+`string` still uses CAS on `aios.stl.cas` for whole-document PUT. Changelog containers use meta CAS around `next_op` / `log_bytes`.
 
 ## Mutex
 
@@ -51,7 +78,8 @@ s.assign("hello");
 s.flush();
 
 aios::map m(sess, "users", aios::sync_mode::sync);
-m["alice"] = "1";   // visible cluster-wide immediately
+m["alice"] = "1";   // append Put; visible cluster-wide
+m.compact();        // optional snapshot + log truncate
 
 aios::mutex mx(sess, "users");
 {
@@ -62,8 +90,9 @@ aios::mutex mx(sess, "users");
 
 ## Notes
 
-- Oids use `/` separators; the client URL-encodes them as `%2F` so `/o/{oid}/lock` routing stays unambiguous.
-- `aios_client` links `aios_core` for shared HTTP HMAC helpers (and so tests can host `HttpServer`).
+- Oids use `/` separators; the client URL-encodes them as `%2F` so `/o/{oid}/lock|append` routing stays unambiguous.
+- Atomic append: [`proto/http.md`](http.md) `POST /o/{oid}/append`.
+- `aios_client` links `aios_core` for shared HTTP HMAC helpers.
 
 ## Benchmark
 
@@ -78,5 +107,4 @@ aios::mutex mx(sess, "users");
 
 ```bash
 cmake --build build --target aios_client aios-bench
-./build/aios_tests
 ```

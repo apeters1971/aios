@@ -202,7 +202,7 @@ int test_http_ec() {
 
   EcHttpFixture fx("xor");
   boost::asio::io_context ioc;
-  HttpServer http(ioc, fx.cfg, *fx.svc);
+  HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
   http.start();
   std::thread th([&] { ioc.run(); });
 
@@ -309,7 +309,7 @@ int test_http_ec() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EcHttpFixture fx_isal("isal", /*port_offset=*/1);
     boost::asio::io_context ioc2;
-    HttpServer http2(ioc2, fx_isal.cfg, *fx_isal.svc);
+    HttpServer http2(ioc2, fx_isal.cfg, *fx_isal.svc, fx_isal.membership);
     http2.start();
     std::thread th2([&] { ioc2.run(); });
 

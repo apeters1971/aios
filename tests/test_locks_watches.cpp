@@ -187,7 +187,7 @@ int test_locks_watches() {
     const std::string& key = fx.cfg.cluster_key;
 
     boost::asio::io_context ioc;
-    HttpServer http(ioc, fx.cfg, *fx.svc);
+    HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
     http.start();
     std::thread th([&] { ioc.run(); });
 

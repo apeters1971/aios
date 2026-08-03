@@ -1,9 +1,11 @@
 #pragma once
 
+#include "client/changelog.hpp"
 #include "client/mode.hpp"
 #include "client/session.hpp"
 #include "client/stl_base.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,8 +17,12 @@ class list : public detail::StlBase {
        bool flush_on_destroy = true);
   ~list();
 
+  list(const list&) = delete;
+  list& operator=(const list&) = delete;
+
   void load();
   void flush();
+  void compact();
 
   void clear();
   std::size_t size() const;
@@ -38,8 +44,12 @@ class list : public detail::StlBase {
 
  private:
   void ensure_fresh_read() const;
-  void persist_if_sync();
+  void pull();
+  void persist_op(changelog::Op op, std::vector<std::string> args);
+  void maybe_compact();
 
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
   mutable std::vector<std::string> local_;
   mutable bool local_valid_{false};
 };

@@ -35,12 +35,14 @@ int main(int argc, char** argv) {
         << "usage: aiosd --cluster-key UUID [--config PATH] [--listen HOST:PORT]\n"
         << "             [--peer HOST:PORT] [--node-id ID] [--status-file PATH]\n"
         << "             [--replica-count N] [--write-quorum N]\n"
-        << "             [--http-listen HOST:PORT]\n"
+        << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
         << "\n"
         << "Standalone AIOS daemon: gossip membership, .aios discovery,\n"
         << "server-side primary replication, and HTTP object API.\n"
         << "cluster_key is a shared secret (UUID recommended); Hello/Gossip/object\n"
-        << "RPCs and HTTP Authorization use HMAC-SHA256.\n";
+        << "RPCs and HTTP Authorization use HMAC-SHA256.\n"
+        << "--admin enables /admin/* and /metrics on http_listen.\n"
+        << "--admin-metrics-public allows unauthenticated GET /metrics (scrape).\n";
     return 0;
   }
 

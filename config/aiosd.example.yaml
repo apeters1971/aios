@@ -39,3 +39,7 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # clone_required: true        # FS COW via FICLONE/clonefile; false allows full-copy fallback
 # max_object_bytes: 68719476736  # HTTP streaming PUT cap (default 64 GiB)
 # status_file: "/tmp/aios-status.json"
+
+# Admin console + Prometheus (only on nodes that should expose ops/config):
+# admin: true
+# admin_metrics_public: true   # GET /metrics without HMAC (restrict network access)

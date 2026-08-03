@@ -31,6 +31,7 @@ Canonical string:
 | Method | Path | Notes |
 |--------|------|-------|
 | `PUT` | `/o/{oid}` | Full replace, or partial with `Content-Range: bytes start-end/*` (new version) |
+| `POST` | `/o/{oid}/append` | Atomic byte-append at tip size (primary-serialized) → `200` `{offset,size,seq,epoch}` |
 | `GET` | `/o/{oid}` | Tip, or `?version={seq}` / `x-aios-version`; `Range` → 206 |
 | `HEAD` | `/o/{oid}` | Stat + attr headers (+ version selection as GET) |
 | `DELETE` | `/o/{oid}` | Delete-marker version at tip |
@@ -49,6 +50,11 @@ Canonical string:
 | `GET` | `/pubsub/{topic}/subscribe` | Long-poll (`timeout_ms`, `after_id`) → messages or `204` |
 | `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1&scope=` | LIST tip objects (default **cluster** scatter-gather; `scope=local` for this node) |
 | `GET` | `/map` | Cluster map JSON (targets include `http_addr`) |
+| `GET` | `/admin/status` | **Admin nodes only:** local status + OPS counters + membership |
+| `GET` | `/admin/ops` | **Admin:** `{node_id,ops}` |
+| `GET` | `/admin/config` | **Admin:** effective config (`cluster_key` redacted) |
+| `GET` | `/admin/cluster` | **Admin:** status + list of alive peers with `http_addr` |
+| `GET` | `/metrics` | **Admin:** Prometheus/OpenMetrics text (optional public scrape) |
 | `POST` | `/txn` | Begin cross-object txn → JSON `{txn_id,state,ops}` (201) |
 | `GET` | `/txn/{id}` | Txn coordinator state JSON |
 | `PUT` | `/txn/{id}/o/{oid}` | Prepare put (install without tip publish) |
@@ -163,6 +169,10 @@ Subscribe long-polls use worker threads (same as watches).
 ### Partial PUT (random overwrite)
 
 `Content-Range: bytes 1000-1999/*` with body length 1000 writes at offset 1000, growing the object; holes are sparse zeros. Always FS-backed.
+
+### Atomic append
+
+`POST /o/{oid}/append` with a raw body appends at the current tip size under the object primary lock. Concurrent appends never share an offset. Response JSON: `{offset,size,seq,epoch}`. Rejected for erasure-coded tips and redirect tips (`400`). Honors `x-aios-lock-token` like other mutates (`409` if lock held without token). Creates the object when missing (append at offset `0`).
 
 ### Partial GET
 

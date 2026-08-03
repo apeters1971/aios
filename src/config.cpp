@@ -145,6 +145,9 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["clone_required"]) cfg.clone_required = root["clone_required"].as<bool>();
     if (root["max_object_bytes"])
       cfg.max_object_bytes = root["max_object_bytes"].as<std::uint64_t>();
+    if (root["admin"]) cfg.admin = root["admin"].as<bool>();
+    if (root["admin_metrics_public"])
+      cfg.admin_metrics_public = root["admin_metrics_public"].as<bool>();
     if (root["peers"]) {
       cfg.peers.clear();
       for (const auto& p : root["peers"]) {
@@ -273,6 +276,14 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       const char* v = need("--http-listen");
       if (!v) return false;
       cfg.http_listen = v;
+      continue;
+    }
+    if (arg == "--admin") {
+      cfg.admin = true;
+      continue;
+    }
+    if (arg == "--admin-metrics-public") {
+      cfg.admin_metrics_public = true;
       continue;
     }
     err = "unknown argument: " + arg;

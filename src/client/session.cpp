@@ -203,12 +203,21 @@ ObjectSnapshot Session::parse_object_meta(const HttpResponse& resp, bool with_bo
     snap.exists = false;
     return snap;
   }
-  if (resp.status != 200 && resp.status != 204) throw_http(resp, "object get/head");
+  if (resp.status != 200 && resp.status != 204 && resp.status != 206) {
+    throw_http(resp, "object get/head");
+  }
   snap.exists = true;
   const auto ver = header_get(resp.headers, "x-aios-version");
   if (!ver.empty()) {
     try {
       snap.seq = static_cast<std::uint64_t>(std::stoull(ver));
+    } catch (...) {
+    }
+  }
+  const auto sz = header_get(resp.headers, "x-aios-size");
+  if (!sz.empty()) {
+    try {
+      snap.size = static_cast<std::uint64_t>(std::stoull(sz));
     } catch (...) {
     }
   }
@@ -225,6 +234,7 @@ ObjectSnapshot Session::parse_object_meta(const HttpResponse& resp, bool with_bo
     }
   }
   if (with_body) snap.body = resp.body;
+  if (snap.size == 0 && with_body) snap.size = snap.body.size();
   return snap;
 }
 
@@ -242,9 +252,23 @@ ObjectSnapshot Session::head_object(const std::string& oid) {
   return parse_object_meta(resp, false);
 }
 
+ObjectSnapshot Session::get_range(const std::string& oid, std::uint64_t start,
+                                  std::uint64_t end_inclusive) {
+  if (end_inclusive < start) {
+    throw client_error("bad_request", "invalid get_range bounds");
+  }
+  const auto path = "/o/" + url_encode_oid(oid);
+  std::unordered_map<std::string, std::string> headers;
+  headers["range"] = "bytes=" + std::to_string(start) + "-" + std::to_string(end_inclusive);
+  auto resp = request("GET", path, headers);
+  if (resp.status == 404) return ObjectSnapshot{};
+  if (resp.status == 416) throw client_error("range_unsatisfiable", "get_range unsatisfiable");
+  return parse_object_meta(resp, true);
+}
+
 std::uint64_t Session::put_object(const std::string& oid, const std::string& body,
                                   const std::string& stl_type, std::uint64_t expected_cas,
-                                  const std::optional<std::string>& lock_token) {
+                                  const std::optional<std::string>& lock_token, int stl_v) {
   if (body.size() > kMaxBodyBytes) {
     throw client_error("payload_too_large", "stl object exceeds 16 MiB");
   }
@@ -252,7 +276,7 @@ std::uint64_t Session::put_object(const std::string& oid, const std::string& bod
   std::unordered_map<std::string, std::string> headers;
   headers["content-type"] = "application/json";
   headers["x-aios-attr-aios.stl.type"] = stl_type;
-  headers["x-aios-attr-aios.stl.v"] = "1";
+  headers["x-aios-attr-aios.stl.v"] = std::to_string(stl_v);
   headers["x-aios-attr-aios.stl.cas"] = std::to_string(new_cas);
   if (lock_token) headers["x-aios-lock-token"] = *lock_token;
 
@@ -278,6 +302,32 @@ std::uint64_t Session::put_object(const std::string& oid, const std::string& bod
     throw_http(resp, "put_object");
   }
   return new_cas;
+}
+
+AppendResult Session::append(const std::string& oid, const std::string& data,
+                             const std::optional<std::string>& lock_token) {
+  if (data.size() > kMaxBodyBytes) {
+    throw client_error("payload_too_large", "append exceeds 16 MiB");
+  }
+  std::unordered_map<std::string, std::string> headers;
+  headers["content-type"] = "application/octet-stream";
+  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  const auto path = "/o/" + url_encode_oid(oid) + "/append";
+  auto resp = request("POST", path, headers, data);
+  if (resp.status != 200) throw_http(resp, "append");
+  try {
+    auto j = nlohmann::json::parse(resp.body);
+    AppendResult ar;
+    ar.offset = j.at("offset").get<std::uint64_t>();
+    ar.size = j.at("size").get<std::uint64_t>();
+    ar.seq = j.value("seq", static_cast<std::uint64_t>(0));
+    ar.epoch = j.value("epoch", static_cast<std::uint64_t>(0));
+    return ar;
+  } catch (const client_error&) {
+    throw;
+  } catch (...) {
+    throw client_error("http", "bad append response");
+  }
 }
 
 std::string Session::lock_acquire(const std::string& oid, int ttl_ms) {

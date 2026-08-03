@@ -44,6 +44,8 @@ Frame ObjectService::reply_err(std::uint64_t epoch, const std::string& code,
 }
 
 ApiResult ObjectService::fail(const std::string& code, const std::string& error) const {
+  // not_primary is a redirect signal, not an operator error.
+  if (code != "not_primary") ops_.errors.fetch_add(1, std::memory_order_relaxed);
   ApiResult r;
   r.ok = false;
   r.code = code;
@@ -1049,8 +1051,13 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
   if (layout.is_ec()) {
-    return commit_ec_put(store, placement, oid, data, len, attrs, replace_attrs,
-                         expected_crc32c, layout);
+    auto r = commit_ec_put(store, placement, oid, data, len, attrs, replace_attrs,
+                           expected_crc32c, layout);
+    if (r.ok) {
+      ops_.put.fetch_add(1, std::memory_order_relaxed);
+      ops_.put_bytes.fetch_add(len, std::memory_order_relaxed);
+    }
+    return r;
   }
 
   auto put_attrs = attrs;
@@ -1061,7 +1068,12 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
     if (err == "crc32c mismatch") return fail("crc_mismatch", err);
     return fail("store_error", err);
   }
-  return commit_prepared(store, placement, pv, data, len, put_attrs);
+  auto r = commit_prepared(store, placement, pv, data, len, put_attrs);
+  if (r.ok) {
+    ops_.put.fetch_add(1, std::memory_order_relaxed);
+    ops_.put_bytes.fetch_add(len, std::memory_order_relaxed);
+  }
+  return r;
 }
 
 ApiResult ObjectService::api_put_file(
@@ -1104,8 +1116,13 @@ ApiResult ObjectService::api_put_file(
         return fail("store_error", "short read of staging file");
       }
     }
-    return commit_ec_put(store, placement, oid, buf.data(), buf.size(), attrs, replace_attrs,
-                         expected_crc32c.value_or(crc32c_val), layout);
+    auto r = commit_ec_put(store, placement, oid, buf.data(), buf.size(), attrs, replace_attrs,
+                           expected_crc32c.value_or(crc32c_val), layout);
+    if (r.ok) {
+      ops_.put.fetch_add(1, std::memory_order_relaxed);
+      ops_.put_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+    return r;
   }
 
   auto put_attrs = attrs;
@@ -1116,7 +1133,12 @@ ApiResult ObjectService::api_put_file(
     if (err == "crc32c mismatch") return fail("crc_mismatch", err);
     return fail("store_error", err);
   }
-  return commit_prepared(store, placement, pv, nullptr, 0, put_attrs);
+  auto r = commit_prepared(store, placement, pv, nullptr, 0, put_attrs);
+  if (r.ok) {
+    ops_.put.fetch_add(1, std::memory_order_relaxed);
+    ops_.put_bytes.fetch_add(size, std::memory_order_relaxed);
+  }
+  return r;
 }
 
 ApiResult ObjectService::api_put_redirect(
@@ -1197,7 +1219,83 @@ ApiResult ObjectService::api_put_range(
   }
   PreparedVersion install = pv;
   install.inline_body = false;
-  return commit_prepared(store, placement, install, full->data(), full->size(), put_attrs);
+  auto r = commit_prepared(store, placement, install, full->data(), full->size(), put_attrs);
+  if (r.ok) {
+    ops_.put_range.fetch_add(1, std::memory_order_relaxed);
+    ops_.put_bytes.fetch_add(len, std::memory_order_relaxed);
+  }
+  return r;
+}
+
+ApiResult ObjectService::api_append(
+    const std::string& oid, const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
+    const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
+    const std::optional<std::string>& lock_token) {
+  std::lock_guard lock(mu_);
+  ObjectLayout layout;
+  std::string err;
+  if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
+    return fail("bad_request", err);
+  }
+  if (layout.is_ec()) {
+    return fail("bad_request", "append not supported for erasure-coded objects");
+  }
+  auto placement = place(oid, map_, layout.n);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return fail("not_found", err);
+  if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+
+  {
+    auto tip_attrs = store->list_attrs(oid, err);
+    if (attrs_are_ec(tip_attrs)) {
+      return fail("bad_request", "append not supported for erasure-coded objects");
+    }
+  }
+
+  std::uint64_t offset = 0;
+  auto tip = store->stat(oid, std::nullopt, err);
+  if (tip && !tip->is_delete) {
+    if (!tip->redirect_oid.empty()) {
+      return fail("bad_request", "append not supported on redirect tip");
+    }
+    offset = tip->size;
+  }
+
+  auto put_attrs = attrs;
+  apply_layout_attrs(put_attrs, layout);
+  PreparedVersion pv;
+  if (!store->prepare_put_range(oid, offset, data, len, put_attrs, replace_attrs, pv, err)) {
+    return fail("store_error", err);
+  }
+  auto full = store->get(oid, pv.seq, err);
+  if (!full) {
+    store->abort_version(oid, pv.seq, err);
+    return fail("store_error", err);
+  }
+  PreparedVersion install = pv;
+  install.inline_body = false;
+  auto r = commit_prepared(store, placement, install, full->data(), full->size(), put_attrs);
+  if (r.ok) {
+    const std::uint64_t new_size = r.info ? r.info->size : offset + static_cast<std::uint64_t>(len);
+    const std::uint64_t seq = r.info ? r.info->seq : 0;
+    r.json_body = nlohmann::json{{"offset", offset},
+                                 {"size", new_size},
+                                 {"seq", seq},
+                                 {"epoch", r.epoch}};
+    ops_.append.fetch_add(1, std::memory_order_relaxed);
+    ops_.append_bytes.fetch_add(len, std::memory_order_relaxed);
+  }
+  return r;
 }
 
 ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint64_t> offset,
@@ -1271,6 +1369,16 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
 
   // EC objects carry aios.ec.* attrs. Non-EC tips (e.g. txn-prepared full copies) still
   // use the normal local read path even when the cluster default layout is ec.
+  auto note_get = [this](ApiResult& r) {
+    if (!r.ok || r.code == "redirect") return;
+    ops_.get.fetch_add(1, std::memory_order_relaxed);
+    if (r.data) {
+      ops_.get_bytes.fetch_add(r.data->size(), std::memory_order_relaxed);
+    } else if (r.info) {
+      ops_.get_bytes.fetch_add(r.info->size, std::memory_order_relaxed);
+    }
+  };
+
   if (attrs_are_ec(attrs)) {
     const int n = placement_n_for_attrs(attrs, map_.replica_count);
     placement = place(oid, map_, n);
@@ -1280,7 +1388,10 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     rec.info->seq = info->seq;
     rec.info->mtime_ms = info->mtime_ms;
     rec.info->ctime_ms = info->ctime_ms;
-    if (!offset.has_value()) return rec;
+    if (!offset.has_value()) {
+      note_get(rec);
+      return rec;
+    }
     if (!rec.data) return fail("store_error", "ec reconstruct produced no data");
     if (*offset >= rec.data->size()) return fail("range_unsatisfiable", "range unsatisfiable");
     std::uint64_t end = end_inclusive.value_or(rec.data->size() - 1);
@@ -1289,6 +1400,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     std::vector<std::uint8_t> slice(rec.data->begin() + static_cast<std::ptrdiff_t>(*offset),
                                     rec.data->begin() + static_cast<std::ptrdiff_t>(end + 1));
     rec.data = std::move(slice);
+    note_get(rec);
     return rec;
   }
 
@@ -1304,6 +1416,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     if (!info->inline_body && info->size >= kStreamThreshold) {
       if (auto path = store->fs_body_path(oid, seq, err)) {
         r.body_path = *path;
+        note_get(r);
         return r;
       }
     }
@@ -1311,10 +1424,12 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     if (!r.data) {
       if (info->is_delete) {
         r.data = std::vector<std::uint8_t>{};
+        note_get(r);
         return r;
       }
       return fail("not_found", err);
     }
+    note_get(r);
     return r;
   }
   if (*offset >= info->size) return fail("range_unsatisfiable", "range unsatisfiable");
@@ -1327,13 +1442,21 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     if (err == "range unsatisfiable") return fail("range_unsatisfiable", err);
     return fail("store_error", err);
   }
+  note_get(r);
   return r;
 }
 
 ApiResult ObjectService::api_head(const std::string& oid,
                                  const std::vector<AttrPrecondition>& preds,
                                  std::optional<std::uint64_t> seq) {
-  return api_get(oid, std::nullopt, std::nullopt, preds, seq);
+  auto r = api_get(oid, std::nullopt, std::nullopt, preds, seq);
+  if (r.ok) {
+    // api_get counted a get; reclassify as head (no body transfer for HEAD).
+    ops_.get.fetch_sub(1, std::memory_order_relaxed);
+    if (r.data) ops_.get_bytes.fetch_sub(r.data->size(), std::memory_order_relaxed);
+    ops_.head.fetch_add(1, std::memory_order_relaxed);
+  }
+  return r;
 }
 
 ApiResult ObjectService::api_del(const std::string& oid,
@@ -1360,7 +1483,9 @@ ApiResult ObjectService::api_del(const std::string& oid,
     if (err == "object not found") return fail("not_found", err);
     return fail("store_error", err);
   }
-  return commit_prepared(store, placement, pv, nullptr, 0, {});
+  auto r = commit_prepared(store, placement, pv, nullptr, 0, {});
+  if (r.ok) ops_.del.fetch_add(1, std::memory_order_relaxed);
+  return r;
 }
 
 ApiResult ObjectService::api_list(const std::string& prefix, const std::string& attr_eq_key,
@@ -1397,7 +1522,9 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
   };
 
   if (!cluster) {
-    return list_local(cursor);
+    auto lr = list_local(cursor);
+    if (lr.ok) ops_.list.fetch_add(1, std::memory_order_relaxed);
+    return lr;
   }
 
   // Scatter-gather by unique node; merge sorted by oid; cursor = last oid.
@@ -1442,9 +1569,11 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
     r.list.objects.push_back(std::move(o));
     if (limit > 0 && r.list.objects.size() >= limit) {
       r.list.next_cursor = r.list.objects.back().oid;
+      ops_.list.fetch_add(1, std::memory_order_relaxed);
       return r;
     }
   }
+  ops_.list.fetch_add(1, std::memory_order_relaxed);
   return r;
 }
 
@@ -2140,6 +2269,7 @@ ApiResult ObjectService::api_lock_acquire(const std::string& oid, int ttl_ms) {
   r.epoch = map_.epoch;
   r.placement = placement;
   r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
+  ops_.lock_acquire.fetch_add(1, std::memory_order_relaxed);
   return r;
 }
 
@@ -2218,6 +2348,7 @@ ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t aft
         ev.op = st->is_delete ? "del" : "put";
         ev.ts_ms = now_ms();
         r.watch_event = ev;
+        ops_.watch.fetch_add(1, std::memory_order_relaxed);
         return r;
       }
       if (!st) after_seq = 0;  // wait for first create
@@ -2238,6 +2369,7 @@ ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t aft
   r.epoch = map_.epoch;
   r.placement = placement;
   r.watch_event = ev;
+  ops_.watch.fetch_add(1, std::memory_order_relaxed);
   return r;
 }
 
@@ -2487,6 +2619,7 @@ ApiResult ObjectService::api_pubsub_publish(const std::string& topic, const std:
                  {"id", msg.id},
                  {"delivery", delivery_mode_name(mode_out)},
                  {"ts_ms", msg.ts_ms}};
+  ops_.pubsub_publish.fetch_add(1, std::memory_order_relaxed);
   return r;
 }
 

@@ -1,11 +1,14 @@
 #pragma once
 
+#include "client/changelog.hpp"
 #include "client/mode.hpp"
 #include "client/session.hpp"
 #include "client/stl_base.hpp"
 
 #include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace aios {
 
@@ -33,8 +36,12 @@ class map : public detail::StlBase {
       bool flush_on_destroy = true);
   ~map();
 
+  map(const map&) = delete;
+  map& operator=(const map&) = delete;
+
   void load();
   void flush();
+  void compact();
 
   void clear();
   std::size_t size() const;
@@ -53,8 +60,12 @@ class map : public detail::StlBase {
 
  private:
   void ensure_fresh_read() const;
-  void persist_if_sync();
+  void pull();
+  void persist_op(changelog::Op op, std::vector<std::string> args);
+  void maybe_compact();
 
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
   mutable std::map<std::string, std::string> local_;
   mutable bool local_valid_{false};
 };

@@ -3,6 +3,7 @@
 #include "cluster/cluster_map.hpp"
 #include "cluster/place.hpp"
 #include "config.hpp"
+#include "metrics/ops_counters.hpp"
 #include "net/framing.hpp"
 #include "object/locks_watches.hpp"
 #include "object/object_layout.hpp"
@@ -76,6 +77,13 @@ class ObjectService {
                           bool replace_attrs, const std::vector<AttrPrecondition>& preds,
                           const LayoutRequest& layout = {},
                           const std::optional<std::string>& lock_token = std::nullopt);
+  // Atomic byte-append at tip.size (primary-serialized). Returns json_body
+  // {offset,size,seq,epoch}. Rejected for EC / redirect tips.
+  ApiResult api_append(const std::string& oid, const std::uint8_t* data, std::size_t len,
+                       const std::unordered_map<std::string, std::string>& attrs,
+                       bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+                       const LayoutRequest& layout = {},
+                       const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_get(const std::string& oid, std::optional<std::uint64_t> offset,
                     std::optional<std::uint64_t> end_inclusive,
                     const std::vector<AttrPrecondition>& preds,
@@ -160,6 +168,9 @@ class ObjectService {
 
   ClusterMap& map() { return map_; }
   const ClusterMap& map() const { return map_; }
+  const Config& config() const { return cfg_; }
+  OpsCounters& ops() { return ops_; }
+  const OpsCounters& ops() const { return ops_; }
   LocalStores& stores() { return stores_; }
   const Config& cfg() const { return cfg_; }
   const std::string& advertise() const { return advertise_; }
@@ -252,6 +263,7 @@ class ObjectService {
   LocalStores& stores_;
   std::string advertise_;
   mutable std::recursive_mutex mu_;
+  mutable OpsCounters ops_;
   LockTable locks_;
   WatchHub watches_;
   TopicHub pubsub_;

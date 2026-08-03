@@ -1,6 +1,8 @@
 #include "test_helpers.hpp"
 
+#include "client/changelog.hpp"
 #include "client/stl.hpp"
+#include "client/wire.hpp"
 #include "http/http_server.hpp"
 
 #include <boost/asio.hpp>
@@ -28,7 +30,7 @@ struct HttpFixture {
       : fx(prefix), port_num(19050 + static_cast<int>(::getpid() % 200)) {
     port = std::to_string(port_num);
     fx.cfg.http_listen = host + ":" + port;
-    http = std::make_unique<aios::HttpServer>(ioc, fx.cfg, *fx.svc);
+    http = std::make_unique<aios::HttpServer>(ioc, fx.cfg, *fx.svc, fx.membership);
     http->start();
     th = std::thread([this] { ioc.run(); });
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -172,7 +174,7 @@ int test_stl_client() {
     m2.unlock();
   }
 
-  // Conflict: two ASYNC flushes with same cas
+  // Conflict: two ASYNC flushes with same cas (string still whole-doc)
   {
     HttpFixture hf("aios-stl-cas");
     Session a(hf.cfg());
@@ -193,6 +195,55 @@ int test_stl_client() {
       conflict = e.code() == "conflict";
     }
     expect(conflict, "stale cas flush conflicts");
+  }
+
+  // Changelog: compact truncates log; peer still sees state
+  {
+    HttpFixture hf("aios-stl-compact");
+    Session a(hf.cfg());
+    Session b(hf.cfg());
+    map m1(a, "clog", sync_mode::sync, false);
+    for (int i = 0; i < 20; ++i) m1.set("k" + std::to_string(i), "v");
+    m1.erase("k0");
+    m1.compact();
+
+    auto log_head = a.head_object(changelog::log_oid("map", "clog"));
+    expect(!log_head.exists || log_head.size == 0, "compact truncates log");
+
+    map m2(b, "clog", sync_mode::sync, false);
+    expect(m2.size() == 19 && m2.at("k1") == "v" && !m2.contains("k0"),
+           "peer sees compacted map");
+  }
+
+  // v1 migrate-on-open
+  {
+    HttpFixture hf("aios-stl-migrate");
+    Session s(hf.cfg());
+    const auto body = wire::make_map_doc({{"legacy", "1"}}, sync_mode::async).dump();
+    s.put_object(Session::stl_oid("map", "old"), body, "map", 0);
+    map m(s, "old", sync_mode::sync, false);
+    expect(m.at("legacy") == "1", "v1 migrate preserves entries");
+    m.set("new", "2");
+    map m2(s, "old", sync_mode::sync, false);
+    expect(m2.at("legacy") == "1" && m2.at("new") == "2", "post-migrate append works");
+    auto meta = s.get_object(Session::stl_oid("map", "old"));
+    expect(meta.exists && meta.body.find("\"aios_stl\":2") != std::string::npos,
+           "meta rewritten to v2");
+  }
+
+  // Concurrent SYNC writers via append (both keys visible)
+  {
+    HttpFixture hf("aios-stl-race");
+    Session a(hf.cfg());
+    Session b(hf.cfg());
+    map m1(a, "race", sync_mode::sync, false);
+    map m2(b, "race", sync_mode::sync, false);
+    m1.set("a", "1");
+    m2.set("b", "2");
+    expect(m1.at("a") == "1", "writer a local");
+    // Re-read from cluster
+    map m3(a, "race", sync_mode::sync, false);
+    expect(m3.contains("a") && m3.contains("b"), "both sync inserts visible");
   }
 
   return failures();

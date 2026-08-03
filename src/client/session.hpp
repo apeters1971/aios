@@ -25,8 +25,16 @@ struct ObjectSnapshot {
   bool exists{false};
   std::uint64_t seq{0};
   std::uint64_t cas{0};
+  std::uint64_t size{0};
   std::string body;
   std::unordered_map<std::string, std::string> attrs;
+};
+
+struct AppendResult {
+  std::uint64_t offset{0};
+  std::uint64_t size{0};
+  std::uint64_t seq{0};
+  std::uint64_t epoch{0};
 };
 
 // Placement-aware HTTP session (HMAC + 307 follow).
@@ -44,12 +52,20 @@ class Session {
 
   ObjectSnapshot get_object(const std::string& oid);
   ObjectSnapshot head_object(const std::string& oid);
+  // Inclusive end (HTTP Range bytes=start-end). Empty if oid missing.
+  ObjectSnapshot get_range(const std::string& oid, std::uint64_t start,
+                           std::uint64_t end_inclusive);
 
   // Put body with STL attrs + CAS. expected_cas=0 means create-or-first-write.
   // On success returns new cas. Throws client_error on conflict/http errors.
   std::uint64_t put_object(const std::string& oid, const std::string& body,
                            const std::string& stl_type, std::uint64_t expected_cas,
-                           const std::optional<std::string>& lock_token = std::nullopt);
+                           const std::optional<std::string>& lock_token = std::nullopt,
+                           int stl_v = 1);
+
+  // Atomic append (follows 307). Returns allocated offset + new size/seq.
+  AppendResult append(const std::string& oid, const std::string& data,
+                      const std::optional<std::string>& lock_token = std::nullopt);
 
   // Lock API on arbitrary oid.
   std::string lock_acquire(const std::string& oid, int ttl_ms = 30000);

@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -346,8 +347,75 @@ bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& 
 
 }  // namespace
 
-HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects)
-    : ioc_(ioc), cfg_(std::move(cfg)), objects_(objects), acceptor_(ioc) {
+nlohmann::json HttpServer::admin_config_json() const {
+  const auto& c = objects_.config();
+  nlohmann::json rules = nlohmann::json::array();
+  for (const auto& r : c.layout_rules) {
+    nlohmann::json jr = {{"prefix", r.prefix}, {"layout", r.layout}};
+    if (r.ec_k) jr["ec_k"] = *r.ec_k;
+    if (r.ec_m) jr["ec_m"] = *r.ec_m;
+    if (r.ec_codec) jr["ec_codec"] = *r.ec_codec;
+    rules.push_back(std::move(jr));
+  }
+  return nlohmann::json{
+      {"node_id", c.node_id},
+      {"listen", c.listen},
+      {"http_listen", c.http_listen},
+      {"peers", c.peers},
+      {"cluster_key", "***"},
+      {"auth_skew_ms", c.auth_skew_ms},
+      {"gossip_interval_ms", c.gossip_interval_ms},
+      {"suspect_after_ms", c.suspect_after_ms},
+      {"dead_after_ms", c.dead_after_ms},
+      {"scan_interval_ms", c.scan_interval_ms},
+      {"status_file", c.status_file},
+      {"replica_count", c.replica_count},
+      {"write_quorum", c.write_quorum > 0 ? c.write_quorum : c.replica_count},
+      {"durability", c.durability},
+      {"ec_k", c.ec_k},
+      {"ec_m", c.ec_m},
+      {"ec_codec", c.ec_codec},
+      {"max_ec_k", c.max_ec_k},
+      {"max_ec_m", c.max_ec_m},
+      {"max_replica_count", c.max_replica_count},
+      {"layout_rules", std::move(rules)},
+      {"repair_interval_ms", c.repair_interval_ms},
+      {"repair_batch_oids", c.repair_batch_oids},
+      {"http_body_sync", c.http_body_sync},
+      {"max_versions", c.max_versions},
+      {"clone_required", c.clone_required},
+      {"max_object_bytes", c.max_object_bytes},
+      {"admin", c.admin},
+      {"admin_metrics_public", c.admin_metrics_public},
+  };
+}
+
+nlohmann::json HttpServer::admin_status_json() const {
+  const auto members = membership_.snapshot();
+  std::size_t alive = 0;
+  for (const auto& m : members) {
+    if (m.state == MemberState::Alive) ++alive;
+  }
+  return nlohmann::json{
+      {"node_id", cfg_.node_id},
+      {"listen", cfg_.listen},
+      {"http_listen", cfg_.http_listen},
+      {"admin", cfg_.admin},
+      {"admin_metrics_public", cfg_.admin_metrics_public},
+      {"map_epoch", objects_.map().epoch},
+      {"map_targets", objects_.map().targets.size()},
+      {"members", members.size()},
+      {"members_alive", alive},
+      {"membership", membership_.to_json()},
+      {"cluster_map", objects_.map().to_json()},
+      {"ops", objects_.ops().to_json()},
+  };
+}
+
+HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
+                       MembershipTable& membership)
+    : ioc_(ioc), cfg_(std::move(cfg)), objects_(objects), membership_(membership),
+      acceptor_(ioc) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
     throw std::runtime_error("invalid http_listen: " + cfg_.http_listen);
@@ -463,7 +531,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (version == "HTTP/1.0") keep_alive = (conn == "keep-alive");
     else keep_alive = (conn != "close");
 
-    requests_.fetch_add(1);
+    objects_.ops().http_requests.fetch_add(1, std::memory_order_relaxed);
 
     std::string path = target;
     std::string query;
@@ -474,20 +542,78 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     }
     auto qmap = parse_query(query);
 
+    // Prometheus scrape may skip HMAC when admin_metrics_public is set.
+    const bool metrics_public =
+        cfg_.admin && cfg_.admin_metrics_public && method == "GET" && path == "/metrics";
+
     // Auth
-    const bool unsigned_payload =
-        header_get(headers, "x-aios-content-sha256") == "UNSIGNED-PAYLOAD";
-    const std::string payload_hash =
-        unsigned_payload ? "UNSIGNED-PAYLOAD" : sha256_hex(body.data(), body.size());
-    auto auth = http_auth_verify(method, target, headers, payload_hash, cfg_.cluster_key,
-                                 cfg_.auth_skew_ms);
-    if (!auth.ok) {
-      write_json(*sock, 401, "Unauthorized", {{"error", auth.error}}, keep_alive);
-      continue;
+    if (!metrics_public) {
+      const bool unsigned_payload =
+          header_get(headers, "x-aios-content-sha256") == "UNSIGNED-PAYLOAD";
+      const std::string payload_hash =
+          unsigned_payload ? "UNSIGNED-PAYLOAD" : sha256_hex(body.data(), body.size());
+      auto auth = http_auth_verify(method, target, headers, payload_hash, cfg_.cluster_key,
+                                   cfg_.auth_skew_ms);
+      if (!auth.ok) {
+        write_json(*sock, 401, "Unauthorized", {{"error", auth.error}}, keep_alive);
+        continue;
+      }
     }
 
     auto preds = parse_preconditions(headers);
     auto attrs = parse_attrs(headers);
+
+    // Admin console API (only when node started with admin: true / --admin).
+    if (path.rfind("/admin", 0) == 0 || path == "/metrics") {
+      if (!cfg_.admin) {
+        write_json(*sock, 404, "Not Found",
+                   {{"error", "admin API disabled (set admin: true)"}}, keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/metrics") {
+        const auto body_txt = objects_.ops().to_prometheus(cfg_.node_id);
+        write_response(*sock, 200, "OK",
+                       {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
+                       reinterpret_cast<const std::uint8_t*>(body_txt.data()), body_txt.size(),
+                       keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/status") {
+        write_json(*sock, 200, "OK", admin_status_json(), keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/ops") {
+        write_json(*sock, 200, "OK",
+                   {{"node_id", cfg_.node_id}, {"ops", objects_.ops().to_json()}}, keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/config") {
+        write_json(*sock, 200, "OK", admin_config_json(), keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/cluster") {
+        // Local membership + map + ops; console scrapes peers for cluster-wide totals.
+        nlohmann::json peers = nlohmann::json::array();
+        std::unordered_set<std::string> seen;
+        for (const auto& m : membership_.snapshot()) {
+          if (m.state != MemberState::Alive) continue;
+          if (m.http_addr.empty()) continue;
+          if (!seen.insert(m.http_addr).second) continue;
+          peers.push_back({{"node_id", m.node_id},
+                           {"addr", m.addr},
+                           {"http_addr", m.http_addr},
+                           {"self", m.node_id == cfg_.node_id}});
+        }
+        write_json(*sock, 200, "OK",
+                   {{"node_id", cfg_.node_id},
+                    {"status", admin_status_json()},
+                    {"admin_peers", peers}},
+                   keep_alive);
+        continue;
+      }
+      write_json(*sock, 404, "Not Found", {{"error", "unknown admin path"}}, keep_alive);
+      continue;
+    }
 
     if (method == "GET" && path == "/map") {
       write_json(*sock, 200, "OK", objects_.map().to_json(), keep_alive);
@@ -920,6 +1046,37 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         if (t.empty()) return std::nullopt;
         return t;
       };
+
+      if (sub == "append" && method == "POST") {
+        if (!upload_path.empty()) {
+          if (content_length > kMaxBodySize) {
+            std::error_code rec;
+            fs::remove(upload_path, rec);
+            upload_path.clear();
+            write_json(*sock, 413, "Payload Too Large", {{"error", "append body too large"}},
+                       keep_alive);
+            continue;
+          }
+          std::ifstream in(upload_path, std::ios::binary);
+          body.resize(content_length);
+          in.read(reinterpret_cast<char*>(body.data()),
+                  static_cast<std::streamsize>(content_length));
+          std::error_code rec;
+          fs::remove(upload_path, rec);
+          upload_path.clear();
+        }
+        const LayoutRequest layout_req = layout_request_from_headers(headers);
+        const auto lock_token = lock_token_hdr();
+        auto r = objects_.api_append(oid, body.data(), body.size(), attrs, false, preds,
+                                     layout_req, lock_token);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
 
       if (sub == "lock" && method == "POST") {
         const int ttl = parse_ttl_ms();

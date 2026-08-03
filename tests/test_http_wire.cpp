@@ -176,7 +176,7 @@ int test_http_wire() {
   fx.cfg.http_listen = "127.0.0.1:" + port;
 
   boost::asio::io_context ioc;
-  HttpServer http(ioc, fx.cfg, *fx.svc);
+  HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
   http.start();
   std::thread th([&] { ioc.run(); });
 

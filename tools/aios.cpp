@@ -1,5 +1,8 @@
 #include "http/http_auth.hpp"
+#include "metrics/ops_counters.hpp"
 #include "util/log.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <boost/asio.hpp>
 
@@ -9,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -43,6 +47,11 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
+      << "  admin [status|ops|config|cluster|metrics|console]\n"
+      << "\n"
+      << "Admin commands require the target node to run with admin: true / --admin.\n"
+      << "  admin                 interactive console (default)\n"
+      << "  admin status|ops|config|cluster|metrics   one-shot\n"
       << "\n"
       << "Follows HTTP 307 redirects to the primary (Location).\n"
       << "put/get stream file bytes (no full-object client buffer).\n";
@@ -336,6 +345,209 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
   return resp;
 }
 
+HttpResp admin_get(std::string host, std::string port, const std::string& path,
+                   const std::string& cluster_key) {
+  return http_exchange(std::move(host), std::move(port), "GET", path, {}, {}, nullptr,
+                       cluster_key);
+}
+
+void print_ops_table(const nlohmann::json& ops, const std::string& label) {
+  std::cout << label << "\n";
+  if (!ops.is_object()) {
+    std::cout << "  (no ops)\n";
+    return;
+  }
+  static const char* keys[] = {
+      "http_requests", "put",           "put_range",      "append",         "get",
+      "head",          "del",           "list",           "put_bytes",      "get_bytes",
+      "append_bytes",  "lock_acquire",  "watch",          "pubsub_publish", "gossip_rounds",
+      "repair_scanned","repair_repaired","repair_failed", "errors"};
+  for (const char* k : keys) {
+    if (!ops.contains(k)) continue;
+    std::cout << "  " << std::left << std::setw(18) << k << " " << ops[k] << "\n";
+  }
+}
+
+int cmd_admin_status(std::string host, std::string port, const std::string& key) {
+  auto r = admin_get(std::move(host), std::move(port), "/admin/status", key);
+  if (r.status < 0) {
+    std::cerr << r.error << "\n";
+    return 1;
+  }
+  if (r.status != 200) {
+    std::cerr << "admin status failed status=" << r.status << " " << r.body << "\n";
+    return 1;
+  }
+  try {
+    auto j = nlohmann::json::parse(r.body);
+    std::cout << "node_id:        " << j.value("node_id", "") << "\n"
+              << "listen:         " << j.value("listen", "") << "\n"
+              << "http_listen:    " << j.value("http_listen", "") << "\n"
+              << "admin:          " << (j.value("admin", false) ? "true" : "false") << "\n"
+              << "map_epoch:      " << j.value("map_epoch", 0) << "\n"
+              << "map_targets:    " << j.value("map_targets", 0) << "\n"
+              << "members:        " << j.value("members", 0)
+              << " (alive " << j.value("members_alive", 0) << ")\n";
+    if (j.contains("ops")) print_ops_table(j["ops"], "ops:");
+  } catch (...) {
+    std::cout << r.body << "\n";
+  }
+  return 0;
+}
+
+int cmd_admin_ops(std::string host, std::string port, const std::string& key) {
+  auto r = admin_get(std::move(host), std::move(port), "/admin/ops", key);
+  if (r.status < 0) {
+    std::cerr << r.error << "\n";
+    return 1;
+  }
+  if (r.status != 200) {
+    std::cerr << "admin ops failed status=" << r.status << " " << r.body << "\n";
+    return 1;
+  }
+  try {
+    auto j = nlohmann::json::parse(r.body);
+    print_ops_table(j.value("ops", nlohmann::json::object()),
+                    "ops (" + j.value("node_id", std::string("?")) + "):");
+  } catch (...) {
+    std::cout << r.body << "\n";
+  }
+  return 0;
+}
+
+int cmd_admin_config(std::string host, std::string port, const std::string& key) {
+  auto r = admin_get(std::move(host), std::move(port), "/admin/config", key);
+  if (r.status < 0) {
+    std::cerr << r.error << "\n";
+    return 1;
+  }
+  if (r.status != 200) {
+    std::cerr << "admin config failed status=" << r.status << " " << r.body << "\n";
+    return 1;
+  }
+  try {
+    auto j = nlohmann::json::parse(r.body);
+    std::cout << j.dump(2) << "\n";
+    std::cout << "\n(note: runtime config changes require restart; cluster_key redacted)\n";
+  } catch (...) {
+    std::cout << r.body << "\n";
+  }
+  return 0;
+}
+
+int cmd_admin_metrics(std::string host, std::string port, const std::string& key) {
+  auto r = admin_get(std::move(host), std::move(port), "/metrics", key);
+  if (r.status < 0) {
+    std::cerr << r.error << "\n";
+    return 1;
+  }
+  if (r.status != 200) {
+    std::cerr << "metrics failed status=" << r.status << " " << r.body << "\n";
+    return 1;
+  }
+  std::cout << r.body;
+  if (!r.body.empty() && r.body.back() != '\n') std::cout << '\n';
+  return 0;
+}
+
+int cmd_admin_cluster(std::string host, std::string port, const std::string& key) {
+  auto r = admin_get(host, port, "/admin/cluster", key);
+  if (r.status < 0) {
+    std::cerr << r.error << "\n";
+    return 1;
+  }
+  if (r.status != 200) {
+    std::cerr << "admin cluster failed status=" << r.status << " " << r.body << "\n";
+    return 1;
+  }
+  aios::OpsCounters total;
+  try {
+    auto j = nlohmann::json::parse(r.body);
+    std::cout << "coordinator: " << j.value("node_id", "") << "\n";
+    if (j.contains("status") && j["status"].contains("ops")) {
+      aios::OpsCounters local;
+      local.load_json(j["status"]["ops"]);
+      total.add_from(local);
+    }
+    const auto peers = j.value("admin_peers", nlohmann::json::array());
+    std::cout << "alive http peers: " << peers.size() << "\n";
+    for (const auto& p : peers) {
+      const std::string nid = p.value("node_id", "");
+      const std::string http = p.value("http_addr", "");
+      const bool self = p.value("self", false);
+      std::cout << "  - " << nid << "  http=" << http << (self ? " (self)" : "") << "\n";
+      if (self || http.empty()) continue;
+      std::string ph, pp;
+      try {
+        parse_endpoint(http, ph, pp);
+      } catch (...) {
+        continue;
+      }
+      auto pr = admin_get(ph, pp, "/admin/ops", key);
+      if (pr.status != 200) {
+        std::cout << "      ops: unavailable (status=" << pr.status << ")\n";
+        continue;
+      }
+      try {
+        auto oj = nlohmann::json::parse(pr.body);
+        aios::OpsCounters local;
+        local.load_json(oj.value("ops", nlohmann::json::object()));
+        total.add_from(local);
+        std::cout << "      put=" << local.put.load() << " get=" << local.get.load()
+                  << " http=" << local.http_requests.load() << "\n";
+      } catch (...) {
+        std::cout << "      ops: bad json\n";
+      }
+    }
+    print_ops_table(total.to_json(), "cluster ops (sum of reachable admin nodes):");
+  } catch (const std::exception& e) {
+    std::cerr << e.what() << "\n";
+    std::cout << r.body << "\n";
+    return 1;
+  }
+  return 0;
+}
+
+void admin_console_help() {
+  std::cout << "commands: status | ops | config | cluster | metrics | help | quit\n";
+}
+
+int run_admin_console(std::string host, std::string port, const std::string& key) {
+  std::cout << "AIOS admin console  endpoint=" << host << ':' << port << "\n";
+  admin_console_help();
+  std::string line;
+  while (true) {
+    std::cout << "admin> " << std::flush;
+    if (!std::getline(std::cin, line)) break;
+    // trim
+    while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) {
+      line.erase(line.begin());
+    }
+    while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back()))) {
+      line.pop_back();
+    }
+    if (line.empty()) continue;
+    if (line == "quit" || line == "exit" || line == "q") break;
+    if (line == "help" || line == "?") {
+      admin_console_help();
+      continue;
+    }
+    int rc = 0;
+    if (line == "status") rc = cmd_admin_status(host, port, key);
+    else if (line == "ops") rc = cmd_admin_ops(host, port, key);
+    else if (line == "config") rc = cmd_admin_config(host, port, key);
+    else if (line == "cluster") rc = cmd_admin_cluster(host, port, key);
+    else if (line == "metrics") rc = cmd_admin_metrics(host, port, key);
+    else {
+      std::cout << "unknown: " << line << "\n";
+      admin_console_help();
+      continue;
+    }
+    if (rc != 0) std::cout << "(command failed)\n";
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -465,6 +677,19 @@ int main(int argc, char** argv) {
         }
       }
       return 0;
+    }
+    if (args.cmd == "admin") {
+      std::string sub = args.positional.empty() ? "console" : args.positional[0];
+      if (sub == "console" || sub == "shell" || sub == "repl") {
+        return run_admin_console(host, port, args.cluster_key);
+      }
+      if (sub == "status") return cmd_admin_status(host, port, args.cluster_key);
+      if (sub == "ops") return cmd_admin_ops(host, port, args.cluster_key);
+      if (sub == "config") return cmd_admin_config(host, port, args.cluster_key);
+      if (sub == "cluster") return cmd_admin_cluster(host, port, args.cluster_key);
+      if (sub == "metrics") return cmd_admin_metrics(host, port, args.cluster_key);
+      std::cerr << "unknown admin subcommand: " << sub << "\n";
+      return 2;
     }
     std::cerr << "unknown command: " << args.cmd << "\n";
     return 2;

@@ -59,6 +59,11 @@ struct Config {
   bool clone_required{true};
   // Max object body size for HTTP streaming PUT (bytes). Default 64 GiB.
   std::uint64_t max_object_bytes{64ull * 1024ull * 1024ull * 1024ull};
+  // When true, expose /admin/* and /metrics on the HTTP listener.
+  bool admin{false};
+  // When true (and admin), GET /metrics skips HMAC so Prometheus can scrape.
+  // Keep the admin HTTP port network-restricted if enabled.
+  bool admin_metrics_public{false};
 };
 
 // Build dialable http host:port from TCP advertise + http_listen.

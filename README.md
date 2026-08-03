@@ -7,12 +7,12 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | Binary / lib | Role |
 |--------------|------|
 | `aiosd` | Cluster daemon (gossip, storage targets, object RPC, HTTP API, repair) |
-| `aios` | Thin HTTP client (put/get/del/stat/list/map; follows `307`) |
+| `aios` | Thin HTTP client (put/get/del/stat/list/map/admin; follows `307`) |
 | `aios-bench` | Multithreaded HTTP create/update/read benchmark |
 | `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client).
 
 ---
 
@@ -189,7 +189,18 @@ http_listen: "0.0.0.0:7480"
 status_file: "/tmp/aios-a.json"
 ```
 
-**CLI overrides:** `--config`, `--cluster-key`, `--listen`, `--peer` (repeatable), `--node-id`, `--status-file`, `--replica-count`, `--write-quorum`, `--http-listen`.
+**CLI overrides:** `--config`, `--cluster-key`, `--listen`, `--peer` (repeatable), `--node-id`, `--status-file`, `--replica-count`, `--write-quorum`, `--http-listen`, `--admin`, `--admin-metrics-public`.
+
+### Admin & monitoring
+
+Enable on selected nodes with `admin: true` / `--admin`. That exposes `/admin/status|ops|config|cluster` and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers.
+
+```bash
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin status
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin   # interactive console
+```
+
+Details: [`proto/admin.md`](proto/admin.md).
 
 ---
 
@@ -325,16 +336,15 @@ Follows `307` redirects. Put/get stream file bytes (no full-object client buffer
 
 ## STL-like C++ client
 
-Library **`aios_client`** (`#include "client/stl.hpp"`) maps **named** STL-style objects onto the HTTP object API. Each named value is a JSON tip at oid `stl/{type}/{name}` (e.g. `stl/map/users`). Element/value type in v1 is `std::string`. Max document size: 16 MiB.
+Library **`aios_client`** (`#include "client/stl.hpp"`) maps **named** STL-style objects onto the HTTP object API. Element/value type is `std::string`.
 
-| Class | Role |
-|-------|------|
-| `aios::string` | Persistent string |
-| `aios::map` | Ordered `string → string` map |
-| `aios::unordered_map` | Hash `string → string` map |
-| `aios::set` | Ordered unique strings |
-| `aios::list` / `aios::deque` | Sequence of strings |
-| `aios::mutex` | Cluster-shared mutex (`BasicLockable` / `std::lock_guard`) |
+| Class | Role | Persistence |
+|-------|------|-------------|
+| `aios::string` | Persistent string | Whole JSON tip (`aios_stl: 1`) |
+| `aios::map` / `unordered_map` / `set` / `list` / `deque` | Containers | Append-only changelog via `POST /o/{oid}/append` (`aios_stl: 2`) |
+| `aios::mutex` | Cluster-shared mutex (`BasicLockable`) | HTTP lock API |
+
+Changelog containers store meta at `stl/{type}/{name}`, an op log at `…/log`, and optional snapshot at `…/snap`. Call **`compact()`** (or rely on auto-compact past ~1 MiB) to snapshot and truncate the log. Opening a v1 whole-document tip migrates on open.
 
 ### SYNC vs ASYNC
 
@@ -342,12 +352,12 @@ Containers (not mutex) take a `aios::sync_mode` (default **ASYNC**):
 
 | Mode | Behavior |
 |------|----------|
-| **SYNC** | Every mutating call (`push_back`, `operator[]` assign, …) immediately PUTs a new tip. Readers always fetch the latest tip. Changes are visible to other clients as soon as the write succeeds. |
-| **ASYNC** | Mutations stay local (`dirty`). **`load()`** atomically replaces local state from the store; **`flush()`** atomically writes the local snapshot. No background push/pull. |
+| **SYNC** | Every mutate appends a framed op (visible to peers on their next read/follow). |
+| **ASYNC** | Mutations stay local (`dirty`). **`load()`** pulls meta/snap/log; **`flush()`** batch-appends pending ops. |
 
 Mode switch: `set_mode(sync)` while dirty fails until `flush()` or `discard()`. Dirty `load()` also fails. ASYNC destructors flush by default (`flush_on_destroy`).
 
-Writes use optimistic concurrency (`aios.stl.cas` attr). Stale flush/put → `aios::client_error` with `code() == "conflict"`.
+`string` still uses CAS on `aios.stl.cas`. Stale string flush → `aios::client_error` with `code() == "conflict"`.
 
 `aios::mutex` uses HTTP object locks on `stl/mutex/{name}` (TTL lease, default 30s). Containers do **not** take it automatically—compose with `std::lock_guard` for critical sections.
 
@@ -363,16 +373,10 @@ aios::string s(sess, "greeting", aios::sync_mode::async);
 s.assign("hello");
 s.flush();
 
-// SYNC: each mutate is cluster-visible immediately
+// SYNC: each mutate appends an op (cluster-visible)
 aios::map m(sess, "users", aios::sync_mode::sync);
 m["alice"] = "1";
-
-aios::unordered_map u(sess, "cache", aios::sync_mode::async);
-u["k"] = "v";
-u.flush();
-
-aios::set tags(sess, "tags", aios::sync_mode::sync);
-tags.insert("red");
+m.compact();
 
 aios::mutex mx(sess, "users");
 {
@@ -388,7 +392,7 @@ cmake --build build --target aios_client
 # link: aios_client (pulls aios_core for HTTP HMAC helpers)
 ```
 
-Wire format, CAS, and API notes: [`proto/stl_client.md`](proto/stl_client.md).
+Wire format, append, and API notes: [`proto/stl_client.md`](proto/stl_client.md), [`proto/http.md`](proto/http.md).
 
 ---
 
@@ -418,6 +422,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | Doc | Topic |
 |-----|-------|
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
+| [`proto/admin.md`](proto/admin.md) | Admin console, OPS counters, Prometheus `/metrics` |
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
 | [`proto/layout.md`](proto/layout.md) | Per-object layout and prefix rules |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
