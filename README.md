@@ -487,7 +487,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
 | [`proto/admin.md`](proto/admin.md) | Admin console, OPS counters, Prometheus `/metrics` |
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
-| [`proto/layout.md`](proto/layout.md) | Per-object layout and prefix rules |
+| [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 
