@@ -187,9 +187,7 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
     }
   }
   rebuild_cluster_map();
-  if (object_service_) {
-    object_service_->ops().gossip_rounds.fetch_add(1, std::memory_order_relaxed);
-  }
+  if (object_service_) object_service_->ops().note_gossip_round();
 
   gossip_timer_.expires_after(std::chrono::milliseconds(cfg_.gossip_interval_ms));
   gossip_timer_.async_wait([this](auto e) { on_gossip_timer(e); });
@@ -226,11 +224,7 @@ void GossipEngine::on_repair_timer(const boost::system::error_code& ec) {
       run_repair(cfg_, advertise_addr(), cluster_map_, local_stores_,
                  static_cast<std::size_t>(std::max(1, cfg_.repair_batch_oids)));
   if (object_service_) {
-    object_service_->ops().repair_scanned.fetch_add(stats.oids_scanned,
-                                                    std::memory_order_relaxed);
-    object_service_->ops().repair_repaired.fetch_add(stats.repaired,
-                                                     std::memory_order_relaxed);
-    object_service_->ops().repair_failed.fetch_add(stats.failed, std::memory_order_relaxed);
+    object_service_->ops().note_repair(stats.oids_scanned, stats.repaired, stats.failed);
   }
   if (stats.oids_scanned > 0 || stats.under_replicated > 0) {
     AIOS_LOG_INFO("repair scanned=", stats.oids_scanned,
@@ -248,14 +242,19 @@ void GossipEngine::write_status() {
       {"advertise", advertise_addr()},
       {"http_listen", cfg_.http_listen},
       {"admin", cfg_.admin},
-      {"http_requests", object_service_ ? object_service_->ops().http_requests.load() : 0},
+      {"http_requests",
+       object_service_ ? object_service_->ops().total().http_requests.load() : 0},
       {"replica_count", cfg_.replica_count},
       {"write_quorum", cfg_.write_quorum > 0 ? cfg_.write_quorum : cfg_.replica_count},
       {"membership", membership_.to_json()},
       {"fs_table", fs_table_.to_json()},
       {"cluster_map", cluster_map_.to_json()},
   };
-  if (object_service_) j["ops"] = object_service_->ops().to_json();
+  if (object_service_) {
+    auto admin = object_service_->ops().to_admin_json();
+    j["ops"] = admin["ops"];
+    j["ops_by_label"] = admin["ops_by_label"];
+  }
   const auto members = membership_.snapshot();
   std::size_t alive = 0;
   for (const auto& m : members) {

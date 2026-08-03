@@ -45,7 +45,7 @@ Frame ObjectService::reply_err(std::uint64_t epoch, const std::string& code,
 
 ApiResult ObjectService::fail(const std::string& code, const std::string& error) const {
   // not_primary is a redirect signal, not an operator error.
-  if (code != "not_primary") ops_.errors.fetch_add(1, std::memory_order_relaxed);
+  if (code != "not_primary") ops_.note_error();
   ApiResult r;
   r.ok = false;
   r.code = code;
@@ -1054,8 +1054,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
     auto r = commit_ec_put(store, placement, oid, data, len, attrs, replace_attrs,
                            expected_crc32c, layout);
     if (r.ok) {
-      ops_.put.fetch_add(1, std::memory_order_relaxed);
-      ops_.put_bytes.fetch_add(len, std::memory_order_relaxed);
+      ops_.note_put(len);
     }
     return r;
   }
@@ -1070,8 +1069,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   }
   auto r = commit_prepared(store, placement, pv, data, len, put_attrs);
   if (r.ok) {
-    ops_.put.fetch_add(1, std::memory_order_relaxed);
-    ops_.put_bytes.fetch_add(len, std::memory_order_relaxed);
+    ops_.note_put(len);
   }
   return r;
 }
@@ -1119,8 +1117,7 @@ ApiResult ObjectService::api_put_file(
     auto r = commit_ec_put(store, placement, oid, buf.data(), buf.size(), attrs, replace_attrs,
                            expected_crc32c.value_or(crc32c_val), layout);
     if (r.ok) {
-      ops_.put.fetch_add(1, std::memory_order_relaxed);
-      ops_.put_bytes.fetch_add(size, std::memory_order_relaxed);
+      ops_.note_put(size);
     }
     return r;
   }
@@ -1135,8 +1132,7 @@ ApiResult ObjectService::api_put_file(
   }
   auto r = commit_prepared(store, placement, pv, nullptr, 0, put_attrs);
   if (r.ok) {
-    ops_.put.fetch_add(1, std::memory_order_relaxed);
-    ops_.put_bytes.fetch_add(size, std::memory_order_relaxed);
+    ops_.note_put(size);
   }
   return r;
 }
@@ -1221,8 +1217,7 @@ ApiResult ObjectService::api_put_range(
   install.inline_body = false;
   auto r = commit_prepared(store, placement, install, full->data(), full->size(), put_attrs);
   if (r.ok) {
-    ops_.put_range.fetch_add(1, std::memory_order_relaxed);
-    ops_.put_bytes.fetch_add(len, std::memory_order_relaxed);
+    ops_.note_put_range(len);
   }
   return r;
 }
@@ -1292,8 +1287,7 @@ ApiResult ObjectService::api_append(
                                  {"size", new_size},
                                  {"seq", seq},
                                  {"epoch", r.epoch}};
-    ops_.append.fetch_add(1, std::memory_order_relaxed);
-    ops_.append_bytes.fetch_add(len, std::memory_order_relaxed);
+    ops_.note_append(len);
   }
   return r;
 }
@@ -1371,12 +1365,10 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   // use the normal local read path even when the cluster default layout is ec.
   auto note_get = [this](ApiResult& r) {
     if (!r.ok || r.code == "redirect") return;
-    ops_.get.fetch_add(1, std::memory_order_relaxed);
-    if (r.data) {
-      ops_.get_bytes.fetch_add(r.data->size(), std::memory_order_relaxed);
-    } else if (r.info) {
-      ops_.get_bytes.fetch_add(r.info->size, std::memory_order_relaxed);
-    }
+    std::uint64_t bytes = 0;
+    if (r.data) bytes = r.data->size();
+    else if (r.info) bytes = r.info->size;
+    ops_.note_get(bytes);
   };
 
   if (attrs_are_ec(attrs)) {
@@ -1452,9 +1444,8 @@ ApiResult ObjectService::api_head(const std::string& oid,
   auto r = api_get(oid, std::nullopt, std::nullopt, preds, seq);
   if (r.ok) {
     // api_get counted a get; reclassify as head (no body transfer for HEAD).
-    ops_.get.fetch_sub(1, std::memory_order_relaxed);
-    if (r.data) ops_.get_bytes.fetch_sub(r.data->size(), std::memory_order_relaxed);
-    ops_.head.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t bytes = r.data ? r.data->size() : (r.info ? r.info->size : 0);
+    ops_.note_reclass_get_to_head(bytes);
   }
   return r;
 }
@@ -1484,7 +1475,7 @@ ApiResult ObjectService::api_del(const std::string& oid,
     return fail("store_error", err);
   }
   auto r = commit_prepared(store, placement, pv, nullptr, 0, {});
-  if (r.ok) ops_.del.fetch_add(1, std::memory_order_relaxed);
+  if (r.ok) ops_.note_del();
   return r;
 }
 
@@ -1523,7 +1514,7 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
 
   if (!cluster) {
     auto lr = list_local(cursor);
-    if (lr.ok) ops_.list.fetch_add(1, std::memory_order_relaxed);
+    if (lr.ok) ops_.note_list();
     return lr;
   }
 
@@ -1569,11 +1560,11 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
     r.list.objects.push_back(std::move(o));
     if (limit > 0 && r.list.objects.size() >= limit) {
       r.list.next_cursor = r.list.objects.back().oid;
-      ops_.list.fetch_add(1, std::memory_order_relaxed);
+      ops_.note_list();
       return r;
     }
   }
-  ops_.list.fetch_add(1, std::memory_order_relaxed);
+  ops_.note_list();
   return r;
 }
 
@@ -2269,7 +2260,7 @@ ApiResult ObjectService::api_lock_acquire(const std::string& oid, int ttl_ms) {
   r.epoch = map_.epoch;
   r.placement = placement;
   r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
-  ops_.lock_acquire.fetch_add(1, std::memory_order_relaxed);
+  ops_.note_lock_acquire();
   return r;
 }
 
@@ -2348,7 +2339,7 @@ ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t aft
         ev.op = st->is_delete ? "del" : "put";
         ev.ts_ms = now_ms();
         r.watch_event = ev;
-        ops_.watch.fetch_add(1, std::memory_order_relaxed);
+        ops_.note_watch();
         return r;
       }
       if (!st) after_seq = 0;  // wait for first create
@@ -2369,7 +2360,7 @@ ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t aft
   r.epoch = map_.epoch;
   r.placement = placement;
   r.watch_event = ev;
-  ops_.watch.fetch_add(1, std::memory_order_relaxed);
+  ops_.note_watch();
   return r;
 }
 
@@ -2619,7 +2610,7 @@ ApiResult ObjectService::api_pubsub_publish(const std::string& topic, const std:
                  {"id", msg.id},
                  {"delivery", delivery_mode_name(mode_out)},
                  {"ts_ms", msg.ts_ms}};
-  ops_.pubsub_publish.fetch_add(1, std::memory_order_relaxed);
+  ops_.note_pubsub_publish();
   return r;
 }
 

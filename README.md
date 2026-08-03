@@ -200,6 +200,8 @@ aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin status
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin   # interactive console
 ```
 
+Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters (QoS limits later).
+
 Details: [`proto/admin.md`](proto/admin.md).
 
 ---

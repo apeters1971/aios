@@ -21,7 +21,7 @@ All admin JSON routes still require the normal AIOS HMAC Authorization header, e
 | Path | Response |
 |------|----------|
 | `GET /admin/status` | Node identity, map epoch, membership, local `ops` |
-| `GET /admin/ops` | `{node_id, ops}` |
+| `GET /admin/ops` | `{node_id, ops, ops_by_label}` |
 | `GET /admin/config` | Effective config (`cluster_key` → `"***"`). Read-only; changes need restart. |
 | `GET /admin/cluster` | Local status + `admin_peers` (`node_id`, `http_addr`) for cluster scrape |
 | `GET /metrics` | Prometheus counters (`aios_*_total`) |
@@ -38,7 +38,13 @@ Process-local monotonic counters (see `src/metrics/ops_counters.hpp`), including
 
 **Cluster-wide totals:** scrape `/admin/ops` (or use the console `cluster` command) across alive peers listed by `/admin/cluster`. Gossip does not carry counters.
 
-Counters are also written into `status_file` under `ops` when that path is configured.
+Counters are also written into `status_file` under `ops` / `ops_by_label` when that path is configured.
+
+### Application labels
+
+Clients send `x-aios-app-label: <label>` (see [`http.md`](http.md)). Each distinct label gets its own counter bucket (max 256; further labels roll into `_overflow`). Totals always include labeled + unlabeled traffic; `ops_by_label` is the breakdown.
+
+Prometheus series add `app_label="…"` for per-label samples (node totals remain without that label).
 
 ## CLI console
 
@@ -61,3 +67,10 @@ Console commands: `status`, `ops`, `config`, `cluster`, `metrics`, `help`, `quit
 Point Prometheus at an admin node's `/metrics`. Prefer `admin_metrics_public: true` plus network ACLs, or configure a scraper that signs AIOS HMAC.
 
 Example metric names: `aios_http_requests_total`, `aios_ops_put_total`, `aios_ops_get_bytes_total`, `aios_gossip_rounds_total`, `aios_repair_repaired_total`.
+
+Labeled example:
+
+```
+aios_ops_put_total{node_id="node-a"} 100
+aios_ops_put_total{node_id="node-a",app_label="etl"} 40
+```

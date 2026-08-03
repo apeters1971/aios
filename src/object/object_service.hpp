@@ -169,8 +169,8 @@ class ObjectService {
   ClusterMap& map() { return map_; }
   const ClusterMap& map() const { return map_; }
   const Config& config() const { return cfg_; }
-  OpsCounters& ops() { return ops_; }
-  const OpsCounters& ops() const { return ops_; }
+  OpsRegistry& ops() { return ops_; }
+  const OpsRegistry& ops() const { return ops_; }
   LocalStores& stores() { return stores_; }
   const Config& cfg() const { return cfg_; }
   const std::string& advertise() const { return advertise_; }
@@ -263,7 +263,7 @@ class ObjectService {
   LocalStores& stores_;
   std::string advertise_;
   mutable std::recursive_mutex mu_;
-  mutable OpsCounters ops_;
+  mutable OpsRegistry ops_;
   LockTable locks_;
   WatchHub watches_;
   TopicHub pubsub_;

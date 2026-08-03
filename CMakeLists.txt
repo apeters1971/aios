@@ -104,6 +104,7 @@ add_library(aios_core STATIC
   src/http/http_auth.cpp
   src/http/http_server.cpp
   src/metrics/ops_counters.cpp
+  src/metrics/app_label.cpp
 )
 target_include_directories(aios_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src

@@ -12,6 +12,18 @@ x-aios-date: <unix-ms>
 x-aios-content-sha256: <sha256-hex of body> | UNSIGNED-PAYLOAD
 ```
 
+### Application label (optional)
+
+Clients may tag requests with a workload label:
+
+```
+x-aios-app-label: my-app
+```
+
+Rules: 1–64 chars matching `[A-Za-z0-9_.:/-]+`. Empty/absent = unlabeled. Invalid → `400`.
+
+Labels feed per-app OPS counters (and are reserved for future QoS). See [`admin.md`](admin.md). The `aios` CLI accepts `--app-label`; `SessionConfig::app_label` / `Session::set_app_label` for `aios_client`.
+
 Canonical string:
 
 ```

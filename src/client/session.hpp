@@ -13,6 +13,8 @@ namespace aios {
 struct SessionConfig {
   std::string endpoint{"127.0.0.1:7480"};
   std::string cluster_key;
+  // Optional workload label sent as x-aios-app-label on every request.
+  std::string app_label;
 };
 
 struct HttpResponse {
@@ -45,6 +47,8 @@ class Session {
   explicit Session(SessionConfig cfg);
 
   const SessionConfig& config() const { return cfg_; }
+  void set_app_label(std::string label) { cfg_.app_label = std::move(label); }
+  const std::string& app_label() const { return cfg_.app_label; }
 
   HttpResponse request(const std::string& method, const std::string& target,
                        std::unordered_map<std::string, std::string> headers = {},

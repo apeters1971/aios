@@ -18,7 +18,7 @@ class HttpServer {
 
   void start();
 
-  std::uint64_t requests() const { return objects_.ops().http_requests.load(); }
+  std::uint64_t requests() const { return objects_.ops().total().http_requests.load(); }
 
  private:
   void do_accept();

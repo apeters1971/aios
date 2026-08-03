@@ -191,6 +191,32 @@ int test_admin() {
     auto cl = http_request("127.0.0.1", "19381", "GET", "/admin/cluster", {}, "", key);
     expect(cl.status == 200, "admin cluster 200");
 
+    // App label → ops_by_label + prometheus app_label series
+    {
+      auto bad = http_request("127.0.0.1", "19381", "PUT", "/o/labeled",
+                              {{"x-aios-app-label", "bad label!"}}, "x", key);
+      expect(bad.status == 400, "invalid app label rejected");
+
+      auto lp = http_request("127.0.0.1", "19381", "PUT", "/o/labeled",
+                             {{"x-aios-app-label", "etl/job-1"}}, "payload", key);
+      expect(lp.status == 204, "labeled put");
+
+      auto ops = http_request("127.0.0.1", "19381", "GET", "/admin/ops", {}, "", key);
+      expect(ops.status == 200, "ops after label");
+      try {
+        auto j = nlohmann::json::parse(ops.body);
+        expect(j.contains("ops_by_label") && j["ops_by_label"].contains("etl/job-1"),
+               "ops_by_label has etl/job-1");
+        expect(j["ops_by_label"]["etl/job-1"].value("put", 0ull) >= 1, "label put count");
+      } catch (...) {
+        expect(false, "ops_by_label json");
+      }
+
+      auto met2 = http_request("127.0.0.1", "19381", "GET", "/metrics", {}, "", key, false);
+      expect(met2.body.find("app_label=\"etl/job-1\"") != std::string::npos,
+             "prom app_label series");
+    }
+
     ioc.stop();
     th.join();
   }

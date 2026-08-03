@@ -118,6 +118,7 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     headers.erase("authorization");
     headers.erase("x-aios-date");
     headers["content-length"] = std::to_string(body.size());
+    if (!cfg_.app_label.empty()) headers["x-aios-app-label"] = cfg_.app_label;
     add_auth(headers, method, path);
 
     boost::asio::io_context ioc;

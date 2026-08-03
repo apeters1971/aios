@@ -30,6 +30,7 @@ constexpr std::size_t kIoChunk = 256u * 1024u;
 struct Args {
   std::string endpoint{"127.0.0.1:7480"};
   std::string cluster_key;
+  std::string app_label;
   std::string cmd;
   std::vector<std::string> positional;
   std::string out_file;
@@ -38,7 +39,8 @@ struct Args {
 
 void usage() {
   std::cout
-      << "usage: aios --cluster-key KEY [--endpoint HOST:PORT] <cmd> [args]\n"
+      << "usage: aios --cluster-key KEY [--endpoint HOST:PORT] [--app-label LABEL]\n"
+      << "            <cmd> [args]\n"
       << "\n"
       << "Commands:\n"
       << "  put  OID FILE\n"
@@ -81,6 +83,12 @@ bool parse_args(int argc, char** argv, Args& a) {
       const char* v = need("--cluster-key");
       if (!v) return false;
       a.cluster_key = v;
+      continue;
+    }
+    if (arg == "--app-label") {
+      const char* v = need("--app-label");
+      if (!v) return false;
+      a.app_label = v;
       continue;
     }
     if (arg == "-o") {
@@ -147,6 +155,9 @@ void add_auth(std::unordered_map<std::string, std::string>& headers, const std::
                              signed_headers + ", Signature=" + sig;
 }
 
+// Set by main from --app-label for http_exchange.
+std::string g_app_label;
+
 struct HttpResp {
   int status{-1};
   std::unordered_map<std::string, std::string> headers;
@@ -199,6 +210,7 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
     headers.erase("authorization");
     headers.erase("x-aios-date");
     headers["content-length"] = std::to_string(body_len);
+    if (!g_app_label.empty()) headers["x-aios-app-label"] = g_app_label;
     add_auth(headers, method, target, cluster_key);
 
     asio::io_context ioc;
@@ -409,6 +421,11 @@ int cmd_admin_ops(std::string host, std::string port, const std::string& key) {
     auto j = nlohmann::json::parse(r.body);
     print_ops_table(j.value("ops", nlohmann::json::object()),
                     "ops (" + j.value("node_id", std::string("?")) + "):");
+    if (j.contains("ops_by_label") && j["ops_by_label"].is_object()) {
+      for (auto it = j["ops_by_label"].begin(); it != j["ops_by_label"].end(); ++it) {
+        print_ops_table(it.value(), "ops_by_label[" + it.key() + "]:");
+      }
+    }
   } catch (...) {
     std::cout << r.body << "\n";
   }
@@ -556,6 +573,7 @@ int main(int argc, char** argv) {
     usage();
     return 2;
   }
+  g_app_label = args.app_label;
   std::string host, port;
   try {
     parse_endpoint(args.endpoint, host, port);

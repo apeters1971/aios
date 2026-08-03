@@ -1,6 +1,7 @@
 #include "http/http_server.hpp"
 
 #include "http/http_auth.hpp"
+#include "metrics/app_label.hpp"
 #include "net/framing.hpp"
 #include "object/object_layout.hpp"
 #include "object/pubsub.hpp"
@@ -409,6 +410,7 @@ nlohmann::json HttpServer::admin_status_json() const {
       {"membership", membership_.to_json()},
       {"cluster_map", objects_.map().to_json()},
       {"ops", objects_.ops().to_json()},
+      {"ops_by_label", objects_.ops().by_label_json()},
   };
 }
 
@@ -531,8 +533,6 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (version == "HTTP/1.0") keep_alive = (conn == "keep-alive");
     else keep_alive = (conn != "close");
 
-    objects_.ops().http_requests.fetch_add(1, std::memory_order_relaxed);
-
     std::string path = target;
     std::string query;
     auto qpos = target.find('?');
@@ -541,6 +541,20 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       query = target.substr(qpos + 1);
     }
     auto qmap = parse_query(query);
+
+    // Optional client workload label (for OPS / future QoS).
+    std::string app_label;
+    {
+      const auto raw = header_get(headers, kAppLabelHeader);
+      std::string lerr;
+      if (!normalize_app_label(raw, app_label, lerr)) {
+        write_json(*sock, 400, "Bad Request", {{"error", lerr}, {"code", "bad_request"}},
+                   keep_alive);
+        continue;
+      }
+    }
+    AppLabelScope label_scope(app_label);
+    objects_.ops().note_http_request();
 
     // Prometheus scrape may skip HMAC when admin_metrics_public is set.
     const bool metrics_public =
@@ -583,8 +597,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         continue;
       }
       if (method == "GET" && path == "/admin/ops") {
-        write_json(*sock, 200, "OK",
-                   {{"node_id", cfg_.node_id}, {"ops", objects_.ops().to_json()}}, keep_alive);
+        auto payload = objects_.ops().to_admin_json();
+        payload["node_id"] = cfg_.node_id;
+        write_json(*sock, 200, "OK", payload, keep_alive);
         continue;
       }
       if (method == "GET" && path == "/admin/config") {
@@ -639,8 +654,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       timeout_ms = std::max(1, std::min(timeout_ms, 120000));
       auto sock_ptr = sock;
       const std::string target_copy = target;
+      const std::string label_copy = app_label;
       ObjectService* svc = &objects_;
-      std::thread([sock_ptr, svc, prefix, timeout_ms, target_copy]() {
+      std::thread([sock_ptr, svc, prefix, timeout_ms, target_copy, label_copy]() {
+        AppLabelScope scope(label_copy);
         auto r = svc->api_watch_prefix(prefix, timeout_ms);
         if (!r.ok) {
           write_api_error(*sock_ptr, r, target_copy, false);
@@ -790,8 +807,11 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         auto sock_ptr = sock;
         const std::string target_copy = target;
+        const std::string label_copy = app_label;
         ObjectService* svc = &objects_;
-        std::thread([sock_ptr, svc, topic, after_id, after_set, timeout_ms, target_copy]() {
+        std::thread([sock_ptr, svc, topic, after_id, after_set, timeout_ms, target_copy,
+                     label_copy]() {
+          AppLabelScope scope(label_copy);
           auto r = svc->api_pubsub_subscribe(topic, after_id, after_set, timeout_ms);
           if (!r.ok) {
             write_api_error(*sock_ptr, r, target_copy, false);
@@ -1172,8 +1192,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         auto sock_ptr = sock;
         const std::string target_copy = target;
+        const std::string label_copy = app_label;
         ObjectService* svc = &objects_;
-        std::thread([sock_ptr, svc, oid, after_seq, timeout_ms, target_copy]() {
+        std::thread([sock_ptr, svc, oid, after_seq, timeout_ms, target_copy, label_copy]() {
+          AppLabelScope scope(label_copy);
           auto r = svc->api_watch_oid(oid, after_seq, timeout_ms);
           if (!r.ok) {
             write_api_error(*sock_ptr, r, target_copy, false);
