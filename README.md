@@ -11,7 +11,7 @@ This repository currently ships **`aiosd`**: a standalone C++20 daemon that
 5. Gossips `statvfs` capacity for usable targets
 6. Builds a **cluster map** (epoch + targets) and serves object **Put/Get/Del/Stat** RPCs
 7. Performs **server-side primary replication** (`replica_count`) or optional **erasure coding** (`durability: ec`: XOR `2+1`, or ISA-L Reed–Solomon e.g. `4+2` when libisal is available) with a background repair loop
-8. Exposes an **HTTP object API** (`http_listen`, default `:7480`) with ranged PUT/GET, attr preconditions, LIST, DELETE, and cross-object transactions (`/txn`)
+8. Exposes an **HTTP object API** (`http_listen`, default `:7480`) with ranged PUT/GET, attr preconditions, LIST, DELETE, cross-object transactions (`/txn`), enforced object locks, and long-poll watches
 
 Plus a local **hybrid object store** library and **`aios-bench`**. Clients are thin and placement-aware: they contact the primary (HTTP or TCP++); the primary fans out replicas. See [`proto/http.md`](proto/http.md).
 

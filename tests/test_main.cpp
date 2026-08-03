@@ -21,6 +21,7 @@ int test_fs_clone();
 int test_mini_cluster();
 int test_ec();
 int test_layout();
+int test_locks_watches();
 
 int main() {
   int failures = 0;
@@ -45,6 +46,7 @@ int main() {
   failures += test_mini_cluster();
   failures += test_ec();
   failures += test_layout();
+  failures += test_locks_watches();
   if (failures == 0) {
     std::cout << "all tests passed\n";
     return 0;

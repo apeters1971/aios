@@ -4,6 +4,7 @@
 #include "cluster/place.hpp"
 #include "config.hpp"
 #include "net/framing.hpp"
+#include "object/locks_watches.hpp"
 #include "object/object_layout.hpp"
 #include "store/local_stores.hpp"
 #include "store/object_store.hpp"
@@ -34,6 +35,10 @@ struct ApiResult {
   Placement placement;
   // Non-empty when tip (or selected version) is a redirect.
   std::string redirect_oid;
+  // Lock / watch payloads (JSON in `data` when set).
+  std::optional<nlohmann::json> json_body;
+  std::optional<WatchEvent> watch_event;
+  std::vector<WatchEvent> watch_events;
 };
 
 // Handles object RPC + primary replication (prepare → quorum install → publish tip).
@@ -49,29 +54,47 @@ class ObjectService {
                     const std::unordered_map<std::string, std::string>& attrs,
                     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
                     std::optional<std::uint32_t> expected_crc32c = std::nullopt,
-                    const LayoutRequest& layout = {});
+                    const LayoutRequest& layout = {},
+                    const std::optional<std::string>& lock_token = std::nullopt);
   // Staging file is moved into the store (FS-backed). Prefer for large bodies.
   ApiResult api_put_file(const std::string& oid, const std::string& staging_abs_path,
                          std::uint64_t size, std::uint32_t crc32c_val,
                          const std::unordered_map<std::string, std::string>& attrs,
                          bool replace_attrs, const std::vector<AttrPrecondition>& preds,
                          std::optional<std::uint32_t> expected_crc32c = std::nullopt,
-                         const LayoutRequest& layout = {});
+                         const LayoutRequest& layout = {},
+                         const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_put_redirect(const std::string& oid, const std::string& target_oid,
                              const std::unordered_map<std::string, std::string>& attrs,
-                             bool replace_attrs, const std::vector<AttrPrecondition>& preds);
+                             bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+                             const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_put_range(const std::string& oid, std::uint64_t offset,
                           const std::uint8_t* data, std::size_t len,
                           const std::unordered_map<std::string, std::string>& attrs,
                           bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-                          const LayoutRequest& layout = {});
+                          const LayoutRequest& layout = {},
+                          const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_get(const std::string& oid, std::optional<std::uint64_t> offset,
                     std::optional<std::uint64_t> end_inclusive,
                     const std::vector<AttrPrecondition>& preds,
                     std::optional<std::uint64_t> seq = std::nullopt);
   ApiResult api_head(const std::string& oid, const std::vector<AttrPrecondition>& preds,
                      std::optional<std::uint64_t> seq = std::nullopt);
-  ApiResult api_del(const std::string& oid, const std::vector<AttrPrecondition>& preds);
+  ApiResult api_del(const std::string& oid, const std::vector<AttrPrecondition>& preds,
+                    const std::optional<std::string>& lock_token = std::nullopt);
+
+  // Enforced leases (primary-local, TTL + token).
+  ApiResult api_lock_acquire(const std::string& oid, int ttl_ms = LockTable::kDefaultTtlMs);
+  ApiResult api_lock_renew(const std::string& oid, const std::string& token,
+                           int ttl_ms = LockTable::kDefaultTtlMs);
+  ApiResult api_lock_release(const std::string& oid, const std::string& token);
+  ApiResult api_lock_stat(const std::string& oid);
+
+  // Long-poll watches (blocking; call from a worker thread, not the io_context).
+  // after_seq: return immediately if tip.seq > after_seq; else wait for next change.
+  ApiResult api_watch_oid(const std::string& oid, std::uint64_t after_seq, int timeout_ms);
+  // Prefix watch: events for oids this node commits as primary under prefix.
+  ApiResult api_watch_prefix(const std::string& prefix, int timeout_ms);
   // cluster=true scatter-gathers ObjectList across nodes; false = local stores only.
   ApiResult api_list(const std::string& prefix, const std::string& attr_eq_key,
                      const std::string& attr_eq_value, std::size_t limit,
@@ -84,14 +107,17 @@ class ObjectService {
   ApiResult api_prepare_put(const std::string& oid, const std::uint8_t* data, std::size_t len,
                             const std::unordered_map<std::string, std::string>& attrs,
                             bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-                            std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+                            std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                            const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_prepare_put_file(const std::string& oid, const std::string& staging_abs_path,
                                  std::uint64_t size, std::uint32_t crc32c_val,
                                  const std::unordered_map<std::string, std::string>& attrs,
                                  bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-                                 std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+                                 std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                                 const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_prepare_delete(const std::string& oid,
-                               const std::vector<AttrPrecondition>& preds);
+                               const std::vector<AttrPrecondition>& preds,
+                               const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_publish_version(const std::string& oid, std::uint64_t seq);
   ApiResult api_abort_prepared(const std::string& oid, std::uint64_t seq);
 
@@ -102,15 +128,18 @@ class ObjectService {
                                 const std::uint8_t* data, std::size_t len,
                                 const std::unordered_map<std::string, std::string>& attrs,
                                 const std::vector<AttrPrecondition>& preds,
-                                std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+                                std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                                const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_txn_prepare_put_file(const std::string& txn_id, const std::string& oid,
                                      const std::string& staging_abs_path, std::uint64_t size,
                                      std::uint32_t crc32c_val,
                                      const std::unordered_map<std::string, std::string>& attrs,
                                      const std::vector<AttrPrecondition>& preds,
-                                     std::optional<std::uint32_t> expected_crc32c = std::nullopt);
+                                     std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                                     const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_txn_prepare_delete(const std::string& txn_id, const std::string& oid,
-                                   const std::vector<AttrPrecondition>& preds);
+                                   const std::vector<AttrPrecondition>& preds,
+                                   const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_txn_commit(const std::string& txn_id);
   ApiResult api_txn_abort(const std::string& txn_id);
 
@@ -192,11 +221,17 @@ class ObjectService {
   ApiResult save_txn_state(const std::string& txn_id, const nlohmann::json& state);
   ApiResult load_txn_state(const std::string& txn_id, nlohmann::json& state_out);
 
+  ApiResult require_primary(const std::string& oid, Placement& placement_out);
+  ApiResult enforce_lock(const std::string& oid, const std::optional<std::string>& token);
+  void signal_watch(const std::string& oid, std::uint64_t seq, const std::string& op);
+
   Config cfg_;
   ClusterMap& map_;
   LocalStores& stores_;
   std::string advertise_;
   mutable std::recursive_mutex mu_;
+  LockTable locks_;
+  WatchHub watches_;
 };
 
 }  // namespace aios

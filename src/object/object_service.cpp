@@ -9,6 +9,8 @@
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
 
+#include <utility>
+
 #include <algorithm>
 #include <fstream>
 #include <mutex>
@@ -48,6 +50,42 @@ ApiResult ObjectService::fail(const std::string& code, const std::string& error)
   r.error = error;
   r.epoch = map_.epoch;
   return r;
+}
+
+ApiResult ObjectService::require_primary(const std::string& oid, Placement& placement_out) {
+  placement_out = place(oid, map_);
+  if (placement_out.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement_out.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement_out;
+    return r;
+  }
+  ApiResult ok;
+  ok.ok = true;
+  ok.epoch = map_.epoch;
+  ok.placement = placement_out;
+  return ok;
+}
+
+ApiResult ObjectService::enforce_lock(const std::string& oid,
+                                     const std::optional<std::string>& token) {
+  if (auto code = locks_.check_mutate(oid, token)) {
+    return fail(*code, "object is locked");
+  }
+  ApiResult ok;
+  ok.ok = true;
+  ok.epoch = map_.epoch;
+  return ok;
+}
+
+void ObjectService::signal_watch(const std::string& oid, std::uint64_t seq,
+                                const std::string& op) {
+  WatchEvent ev;
+  ev.oid = oid;
+  ev.seq = seq;
+  ev.op = op;
+  ev.ts_ms = now_ms();
+  watches_.notify(std::move(ev));
 }
 
 int ObjectService::quorum_need(const Placement& placement) const {
@@ -291,6 +329,7 @@ ApiResult ObjectService::commit_prepared(
     return fail("store_error", err);
   }
   replicate_publish(placement, pv.oid, pv.seq);
+  signal_watch(pv.oid, pv.seq, pv.is_delete ? "del" : "put");
 
   if (auto st = store->stat(pv.oid, err)) {
     r.info = st;
@@ -889,6 +928,7 @@ ApiResult ObjectService::commit_ec_put(
     return fail("store_error", err);
   }
   replicate_publish(placement, oid, pv.seq);
+  signal_watch(oid, pv.seq, "put");
 
   ApiResult r;
   r.ok = true;
@@ -986,7 +1026,8 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
                                 bool replace_attrs,
                                 const std::vector<AttrPrecondition>& preds,
                                 std::optional<std::uint32_t> expected_crc32c,
-                                const LayoutRequest& layout_req) {
+                                const LayoutRequest& layout_req,
+                                const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
@@ -1000,6 +1041,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   auto pr = check_preds_on(store, oid, preds, err);
@@ -1026,7 +1068,8 @@ ApiResult ObjectService::api_put_file(
     const std::string& oid, const std::string& staging_abs_path, std::uint64_t size,
     std::uint32_t crc32c_val, const std::unordered_map<std::string, std::string>& attrs,
     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-    std::optional<std::uint32_t> expected_crc32c, const LayoutRequest& layout_req) {
+    std::optional<std::uint32_t> expected_crc32c, const LayoutRequest& layout_req,
+    const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
@@ -1040,6 +1083,7 @@ ApiResult ObjectService::api_put_file(
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   auto pr = check_preds_on(store, oid, preds, err);
@@ -1078,7 +1122,8 @@ ApiResult ObjectService::api_put_file(
 ApiResult ObjectService::api_put_redirect(
     const std::string& oid, const std::string& target_oid,
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
-    const std::vector<AttrPrecondition>& preds) {
+    const std::vector<AttrPrecondition>& preds,
+    const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
@@ -1087,6 +1132,7 @@ ApiResult ObjectService::api_put_redirect(
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -1106,7 +1152,8 @@ ApiResult ObjectService::api_put_redirect(
 ApiResult ObjectService::api_put_range(
     const std::string& oid, std::uint64_t offset, const std::uint8_t* data, std::size_t len,
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
-    const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req) {
+    const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
+    const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
@@ -1123,6 +1170,7 @@ ApiResult ObjectService::api_put_range(
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   auto pr = check_preds_on(store, oid, preds, err);
@@ -1289,7 +1337,8 @@ ApiResult ObjectService::api_head(const std::string& oid,
 }
 
 ApiResult ObjectService::api_del(const std::string& oid,
-                                const std::vector<AttrPrecondition>& preds) {
+                                const std::vector<AttrPrecondition>& preds,
+                                const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
@@ -1298,6 +1347,7 @@ ApiResult ObjectService::api_del(const std::string& oid,
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -1611,7 +1661,8 @@ std::string txn_oid(const std::string& txn_id) { return "txn/" + txn_id; }
 ApiResult ObjectService::api_prepare_put(
     const std::string& oid, const std::uint8_t* data, std::size_t len,
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
-    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c) {
+    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c,
+    const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
@@ -1620,6 +1671,7 @@ ApiResult ObjectService::api_prepare_put(
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -1638,7 +1690,8 @@ ApiResult ObjectService::api_prepare_put_file(
     const std::string& oid, const std::string& staging_abs_path, std::uint64_t size,
     std::uint32_t crc32c_val, const std::unordered_map<std::string, std::string>& attrs,
     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
-    std::optional<std::uint32_t> expected_crc32c) {
+    std::optional<std::uint32_t> expected_crc32c,
+    const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
@@ -1647,6 +1700,7 @@ ApiResult ObjectService::api_prepare_put_file(
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -1663,7 +1717,8 @@ ApiResult ObjectService::api_prepare_put_file(
 }
 
 ApiResult ObjectService::api_prepare_delete(const std::string& oid,
-                                           const std::vector<AttrPrecondition>& preds) {
+                                           const std::vector<AttrPrecondition>& preds,
+                                           const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   auto placement = place(oid, map_);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
@@ -1672,6 +1727,7 @@ ApiResult ObjectService::api_prepare_delete(const std::string& oid,
     r.placement = placement;
     return r;
   }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -1700,6 +1756,11 @@ ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64
   if (!store) return fail("store_error", err);
   if (!store->publish_tip(oid, seq, err)) return fail("store_error", err);
   replicate_publish(placement, oid, seq);
+  std::string op = "put";
+  if (auto st = store->stat(oid, err)) {
+    if (st->is_delete) op = "del";
+  }
+  signal_watch(oid, seq, op);
   ApiResult r;
   r.ok = true;
   r.epoch = map_.epoch;
@@ -1818,7 +1879,8 @@ ApiResult ObjectService::api_txn_get(const std::string& txn_id) {
 ApiResult ObjectService::api_txn_prepare_put(
     const std::string& txn_id, const std::string& oid, const std::uint8_t* data,
     std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
-    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c) {
+    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c,
+    const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
@@ -1833,7 +1895,7 @@ ApiResult ObjectService::api_txn_prepare_put(
 
   ApiResult prep;
   if (placement.acting_set[0].node_id == cfg_.node_id) {
-    prep = api_prepare_put(oid, data, len, put_attrs, true, preds, expected_crc32c);
+    prep = api_prepare_put(oid, data, len, put_attrs, true, preds, expected_crc32c, lock_token);
   } else {
     auto remote = object_prepare_put_remote(
         placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
@@ -1880,7 +1942,8 @@ ApiResult ObjectService::api_txn_prepare_put_file(
     const std::string& txn_id, const std::string& oid, const std::string& staging_abs_path,
     std::uint64_t size, std::uint32_t crc32c_val,
     const std::unordered_map<std::string, std::string>& attrs,
-    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c) {
+    const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c,
+    const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
@@ -1898,7 +1961,7 @@ ApiResult ObjectService::api_txn_prepare_put_file(
   std::unordered_map<std::string, std::string> put_attrs = attrs;
   put_attrs["aios.txn"] = txn_id;
   auto prep = api_prepare_put_file(oid, staging_abs_path, size, crc32c_val, put_attrs, true,
-                                   preds, expected_crc32c);
+                                   preds, expected_crc32c, lock_token);
   if (!prep.ok) return prep;
   state["ops"].push_back({{"oid", oid},
                           {"seq", prep.info->seq},
@@ -1915,8 +1978,9 @@ ApiResult ObjectService::api_txn_prepare_put_file(
   return prep;
 }
 
-ApiResult ObjectService::api_txn_prepare_delete(const std::string& txn_id, const std::string& oid,
-                                              const std::vector<AttrPrecondition>& preds) {
+ApiResult ObjectService::api_txn_prepare_delete(
+    const std::string& txn_id, const std::string& oid,
+    const std::vector<AttrPrecondition>& preds, const std::optional<std::string>& lock_token) {
   std::lock_guard lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
@@ -1928,7 +1992,7 @@ ApiResult ObjectService::api_txn_prepare_delete(const std::string& txn_id, const
 
   ApiResult prep;
   if (placement.acting_set[0].node_id == cfg_.node_id) {
-    prep = api_prepare_delete(oid, preds);
+    prep = api_prepare_delete(oid, preds, lock_token);
   } else {
     auto remote = object_prepare_delete_remote(
         placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
@@ -2060,4 +2124,139 @@ ApiResult ObjectService::api_txn_abort(const std::string& txn_id) {
   return saved;
 }
 
+ApiResult ObjectService::api_lock_acquire(const std::string& oid, int ttl_ms) {
+  std::lock_guard lock(mu_);
+  Placement placement;
+  auto pr = require_primary(oid, placement);
+  if (!pr.ok) return pr;
+  std::string token;
+  std::int64_t expires = 0;
+  std::string err;
+  if (!locks_.acquire(oid, ttl_ms, token, expires, err)) {
+    return fail("lock_held", err);
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
+  return r;
+}
+
+ApiResult ObjectService::api_lock_renew(const std::string& oid, const std::string& token,
+                                       int ttl_ms) {
+  std::lock_guard lock(mu_);
+  Placement placement;
+  auto pr = require_primary(oid, placement);
+  if (!pr.ok) return pr;
+  std::int64_t expires = 0;
+  std::string err;
+  if (!locks_.renew(oid, token, ttl_ms, expires, err)) {
+    if (err.find("mismatch") != std::string::npos) return fail("lock_held", err);
+    return fail("not_found", err);
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
+  return r;
+}
+
+ApiResult ObjectService::api_lock_release(const std::string& oid, const std::string& token) {
+  std::lock_guard lock(mu_);
+  Placement placement;
+  auto pr = require_primary(oid, placement);
+  if (!pr.ok) return pr;
+  std::string err;
+  if (!locks_.release(oid, token, err)) {
+    if (err.find("mismatch") != std::string::npos) return fail("lock_held", err);
+    return fail("not_found", err);
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  return r;
+}
+
+ApiResult ObjectService::api_lock_stat(const std::string& oid) {
+  std::lock_guard lock(mu_);
+  Placement placement;
+  auto pr = require_primary(oid, placement);
+  if (!pr.ok) return pr;
+  std::int64_t expires = 0;
+  if (!locks_.stat(oid, expires)) return fail("not_found", "lock not held");
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.json_body = {{"oid", oid}, {"held", true}, {"expires_ms", expires}};
+  return r;
+}
+
+ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t after_seq,
+                                      int timeout_ms) {
+  Placement placement;
+  {
+    std::lock_guard lock(mu_);
+    auto pr = require_primary(oid, placement);
+    if (!pr.ok) return pr;
+    // Immediate event if tip already advanced past after_seq.
+    std::string err;
+    auto* store = primary_store(placement, err);
+    if (store) {
+      auto st = store->stat(oid, err);
+      if (st && st->seq > after_seq) {
+        ApiResult r;
+        r.ok = true;
+        r.epoch = map_.epoch;
+        r.placement = placement;
+        WatchEvent ev;
+        ev.oid = oid;
+        ev.seq = st->seq;
+        ev.op = st->is_delete ? "del" : "put";
+        ev.ts_ms = now_ms();
+        r.watch_event = ev;
+        return r;
+      }
+      if (!st) after_seq = 0;  // wait for first create
+    }
+  }
+  // Block outside ObjectService mutex so mutates can proceed and signal.
+  WatchEvent ev;
+  if (!watches_.wait_oid(oid, after_seq, timeout_ms, ev)) {
+    ApiResult r;
+    r.ok = true;
+    r.code = "timeout";
+    r.epoch = map_.epoch;
+    r.placement = placement;
+    return r;
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  r.watch_event = ev;
+  return r;
+}
+
+ApiResult ObjectService::api_watch_prefix(const std::string& prefix, int timeout_ms) {
+  if (prefix.empty()) return fail("bad_request", "prefix required");
+  std::vector<WatchEvent> events;
+  if (!watches_.wait_prefix(prefix, timeout_ms, events)) {
+    ApiResult r;
+    r.ok = true;
+    r.code = "timeout";
+    r.epoch = map_.epoch;
+    return r;
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.watch_events = std::move(events);
+  return r;
+}
+
 }  // namespace aios
+

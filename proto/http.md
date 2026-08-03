@@ -37,6 +37,12 @@ Canonical string:
 | `DELETE` | `/o/{oid}?version={seq}` | Purge one non-tip version |
 | `GET` | `/o/{oid}/versions` | List versions newest first (`seq,size,crc32c,ctime_ms,is_delete`) |
 | `POST` | `/o/{oid}/purge?keep={n}` | Keep newest `n` versions (default `max_versions`) |
+| `POST` | `/o/{oid}/lock` | Acquire enforced lease → `201` `{oid,token,expires_ms}` |
+| `POST` | `/o/{oid}/lock/renew` | Renew (`x-aios-lock-token` required) |
+| `DELETE` | `/o/{oid}/lock` | Release (`x-aios-lock-token` required) |
+| `GET` | `/o/{oid}/lock` | Stat held lock (no token in response) or `404` |
+| `GET` | `/o/{oid}/watch` | Long-poll tip change (`timeout_ms`, `after_seq`) → event or `204` |
+| `GET` | `/watch?prefix=` | Long-poll events for oids this node is primary for under `prefix` |
 | `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1&scope=` | LIST tip objects (default **cluster** scatter-gather; `scope=local` for this node) |
 | `GET` | `/map` | Cluster map JSON (targets include `http_addr`) |
 | `POST` | `/txn` | Begin cross-object txn → JSON `{txn_id,state,ops}` (201) |
@@ -102,6 +108,27 @@ Whole-object Castagnoli CRC-32C is stored with each object and updated on full a
 - Response / HEAD: `x-aios-crc32c: <uint32 decimal>`
 - Optional request on PUT: `x-aios-crc32c` must match the request body (full object or the ranged patch bytes). Mismatch → `400` / `crc_mismatch`.
 - Replication carries `crc32c` / `range_crc32c`; replicas verify before accepting. Scrub repairs size or CRC mismatches.
+
+### Locks (enforced leases)
+
+Primary-local, in-memory leases (lost on restart / primary change). While held:
+
+- Mutating ops (`PUT` / ranged PUT / redirect PUT / `DELETE` / txn prepare) without matching `x-aios-lock-token` → **409** `lock_held`
+- With the token → allowed
+
+| Header | Role |
+|--------|------|
+| `x-aios-lock-ttl-ms` | Acquire/renew TTL (default 30000, max 300000) |
+| `x-aios-lock-token` | Present lock token for renew/release/mutate |
+
+Wrong coordinator → **307** like other mutating APIs.
+
+### Watches (HTTP long-poll)
+
+- `GET /o/{oid}/watch?timeout_ms=30000&after_seq=N` — wait on oid primary until tip `seq > after_seq` (default: current tip, i.e. next change), then `200` `{"oid","seq","op","ts_ms"}`; timeout → **204**
+- `GET /watch?prefix=foo/&timeout_ms=30000` — events for oids **this node commits as primary** under `prefix` (not a cluster-wide stream)
+
+Long-polls run on worker threads so they do not block the daemon accept loop.
 
 ### Preconditions (412 on failure)
 

@@ -18,6 +18,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -208,6 +209,7 @@ int status_for(const ApiResult& r) {
   if (r.code == "quorum_failed") return 503;
   if (r.code == "bad_request") return 400;
   if (r.code == "conflict") return 409;
+  if (r.code == "lock_held") return 409;
   return 500;
 }
 
@@ -488,6 +490,47 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       continue;
     }
 
+    // Prefix watch (primary-local): GET /watch?prefix=&timeout_ms=
+    if (method == "GET" && path == "/watch") {
+      const auto prefix = qmap.count("prefix") ? qmap["prefix"] : "";
+      if (prefix.empty()) {
+        write_json(*sock, 400, "Bad Request", {{"error", "prefix required"}}, keep_alive);
+        continue;
+      }
+      int timeout_ms = 30000;
+      if (qmap.count("timeout_ms")) {
+        try {
+          timeout_ms = std::stoi(qmap["timeout_ms"]);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad timeout_ms"}}, keep_alive);
+          continue;
+        }
+      }
+      timeout_ms = std::max(1, std::min(timeout_ms, 120000));
+      auto sock_ptr = sock;
+      const std::string target_copy = target;
+      ObjectService* svc = &objects_;
+      std::thread([sock_ptr, svc, prefix, timeout_ms, target_copy]() {
+        auto r = svc->api_watch_prefix(prefix, timeout_ms);
+        if (!r.ok) {
+          write_api_error(*sock_ptr, r, target_copy, false);
+          return;
+        }
+        if (r.code == "timeout") {
+          write_response(*sock_ptr, 204, "No Content",
+                         {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
+          return;
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& e : r.watch_events) {
+          arr.push_back(
+              {{"oid", e.oid}, {"seq", e.seq}, {"op", e.op}, {"ts_ms", e.ts_ms}});
+        }
+        write_json(*sock_ptr, 200, "OK", {{"events", arr}}, false);
+      }).detach();
+      return;
+    }
+
     // Cross-object transactions: /txn, /txn/{id}, /txn/{id}/commit|abort, /txn/{id}/o/{oid}
     if (path == "/txn" && method == "POST") {
       auto r = objects_.api_txn_begin();
@@ -699,6 +742,138 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         continue;
       }
 
+      auto parse_ttl_ms = [&]() -> int {
+        int ttl = LockTable::kDefaultTtlMs;
+        const auto h = header_get(headers, "x-aios-lock-ttl-ms");
+        if (!h.empty()) {
+          try {
+            ttl = std::stoi(h);
+          } catch (...) {
+            ttl = -1;
+          }
+        }
+        return ttl;
+      };
+      auto lock_token_hdr = [&]() -> std::optional<std::string> {
+        const auto t = header_get(headers, "x-aios-lock-token");
+        if (t.empty()) return std::nullopt;
+        return t;
+      };
+
+      if (sub == "lock" && method == "POST") {
+        const int ttl = parse_ttl_ms();
+        if (ttl < 0) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-lock-ttl-ms"}},
+                     keep_alive);
+          continue;
+        }
+        auto r = objects_.api_lock_acquire(oid, ttl);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 201, "Created", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+      if (sub == "lock/renew" && method == "POST") {
+        const auto tok = lock_token_hdr();
+        if (!tok) {
+          write_json(*sock, 400, "Bad Request", {{"error", "x-aios-lock-token required"}},
+                     keep_alive);
+          continue;
+        }
+        const int ttl = parse_ttl_ms();
+        if (ttl < 0) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-lock-ttl-ms"}},
+                     keep_alive);
+          continue;
+        }
+        auto r = objects_.api_lock_renew(oid, *tok, ttl);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+      if (sub == "lock" && method == "DELETE") {
+        const auto tok = lock_token_hdr();
+        if (!tok) {
+          write_json(*sock, 400, "Bad Request", {{"error", "x-aios-lock-token required"}},
+                     keep_alive);
+          continue;
+        }
+        auto r = objects_.api_lock_release(oid, *tok);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_response(*sock, 204, "No Content",
+                       {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, keep_alive);
+        continue;
+      }
+      if (sub == "lock" && method == "GET") {
+        auto r = objects_.api_lock_stat(oid);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+
+      if (sub == "watch" && method == "GET") {
+        int timeout_ms = 30000;
+        if (qmap.count("timeout_ms")) {
+          try {
+            timeout_ms = std::stoi(qmap["timeout_ms"]);
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad timeout_ms"}}, keep_alive);
+            continue;
+          }
+        }
+        timeout_ms = std::max(1, std::min(timeout_ms, 120000));
+        std::uint64_t after_seq = 0;
+        bool after_set = false;
+        if (qmap.count("after_seq")) {
+          try {
+            after_seq = static_cast<std::uint64_t>(std::stoull(qmap["after_seq"]));
+            after_set = true;
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad after_seq"}}, keep_alive);
+            continue;
+          }
+        }
+        // Default: wait for the next change after current tip (not the current tip).
+        if (!after_set) {
+          auto tip = objects_.api_head(oid, {});
+          if (tip.ok && tip.info) after_seq = tip.info->seq;
+        }
+        auto sock_ptr = sock;
+        const std::string target_copy = target;
+        ObjectService* svc = &objects_;
+        std::thread([sock_ptr, svc, oid, after_seq, timeout_ms, target_copy]() {
+          auto r = svc->api_watch_oid(oid, after_seq, timeout_ms);
+          if (!r.ok) {
+            write_api_error(*sock_ptr, r, target_copy, false);
+            return;
+          }
+          if (r.code == "timeout") {
+            write_response(*sock_ptr, 204, "No Content",
+                           {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
+            return;
+          }
+          const auto& e = *r.watch_event;
+          write_json(*sock_ptr, 200, "OK",
+                     {{"oid", e.oid}, {"seq", e.seq}, {"op", e.op}, {"ts_ms", e.ts_ms}},
+                     false);
+        }).detach();
+        return;
+      }
+
       if (!sub.empty()) {
         write_json(*sock, 404, "Not Found", {{"error", "not found"}}, keep_alive);
         continue;
@@ -719,6 +894,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
         }
         const LayoutRequest layout_req = layout_request_from_headers(headers);
+        const auto lock_token = lock_token_hdr();
         ApiResult r;
         if (!redirect_to.empty()) {
           if (!cr.empty()) {
@@ -731,7 +907,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                        {{"error", "redirect PUT must have empty body"}}, keep_alive);
             continue;
           }
-          r = objects_.api_put_redirect(oid, redirect_to, attrs, true, preds);
+          r = objects_.api_put_redirect(oid, redirect_to, attrs, true, preds, lock_token);
         } else if (!cr.empty()) {
           if (!upload_path.empty()) {
             // Load staged range patch (capped at frame/object chunk size).
@@ -773,16 +949,16 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             continue;
           }
           r = objects_.api_put_range(oid, start, body.data(), body.size(), attrs, false,
-                                     preds, layout_req);
+                                     preds, layout_req, lock_token);
         } else if (!upload_path.empty()) {
           r = objects_.api_put_file(oid, upload_path, content_length, upload_crc, attrs, true,
-                                    preds, expected_crc, layout_req);
+                                    preds, expected_crc, layout_req, lock_token);
           std::error_code rec;
           fs::remove(upload_path, rec);
           upload_path.clear();
         } else {
           r = objects_.api_put(oid, body.data(), body.size(), attrs, true, preds,
-                               expected_crc, layout_req);
+                               expected_crc, layout_req, lock_token);
         }
         if (!r.ok) {
           if (!upload_path.empty()) {
@@ -900,7 +1076,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                          keep_alive);
           continue;
         }
-        auto r = objects_.api_del(oid, preds);
+        auto r = objects_.api_del(oid, preds, lock_token_hdr());
         if (!r.ok) {
           write_api_error(*sock, r, target, keep_alive);
           continue;
