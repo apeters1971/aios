@@ -204,15 +204,72 @@ int test_layout() {
     cfg.max_ec_k = 4;
     ObjectLayout layout;
     std::string err;
-    expect(resolve_object_layout(cfg, {}, layout, err) && !layout.is_ec() && layout.n == 3,
+    expect(resolve_object_layout(cfg, "any", {}, layout, err) && !layout.is_ec() && layout.n == 3,
            "default replica layout");
     LayoutRequest ec_req;
     ec_req.layout = "ec";
-    expect(resolve_object_layout(cfg, ec_req, layout, err) && layout.is_ec() && layout.n == 3 &&
-               layout.ec_codec == "xor",
+    expect(resolve_object_layout(cfg, "any", ec_req, layout, err) && layout.is_ec() &&
+               layout.n == 3 && layout.ec_codec == "xor",
            "request ec uses defaults");
     ec_req.ec_k = 8;
-    expect(!resolve_object_layout(cfg, ec_req, layout, err), "ec_k cap");
+    expect(!resolve_object_layout(cfg, "any", ec_req, layout, err), "ec_k cap");
+  }
+
+  // Prefix layout rules: longest match; request overrides
+  {
+    Config cfg;
+    cfg.durability = "replica";
+    cfg.replica_count = 3;
+    cfg.ec_k = 2;
+    cfg.ec_m = 1;
+    cfg.layout_rules = {
+        {.prefix = "cold/", .layout = "ec", .ec_k = 2, .ec_m = 1, .ec_codec = "xor"},
+        {.prefix = "hot/", .layout = "replica"},
+        {.prefix = "cold/logs/", .layout = "replica"},
+    };
+    std::string err;
+    expect(normalize_config(cfg, err), "normalize layout_rules");
+
+    ObjectLayout layout;
+    expect(resolve_object_layout(cfg, "cold/x", {}, layout, err) && layout.is_ec(),
+           "cold/ → ec rule");
+    expect(resolve_object_layout(cfg, "hot/x", {}, layout, err) && !layout.is_ec(),
+           "hot/ → replica rule");
+    expect(resolve_object_layout(cfg, "cold/logs/a", {}, layout, err) && !layout.is_ec(),
+           "longer prefix cold/logs/ beats cold/");
+    expect(resolve_object_layout(cfg, "other/x", {}, layout, err) && !layout.is_ec(),
+           "no rule → cluster default");
+
+    LayoutRequest force_repl;
+    force_repl.layout = "replica";
+    expect(resolve_object_layout(cfg, "cold/x", force_repl, layout, err) && !layout.is_ec(),
+           "request wins over prefix rule");
+  }
+
+  // Service: prefix rules applied on PUT without headers
+  {
+    MixedLayoutFixture fx;
+    fx.cfg.layout_rules = {
+        {.prefix = "cold/", .layout = "ec", .ec_k = 2, .ec_m = 1, .ec_codec = "xor"},
+        {.prefix = "hot/", .layout = "replica"},
+    };
+    std::string nerr;
+    expect(normalize_config(fx.cfg, nerr), "normalize fixture rules");
+    fx.svc = std::make_unique<ObjectService>(fx.cfg, fx.map, fx.stores);
+    fx.svc->set_advertise("127.0.0.1:7400");
+
+    const auto* body = reinterpret_cast<const std::uint8_t*>("prefix-rule-body");
+    auto cold = fx.svc->api_put("cold/obj", body, 16, {}, true, {});
+    expect(cold.ok && attrs_are_ec(cold.attrs), "cold/ put uses EC rule");
+    auto hot = fx.svc->api_put("hot/obj", body, 16, {}, true, {});
+    expect(hot.ok && !attrs_are_ec(hot.attrs) && hot.attrs.at(kLayoutAttr) == "replica",
+           "hot/ put uses replica rule");
+    LayoutRequest force_repl;
+    force_repl.layout = "replica";
+    auto override_put =
+        fx.svc->api_put("cold/override", body, 16, {}, true, {}, std::nullopt, force_repl);
+    expect(override_put.ok && !attrs_are_ec(override_put.attrs),
+           "header/request overrides cold/ EC rule");
   }
 
   // place(oid, map, n) hard-fails when n > targets

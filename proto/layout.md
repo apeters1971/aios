@@ -2,11 +2,11 @@
 
 AIOS does **not** use Ceph-style pools or placement groups. Durability and data layout are chosen **per object version at write time**. Cluster configuration supplies **defaults and safety caps** only.
 
-Per-object layout is implemented for HTTP/`api_put*` and TCP++ `ObjectPut` / `ObjectPutRange`: clients may send `x-aios-layout` / `x-aios-ec-*` headers or JSON `layout` / `ec_k` / `ec_m` / `ec_codec`; omit → cluster `durability` / `ec_*` defaults. Layout attrs (`aios.layout`, `aios.n`, and `aios.ec.*` when EC) are stored on each version.
+Per-object layout is implemented for HTTP/`api_put*` and TCP++ `ObjectPut` / `ObjectPutRange`: clients may send `x-aios-layout` / `x-aios-ec-*` headers or JSON `layout` / `ec_k` / `ec_m` / `ec_codec`; omit → longest matching `layout_rules` prefix, else cluster `durability` / `ec_*` defaults. Layout attrs (`aios.layout`, `aios.n`, and `aios.ec.*` when EC) are stored on each version.
 
 ## Goals
 
-- Client (or admin default) picks `replica` or `ec` (and EC `k` / `m` / codec) **per PUT**
+- Client (or admin default / prefix rule) picks `replica` or `ec` (and EC `k` / `m` / codec) **per PUT**
 - Layout is stored on the version and is authoritative for GET / HEAD / repair
 - The same oid may change layout across versions (each full PUT chooses anew)
 - No pool namespace and no PG map
@@ -14,7 +14,8 @@ Per-object layout is implemented for HTTP/`api_put*` and TCP++ `ObjectPut` / `Ob
 ## Non-goals (v1)
 
 - Background layout migration / re-encode of existing tips
-- Per-prefix policy engines
+- Hard deny of client overrides (prefix rules are defaults, not locks)
+- Runtime rule reload / gossip of rules (config load / restart only)
 - Silently using fewer targets than requested (`n` larger than the cluster → hard fail)
 - Changing acting-set size for an already-written version
 
@@ -54,22 +55,36 @@ On `PUT /o/{oid}` (and later txn prepare when wired):
 
 | Header | Role |
 |--------|------|
-| `x-aios-layout: replica \| ec` | Select layout; omit → cluster default |
-| `x-aios-ec-k`, `x-aios-ec-m` | EC parameters; omit → cluster defaults |
+| `x-aios-layout: replica \| ec` | Select layout; omit → prefix rule / cluster default |
+| `x-aios-ec-k`, `x-aios-ec-m` | EC parameters; omit → prefix rule / cluster defaults |
 | `x-aios-ec-codec: xor \| isal` | Omit → auto (`xor` if `m==1`, else `isal`) |
 
 GET/HEAD already return attrs as `x-aios-attr-*`, so clients can discover layout after the fact.
 
-TCP++ `ObjectPut` should carry the same fields in the JSON body when this design is implemented.
+TCP++ `ObjectPut` / `ObjectPutRange` accept the same fields as JSON (`layout`, `ec_k`, `ec_m`, `ec_codec`).
 
-### Cluster config (defaults and caps)
+### Cluster config (defaults, caps, prefix rules)
 
 | Knob | Role |
 |------|------|
-| `default_layout` (`replica` \| `ec`) | Used when the client omits `x-aios-layout`. Today’s `durability` maps here for compatibility |
+| `default_layout` (`replica` \| `ec`) | Cluster default when no request field and no matching rule. Today’s `durability` maps here |
 | `default_ec_k`, `default_ec_m`, `default_ec_codec` | Defaults for EC writes |
-| `max_ec_k`, `max_ec_m`, `max_replica_count` | Reject oversized client requests |
+| `max_ec_k`, `max_ec_m`, `max_replica_count` | Reject oversized client / rule requests |
+| `layout_rules` | Optional list of `{prefix, layout, ec_*?}` admin defaults |
 | `replica_count` / map field | Default **N** for replica layout and upper bound for the placement ring width — **not** “every object uses N” |
+
+**Resolve precedence (field-by-field):** request → longest matching `layout_rules` prefix → cluster defaults. Equal-length prefixes: first rule in YAML wins. Empty prefix `""` is allowed as a catch-all.
+
+```yaml
+layout_rules:
+  - prefix: "hot/"
+    layout: replica
+  - prefix: "cold/"
+    layout: ec
+    ec_k: 2
+    ec_m: 1
+    ec_codec: xor
+```
 
 ### Placement
 
@@ -85,7 +100,7 @@ Placement place(const std::string& oid, const ClusterMap& map, int n);
 
 ### Write path
 
-1. Resolve `ObjectLayout` from request headers + config defaults + caps
+1. Resolve `ObjectLayout` from request + prefix rules + config defaults + caps
 2. `place(oid, map, layout.n)`
 3. Branch:
    - **replica** → prepare + quorum install of full copies + publish tip

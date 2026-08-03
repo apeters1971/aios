@@ -33,11 +33,41 @@ bool resolve_codec(int m, std::string codec, std::string& out, std::string& err)
   return true;
 }
 
+const LayoutRule* find_layout_rule(const Config& cfg, const std::string& oid) {
+  const LayoutRule* best = nullptr;
+  for (const auto& rule : cfg.layout_rules) {
+    if (oid.size() < rule.prefix.size()) continue;
+    if (oid.compare(0, rule.prefix.size(), rule.prefix) != 0) continue;
+    if (!best || rule.prefix.size() > best->prefix.size()) {
+      best = &rule;
+    }
+    // Equal length: keep earlier rule (first in YAML).
+  }
+  return best;
+}
+
 }  // namespace
 
-bool resolve_object_layout(const Config& cfg, const LayoutRequest& req, ObjectLayout& out,
-                           std::string& err) {
-  std::string layout = req.layout.value_or(cfg.durability);
+bool resolve_object_layout(const Config& cfg, const std::string& oid, const LayoutRequest& req,
+                           ObjectLayout& out, std::string& err) {
+  // Effective defaults: cluster → longest prefix rule → request (field-by-field).
+  std::string layout = cfg.durability;
+  int ec_k = cfg.ec_k;
+  int ec_m = cfg.ec_m;
+  std::string ec_codec = cfg.ec_codec;
+
+  if (const LayoutRule* rule = find_layout_rule(cfg, oid)) {
+    if (!rule->layout.empty()) layout = rule->layout;
+    if (rule->ec_k) ec_k = *rule->ec_k;
+    if (rule->ec_m) ec_m = *rule->ec_m;
+    if (rule->ec_codec) ec_codec = *rule->ec_codec;
+  }
+
+  if (req.layout) layout = *req.layout;
+  if (req.ec_k) ec_k = *req.ec_k;
+  if (req.ec_m) ec_m = *req.ec_m;
+  if (req.ec_codec) ec_codec = *req.ec_codec;
+
   if (layout.empty()) layout = "replica";
   layout = lower_copy(std::move(layout));
 
@@ -62,30 +92,28 @@ bool resolve_object_layout(const Config& cfg, const LayoutRequest& req, ObjectLa
     return false;
   }
 
-  const int k = req.ec_k.value_or(cfg.ec_k);
-  const int m = req.ec_m.value_or(cfg.ec_m);
-  if (k < 1 || m < 1) {
+  if (ec_k < 1 || ec_m < 1) {
     err = "ec_k and ec_m must be >= 1";
     return false;
   }
-  if (cfg.max_ec_k > 0 && k > cfg.max_ec_k) {
+  if (cfg.max_ec_k > 0 && ec_k > cfg.max_ec_k) {
     err = "ec_k exceeds max_ec_k";
     return false;
   }
-  if (cfg.max_ec_m > 0 && m > cfg.max_ec_m) {
+  if (cfg.max_ec_m > 0 && ec_m > cfg.max_ec_m) {
     err = "ec_m exceeds max_ec_m";
     return false;
   }
 
   std::string codec;
-  if (!resolve_codec(m, req.ec_codec.value_or(cfg.ec_codec), codec, err)) return false;
+  if (!resolve_codec(ec_m, ec_codec, codec, err)) return false;
 
   out = ObjectLayout{};
   out.kind = ObjectLayout::Kind::Ec;
-  out.ec_k = k;
-  out.ec_m = m;
+  out.ec_k = ec_k;
+  out.ec_m = ec_m;
   out.ec_codec = std::move(codec);
-  out.n = k + m;
+  out.n = ec_k + ec_m;
   if (cfg.max_replica_count > 0 && out.n > cfg.max_replica_count) {
     err = "k+m exceeds max_replica_count";
     return false;

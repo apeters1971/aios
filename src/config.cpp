@@ -5,9 +5,78 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cctype>
 #include <string>
 
 namespace aios {
+namespace {
+
+std::string lower_copy(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+bool validate_ec_codec_choice(int m, std::string& codec, std::string& err) {
+  if (codec.empty()) codec = (m == 1) ? "xor" : "isal";
+  if (codec == "xor") {
+    if (m != 1) {
+      err = "ec_codec=xor requires ec_m=1";
+      return false;
+    }
+  } else if (codec == "isal" || codec == "rs") {
+    if (!isal_ec_available()) {
+      err = "ec_codec=isal requires a build with ISA-L (AIOS_WITH_ISAL + libisal)";
+      return false;
+    }
+    codec = "isal";
+  } else {
+    err = "ec_codec must be empty, 'xor', or 'isal'";
+    return false;
+  }
+  return true;
+}
+
+bool validate_layout_rule(LayoutRule& rule, const Config& cfg, std::string& err) {
+  rule.layout = lower_copy(rule.layout);
+  if (rule.layout != "replica" && rule.layout != "ec") {
+    err = "layout_rules entry layout must be 'replica' or 'ec'";
+    return false;
+  }
+  if (rule.layout == "replica") return true;
+
+  const int k = rule.ec_k.value_or(cfg.ec_k);
+  const int m = rule.ec_m.value_or(cfg.ec_m);
+  if (k < 1 || m < 1) {
+    err = "layout_rules ec_k and ec_m must be >= 1";
+    return false;
+  }
+  if (cfg.max_ec_k > 0 && k > cfg.max_ec_k) {
+    err = "layout_rules ec_k exceeds max_ec_k";
+    return false;
+  }
+  if (cfg.max_ec_m > 0 && m > cfg.max_ec_m) {
+    err = "layout_rules ec_m exceeds max_ec_m";
+    return false;
+  }
+  std::string codec = rule.ec_codec.value_or(cfg.ec_codec);
+  if (!validate_ec_codec_choice(m, codec, err)) {
+    err = "layout_rules: " + err;
+    return false;
+  }
+  if (cfg.max_replica_count > 0 && k + m > cfg.max_replica_count) {
+    err = "layout_rules k+m exceeds max_replica_count";
+    return false;
+  }
+  // Normalize resolved codec onto the rule when the rule omitted it.
+  if (!rule.ec_codec.has_value()) {
+    // leave unset so resolve can still inherit cluster codec; validation already ok
+  } else {
+    rule.ec_codec = codec;
+  }
+  return true;
+}
+
+}  // namespace
 
 bool split_host_port(const std::string& addr, std::string& host, std::string& port) {
   const auto pos = addr.rfind(':');
@@ -80,6 +149,30 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
       cfg.peers.clear();
       for (const auto& p : root["peers"]) {
         cfg.peers.push_back(p.as<std::string>());
+      }
+    }
+    if (root["layout_rules"]) {
+      if (!root["layout_rules"].IsSequence()) {
+        err = "layout_rules must be a sequence";
+        return false;
+      }
+      cfg.layout_rules.clear();
+      for (const auto& node : root["layout_rules"]) {
+        if (!node.IsMap()) {
+          err = "layout_rules entries must be mappings";
+          return false;
+        }
+        if (!node["prefix"] || !node["layout"]) {
+          err = "layout_rules entries require prefix and layout";
+          return false;
+        }
+        LayoutRule rule;
+        rule.prefix = node["prefix"].as<std::string>();
+        rule.layout = node["layout"].as<std::string>();
+        if (node["ec_k"]) rule.ec_k = node["ec_k"].as<int>();
+        if (node["ec_m"]) rule.ec_m = node["ec_m"].as<int>();
+        if (node["ec_codec"]) rule.ec_codec = node["ec_codec"].as<std::string>();
+        cfg.layout_rules.push_back(std::move(rule));
       }
     }
   } catch (const std::exception& e) {
@@ -201,35 +294,24 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
 bool normalize_config(Config& cfg, std::string& err) {
   if (cfg.durability.empty() || cfg.durability == "replica") {
     cfg.durability = "replica";
-    return true;
-  }
-  if (cfg.durability != "ec") {
+  } else if (cfg.durability != "ec") {
     err = "durability must be 'replica' or 'ec'";
     return false;
-  }
-  if (cfg.ec_k < 1 || cfg.ec_m < 1) {
-    err = "ec_k and ec_m must be >= 1";
-    return false;
-  }
-  std::string codec = cfg.ec_codec;
-  if (codec.empty()) codec = (cfg.ec_m == 1) ? "xor" : "isal";
-  if (codec == "xor") {
-    if (cfg.ec_m != 1) {
-      err = "ec_codec=xor requires ec_m=1";
-      return false;
-    }
-  } else if (codec == "isal" || codec == "rs") {
-    if (!isal_ec_available()) {
-      err = "ec_codec=isal requires a build with ISA-L (AIOS_WITH_ISAL + libisal)";
-      return false;
-    }
   } else {
-    err = "ec_codec must be empty, 'xor', or 'isal'";
-    return false;
+    if (cfg.ec_k < 1 || cfg.ec_m < 1) {
+      err = "ec_k and ec_m must be >= 1";
+      return false;
+    }
+    std::string codec = cfg.ec_codec;
+    if (!validate_ec_codec_choice(cfg.ec_m, codec, err)) return false;
+    cfg.ec_codec = codec;
+    cfg.replica_count = cfg.ec_k + cfg.ec_m;
+    if (cfg.write_quorum == 0) cfg.write_quorum = cfg.replica_count;
   }
-  cfg.ec_codec = codec;
-  cfg.replica_count = cfg.ec_k + cfg.ec_m;
-  if (cfg.write_quorum == 0) cfg.write_quorum = cfg.replica_count;
+
+  for (auto& rule : cfg.layout_rules) {
+    if (!validate_layout_rule(rule, cfg, err)) return false;
+  }
   return true;
 }
 

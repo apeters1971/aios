@@ -460,7 +460,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     // prepare-only (publish=false): replica layout only for now.
     ObjectLayout layout;
     std::string lerr;
-    if (!resolve_object_layout(cfg_, layout_req, layout, lerr)) {
+    if (!resolve_object_layout(cfg_, oid, layout_req, layout, lerr)) {
       return reply_err(map_.epoch, "bad_request", lerr);
     }
     if (layout.is_ec()) {
@@ -990,7 +990,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
-  if (!resolve_object_layout(cfg_, layout_req, layout, err)) {
+  if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
     return fail("bad_request", err);
   }
   auto placement = place(oid, map_, layout.n);
@@ -1030,7 +1030,7 @@ ApiResult ObjectService::api_put_file(
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
-  if (!resolve_object_layout(cfg_, layout_req, layout, err)) {
+  if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
     return fail("bad_request", err);
   }
   auto placement = place(oid, map_, layout.n);
@@ -1110,7 +1110,7 @@ ApiResult ObjectService::api_put_range(
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
-  if (!resolve_object_layout(cfg_, layout_req, layout, err)) {
+  if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
     return fail("bad_request", err);
   }
   if (layout.is_ec()) {

@@ -58,11 +58,11 @@ When the daemon runs with `durability: ec`, ordinary `PUT /o/{oid}` stripes the 
 
 | Header | Role |
 |--------|------|
-| `x-aios-layout: replica \| ec` | Select layout; omit → cluster `durability` default |
-| `x-aios-ec-k`, `x-aios-ec-m` | EC params; omit → cluster `ec_k` / `ec_m` |
+| `x-aios-layout: replica \| ec` | Select layout; omit → prefix rule / cluster `durability` |
+| `x-aios-ec-k`, `x-aios-ec-m` | EC params; omit → prefix rule / cluster `ec_k` / `ec_m` |
 | `x-aios-ec-codec: xor \| isal` | Omit → auto (`xor` if `m==1`, else `isal`) |
 
-Layout is stored on the version (`x-aios-attr-aios.layout`, etc.). Same oid may use different layouts across versions. See [`layout.md`](layout.md).
+Layout is stored on the version (`x-aios-attr-aios.layout`, etc.). Optional YAML `layout_rules` set admin defaults by oid prefix. See [`layout.md`](layout.md).
 
 ### Large objects
 

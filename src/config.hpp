@@ -1,10 +1,20 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace aios {
+
+// Admin default layout for oids under `prefix` (longest match wins).
+struct LayoutRule {
+  std::string prefix;
+  std::string layout;  // required: "replica" | "ec"
+  std::optional<int> ec_k;
+  std::optional<int> ec_m;
+  std::optional<std::string> ec_codec;
+};
 
 struct Config {
   std::string node_id;
@@ -34,6 +44,8 @@ struct Config {
   int max_ec_k{16};
   int max_ec_m{16};
   int max_replica_count{64};
+  // Prefix → layout defaults (longest matching prefix; request headers still win).
+  std::vector<LayoutRule> layout_rules;
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};

@@ -21,6 +21,15 @@ replica_count: 3
 # max_ec_k: 16
 # max_ec_m: 16
 # max_replica_count: 64
+# Prefix → layout defaults (longest matching prefix; per-PUT headers still win):
+# layout_rules:
+#   - prefix: "hot/"
+#     layout: replica
+#   - prefix: "cold/"
+#     layout: ec
+#     ec_k: 2
+#     ec_m: 1
+#     ec_codec: xor
 
 # repair_interval_ms: 30000
 # repair_batch_oids: 256

@@ -32,9 +32,10 @@ struct ObjectLayout {
   bool is_ec() const { return kind == Kind::Ec; }
 };
 
-// Resolve request + Config defaults/caps into a concrete layout for one write.
-bool resolve_object_layout(const Config& cfg, const LayoutRequest& req, ObjectLayout& out,
-                           std::string& err);
+// Resolve request + prefix rules + Config defaults/caps for one write.
+// Precedence: request fields → longest matching layout_rules prefix → cluster defaults.
+bool resolve_object_layout(const Config& cfg, const std::string& oid, const LayoutRequest& req,
+                           ObjectLayout& out, std::string& err);
 
 // Persist layout keys on a version's attr map (replica or EC).
 void apply_layout_attrs(std::unordered_map<std::string, std::string>& attrs,
