@@ -1,6 +1,6 @@
 # Per-object layout (design)
 
-AIOS does **not** use Ceph-style pools or placement groups. Durability and data layout are chosen **per object version at write time**. Cluster configuration supplies **defaults and safety caps** only.
+AIOS has no pools or placement groups. Durability and data layout are chosen **per object version at write time**. Cluster configuration supplies **defaults and safety caps** only.
 
 Per-object layout is implemented for HTTP/`api_put*` and TCP++ `ObjectPut` / `ObjectPutRange`: clients may send `x-aios-layout` / `x-aios-ec-*` headers or JSON `layout` / `ec_k` / `ec_m` / `ec_codec`; omit → longest matching `layout_rules` prefix, else cluster `durability` / `ec_*` defaults. Layout attrs (`aios.layout`, `aios.n`, and `aios.ec.*` when EC) are stored on each version.
 

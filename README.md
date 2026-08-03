@@ -1,123 +1,261 @@
 # AIOS
 
-Pragmatic cluster object-storage foundation (RADOS-inspired, intentionally small).
+AIOS is a small C++20 **cluster object store**: durable objects on local filesystems, gossip membership, deterministic placement, and a placement-aware HTTP API.
 
-This repository currently ships **`aiosd`**: a standalone C++20 daemon that
+Clients talk to the **primary** for an object (HTTP or TCP++); the primary replicates or erasure-codes across the acting set. There are no pools or placement groups—layout is chosen **per object version** at write time.
 
-1. Joins a peer set from config/CLI (including an empty seed list for the first node)
-2. Maintains a shared membership table via custom TCP gossip (“TCP++”)
-3. Scans mount points for a top-level `.aios` marker
-4. Prepares `…/aios/` object-storage target directories
-5. Gossips `statvfs` capacity for usable targets
-6. Builds a **cluster map** (epoch + targets) and serves object **Put/Get/Del/Stat** RPCs
-7. Performs **server-side primary replication** (`replica_count`) or optional **erasure coding** (`durability: ec`: XOR `2+1`, or ISA-L Reed–Solomon e.g. `4+2` when libisal is available) with a background repair loop
-8. Exposes an **HTTP object API** (`http_listen`, default `:7480`) with ranged PUT/GET, attr preconditions, LIST, DELETE, cross-object transactions (`/txn`), enforced object locks, long-poll watches, and topic pub/sub (`/pubsub`, ephemeral/buffered/durable)
+| Binary | Role |
+|--------|------|
+| `aiosd` | Cluster daemon (gossip, storage targets, object RPC, HTTP API, repair) |
+| `aios` | Thin HTTP client (put/get/del/stat/list/map; follows `307`) |
+| `aios-bench` | Multithreaded HTTP create/update/read benchmark |
+| `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
 
-Plus a local **hybrid object store** library and **`aios-bench`**. Clients are thin and placement-aware: they contact the primary (HTTP or TCP++); the primary fans out replicas. See [`proto/http.md`](proto/http.md).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout).
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Build](#build)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Storage targets (`.aios`)](#storage-targets-aios)
+- [Redundancy and layout](#redundancy-and-layout)
+- [HTTP object API](#http-object-api)
+- [Local object store](#local-object-store)
+- [Tools](#tools)
+- [Authentication](#authentication)
+- [Logging](#logging)
+- [Documentation](#documentation)
+
+---
+
+## Features
+
+**Cluster**
+
+- Peer join from config/CLI (empty peer list = bootstrap node)
+- Membership via signed TCP gossip (“TCP++”)
+- Cluster map (epoch + storage targets) rebuilt from gossiped capacity
+- Deterministic placement: `place(oid, map) → acting_set` (primary = first target)
+
+**Storage**
+
+- Discover mounts via top-level `.aios` markers; prepare `…/aios/` targets
+- Hybrid local store: SQLite metadata + inline or filesystem bodies, sharded by oid hash
+- Versioned objects (`max_versions`), attrs, ranged PUT/GET, delete markers
+- Server-side **replica** or **erasure-coded** durability, with background repair
+
+**HTTP API** (`http_listen`, default `:7480`)
+
+- Object CRUD, LIST (cluster scatter-gather or local), cluster map
+- Attr preconditions (`If-Match` / `If-None-Match` / attr predicates)
+- Cross-object transactions (`/txn`)
+- Enforced object locks (TTL leases)
+- Long-poll watches (per-oid and prefix)
+- Topic pub/sub (`/pubsub`: ephemeral, buffered, or durable)
+
+**Ops**
+
+- Status JSON file, HMAC shared-secret auth on gossip/RPC/HTTP
+- Optional Intel ISA-L Reed–Solomon for EC with `m > 1`
+
+---
+
+## Architecture
+
+```text
+                    ┌─────────────┐
+                    │  aios /     │
+                    │  HTTP apps  │
+                    └──────┬──────┘
+                           │ HTTP :7480 (HMAC)
+              ┌────────────▼────────────┐
+              │     primary aiosd       │
+              │  place(oid) → acting set│
+              └─────┬──────────┬────────┘
+                    │          │ TCP++ object RPC
+           ┌────────▼──┐  ┌────▼────────┐
+           │ local     │  │ peer aiosd  │
+           │ …/aios/   │  │ replicas/EC │
+           └───────────┘  └─────────────┘
+                    ▲
+                    │ gossip :7400 (membership + fs_table + map)
+```
+
+1. Daemons gossip membership and `statvfs` for each usable target.
+2. Each node builds the same **cluster map** for a given epoch.
+3. Writes hash the oid to an acting set; the primary installs and publishes the tip, then fans out.
+4. Reads go to the primary (or any node that can reconstruct EC); wrong node → HTTP **307** with `Location`.
+
+---
 
 ## Build
 
-Requirements:
+**Requirements**
 
 - CMake ≥ 3.24
 - C++20 compiler
 - Boost (Asio headers)
-- OpenSSL (HMAC-SHA256 for cluster auth)
+- OpenSSL (HMAC-SHA256)
 - SQLite3
-- Network for first configure (FetchContent pulls yaml-cpp + nlohmann/json)
+- Network on first configure (FetchContent: yaml-cpp, nlohmann/json)
+- Optional: [ISA-L](https://github.com/intel/isa-l) for Reed–Solomon EC (`m > 1`)
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH"   # macOS Homebrew
-# Optional for Reed–Solomon EC (m>1): brew install isa-l
+# Optional for RS EC: brew install isa-l
+
 cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_PREFIX_PATH="/opt/homebrew;/opt/homebrew/opt/sqlite;/opt/homebrew/opt/openssl@3;/opt/homebrew/opt/isa-l"
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Binaries: `build/aiosd`, `build/aios`, `build/aios-bench`, `build/aios-store-bench`
+Outputs: `build/aiosd`, `build/aios`, `build/aios-bench`, `build/aios-store-bench`, `build/aios_tests`.
+
+---
+
+## Quick start
+
+Shared secret (UUID recommended)—every node and client must use the same key:
+
+```bash
+KEY=550e8400-e29b-41d4-a716-446655440000
+```
+
+**Terminal A** (bootstrap, no peers):
+
+```bash
+./build/aiosd --cluster-key "$KEY" --node-id a --listen 127.0.0.1:7400 \
+  --http-listen 127.0.0.1:7480 --status-file /tmp/aios-a.json
+```
+
+**Terminal B**:
+
+```bash
+./build/aiosd --cluster-key "$KEY" --node-id b --listen 127.0.0.1:7401 \
+  --peer 127.0.0.1:7400 --http-listen 127.0.0.1:7481 \
+  --status-file /tmp/aios-b.json
+```
+
+Within a few seconds both status files should list `a` and `b` as `alive`. A daemon with a different `--cluster-key` will not join.
+
+**Client** (against A’s HTTP port; follows redirects to the primary):
+
+```bash
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" put demo/hello ./file.bin
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" get demo/hello -o ./out.bin
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" list --prefix demo/
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" map
+```
+
+For real capacity you need at least one mount with a [`.aios` marker](#storage-targets-aios). Without targets, membership still works but object puts fail with `no_targets`.
+
+---
 
 ## Configuration
 
-See [`config/aiosd.example.yaml`](config/aiosd.example.yaml).
+Full example: [`config/aiosd.example.yaml`](config/aiosd.example.yaml).
 
 ```yaml
 node_id: "node-a"
 listen: "0.0.0.0:7400"
-cluster_key: "550e8400-e29b-41d4-a716-446655440000"  # required shared secret
-peers: []          # first node: empty
+cluster_key: "550e8400-e29b-41d4-a716-446655440000"
+peers: []
 gossip_interval_ms: 1000
 suspect_after_ms: 5000
 dead_after_ms: 15000
 scan_interval_ms: 5000
 replica_count: 3
+# durability: replica       # or ec
+# ec_k: 2
+# ec_m: 1                   # m=1 → XOR; m>1 needs ISA-L
+http_listen: "0.0.0.0:7480"
+# max_versions: 16
+# max_object_bytes: 68719476736
+# layout_rules:
+#   - prefix: "hot/"
+#     layout: replica
+#   - prefix: "cold/"
+#     layout: ec
+#     ec_k: 2
+#     ec_m: 1
 status_file: "/tmp/aios-a.json"
 ```
 
-CLI overrides: `--cluster-key`, `--config`, `--listen`, `--peer` (repeatable), `--node-id`, `--status-file`, `--replica-count`, `--write-quorum`, `--http-listen`.
+**CLI overrides:** `--config`, `--cluster-key`, `--listen`, `--peer` (repeatable), `--node-id`, `--status-file`, `--replica-count`, `--write-quorum`, `--http-listen`.
 
-### Redundancy
+---
 
-Placement is deterministic: `place(oid, cluster_map) → acting_set` (primary = `[0]`).
+## Storage targets (`.aios`)
 
-- **`durability: replica` (default):** primary writes the full object and fans out identical copies; ACK when `write_quorum` copies succeed.
-- **`durability: ec`:** Primary stripes into `ec_k + ec_m` shards (one per acting-set target). GET reconstructs from any `k` shards; repair rebuilds missing shards. Codec is auto-selected (`xor` when `ec_m=1`, else `isal` / Reed–Solomon via Intel ISA-L). Build with `AIOS_WITH_ISAL=ON` (default) and install `libisal` (e.g. `brew install isa-l`) for `m>1`. Ranged PUT is rejected; staged PUT capped at 16 MiB for now.
-
-**Per-object layout** (no pools/PGs): PUT may override via `x-aios-layout` / `x-aios-ec-*` headers; `durability` / `ec_*` are cluster defaults. Optional `layout_rules` map oid prefixes to layout defaults (longest match; request headers still win). See [`proto/layout.md`](proto/layout.md).
-
-See [`proto/README.md`](proto/README.md) and [`proto/http.md`](proto/http.md).
-
-### Cluster key
-
-Every daemon in a cluster must share the same `cluster_key` (a UUID is a good choice). `Hello` and `Gossip` messages are signed with **HMAC-SHA256** over a canonical body + timestamp; peers with the wrong key are rejected. This is minimum shared-secret clustering, not full mutual TLS.
-
-## `.aios` marker
-
-Place a file named `.aios` in the **top level** of a mounted filesystem.
+Place a file named `.aios` in the **top level** of a mounted filesystem the daemon can see.
 
 | Contents | Effect |
 |----------|--------|
-| empty / `{}` / no `targets` | Whole mount is one target → `<mount>/aios/` |
+| empty / `{}` / no `targets` | One target → `<mount>/aios/` |
 | `targets: [data, scratch]` | `<mount>/data/aios/` and `<mount>/scratch/aios/` |
 
-The daemon creates each `aios/` directory if missing, then checks that its ownership matches the process **euid/egid**. Mismatches are logged and the target is **not** advertised.
-
-## Two-node smoke test
-
-Terminal A (first node, no peers):
+The daemon creates each `aios/` directory if missing, then requires ownership to match the process **euid/egid**. Mismatches are logged and the target is **not** advertised. Usable targets appear in status JSON under `fs_table` with `statvfs` fields.
 
 ```bash
-KEY=550e8400-e29b-41d4-a716-446655440000
-./build/aiosd --cluster-key "$KEY" --node-id a --listen 127.0.0.1:7400 \
-  --status-file /tmp/aios-a.json
-```
-
-Terminal B:
-
-```bash
-KEY=550e8400-e29b-41d4-a716-446655440000
-./build/aiosd --cluster-key "$KEY" --node-id b --listen 127.0.0.1:7401 \
-  --peer 127.0.0.1:7400 --status-file /tmp/aios-b.json
-```
-
-Within a few seconds both status files should list members `a` and `b` as `alive`. A third daemon with a different `--cluster-key` will fail to join.
-
-Optional FS fixture (requires a directory you own that is a mount root, or use a bind/disk image in real deployments). For a quick local marker on a writable mount you control:
-
-```bash
-# Example only if /path/to/mount is a real mount root you own:
-echo 'targets: []' > /path/to/mount/.aios
-# or empty file:
+# On a mount root you own:
 : > /path/to/mount/.aios
+# or:
+echo 'targets: [data]' > /path/to/mount/.aios
 ```
 
-Then check `fs_table.entries` in the status JSON for `…/aios` paths and `statvfs` fields.
+---
 
-Wire format: [`proto/README.md`](proto/README.md).
+## Redundancy and layout
+
+Placement is deterministic: `place(oid, cluster_map, n) → acting_set`.
+
+| Mode | Behavior |
+|------|----------|
+| **`durability: replica`** (default) | Primary writes the full object and fans out identical copies; ACK when `write_quorum` succeeds |
+| **`durability: ec`** | Primary stripes into `ec_k + ec_m` shards (one per acting-set target). GET reconstructs from any `k` shards; repair rebuilds missing shards |
+
+EC codec is auto-selected (`xor` when `ec_m=1`, else `isal` / Reed–Solomon). Build with ISA-L available for `m>1`. Ranged PUT is rejected under EC; staged PUT is capped (see HTTP docs).
+
+**Per-object layout** (no pools): each PUT may override via headers (`x-aios-layout`, `x-aios-ec-*`). Cluster `durability` / `ec_*` are defaults. Optional YAML `layout_rules` map oid prefixes to defaults (longest match; request headers still win). Details: [`proto/layout.md`](proto/layout.md).
+
+---
+
+## HTTP object API
+
+Listen address: `http_listen` (empty disables HTTP). Bodies are raw octets. Auth: HMAC (see [Authentication](#authentication)).
+
+| Area | Endpoints (summary) |
+|------|---------------------|
+| Objects | `PUT/GET/HEAD/DELETE /o/{oid}`, versions, purge, ranged I/O |
+| List / map | `GET /o?prefix=…`, `GET /map` |
+| Transactions | `POST /txn`, prepare put/delete, commit/abort |
+| Locks | `POST/GET/DELETE /o/{oid}/lock` (+ renew); mutates need `x-aios-lock-token` |
+| Watches | Long-poll `GET /o/{oid}/watch`, `GET /watch?prefix=` |
+| Pub/sub | `PUT/GET /pubsub/{topic}`, `POST …/publish`, `GET …/subscribe` |
+
+Wrong primary → **307** with `Location` to the coordinator. Full contract: [`proto/http.md`](proto/http.md).
+
+**Pub/sub delivery modes** (sticky per topic):
+
+| Mode | Behavior |
+|------|----------|
+| `ephemeral` | Fanout to current long-poll waiters only |
+| `buffered` | In-memory ring; catch up with `after_id` |
+| `durable` | Messages stored as objects under `pubsub/{topic}/m/{id}` |
+
+**Locks / watches** are primary-local and in-memory (lost on restart or primary move), except durable pub/sub message bodies.
+
+---
 
 ## Local object store
 
-Each `…/aios/` target can hold a sharded hybrid store:
+Each `…/aios/` target holds a sharded hybrid store:
 
 ```text
 aios/
@@ -129,37 +267,41 @@ aios/
       tmp/
 ```
 
-- **Shard** = `SHA-256(oid)` low bits (`shard_count` must be power of two; default 256)
-- **Inline** (`size ≤ inline_max_bytes`, default 64 KiB): body BLOB in that shard’s SQLite
-- **Filesystem**: body as a file under the shard; metadata/attrs always in SQLite
-- Arbitrary object attrs in table `attrs(oid,key,value)`
+- **Shard** = low bits of `SHA-256(oid)` (`shard_count` power of two; default 256)
+- **Inline** (`size ≤ inline_max_bytes`, default 64 KiB): body BLOB in SQLite
+- **Filesystem**: large bodies on disk; metadata/attrs always in SQLite
 
-### Client CLI (`aios`)
+Objects larger than 256 KiB are streamed to disk on the HTTP path (default max 64 GiB via `max_object_bytes`).
 
-Placement-aware HTTP client (follows `307` redirects to the primary):
+---
+
+## Tools
+
+### `aios` — HTTP client
 
 ```bash
-./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" put myoid ./file.bin
-./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" get myoid -o ./out.bin
-./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" list --prefix my
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" put OID FILE
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" get OID [-o FILE]
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" del OID
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" stat OID
+./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" list [--prefix P]
 ./build/aios --endpoint 127.0.0.1:7480 --cluster-key "$KEY" map
 ```
 
-Objects larger than 256 KiB are streamed to disk on the server (default max 64 GiB via `max_object_bytes`). `GET /o` lists cluster-wide (scatter-gather); use `?scope=local` for this node only.
+Follows `307` redirects. Put/get stream file bytes (no full-object client buffer).
 
-### Client benchmark (`aios-bench`)
+### `aios-bench` — HTTP benchmark
 
-Multithreaded HTTP create/update/read across object sizes (default 1 KiB … 16 MiB). Reports IOPS, MiB/s, and latency p50/p95/p99.
+Reports IOPS, MiB/s, and latency p50/p95/p99. Optional `--layout ec` for per-PUT layout headers.
 
 ```bash
-# against a running aiosd with http_listen and matching cluster_key
 ./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
   --threads 16 --ops 200
 ./build/aios-bench --endpoint 127.0.0.1:7480 --cluster-key "$KEY" \
   --sizes 1k,64k,1M --ops-mix create,read --json
 ```
 
-### Local store microbench (`aios-store-bench`)
+### `aios-store-bench` — local store microbench
 
 ```bash
 ./build/aios-store-bench --root /tmp/aios-bench --mode both --shards 16 --count 1000
@@ -167,6 +309,42 @@ Multithreaded HTTP create/update/read across object sizes (default 1 KiB … 16 
 ./build/aios-store-bench --root /tmp/aios-bench --mode fs --large-size 262144 --count 200 --keep
 ```
 
+---
+
+## Authentication
+
+Every daemon and HTTP client in a cluster must share `cluster_key`.
+
+| Surface | Mechanism |
+|---------|-----------|
+| TCP++ `Hello` / `Gossip` / object RPC | HMAC-SHA256 over canonical body + timestamp |
+| HTTP | `Authorization: AIOS-HMAC-SHA256 …` + `x-aios-date` + content hash |
+
+Skew window: `auth_skew_ms` (default 60s). This is shared-secret clustering, not mutual TLS. Details: [`proto/README.md`](proto/README.md), [`proto/http.md`](proto/http.md).
+
+---
+
 ## Logging
 
-`AIOS_LOG=debug|info|warn|error` (default `info`).
+```bash
+AIOS_LOG=debug|info|warn|error   # default: info
+```
+
+---
+
+## Documentation
+
+| Doc | Topic |
+|-----|-------|
+| [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
+| [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
+| [`proto/layout.md`](proto/layout.md) | Per-object layout and prefix rules |
+| [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
+
+Run the unit suite after changes:
+
+```bash
+./build/aios_tests
+# or
+ctest --test-dir build --output-on-failure
+```
