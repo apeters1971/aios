@@ -41,6 +41,10 @@ enum aios_kabi_opcode {
   AIOS_OP_FSYNC = 15,
   AIOS_OP_STATFS = 16,
   AIOS_OP_LINK = 17,
+  AIOS_OP_SETXATTR = 18,
+  AIOS_OP_GETXATTR = 19,
+  AIOS_OP_LISTXATTR = 20,
+  AIOS_OP_REMOVEXATTR = 21,
 };
 
 /* Wire-format inode attributes (packed, LE on the wire as host for Alma9 x86_64). */
@@ -194,6 +198,49 @@ enum {
   AIOS_KABI_SET_SIZE = 1u << 3,
   AIOS_KABI_SET_MTIME = 1u << 4,
   AIOS_KABI_SET_ATIME = 1u << 5,
+};
+
+/* Extended attributes (mirror aios_posix_*xattr; values are opaque bytes). */
+#define AIOS_KABI_XATTR_VALUE_MAX (64u * 1024u)
+
+enum {
+  AIOS_KABI_XATTR_CREATE = 1,
+  AIOS_KABI_XATTR_REPLACE = 2,
+};
+
+/* AIOS_OP_SETXATTR: header + value_len bytes. */
+struct aios_kabi_setxattr_in {
+  uint64_t ino;
+  uint32_t flags; /* 0, CREATE, and/or REPLACE */
+  uint32_t value_len;
+  char name[AIOS_KABI_NAME_MAX + 1];
+  /* followed by value_len bytes */
+};
+
+/* AIOS_OP_GETXATTR: size==0 queries length only. */
+struct aios_kabi_getxattr_in {
+  uint64_t ino;
+  uint32_t size;
+  uint32_t _pad;
+  char name[AIOS_KABI_NAME_MAX + 1];
+};
+
+/* AIOS_OP_GETXATTR / LISTXATTR reply header; payload follows when size>0. */
+struct aios_kabi_xattr_out {
+  uint32_t size;
+  uint32_t _pad;
+  /* followed by size bytes */
+};
+
+struct aios_kabi_listxattr_in {
+  uint64_t ino;
+  uint32_t size; /* 0 = query length */
+  uint32_t _pad;
+};
+
+struct aios_kabi_removexattr_in {
+  uint64_t ino;
+  char name[AIOS_KABI_NAME_MAX + 1];
 };
 
 #ifdef __cplusplus

@@ -4,12 +4,17 @@
 
 #include "aios_http_api.h"
 
+#include <linux/atomic.h>
 #include <linux/mutex.h>
+#include <linux/net.h>
+#include <linux/semaphore.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 
 #define AIOS_HTTP_MAX_BODY (16u * 1024u * 1024u)
 #define AIOS_HTTP_MAX_HDR (16u * 1024u)
 #define AIOS_HTTP_MAX_REDIRECTS 5
+#define AIOS_HTTP_DEFAULT_TIMEOUT_MS 30000u
 
 struct aios_http_client {
 	char host[256];
@@ -18,7 +23,19 @@ struct aios_http_client {
 	char cluster_key[256];
 	char app_label[64];
 	gfp_t gfp;
+	unsigned int timeout_ms;
+	struct socket *sock; /* keep-alive TCP; NULL if disconnected */
+	atomic64_t timeouts;
+	atomic64_t reconnects;
 	struct mutex mu; /* serialize TCP transactions on this client */
+};
+
+struct aios_http_pool {
+	struct aios_http_client **clients;
+	unsigned int n;
+	unsigned long busy; /* bitmask; n <= BITS_PER_LONG */
+	spinlock_t lock;
+	struct semaphore sem;
 };
 
 int aios_http_hmac_sha256_hex(const char *key, size_t key_len, const char *data,
@@ -50,5 +67,7 @@ int aios_http_fill_posix_cas(struct aios_http_client *c, const char *oid, u64 ex
 
 int aios_http_json_string(const char *js, size_t js_len, const char *key, char *out,
 			  size_t out_len);
+
+void aios_http_client_close_sock(struct aios_http_client *c);
 
 #endif /* AIOS_HTTP_INTERNAL_H */

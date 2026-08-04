@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "internal.h"
 
+#include <linux/atomic.h>
 #include <linux/ctype.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -45,6 +46,10 @@ struct aios_http_client *aios_http_client_create(const char *endpoint, const cha
 	strscpy(c->endpoint, endpoint, sizeof(c->endpoint));
 	strscpy(c->cluster_key, cluster_key, sizeof(c->cluster_key));
 	c->gfp = gfp;
+	c->timeout_ms = AIOS_HTTP_DEFAULT_TIMEOUT_MS;
+	c->sock = NULL;
+	atomic64_set(&c->timeouts, 0);
+	atomic64_set(&c->reconnects, 0);
 	mutex_init(&c->mu);
 	return c;
 }
@@ -54,6 +59,9 @@ void aios_http_client_destroy(struct aios_http_client *c)
 {
 	if (!c)
 		return;
+	mutex_lock(&c->mu);
+	aios_http_client_close_sock(c);
+	mutex_unlock(&c->mu);
 	memzero_explicit(c->cluster_key, sizeof(c->cluster_key));
 	kfree(c);
 }
@@ -69,6 +77,23 @@ void aios_http_client_set_app_label(struct aios_http_client *c, const char *labe
 		strscpy(c->app_label, label, sizeof(c->app_label));
 }
 EXPORT_SYMBOL_GPL(aios_http_client_set_app_label);
+
+void aios_http_client_set_timeout_ms(struct aios_http_client *c, unsigned int ms)
+{
+	if (!c)
+		return;
+	c->timeout_ms = ms ? ms : AIOS_HTTP_DEFAULT_TIMEOUT_MS;
+}
+EXPORT_SYMBOL_GPL(aios_http_client_set_timeout_ms);
+
+void aios_http_client_get_stats(struct aios_http_client *c, u64 *timeouts, u64 *reconnects)
+{
+	if (timeouts)
+		*timeouts = c ? atomic64_read(&c->timeouts) : 0;
+	if (reconnects)
+		*reconnects = c ? atomic64_read(&c->reconnects) : 0;
+}
+EXPORT_SYMBOL_GPL(aios_http_client_get_stats);
 
 int aios_http_encode_oid(const char *oid, char *out, size_t out_len)
 {
@@ -208,6 +233,9 @@ static int apply_redirect(struct aios_http_client *c, const char *location, char
 		strscpy(cur_path, path, cur_path_len);
 		return 0;
 	}
+	/* Host change invalidates keep-alive socket. */
+	if (strcmp(c->host, host) || strcmp(c->port, port))
+		aios_http_client_close_sock(c);
 	strscpy(c->host, host, sizeof(c->host));
 	strscpy(c->port, port, sizeof(c->port));
 	snprintf(c->endpoint, sizeof(c->endpoint), "%s:%s", c->host, c->port);
@@ -436,6 +464,62 @@ int aios_http_put(struct aios_http_client *c, const char *oid, const void *body,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(aios_http_put);
+
+int aios_http_put_range(struct aios_http_client *c, const char *oid, u64 offset,
+			const void *data, size_t len, u64 *cas_inout)
+{
+	char path[1100];
+	char cas_hdrs[512];
+	char range_hdr[96];
+	char combined[768];
+	char hdrs[AIOS_HTTP_MAX_HDR];
+	int status = 0;
+	int err;
+	u64 new_cas = 0;
+	u64 end;
+
+	if (!data && len)
+		return -EINVAL;
+	if (!len)
+		return 0;
+	end = offset + (u64)len - 1;
+	if (end < offset)
+		return -EINVAL;
+
+	err = aios_http_oid_path(oid, path, sizeof(path));
+	if (err)
+		return err;
+
+	cas_hdrs[0] = '\0';
+	if (cas_inout) {
+		err = aios_http_fill_posix_cas(c, oid, *cas_inout, cas_hdrs, sizeof(cas_hdrs),
+					       &new_cas);
+		if (err)
+			return err;
+	}
+
+	snprintf(range_hdr, sizeof(range_hdr), "Content-Range: bytes %llu-%llu/*\r\n",
+		 (unsigned long long)offset, (unsigned long long)end);
+	snprintf(combined, sizeof(combined), "%s%s", cas_hdrs, range_hdr);
+
+	{
+		char ctype[64] = "Content-Type: application/octet-stream\r\n";
+		char all[832];
+
+		snprintf(all, sizeof(all), "%s%s", ctype, combined);
+		err = request_with_hdrs(c, "PUT", path, all, data, len, &status, NULL, hdrs,
+					sizeof(hdrs));
+	}
+	if (err)
+		return err;
+	err = aios_http_map_status(status);
+	if (err)
+		return err;
+	if (cas_inout)
+		*cas_inout = new_cas;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(aios_http_put_range);
 
 int aios_http_delete(struct aios_http_client *c, const char *oid)
 {

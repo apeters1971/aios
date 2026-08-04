@@ -8,11 +8,33 @@
 #include <linux/socket.h>
 #include <linux/string.h>
 #include <linux/tcp.h>
+#include <linux/time.h>
 #include <net/sock.h>
 
 #ifdef CONFIG_DNS_RESOLVER
 #include <linux/dns_resolver.h>
 #endif
+
+void aios_http_client_close_sock(struct aios_http_client *c)
+{
+	if (!c || !c->sock)
+		return;
+	sock_release(c->sock);
+	c->sock = NULL;
+}
+
+static void apply_sock_timeouts(struct aios_http_client *c, struct socket *sock)
+{
+	unsigned long to;
+
+	if (!sock || !sock->sk)
+		return;
+	to = msecs_to_jiffies(c->timeout_ms ? c->timeout_ms : AIOS_HTTP_DEFAULT_TIMEOUT_MS);
+	if (!to)
+		to = 1;
+	sock->sk->sk_rcvtimeo = to;
+	sock->sk->sk_sndtimeo = to;
+}
 
 static int resolve_ipv4(const char *host, __be32 *addr)
 {
@@ -36,7 +58,8 @@ static int resolve_ipv4(const char *host, __be32 *addr)
 	return -EHOSTUNREACH;
 }
 
-static int sock_send_all(struct socket *sock, const void *buf, size_t len)
+static int sock_send_all(struct aios_http_client *c, struct socket *sock, const void *buf,
+			 size_t len)
 {
 	struct kvec iov;
 	struct msghdr msg;
@@ -49,6 +72,10 @@ static int sock_send_all(struct socket *sock, const void *buf, size_t len)
 		iov.iov_len = len - sent;
 		memset(&msg, 0, sizeof(msg));
 		n = kernel_sendmsg(sock, &msg, &iov, 1, iov.iov_len);
+		if (n == -EAGAIN || n == -EWOULDBLOCK || n == -ETIMEDOUT) {
+			atomic64_inc(&c->timeouts);
+			return -ETIMEDOUT;
+		}
 		if (n <= 0)
 			return n ? n : -EIO;
 		sent += n;
@@ -56,26 +83,30 @@ static int sock_send_all(struct socket *sock, const void *buf, size_t len)
 	return 0;
 }
 
-static int sock_recv_some(struct socket *sock, void *buf, size_t len)
+static int sock_recv_some(struct aios_http_client *c, struct socket *sock, void *buf, size_t len)
 {
 	struct kvec iov = { .iov_base = buf, .iov_len = len };
 	struct msghdr msg;
+	int n;
 
 	memset(&msg, 0, sizeof(msg));
-	return kernel_recvmsg(sock, &msg, &iov, 1, len, 0);
+	n = kernel_recvmsg(sock, &msg, &iov, 1, len, 0);
+	if (n == -EAGAIN || n == -EWOULDBLOCK || n == -ETIMEDOUT) {
+		atomic64_inc(&c->timeouts);
+		return -ETIMEDOUT;
+	}
+	return n;
 }
 
-static int sock_recv_until(struct socket *sock, char *buf, size_t cap, const char *needle,
-			   size_t *have)
+static int sock_recv_until(struct aios_http_client *c, struct socket *sock, char *buf, size_t cap,
+			   const char *needle, size_t *have)
 {
-	size_t nlen = strlen(needle);
-
 	*have = 0;
 	while (*have + 1 < cap) {
 		char *p;
 		int n;
 
-		n = sock_recv_some(sock, buf + *have, cap - *have - 1);
+		n = sock_recv_some(c, sock, buf + *have, cap - *have - 1);
 		if (n <= 0)
 			return n ? n : -EIO;
 		*have += n;
@@ -203,14 +234,68 @@ int aios_http_parse_location(const char *loc, char *host, size_t host_len, char 
 	return 0;
 }
 
-int aios_http_tcp_request(struct aios_http_client *c, const char *method, const char *path,
-			  const char *extra_hdrs, const void *body, size_t body_len,
-			  int *status_out, char *location_out, size_t location_len,
-			  struct aios_http_buf *resp_body, char *resp_hdrs,
-			  size_t resp_hdrs_len)
+static int connect_sock(struct aios_http_client *c)
 {
 	struct socket *sock = NULL;
 	struct sockaddr_in sin = { 0 };
+	__be32 addr;
+	u16 port_n;
+	int err;
+
+	err = resolve_ipv4(c->host, &addr);
+	if (err)
+		return err;
+	if (kstrtou16(c->port, 10, &port_n))
+		return -EINVAL;
+
+	err = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+	if (err)
+		return err;
+
+	apply_sock_timeouts(c, sock);
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(port_n);
+	sin.sin_addr.s_addr = addr;
+	err = kernel_connect(sock, (struct sockaddr *)&sin, sizeof(sin), 0);
+	if (err) {
+		if (err == -EAGAIN || err == -EWOULDBLOCK || err == -ETIMEDOUT)
+			atomic64_inc(&c->timeouts);
+		sock_release(sock);
+		return (err == -EAGAIN || err == -EWOULDBLOCK) ? -ETIMEDOUT : err;
+	}
+	c->sock = sock;
+	return 0;
+}
+
+static int ensure_sock(struct aios_http_client *c, bool force_new)
+{
+	if (force_new)
+		aios_http_client_close_sock(c);
+	if (c->sock) {
+		apply_sock_timeouts(c, c->sock);
+		return 0;
+	}
+	return connect_sock(c);
+}
+
+static bool response_wants_close(const char *hdrs)
+{
+	char conn[64];
+
+	if (!aios_http_header_get(hdrs, "Connection", conn, sizeof(conn))) {
+		if (!strncasecmp(conn, "close", 5))
+			return true;
+	}
+	return false;
+}
+
+static int tcp_request_once(struct aios_http_client *c, const char *method, const char *path,
+			    const char *extra_hdrs, const void *body, size_t body_len,
+			    int *status_out, char *location_out, size_t location_len,
+			    struct aios_http_buf *resp_body, char *resp_hdrs, size_t resp_hdrs_len,
+			    bool force_new)
+{
+	struct socket *sock;
 	char *req = NULL;
 	char *hdrbuf = NULL;
 	char auth[512];
@@ -220,10 +305,9 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 	char *body_start;
 	size_t header_bytes;
 	size_t already;
-	__be32 addr;
-	u16 port_n;
 	int err;
 	int n;
+	bool keep = true;
 
 	if (location_out && location_len)
 		location_out[0] = '\0';
@@ -236,12 +320,6 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 
 	if (body_len > AIOS_HTTP_MAX_BODY)
 		return -EFBIG;
-
-	err = resolve_ipv4(c->host, &addr);
-	if (err)
-		return err;
-	if (kstrtou16(c->port, 10, &port_n))
-		return -EINVAL;
 
 	err = aios_http_build_auth(c, method, path, auth, sizeof(auth));
 	if (err)
@@ -260,7 +338,7 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 		n = snprintf(req, AIOS_HTTP_MAX_HDR + 512,
 			     "%s %s HTTP/1.1\r\n"
 			     "Host: %s\r\n"
-			     "Connection: close\r\n"
+			     "Connection: keep-alive\r\n"
 			     "Content-Length: %zu\r\n"
 			     "%s%s%s"
 			     "\r\n",
@@ -272,39 +350,33 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 		goto out;
 	}
 
-	err = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+	err = ensure_sock(c, force_new);
 	if (err)
 		goto out;
+	sock = c->sock;
 
-	sin.sin_family = AF_INET;
-	sin.sin_port = htons(port_n);
-	sin.sin_addr.s_addr = addr;
-	err = kernel_connect(sock, (struct sockaddr *)&sin, sizeof(sin), 0);
+	err = sock_send_all(c, sock, req, n);
 	if (err)
-		goto out_sock;
-
-	err = sock_send_all(sock, req, n);
-	if (err)
-		goto out_sock;
+		goto fail_sock;
 	if (body_len && body) {
-		err = sock_send_all(sock, body, body_len);
+		err = sock_send_all(c, sock, body, body_len);
 		if (err)
-			goto out_sock;
+			goto fail_sock;
 	}
 
 	hdrbuf = kmalloc(AIOS_HTTP_MAX_HDR, GFP_KERNEL);
 	if (!hdrbuf) {
 		err = -ENOMEM;
-		goto out_sock;
+		goto fail_sock;
 	}
-	err = sock_recv_until(sock, hdrbuf, AIOS_HTTP_MAX_HDR, "\r\n\r\n", &have);
+	err = sock_recv_until(c, sock, hdrbuf, AIOS_HTTP_MAX_HDR, "\r\n\r\n", &have);
 	if (err)
-		goto out_sock;
+		goto fail_sock;
 
 	body_start = strnstr(hdrbuf, "\r\n\r\n", have);
 	if (!body_start) {
 		err = -EIO;
-		goto out_sock;
+		goto fail_sock;
 	}
 	header_bytes = body_start - hdrbuf + 4;
 	if (resp_hdrs && resp_hdrs_len) {
@@ -316,7 +388,7 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 
 	err = parse_status_line(hdrbuf, status_out);
 	if (err)
-		goto out_sock;
+		goto fail_sock;
 
 	if (!aios_http_header_get(hdrbuf, "Content-Length", clen, sizeof(clen))) {
 		if (kstrtoul(clen, 10, &content_length))
@@ -325,16 +397,19 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 	if (location_out && location_len)
 		aios_http_header_get(hdrbuf, "Location", location_out, location_len);
 
+	if (response_wants_close(hdrbuf))
+		keep = false;
+
 	already = have - header_bytes;
 	if (resp_body && content_length > 0) {
 		if (content_length > AIOS_HTTP_MAX_BODY) {
 			err = -EFBIG;
-			goto out_sock;
+			goto fail_sock;
 		}
 		resp_body->data = kvmalloc(content_length, GFP_KERNEL);
 		if (!resp_body->data) {
 			err = -ENOMEM;
-			goto out_sock;
+			goto fail_sock;
 		}
 		resp_body->len = content_length;
 		if (already) {
@@ -346,14 +421,14 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 			already = 0;
 		}
 		while (already < content_length) {
-			int got = sock_recv_some(sock, (char *)resp_body->data + already,
+			int got = sock_recv_some(c, sock, (char *)resp_body->data + already,
 						 content_length - already);
 			if (got <= 0) {
 				err = got ? got : -EIO;
 				kvfree(resp_body->data);
 				resp_body->data = NULL;
 				resp_body->len = 0;
-				goto out_sock;
+				goto fail_sock;
 			}
 			already += got;
 		}
@@ -362,19 +437,51 @@ int aios_http_tcp_request(struct aios_http_client *c, const char *method, const 
 		resp_body->data = kvmalloc(already, GFP_KERNEL);
 		if (!resp_body->data) {
 			err = -ENOMEM;
-			goto out_sock;
+			goto fail_sock;
 		}
 		memcpy(resp_body->data, body_start + 4, already);
 		resp_body->len = already;
+		keep = false; /* ambiguous framing */
 	}
 
+	if (!keep)
+		aios_http_client_close_sock(c);
 	err = 0;
+	goto out;
 
-out_sock:
-	if (sock)
-		sock_release(sock);
+fail_sock:
+	aios_http_client_close_sock(c);
 out:
 	kfree(req);
 	kfree(hdrbuf);
+	return err;
+}
+
+int aios_http_tcp_request(struct aios_http_client *c, const char *method, const char *path,
+			  const char *extra_hdrs, const void *body, size_t body_len,
+			  int *status_out, char *location_out, size_t location_len,
+			  struct aios_http_buf *resp_body, char *resp_hdrs,
+			  size_t resp_hdrs_len)
+{
+	bool had_sock = c->sock != NULL;
+	int err;
+
+	err = tcp_request_once(c, method, path, extra_hdrs, body, body_len, status_out,
+			       location_out, location_len, resp_body, resp_hdrs, resp_hdrs_len,
+			       false);
+	if (!err)
+		return 0;
+
+	/* Reconnect once on transport / timeout errors. */
+	if (err == -EPIPE || err == -ECONNRESET || err == -ENOTCONN || err == -ECONNABORTED ||
+	    err == -ETIMEDOUT || err == -EIO || err == -EAGAIN) {
+		if (resp_body)
+			aios_http_buf_free(resp_body);
+		if (had_sock || err == -ETIMEDOUT || err == -EPIPE || err == -ECONNRESET)
+			atomic64_inc(&c->reconnects);
+		err = tcp_request_once(c, method, path, extra_hdrs, body, body_len, status_out,
+				       location_out, location_len, resp_body, resp_hdrs,
+				       resp_hdrs_len, true);
+	}
 	return err;
 }

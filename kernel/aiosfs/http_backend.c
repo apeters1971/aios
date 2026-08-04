@@ -7,6 +7,7 @@
 
 #include "../aios_http/aios_http_api.h"
 
+#include <linux/completion.h>
 #include <linux/ctype.h>
 #include <linux/delay.h>
 #include <linux/mm.h>
@@ -17,6 +18,8 @@
 #include <linux/statfs.h>
 #include <linux/string.h>
 #include <linux/uio.h>
+#include <linux/workqueue.h>
+#include <linux/writeback.h>
 
 #define AIOS_HTTP_ROOT_INO 1
 #define AIOS_HTTP_DEFAULT_STRIPE_UNIT (1024ull * 1024ull)
@@ -26,6 +29,8 @@
 #define AIOS_HTTP_OP_LINK 1
 #define AIOS_HTTP_OP_UNLINK 2
 #define AIOS_HTTP_OP_RENAME 3
+#define AIOS_HTTP_MAX_XATTRS 128
+#define AIOS_HTTP_MAX_XATTR_VALUE AIOS_KABI_XATTR_VALUE_MAX
 
 struct aios_iinfo {
 	u64 cas;
@@ -597,6 +602,329 @@ static int inode_to_json(const struct aios_inode_meta *m, char *buf, size_t n)
 	return (w < 0 || (size_t)w >= n) ? -EOVERFLOW : 0;
 }
 
+/* Extract `"xattrs":{...}` object body (including braces). Caller kfree. */
+static char *extract_xattrs_object(const char *js)
+{
+	const char *p = strstr(js, "\"xattrs\"");
+	const char *start;
+	const char *q;
+	int depth;
+	size_t len;
+	char *out;
+
+	if (!p)
+		return NULL;
+	p = strchr(p + 8, '{');
+	if (!p)
+		return NULL;
+	start = p;
+	depth = 0;
+	for (q = p; *q; q++) {
+		if (*q == '{')
+			depth++;
+		else if (*q == '}') {
+			depth--;
+			if (depth == 0) {
+				q++;
+				break;
+			}
+		}
+	}
+	if (depth != 0)
+		return NULL;
+	len = q - start;
+	out = kmalloc(len + 1, GFP_KERNEL);
+	if (!out)
+		return NULL;
+	memcpy(out, start, len);
+	out[len] = '\0';
+	return out;
+}
+
+/* Merge base inode JSON (no xattrs) with optional xattrs object "{...}". */
+static int inode_json_merge_xattrs(const char *base, const char *xattrs_obj, char **out,
+				  size_t *out_len)
+{
+	size_t blen = strlen(base);
+	size_t xlen = xattrs_obj ? strlen(xattrs_obj) : 0;
+	char *full;
+	size_t n;
+
+	if (blen < 2 || base[blen - 1] != '}')
+		return -EINVAL;
+	if (!xattrs_obj || xattrs_obj[0] != '{') {
+		full = kmalloc(blen + 1, GFP_KERNEL);
+		if (!full)
+			return -ENOMEM;
+		memcpy(full, base, blen);
+		full[blen] = '\0';
+		*out = full;
+		if (out_len)
+			*out_len = blen;
+		return 0;
+	}
+	n = blen + xlen + sizeof(",\"xattrs\":");
+	full = kmalloc(n, GFP_KERNEL);
+	if (!full)
+		return -ENOMEM;
+	memcpy(full, base, blen - 1);
+	scnprintf(full + blen - 1, n - (blen - 1), ",\"xattrs\":%s}", xattrs_obj);
+	*out = full;
+	if (out_len)
+		*out_len = strlen(full);
+	return 0;
+}
+
+static const char b64_tbl[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int b64_val(char c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return c - 'a' + 26;
+	if (c >= '0' && c <= '9')
+		return c - '0' + 52;
+	if (c == '+')
+		return 62;
+	if (c == '/')
+		return 63;
+	return -1;
+}
+
+static int base64_encode(const u8 *data, size_t len, char **out, size_t *out_len)
+{
+	size_t n = ((len + 2) / 3) * 4;
+	char *s;
+	size_t i, o = 0;
+
+	s = kmalloc(n + 1, GFP_KERNEL);
+	if (!s)
+		return -ENOMEM;
+	for (i = 0; i < len; i += 3) {
+		u32 v = ((u32)data[i] << 16) | ((i + 1 < len ? data[i + 1] : 0) << 8) |
+			(i + 2 < len ? data[i + 2] : 0);
+
+		s[o++] = b64_tbl[(v >> 18) & 63];
+		s[o++] = b64_tbl[(v >> 12) & 63];
+		s[o++] = (i + 1 < len) ? b64_tbl[(v >> 6) & 63] : '=';
+		s[o++] = (i + 2 < len) ? b64_tbl[v & 63] : '=';
+	}
+	s[o] = '\0';
+	*out = s;
+	if (out_len)
+		*out_len = o;
+	return 0;
+}
+
+static int base64_decode(const char *in, size_t in_len, u8 **out, size_t *out_len)
+{
+	u8 *buf;
+	size_t i, o = 0;
+
+	if (in_len % 4)
+		return -EINVAL;
+	buf = kmalloc(in_len / 4 * 3 + 1, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	for (i = 0; i < in_len; i += 4) {
+		int a = b64_val(in[i]);
+		int b = b64_val(in[i + 1]);
+		int c = in[i + 2] == '=' ? -2 : b64_val(in[i + 2]);
+		int d = in[i + 3] == '=' ? -2 : b64_val(in[i + 3]);
+
+		if (a < 0 || b < 0 || c == -1 || d == -1) {
+			kfree(buf);
+			return -EINVAL;
+		}
+		buf[o++] = (u8)((a << 2) | (b >> 4));
+		if (c >= 0)
+			buf[o++] = (u8)(((b & 15) << 4) | (c >> 2));
+		if (d >= 0)
+			buf[o++] = (u8)(((c & 3) << 6) | d);
+	}
+	*out = buf;
+	if (out_len)
+		*out_len = o;
+	return 0;
+}
+
+struct aios_xa_ent {
+	char name[AIOS_KABI_NAME_MAX + 1];
+	u8 *value;
+	size_t value_len;
+};
+
+static void free_xa_ents(struct aios_xa_ent *ents, unsigned int n)
+{
+	unsigned int i;
+
+	if (!ents)
+		return;
+	for (i = 0; i < n; i++)
+		kfree(ents[i].value);
+	kfree(ents);
+}
+
+/* Parse xattrs object into heap array. */
+static int parse_xattrs_object(const char *obj, struct aios_xa_ent **ents_out, unsigned int *n_out)
+{
+	struct aios_xa_ent *ents;
+	const char *p, *end;
+	unsigned int n = 0;
+
+	*ents_out = NULL;
+	*n_out = 0;
+	if (!obj || obj[0] != '{')
+		return 0;
+	ents = kcalloc(AIOS_HTTP_MAX_XATTRS, sizeof(*ents), GFP_KERNEL);
+	if (!ents)
+		return -ENOMEM;
+	p = obj + 1;
+	end = obj + strlen(obj);
+	while (p < end && *p) {
+		const char *q;
+		size_t nlen, vlen;
+		char *b64 = NULL;
+		u8 *raw = NULL;
+		size_t raw_len = 0;
+		int err;
+
+		while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == ','))
+			p++;
+		if (p >= end || *p == '}')
+			break;
+		if (*p != '"' || n >= AIOS_HTTP_MAX_XATTRS) {
+			free_xa_ents(ents, n);
+			return n >= AIOS_HTTP_MAX_XATTRS ? -ENOSPC : -EINVAL;
+		}
+		p++;
+		q = p;
+		while (q < end && *q && *q != '"')
+			q++;
+		if (q >= end || *q != '"') {
+			free_xa_ents(ents, n);
+			return -EINVAL;
+		}
+		nlen = q - p;
+		if (nlen == 0 || nlen > AIOS_KABI_NAME_MAX) {
+			free_xa_ents(ents, n);
+			return -EINVAL;
+		}
+		memcpy(ents[n].name, p, nlen);
+		ents[n].name[nlen] = '\0';
+		p = q + 1;
+		while (p < end && (*p == ' ' || *p == '\t' || *p == ':'))
+			p++;
+		if (p >= end || *p != '"') {
+			free_xa_ents(ents, n);
+			return -EINVAL;
+		}
+		p++;
+		q = p;
+		while (q < end && *q && *q != '"')
+			q++;
+		if (q >= end || *q != '"') {
+			free_xa_ents(ents, n);
+			return -EINVAL;
+		}
+		vlen = q - p;
+		b64 = kmalloc(vlen + 1, GFP_KERNEL);
+		if (!b64) {
+			free_xa_ents(ents, n);
+			return -ENOMEM;
+		}
+		memcpy(b64, p, vlen);
+		b64[vlen] = '\0';
+		err = base64_decode(b64, vlen, &raw, &raw_len);
+		kfree(b64);
+		if (err) {
+			free_xa_ents(ents, n);
+			return err;
+		}
+		ents[n].value = raw;
+		ents[n].value_len = raw_len;
+		n++;
+		p = q + 1;
+	}
+	*ents_out = ents;
+	*n_out = n;
+	return 0;
+}
+
+static int build_xattrs_object(struct aios_xa_ent *ents, unsigned int n, char **out)
+{
+	size_t cap = 2;
+	char *s;
+	size_t pos;
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		cap += strlen(ents[i].name) + ((ents[i].value_len + 2) / 3) * 4 + 8;
+	s = kmalloc(cap + 16, GFP_KERNEL);
+	if (!s)
+		return -ENOMEM;
+	pos = scnprintf(s, cap + 16, "{");
+	for (i = 0; i < n; i++) {
+		char *b64 = NULL;
+		size_t blen = 0;
+		int err = base64_encode(ents[i].value, ents[i].value_len, &b64, &blen);
+
+		if (err) {
+			kfree(s);
+			return err;
+		}
+		pos += scnprintf(s + pos, cap + 16 - pos, "%s\"%s\":\"%s\"", i ? "," : "",
+				 ents[i].name, b64);
+		kfree(b64);
+	}
+	scnprintf(s + pos, cap + 16 - pos, "}");
+	*out = s;
+	return 0;
+}
+
+/* Build full inode JSON, preserving xattrs from the cluster object when present. */
+static int inode_to_json_full(struct aios_sb_info *info, struct aios_inode_meta *m, char **out,
+			      size_t *out_len)
+{
+	char base[512];
+	char oid[160];
+	struct aios_http_buf body = { 0 };
+	char *xattrs = NULL;
+	char *js = NULL;
+	int err;
+
+	err = inode_to_json(m, base, sizeof(base));
+	if (err)
+		return err;
+	oid_ino(info->volume, m->ino, oid, sizeof(oid));
+	err = aios_http_get(info->http, oid, &body, NULL);
+	if (!err && body.len) {
+		char *tmp = kmalloc(body.len + 1, GFP_KERNEL);
+
+		if (!tmp) {
+			aios_http_buf_free(&body);
+			return -ENOMEM;
+		}
+		memcpy(tmp, body.data, body.len);
+		tmp[body.len] = '\0';
+		xattrs = extract_xattrs_object(tmp);
+		kfree(tmp);
+	} else if (err == -ENOENT) {
+		err = 0;
+	}
+	aios_http_buf_free(&body);
+	if (err)
+		return err;
+	err = inode_json_merge_xattrs(base, xattrs, &js, out_len);
+	kfree(xattrs);
+	if (err)
+		return err;
+	*out = js;
+	return 0;
+}
+
 static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta *m)
 {
 	char oid[160];
@@ -629,14 +957,16 @@ static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta
 static int store_inode(struct aios_sb_info *info, struct aios_inode_meta *m)
 {
 	char oid[160];
-	char js[512];
+	char *js = NULL;
+	size_t jslen = 0;
 	int err;
 
-	err = inode_to_json(m, js, sizeof(js));
+	err = inode_to_json_full(info, m, &js, &jslen);
 	if (err)
 		return err;
 	oid_ino(info->volume, m->ino, oid, sizeof(oid));
-	err = aios_http_put(info->http, oid, js, strlen(js), NULL, &m->cas);
+	err = aios_http_put(info->http, oid, js, jslen, NULL, &m->cas);
+	kfree(js);
 	return err;
 }
 
@@ -1162,7 +1492,6 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 		struct aios_held_lock locks[4];
 		char txn_id[128];
 		char oid[160];
-		char js[512];
 		u64 ino, victim_ino = 0;
 		u64 ts;
 		u64 old_cas, new_cas, victim_cas = 0;
@@ -1333,38 +1662,49 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 		if (err)
 			goto abort;
 
-		err = inode_to_json(&old_p, js, sizeof(js));
-		if (err)
-			goto abort;
-		oid_ino(info->volume, old_parent, oid, sizeof(oid));
-		old_cas = old_p.cas;
-		err = aios_http_txn_prepare_put(info->http, txn_id, oid, js, strlen(js), NULL,
-						&old_cas);
-		if (err)
-			goto abort;
+		{
+			char *full = NULL;
+			size_t flen = 0;
 
-		err = inode_to_json(&new_p, js, sizeof(js));
-		if (err)
-			goto abort;
-		oid_ino(info->volume, new_parent, oid, sizeof(oid));
-		new_cas = new_p.cas;
-		err = aios_http_txn_prepare_put(info->http, txn_id, oid, js, strlen(js), NULL,
-						&new_cas);
-		if (err)
-			goto abort;
+			err = inode_to_json_full(info, &old_p, &full, &flen);
+			if (err)
+				goto abort;
+			oid_ino(info->volume, old_parent, oid, sizeof(oid));
+			old_cas = old_p.cas;
+			err = aios_http_txn_prepare_put(info->http, txn_id, oid, full, flen, NULL,
+							&old_cas);
+			kfree(full);
+			if (err)
+				goto abort;
+
+			err = inode_to_json_full(info, &new_p, &full, &flen);
+			if (err)
+				goto abort;
+			oid_ino(info->volume, new_parent, oid, sizeof(oid));
+			new_cas = new_p.cas;
+			err = aios_http_txn_prepare_put(info->http, txn_id, oid, full, flen, NULL,
+							&new_cas);
+			kfree(full);
+			if (err)
+				goto abort;
+		}
 
 		delete_victim = false;
 		if (victim_ino && victim_ino != ino && victim_exists) {
 			oid_ino(info->volume, victim_ino, oid, sizeof(oid));
 			if (victim.nlink > 1) {
+				char *full = NULL;
+				size_t flen = 0;
+
 				victim.nlink -= 1;
 				victim.ctime_ns = ts;
-				err = inode_to_json(&victim, js, sizeof(js));
+				err = inode_to_json_full(info, &victim, &full, &flen);
 				if (err)
 					goto abort;
 				victim_cas = victim.cas;
-				err = aios_http_txn_prepare_put(info->http, txn_id, oid, js,
-								strlen(js), NULL, &victim_cas);
+				err = aios_http_txn_prepare_put(info->http, txn_id, oid, full, flen,
+								NULL, &victim_cas);
+				kfree(full);
 				if (err)
 					goto abort;
 			} else {
@@ -1418,6 +1758,84 @@ next:
 			return err;
 	}
 	return -EAGAIN;
+}
+
+static int http_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
+{
+	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
+	struct aios_dir_table new_dt;
+	struct aios_inode_meta m, np;
+	struct inode *inode = d_inode(old_dentry);
+	char new_name[AIOS_KABI_NAME_MAX + 1];
+	char inos[32];
+	u64 ts;
+	int err;
+
+	if (!inode || !S_ISREG(inode->i_mode))
+		return -EPERM;
+	if (dentry->d_name.len > AIOS_KABI_NAME_MAX)
+		return -ENAMETOOLONG;
+	memcpy(new_name, dentry->d_name.name, dentry->d_name.len);
+	new_name[dentry->d_name.len] = '\0';
+	if (strchr(new_name, '/'))
+		return -EINVAL;
+
+	mutex_lock(&info->http_mu);
+	err = load_inode(info, inode->i_ino, &m);
+	if (err)
+		goto out;
+	if (S_ISDIR(m.mode)) {
+		err = -EPERM;
+		goto out;
+	}
+	err = load_inode(info, dir->i_ino, &np);
+	if (err)
+		goto out;
+	if (!S_ISDIR(np.mode)) {
+		err = -ENOTDIR;
+		goto out;
+	}
+	err = dir_table_init(&new_dt, info->volume, dir->i_ino);
+	if (err)
+		goto out;
+	err = dir_load(info, &new_dt);
+	if (err)
+		goto out_dt;
+	if (!dir_find(&new_dt, new_name, NULL)) {
+		err = -EEXIST;
+		goto out_dt;
+	}
+	ts = now_ns();
+	m.nlink += 1;
+	m.ctime_ns = ts;
+	err = store_inode(info, &m);
+	if (err)
+		goto out_dt;
+	snprintf(inos, sizeof(inos), "%llu", (unsigned long long)m.ino);
+	err = apply_dir_op(&new_dt, AIOS_HTTP_OP_LINK, new_name, inos);
+	if (err)
+		goto out_dt;
+	err = dir_store_compact(info, &new_dt);
+	if (err)
+		goto out_dt;
+	np.mtime_ns = np.ctime_ns = ts;
+	err = store_inode(info, &np);
+	if (err)
+		goto out_dt;
+	{
+		struct aios_kabi_stat st;
+
+		meta_to_stat(&m, &st);
+		aios_stat_to_inode(inode, &st);
+		attach_iinfo(inode, &m);
+	}
+	ihold(inode);
+	d_instantiate(dentry, inode);
+out_dt:
+	dir_table_free(&new_dt);
+out:
+	mutex_unlock(&info->http_mu);
+	return err;
 }
 
 static int http_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
@@ -1564,13 +1982,16 @@ const struct inode_operations aios_http_dir_inode_ops = {
 	.unlink = http_unlink,
 	.rmdir = http_rmdir,
 	.rename = http_rename,
+	.link = http_link,
 	.getattr = http_getattr,
 	.setattr = http_setattr,
+	.listxattr = aios_listxattr,
 };
 
 const struct inode_operations aios_http_file_inode_ops = {
 	.getattr = http_getattr,
 	.setattr = http_setattr,
+	.listxattr = aios_listxattr,
 };
 
 static int http_readdir(struct file *file, struct dir_context *ctx)
@@ -1693,12 +2114,53 @@ out:
 	return err;
 }
 
+/* Chunk RMW using an explicit client (no http_mu; caller serializes per-chunk). */
+static int http_chunk_write(struct aios_http_client *c, const char *volume, u64 ino, u64 unit,
+			    u64 pos, const void *buf, size_t len)
+{
+	u64 p = pos;
+	size_t done = 0;
+	int err = 0;
+
+	while (done < len) {
+		u64 chunk = p / unit;
+		u64 chunk_off = p % unit;
+		size_t n = min_t(size_t, (size_t)(unit - chunk_off), len - done);
+		char oid[160];
+		struct aios_http_buf body = { 0 };
+		char *nb;
+		size_t nlen;
+
+		oid_chunk(volume, ino, chunk, oid, sizeof(oid));
+		err = aios_http_get(c, oid, &body, NULL);
+		if (err && err != -ENOENT)
+			return err;
+		nlen = max_t(size_t, body.len, chunk_off + n);
+		nb = kvmalloc(nlen, GFP_KERNEL);
+		if (!nb) {
+			aios_http_buf_free(&body);
+			return -ENOMEM;
+		}
+		memset(nb, 0, nlen);
+		if (body.len)
+			memcpy(nb, body.data, body.len);
+		aios_http_buf_free(&body);
+		memcpy(nb + chunk_off, (char *)buf + done, n);
+		err = aios_http_put(c, oid, nb, nlen, NULL, NULL);
+		kvfree(nb);
+		if (err)
+			return err;
+		p += n;
+		done += n;
+	}
+	return 0;
+}
+
 int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t len)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	struct aios_inode_meta m;
-	u64 unit, p;
-	size_t done = 0;
+	u64 unit;
 	int err;
 
 	if (!len)
@@ -1713,39 +2175,9 @@ int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t 
 		goto out;
 	}
 	unit = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
-	p = (u64)pos;
-	while (done < len) {
-		u64 chunk = p / unit;
-		u64 chunk_off = p % unit;
-		size_t n = min_t(size_t, (size_t)(unit - chunk_off), len - done);
-		char oid[160];
-		struct aios_http_buf body = { 0 };
-		char *nb;
-		size_t nlen;
-
-		oid_chunk(info->volume, m.ino, chunk, oid, sizeof(oid));
-		err = aios_http_get(info->http, oid, &body, NULL);
-		if (err && err != -ENOENT)
-			goto out;
-		nlen = max_t(size_t, body.len, chunk_off + n);
-		nb = kvmalloc(nlen, GFP_KERNEL);
-		if (!nb) {
-			aios_http_buf_free(&body);
-			err = -ENOMEM;
-			goto out;
-		}
-		memset(nb, 0, nlen);
-		if (body.len)
-			memcpy(nb, body.data, body.len);
-		aios_http_buf_free(&body);
-		memcpy(nb + chunk_off, (char *)buf + done, n);
-		err = aios_http_put(info->http, oid, nb, nlen, NULL, NULL);
-		kvfree(nb);
-		if (err)
-			goto out;
-		p += n;
-		done += n;
-	}
+	err = http_chunk_write(info->http, info->volume, m.ino, unit, (u64)pos, buf, len);
+	if (err)
+		goto out;
 	m.size = max_t(u64, m.size, (u64)pos + len);
 	m.mtime_ns = m.ctime_ns = now_ns();
 	err = store_inode(info, &m);
@@ -1753,6 +2185,234 @@ int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t 
 		attach_iinfo(inode, &m);
 out:
 	mutex_unlock(&info->http_mu);
+	return err;
+}
+
+#define AIOS_HTTP_WB_MAX 64
+
+struct aios_http_wb_page {
+	struct page *page;
+	loff_t pos;
+	size_t len;
+	void *data;
+};
+
+struct aios_http_wb_chunk {
+	struct work_struct work;
+	struct aios_sb_info *info;
+	u64 ino;
+	u64 unit;
+	u64 chunk;
+	struct aios_http_wb_page *pages;
+	unsigned int npages;
+	int err;
+	struct completion done;
+};
+
+static int aios_http_wb_cmp(const void *a, const void *b)
+{
+	const struct aios_http_wb_page *pa = a, *pb = b;
+
+	if (pa->pos < pb->pos)
+		return -1;
+	if (pa->pos > pb->pos)
+		return 1;
+	return 0;
+}
+
+static void aios_http_wb_chunk_work(struct work_struct *work)
+{
+	struct aios_http_wb_chunk *cw = container_of(work, struct aios_http_wb_chunk, work);
+	struct aios_http_client *c = aios_http_pool_get(cw->info->http_pool);
+	unsigned int i;
+	int err = 0;
+
+	if (!c) {
+		cw->err = -ENOMEM;
+		complete(&cw->done);
+		return;
+	}
+	for (i = 0; i < cw->npages && !err; i++) {
+		err = http_chunk_write(c, cw->info->volume, cw->ino, cw->unit, (u64)cw->pages[i].pos,
+				       cw->pages[i].data, cw->pages[i].len);
+	}
+	aios_http_pool_put(cw->info->http_pool, c);
+	cw->err = err;
+	complete(&cw->done);
+}
+
+static int aios_http_wb_collect(struct page *page, struct writeback_control *wbc, void *data)
+{
+	struct aios_http_wb_page **pp = data;
+	struct aios_http_wb_page *batch = *pp;
+	struct inode *inode = page->mapping->host;
+	loff_t pos = page_offset(page);
+	loff_t i_size = i_size_read(inode);
+	void *kaddr;
+	unsigned int n = 0;
+
+	while (n < AIOS_HTTP_WB_MAX && batch[n].page)
+		n++;
+	if (n >= AIOS_HTTP_WB_MAX) {
+		/* Batch full — skip; write_cache_pages will revisit dirty pages. */
+		redirty_page_for_writepage(wbc, page);
+		unlock_page(page);
+		return 0;
+	}
+
+	set_page_writeback(page);
+	batch[n].page = page;
+	batch[n].pos = pos;
+	batch[n].len = 0;
+	batch[n].data = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!batch[n].data) {
+		end_page_writeback(page);
+		unlock_page(page);
+		return -ENOMEM;
+	}
+	if (pos < i_size) {
+		batch[n].len = min_t(loff_t, PAGE_SIZE, i_size - pos);
+		kaddr = kmap(page);
+		memcpy(batch[n].data, kaddr, batch[n].len);
+		kunmap(page);
+	}
+	unlock_page(page);
+	return 0;
+}
+
+int aios_http_writepages(struct address_space *mapping, struct writeback_control *wbc)
+{
+	struct inode *inode = mapping->host;
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_http_wb_page *batch;
+	struct aios_inode_meta m;
+	struct aios_http_wb_chunk *chunks = NULL;
+	unsigned int n = 0, nchunks = 0, i, c;
+	u64 unit, max_end = 0;
+	int err;
+
+	if (!info->http_pool)
+		return -EINVAL;
+
+	batch = kcalloc(AIOS_HTTP_WB_MAX, sizeof(*batch), GFP_KERNEL);
+	if (!batch)
+		return -ENOMEM;
+
+	err = write_cache_pages(mapping, wbc, aios_http_wb_collect, &batch);
+	if (err)
+		goto out_pages;
+
+	for (i = 0; i < AIOS_HTTP_WB_MAX; i++) {
+		if (!batch[i].page)
+			break;
+		n++;
+		if (batch[i].len)
+			max_end = max_t(u64, max_end, (u64)batch[i].pos + batch[i].len);
+	}
+	if (!n) {
+		kfree(batch);
+		return 0;
+	}
+
+	sort(batch, n, sizeof(*batch), aios_http_wb_cmp, NULL);
+
+	mutex_lock(&info->http_mu);
+	err = load_inode(info, inode->i_ino, &m);
+	if (err) {
+		mutex_unlock(&info->http_mu);
+		goto out_pages;
+	}
+	unit = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+	mutex_unlock(&info->http_mu);
+
+	/* Count distinct chunks. */
+	nchunks = 1;
+	for (i = 1; i < n; i++) {
+		if (batch[i].pos / unit != batch[i - 1].pos / unit)
+			nchunks++;
+	}
+	chunks = kcalloc(nchunks, sizeof(*chunks), GFP_KERNEL);
+	if (!chunks) {
+		err = -ENOMEM;
+		goto out_pages;
+	}
+
+	c = 0;
+	chunks[0].info = info;
+	chunks[0].ino = inode->i_ino;
+	chunks[0].unit = unit;
+	chunks[0].chunk = batch[0].pos / unit;
+	chunks[0].pages = &batch[0];
+	chunks[0].npages = 1;
+	init_completion(&chunks[0].done);
+	INIT_WORK(&chunks[0].work, aios_http_wb_chunk_work);
+	for (i = 1; i < n; i++) {
+		u64 ch = batch[i].pos / unit;
+
+		if (ch == chunks[c].chunk) {
+			chunks[c].npages++;
+		} else {
+			c++;
+			chunks[c].info = info;
+			chunks[c].ino = inode->i_ino;
+			chunks[c].unit = unit;
+			chunks[c].chunk = ch;
+			chunks[c].pages = &batch[i];
+			chunks[c].npages = 1;
+			init_completion(&chunks[c].done);
+			INIT_WORK(&chunks[c].work, aios_http_wb_chunk_work);
+		}
+	}
+
+	for (i = 0; i < nchunks; i++)
+		schedule_work(&chunks[i].work);
+	err = 0;
+	for (i = 0; i < nchunks; i++) {
+		wait_for_completion(&chunks[i].done);
+		if (chunks[i].err && !err)
+			err = chunks[i].err;
+	}
+
+	if (!err && max_end) {
+		mutex_lock(&info->http_mu);
+		if (!load_inode(info, inode->i_ino, &m) && S_ISREG(m.mode)) {
+			m.size = max_t(u64, m.size, max_end);
+			m.mtime_ns = m.ctime_ns = now_ns();
+			err = store_inode(info, &m);
+			if (!err)
+				attach_iinfo(inode, &m);
+		}
+		mutex_unlock(&info->http_mu);
+	}
+
+	for (i = 0; i < n; i++) {
+		if (err) {
+			SetPageError(batch[i].page);
+			mapping_set_error(mapping, err);
+			set_page_dirty(batch[i].page);
+		} else {
+			ClearPageError(batch[i].page);
+		}
+		end_page_writeback(batch[i].page);
+	}
+
+	kfree(chunks);
+	for (i = 0; i < n; i++)
+		kfree(batch[i].data);
+	kfree(batch);
+	return err;
+
+out_pages:
+	for (i = 0; i < AIOS_HTTP_WB_MAX; i++) {
+		if (!batch[i].page)
+			break;
+		SetPageError(batch[i].page);
+		mapping_set_error(mapping, err ? err : -EIO);
+		end_page_writeback(batch[i].page);
+		kfree(batch[i].data);
+	}
+	kfree(batch);
+	kfree(chunks);
 	return err;
 }
 
@@ -1782,6 +2442,349 @@ out:
 	return err;
 }
 
+/* Best-effort punch hole with KEEP_SIZE: zero overlapping chunk ranges. */
+int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_inode_meta m;
+	u64 unit, start, end, p;
+	int err;
+
+	if (offset < 0 || len <= 0)
+		return -EINVAL;
+
+	mutex_lock(&info->http_mu);
+	err = load_inode(info, inode->i_ino, &m);
+	if (err)
+		goto out;
+	if (!S_ISREG(m.mode)) {
+		err = -EISDIR;
+		goto out;
+	}
+	if ((u64)offset >= m.size) {
+		err = 0;
+		goto out;
+	}
+	unit = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+	start = (u64)offset;
+	end = min_t(u64, (u64)offset + (u64)len, m.size);
+	p = start;
+	while (p < end) {
+		u64 chunk = p / unit;
+		u64 chunk_off = p % unit;
+		u64 chunk_end = min_t(u64, end, (chunk + 1) * unit);
+		size_t n = (size_t)(chunk_end - p);
+		char oid[160];
+		struct aios_http_buf body = { 0 };
+		char *nb;
+		size_t nlen;
+
+		oid_chunk(info->volume, m.ino, chunk, oid, sizeof(oid));
+		if (chunk_off == 0 && n == unit) {
+			/* Entire chunk punched — delete object. */
+			err = aios_http_delete(info->http, oid);
+			if (err && err != -ENOENT)
+				goto out;
+			err = 0;
+			p += n;
+			continue;
+		}
+		err = aios_http_get(info->http, oid, &body, NULL);
+		if (err == -ENOENT) {
+			err = 0;
+			p += n;
+			continue;
+		}
+		if (err)
+			goto out;
+		nlen = body.len;
+		if (chunk_off + n > nlen)
+			nlen = chunk_off + n;
+		nb = kvmalloc(nlen, GFP_KERNEL);
+		if (!nb) {
+			aios_http_buf_free(&body);
+			err = -ENOMEM;
+			goto out;
+		}
+		memset(nb, 0, nlen);
+		if (body.len)
+			memcpy(nb, body.data, body.len);
+		aios_http_buf_free(&body);
+		memset(nb + chunk_off, 0, n);
+		err = aios_http_put(info->http, oid, nb, nlen, NULL, NULL);
+		kvfree(nb);
+		if (err)
+			goto out;
+		p += n;
+	}
+	m.ctime_ns = now_ns();
+	err = store_inode(info, &m);
+	if (!err)
+		attach_iinfo(inode, &m);
+out:
+	mutex_unlock(&info->http_mu);
+	return err;
+}
+
+static int http_load_xattrs(struct aios_sb_info *info, u64 ino, struct aios_xa_ent **ents,
+			    unsigned int *n, u64 *cas_out, char **raw_js_out)
+{
+	char oid[160];
+	struct aios_http_buf body = { 0 };
+	char *js;
+	char *xobj;
+	u64 cas = 0;
+	int err;
+
+	oid_ino(info->volume, ino, oid, sizeof(oid));
+	err = aios_http_get(info->http, oid, &body, &cas);
+	if (err)
+		return err;
+	js = kmalloc(body.len + 1, GFP_KERNEL);
+	if (!js) {
+		aios_http_buf_free(&body);
+		return -ENOMEM;
+	}
+	memcpy(js, body.data, body.len);
+	js[body.len] = '\0';
+	aios_http_buf_free(&body);
+	xobj = extract_xattrs_object(js);
+	err = parse_xattrs_object(xobj, ents, n);
+	kfree(xobj);
+	if (err) {
+		kfree(js);
+		return err;
+	}
+	if (cas_out)
+		*cas_out = cas;
+	if (raw_js_out)
+		*raw_js_out = js;
+	else
+		kfree(js);
+	return 0;
+}
+
+static int http_store_xattrs(struct aios_sb_info *info, u64 ino, struct aios_xa_ent *ents,
+			     unsigned int n, u64 cas, const char *raw_js)
+{
+	struct aios_inode_meta m;
+	char base[512];
+	char *xobj = NULL;
+	char *full = NULL;
+	size_t flen = 0;
+	char oid[160];
+	int err;
+
+	err = inode_from_json(raw_js, cas, &m);
+	if (err)
+		return err;
+	m.ctime_ns = now_ns();
+	err = inode_to_json(&m, base, sizeof(base));
+	if (err)
+		return err;
+	if (n) {
+		err = build_xattrs_object(ents, n, &xobj);
+		if (err)
+			return err;
+	}
+	err = inode_json_merge_xattrs(base, xobj, &full, &flen);
+	kfree(xobj);
+	if (err)
+		return err;
+	oid_ino(info->volume, ino, oid, sizeof(oid));
+	err = aios_http_put(info->http, oid, full, flen, NULL, &cas);
+	kfree(full);
+	return err;
+}
+
+int aios_http_getxattr(struct inode *inode, const char *name, void *buf, size_t size)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_xa_ent *ents = NULL;
+	unsigned int n = 0, i;
+	int err;
+
+	if (!name || !*name || strlen(name) > AIOS_KABI_NAME_MAX)
+		return -EINVAL;
+
+	mutex_lock(&info->http_mu);
+	err = http_load_xattrs(info, inode->i_ino, &ents, &n, NULL, NULL);
+	if (err)
+		goto out;
+	err = -ENODATA;
+	for (i = 0; i < n; i++) {
+		if (!strcmp(ents[i].name, name)) {
+			if (size == 0) {
+				err = (int)ents[i].value_len;
+			} else if (size < ents[i].value_len) {
+				err = -ERANGE;
+			} else {
+				if (buf && ents[i].value_len)
+					memcpy(buf, ents[i].value, ents[i].value_len);
+				err = (int)ents[i].value_len;
+			}
+			break;
+		}
+	}
+	free_xa_ents(ents, n);
+out:
+	mutex_unlock(&info->http_mu);
+	return err;
+}
+
+int aios_http_setxattr(struct inode *inode, const char *name, const void *buf, size_t size,
+		       int flags)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_xa_ent *ents = NULL;
+	unsigned int n = 0, i;
+	char *raw = NULL;
+	u64 cas = 0;
+	int err;
+	bool present = false;
+
+	if (!name || !*name || strlen(name) > AIOS_KABI_NAME_MAX)
+		return -EINVAL;
+	if (size > AIOS_HTTP_MAX_XATTR_VALUE)
+		return -E2BIG;
+	if (size && !buf)
+		return -EINVAL;
+
+	mutex_lock(&info->http_mu);
+	err = http_load_xattrs(info, inode->i_ino, &ents, &n, &cas, &raw);
+	if (err)
+		goto out;
+	if (!ents) {
+		ents = kcalloc(AIOS_HTTP_MAX_XATTRS, sizeof(*ents), GFP_KERNEL);
+		if (!ents) {
+			err = -ENOMEM;
+			goto out_raw;
+		}
+	}
+	for (i = 0; i < n; i++) {
+		if (!strcmp(ents[i].name, name)) {
+			present = true;
+			break;
+		}
+	}
+	if ((flags & AIOS_KABI_XATTR_CREATE) && present) {
+		err = -EEXIST;
+		goto out_free;
+	}
+	if ((flags & AIOS_KABI_XATTR_REPLACE) && !present) {
+		err = -ENODATA;
+		goto out_free;
+	}
+	if (!present) {
+		if (n >= AIOS_HTTP_MAX_XATTRS) {
+			err = -ENOSPC;
+			goto out_free;
+		}
+		i = n++;
+		strscpy(ents[i].name, name, sizeof(ents[i].name));
+		ents[i].value = NULL;
+		ents[i].value_len = 0;
+	}
+	kfree(ents[i].value);
+	ents[i].value = NULL;
+	ents[i].value_len = 0;
+	if (size) {
+		ents[i].value = kmemdup(buf, size, GFP_KERNEL);
+		if (!ents[i].value) {
+			err = -ENOMEM;
+			goto out_free;
+		}
+		ents[i].value_len = size;
+	}
+	err = http_store_xattrs(info, inode->i_ino, ents, n, cas, raw);
+out_free:
+	free_xa_ents(ents, n);
+out_raw:
+	kfree(raw);
+out:
+	mutex_unlock(&info->http_mu);
+	return err;
+}
+
+int aios_http_listxattr(struct inode *inode, char *list, size_t size)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_xa_ent *ents = NULL;
+	unsigned int n = 0, i;
+	size_t need = 0, off = 0;
+	int err;
+
+	mutex_lock(&info->http_mu);
+	err = http_load_xattrs(info, inode->i_ino, &ents, &n, NULL, NULL);
+	if (err)
+		goto out;
+	for (i = 0; i < n; i++)
+		need += strlen(ents[i].name) + 1;
+	if (size == 0) {
+		err = (int)need;
+		goto out_free;
+	}
+	if (size < need) {
+		err = -ERANGE;
+		goto out_free;
+	}
+	for (i = 0; i < n; i++) {
+		size_t nl = strlen(ents[i].name);
+
+		if (list) {
+			memcpy(list + off, ents[i].name, nl);
+			list[off + nl] = '\0';
+		}
+		off += nl + 1;
+	}
+	err = (int)need;
+out_free:
+	free_xa_ents(ents, n);
+out:
+	mutex_unlock(&info->http_mu);
+	return err;
+}
+
+int aios_http_removexattr(struct inode *inode, const char *name)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_xa_ent *ents = NULL;
+	unsigned int n = 0, i;
+	char *raw = NULL;
+	u64 cas = 0;
+	int err;
+	bool found = false;
+
+	if (!name || !*name || strlen(name) > AIOS_KABI_NAME_MAX)
+		return -EINVAL;
+
+	mutex_lock(&info->http_mu);
+	err = http_load_xattrs(info, inode->i_ino, &ents, &n, &cas, &raw);
+	if (err)
+		goto out;
+	for (i = 0; i < n; i++) {
+		if (!strcmp(ents[i].name, name)) {
+			kfree(ents[i].value);
+			ents[i] = ents[n - 1];
+			ents[n - 1].value = NULL;
+			n--;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		err = -ENODATA;
+		goto out_free;
+	}
+	err = http_store_xattrs(info, inode->i_ino, ents, n, cas, raw);
+out_free:
+	free_xa_ents(ents, n);
+	kfree(raw);
+out:
+	mutex_unlock(&info->http_mu);
+	return err;
+}
+
 static int http_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	buf->f_type = AIOSFS_MAGIC;
@@ -1801,7 +2804,14 @@ static void http_put_super(struct super_block *sb)
 
 	if (!info)
 		return;
-	if (info->http) {
+	if (info->http_pool) {
+		if (info->http) {
+			aios_http_pool_put(info->http_pool, info->http);
+			info->http = NULL;
+		}
+		aios_http_pool_destroy(info->http_pool);
+		info->http_pool = NULL;
+	} else if (info->http) {
 		aios_http_client_destroy(info->http);
 		info->http = NULL;
 	}
@@ -1820,6 +2830,7 @@ static const struct super_operations aios_http_super_ops = {
 
 int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 {
+	struct aios_http_pool *pool;
 	struct aios_http_client *c;
 	struct aios_inode_meta root;
 	struct inode *root_inode;
@@ -1828,6 +2839,7 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	sb->s_magic = AIOSFS_MAGIC;
 	sb->s_op = &aios_http_super_ops;
 	sb->s_d_op = &aios_dentry_ops;
+	sb->s_xattr = aios_xattr_handlers;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_blocksize = 4096;
 	sb->s_blocksize_bits = 12;
@@ -1838,11 +2850,19 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	info->conn = NULL;
 	mutex_init(&info->http_mu);
 
-	c = aios_http_client_create(info->endpoint, info->cluster_key, GFP_KERNEL);
-	if (IS_ERR(c))
-		return PTR_ERR(c);
-	if (info->app_label[0])
-		aios_http_client_set_app_label(c, info->app_label);
+	pool = aios_http_pool_create(info->endpoint, info->cluster_key,
+				     info->app_label[0] ? info->app_label : NULL,
+				     AIOSFS_HTTP_POOL_SIZE, GFP_KERNEL);
+	if (IS_ERR(pool))
+		return PTR_ERR(pool);
+	aios_http_pool_set_timeout_ms(pool, 30000);
+	info->http_pool = pool;
+	c = aios_http_pool_get(pool);
+	if (!c) {
+		aios_http_pool_destroy(pool);
+		info->http_pool = NULL;
+		return -ENOMEM;
+	}
 	info->http = c;
 
 	err = ensure_super(info);
@@ -1864,11 +2884,15 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 		err = -ENOMEM;
 		goto fail;
 	}
-	pr_info("aiosfs: mounted with backend=http (in-kernel)\n");
+	pr_info("aiosfs: mounted with backend=http (pool=%u)\n", AIOSFS_HTTP_POOL_SIZE);
 	return 0;
 
 fail:
-	aios_http_client_destroy(info->http);
+	if (info->http && info->http_pool)
+		aios_http_pool_put(info->http_pool, info->http);
 	info->http = NULL;
+	if (info->http_pool)
+		aios_http_pool_destroy(info->http_pool);
+	info->http_pool = NULL;
 	return err;
 }

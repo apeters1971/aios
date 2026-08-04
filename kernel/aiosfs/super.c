@@ -200,6 +200,7 @@ int aios_fill_super(struct super_block *sb, struct aios_sb_info *info)
 	sb->s_magic = AIOSFS_MAGIC;
 	sb->s_op = &aios_super_ops;
 	sb->s_d_op = &aios_dentry_ops;
+	sb->s_xattr = aios_xattr_handlers;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_blocksize = 4096;
 	sb->s_blocksize_bits = 12;

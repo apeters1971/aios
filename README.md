@@ -14,6 +14,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
 | `aios-fuse` | FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
+| `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
 Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
@@ -72,6 +73,13 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 - Status JSON file, HMAC shared-secret auth on gossip/RPC/HTTP
 - Admin console + Prometheus (`/admin/*`, `/metrics`); application labels for per-workload OPS
 - Optional Intel ISA-L Reed–Solomon for EC with `m > 1`
+
+**Kernel (AlmaLinux 9 / 5.14)**
+
+- In-kernel HTTP client (`aios_http.ko`): HMAC auth, keep-alive TCP, timeouts/reconnect, `Content-Range` PUT, shared client pool
+- VFS mount `aiosfs.ko`: page cache + `O_DIRECT`, xattrs, node-local locks, HTTP hardlinks / punch-hole, parallel writeback
+- Block volumes `aiosvd.ko`: object-striped `/dev/aiosvdN`, discard, COW clones, resize/rename, QoS map knobs
+- Optional DKMS package `aios-kernel`; userspace helpers `aios-kbridge`, `aios-vd`
 
 ---
 
@@ -486,14 +494,56 @@ aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 
 ## Kernel prototype (AlmaLinux 9)
 
-Out-of-tree modules on el9 / kernel 5.14: **`aios_http.ko`** (HTTP + HMAC) and **`aiosfs.ko`** (`mount -t aios`). Use `backend=http` for a fully in-kernel path, or `backend=upcall` with **`aios-kbridge`**. Details: [`kernel/README.md`](kernel/README.md).
+Out-of-tree modules for **el9 / kernel 5.14**. Full detail: [`kernel/README.md`](kernel/README.md).
+
+| Module | Role |
+|--------|------|
+| `aios_http.ko` | In-kernel HTTP/1.1 + AIOS-HMAC; keep-alive, ~30s timeouts, reconnect; `put_range`; shared client pool |
+| `aiosfs.ko` | `mount -t aios` — `backend=http` (direct) or `backend=upcall` (+ `aios-kbridge`) |
+| `aiosvd.ko` | Block volume device `/dev/aiosvdN` over `vd/{pool}/{name}/data.*` object stripes |
+
+**aiosfs**
+
+- Buffered page cache with writeback; HTTP path flushes dirty chunks in parallel via the HTTP pool
+- `O_DIRECT` (`IOCB_DIRECT`) bypasses the page cache
+- xattrs (`user.*` / `trusted.*`): HTTP stores them in inode meta JSON; upcall uses kabi ops → `aios_posix_*xattr`
+- Advisory POSIX/`flock` locks are **node-local** (not cluster-wide)
+- HTTP densening: hardlinks, `fallocate` punch-hole + `KEEP_SIZE`; cross-directory rename via `/txn`
+
+**aiosvd**
+
+- blk-mq + dual workqueues; object cache; partial writes prefer `Content-Range` PUT
+- Discard / WRITE_ZEROES (thin); FLUSH/FUA; resize (CAS header); rename; lightweight COW **clone**
+- Map flags: `--create`, `--excl`, `--readonly`, `--key-id` (hook only — no in-kernel AES), `--queue-depth`, `--max-clients`
+- CLI: `aios-vd map|unmap|info|list|resize|clone|rename`; stress: `tools/aios_vd_stress.sh`
+- Stats: `aios-vd info` and sysfs `…/aiosvd/stats`
+
+**Build / install**
 
 ```bash
-# on AlmaLinux 9 — in-kernel HTTP
-cd kernel && make && sudo insmod aios_http/aios_http.ko && sudo insmod aiosfs/aiosfs.ko
+# on AlmaLinux 9
+sudo dnf install -y kernel-devel-$(uname -r) gcc make elfutils-libelf-devel
+cd kernel && make && sudo make install
+# or DKMS: sudo dnf install -y dkms && sudo make dkms-install   # package aios-kernel
+
+# userspace helpers (from repo root)
+cmake -S . -B build -DAIOS_WITH_KBRIDGE=ON
+cmake --build build --target aios-kbridge aios-vd -j
+
+# filesystem (in-kernel HTTP)
+sudo modprobe aios_http   # or insmod …/aios_http.ko
+sudo modprobe aiosfs
 sudo mount -t aios none /mnt/aios \
   -o backend=http,endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
+
+# block volume
+sudo modprobe aiosvd
+sudo ./build/aios-vd map --endpoint 127.0.0.1:7480 --key $KEY \
+  --pool default --name disk1 --size 1G --create --excl   # → /dev/aiosvd0
+KEY=$KEY ./tools/aios_vd_stress.sh
 ```
+
+Secure Boot still requires signed modules (or SB disabled). Limits and ABI notes live in [`kernel/README.md`](kernel/README.md).
 
 ---
 
@@ -528,7 +578,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
 | [`proto/posix_fuse.md`](proto/posix_fuse.md) | POSIX C ABI, striping, FUSE3 mount |
-| [`kernel/README.md`](kernel/README.md) | AlmaLinux 9 `aiosfs` kernel prototype |
+| [`kernel/README.md`](kernel/README.md) | AlmaLinux 9 modules: `aios_http` / `aiosfs` / `aiosvd`, DKMS |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 
 Run the unit suite after changes:

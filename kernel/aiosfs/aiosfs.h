@@ -7,15 +7,19 @@
 #include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
+#include <linux/uio.h>
 #include <linux/wait.h>
 #include <linux/writeback.h>
+#include <linux/xattr.h>
 
 #include "../aios_kabi.h"
 
 struct aios_http_client;
+struct aios_http_pool;
 
 #define AIOSFS_NAME "aios"
 #define AIOSFS_MAGIC 0x41494F53 /* AIOS */
+#define AIOSFS_HTTP_POOL_SIZE 4
 
 enum aios_backend {
 	AIOS_BACKEND_UPCALL = 0,
@@ -28,6 +32,7 @@ struct aios_sb_info {
 	enum aios_backend backend;
 	struct aios_conn *conn;
 	struct aios_http_client *http;
+	struct aios_http_pool *http_pool;
 	struct mutex http_mu;
 	int mount_id;
 	char endpoint[256];
@@ -73,13 +78,33 @@ int aios_io_fsync(struct inode *inode);
 int aios_http_io_read(struct inode *inode, loff_t pos, void *buf, size_t len, size_t *out_len);
 int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t len);
 int aios_http_io_set_size(struct inode *inode, loff_t size);
+int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len);
+/* Parallel dirty-page flush using aios_http_pool (chunk-grouped). */
+int aios_http_writepages(struct address_space *mapping, struct writeback_control *wbc);
 
-/* Page cache */
+/* xattrs (HTTP backend) */
+int aios_http_getxattr(struct inode *inode, const char *name, void *buf, size_t size);
+int aios_http_setxattr(struct inode *inode, const char *name, const void *buf, size_t size,
+		       int flags);
+int aios_http_listxattr(struct inode *inode, char *list, size_t size);
+int aios_http_removexattr(struct inode *inode, const char *name);
+
+/* xattrs (dispatch + VFS handlers for 5.14) */
+int aios_getxattr(struct inode *inode, const char *name, void *buf, size_t size);
+int aios_setxattr(struct inode *inode, const char *name, const void *buf, size_t size, int flags);
+int aios_listxattr(struct dentry *dentry, char *list, size_t size);
+int aios_removexattr(struct inode *inode, const char *name);
+extern const struct xattr_handler *aios_xattr_handlers[];
+
+/* Page cache / file ops helpers */
 extern const struct address_space_operations aios_aops;
 void aios_setup_file_inode(struct inode *inode);
 int aios_write_inode(struct inode *inode, struct writeback_control *wbc);
 void aios_evict_inode(struct inode *inode);
 int aios_file_fsync(struct file *file, loff_t start, loff_t end, int datasync);
+ssize_t aios_file_read_iter(struct kiocb *iocb, struct iov_iter *to);
+ssize_t aios_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
+long aios_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 
 extern const struct inode_operations aios_dir_inode_ops;
 extern const struct inode_operations aios_file_inode_ops;

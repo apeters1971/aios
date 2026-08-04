@@ -225,6 +225,12 @@ if(AIOS_WITH_KBRIDGE)
   install(FILES kernel/aios_kabi.h DESTINATION include/aios)
 endif()
 
+# Userspace control for aiosvd.ko (AIOS Volume Device).
+add_executable(aios-vd tools/aios_vd.cpp)
+target_include_directories(aios-vd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+install(TARGETS aios-vd RUNTIME DESTINATION bin)
+install(FILES kernel/aiosvd_uapi.h DESTINATION include/aios)
+
 enable_testing()
 add_executable(aios_tests
   tests/test_framing.cpp

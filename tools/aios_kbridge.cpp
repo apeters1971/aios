@@ -286,6 +286,66 @@ bool serve_one(int fd, const aios_kabi_req_hdr& hdr, const std::vector<uint8_t>&
       out.namemax = st.namemax;
       return write_reply(fd, hdr.unique, 0, &out, sizeof(out));
     }
+    case AIOS_OP_SETXATTR: {
+      if (payload.size() < sizeof(aios_kabi_setxattr_in))
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      auto* in = reinterpret_cast<const aios_kabi_setxattr_in*>(payload.data());
+      if (payload.size() < sizeof(*in) + in->value_len)
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      const void* val = in->value_len ? static_cast<const void*>(in + 1) : nullptr;
+      int rc = aios_posix_setxattr(fs, in->ino, in->name, val, in->value_len, in->flags);
+      return write_reply(fd, hdr.unique, rc, nullptr, 0);
+    }
+    case AIOS_OP_GETXATTR: {
+      if (payload.size() < sizeof(aios_kabi_getxattr_in))
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      auto* in = reinterpret_cast<const aios_kabi_getxattr_in*>(payload.data());
+      if (in->size == 0) {
+        int rc = aios_posix_getxattr(fs, in->ino, in->name, nullptr, 0);
+        if (rc < 0) return write_reply(fd, hdr.unique, rc, nullptr, 0);
+        aios_kabi_xattr_out out{};
+        out.size = static_cast<uint32_t>(rc);
+        return write_reply(fd, hdr.unique, 0, &out, sizeof(out));
+      }
+      uint32_t n = in->size;
+      if (n > AIOS_KABI_XATTR_VALUE_MAX) n = AIOS_KABI_XATTR_VALUE_MAX;
+      std::vector<uint8_t> buf(sizeof(aios_kabi_xattr_out) + n);
+      auto* hdr_out = reinterpret_cast<aios_kabi_xattr_out*>(buf.data());
+      int rc = aios_posix_getxattr(fs, in->ino, in->name, hdr_out + 1, n);
+      if (rc < 0) return write_reply(fd, hdr.unique, rc, nullptr, 0);
+      hdr_out->size = static_cast<uint32_t>(rc);
+      return write_reply(fd, hdr.unique, 0, buf.data(),
+                         static_cast<uint32_t>(sizeof(*hdr_out) + rc));
+    }
+    case AIOS_OP_LISTXATTR: {
+      if (payload.size() < sizeof(aios_kabi_listxattr_in))
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      auto* in = reinterpret_cast<const aios_kabi_listxattr_in*>(payload.data());
+      if (in->size == 0) {
+        int rc = aios_posix_listxattr(fs, in->ino, nullptr, 0);
+        if (rc < 0) return write_reply(fd, hdr.unique, rc, nullptr, 0);
+        aios_kabi_xattr_out out{};
+        out.size = static_cast<uint32_t>(rc);
+        return write_reply(fd, hdr.unique, 0, &out, sizeof(out));
+      }
+      uint32_t n = in->size;
+      if (n > AIOS_KABI_MAX_PAYLOAD - sizeof(aios_kabi_xattr_out))
+        n = AIOS_KABI_MAX_PAYLOAD - sizeof(aios_kabi_xattr_out);
+      std::vector<uint8_t> buf(sizeof(aios_kabi_xattr_out) + n);
+      auto* hdr_out = reinterpret_cast<aios_kabi_xattr_out*>(buf.data());
+      int rc = aios_posix_listxattr(fs, in->ino, reinterpret_cast<char*>(hdr_out + 1), n);
+      if (rc < 0) return write_reply(fd, hdr.unique, rc, nullptr, 0);
+      hdr_out->size = static_cast<uint32_t>(rc);
+      return write_reply(fd, hdr.unique, 0, buf.data(),
+                         static_cast<uint32_t>(sizeof(*hdr_out) + rc));
+    }
+    case AIOS_OP_REMOVEXATTR: {
+      if (payload.size() < sizeof(aios_kabi_removexattr_in))
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      auto* in = reinterpret_cast<const aios_kabi_removexattr_in*>(payload.data());
+      int rc = aios_posix_removexattr(fs, in->ino, in->name);
+      return write_reply(fd, hdr.unique, rc, nullptr, 0);
+    }
     default:
       return write_reply(fd, hdr.unique, -ENOSYS, nullptr, 0);
   }

@@ -23,4 +23,4 @@ module_exit(aios_http_exit);
 MODULE_AUTHOR("AIOS");
 MODULE_DESCRIPTION("AIOS in-kernel HTTP/1.1 + HMAC client");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1.0");
+MODULE_VERSION("0.2.0");

@@ -331,11 +331,13 @@ const struct inode_operations aios_dir_inode_ops = {
 	.link = aios_link,
 	.getattr = aios_getattr,
 	.setattr = aios_setattr,
+	.listxattr = aios_listxattr,
 };
 
 const struct inode_operations aios_file_inode_ops = {
 	.getattr = aios_getattr,
 	.setattr = aios_setattr,
+	.listxattr = aios_listxattr,
 };
 
 static int aios_readdir(struct file *file, struct dir_context *ctx)
@@ -410,10 +412,13 @@ int aios_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 const struct file_operations aios_file_ops = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
-	.read_iter = generic_file_read_iter,
-	.write_iter = generic_file_write_iter,
+	.read_iter = aios_file_read_iter,
+	.write_iter = aios_file_write_iter,
 	.mmap = generic_file_mmap,
 	.fsync = aios_file_fsync,
+	.fallocate = aios_fallocate,
+	.lock = locks_lock_file_wait,
+	.flock = locks_lock_file_wait,
 	.splice_read = generic_file_splice_read,
 	.open = generic_file_open,
 };

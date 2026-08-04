@@ -9,6 +9,7 @@
 #include <linux/types.h>
 
 struct aios_http_client;
+struct aios_http_pool;
 
 struct aios_http_buf {
 	void *data; /* kvmalloc'd; caller uses aios_http_buf_free() */
@@ -19,6 +20,10 @@ struct aios_http_client *aios_http_client_create(const char *endpoint /* HOST:PO
 						 const char *cluster_key, gfp_t gfp);
 void aios_http_client_destroy(struct aios_http_client *c);
 void aios_http_client_set_app_label(struct aios_http_client *c, const char *label);
+
+/* Socket send/recv timeout (default 30000). Applied to sk_sndtimeo/sk_rcvtimeo. */
+void aios_http_client_set_timeout_ms(struct aios_http_client *c, unsigned int ms);
+void aios_http_client_get_stats(struct aios_http_client *c, u64 *timeouts, u64 *reconnects);
 
 void aios_http_buf_free(struct aios_http_buf *b);
 
@@ -37,6 +42,9 @@ int aios_http_get(struct aios_http_client *c, const char *oid, struct aios_http_
 int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u64 *cas_out);
 int aios_http_put(struct aios_http_client *c, const char *oid, const void *body, size_t len,
 		  const char *extra_hdrs, u64 *cas_inout /* NULL=unconditional; else CAS */);
+/* Partial PUT via Content-Range: bytes start-end/* (inclusive end). */
+int aios_http_put_range(struct aios_http_client *c, const char *oid, u64 offset,
+			const void *data, size_t len, u64 *cas_inout);
 int aios_http_delete(struct aios_http_client *c, const char *oid);
 
 /* Range GET: bytes start-end inclusive. */
@@ -57,5 +65,18 @@ int aios_http_txn_prepare_delete(struct aios_http_client *c, const char *txn_id,
 				 const char *lock_token);
 int aios_http_txn_commit(struct aios_http_client *c, const char *txn_id);
 int aios_http_txn_abort(struct aios_http_client *c, const char *txn_id);
+
+/*
+ * Shared client pool — create/get/put/destroy. aiosvd uses this; aiosfs may adopt later.
+ * Clients are keep-alive TCP sockets with per-client mutex serialization.
+ */
+struct aios_http_pool *aios_http_pool_create(const char *endpoint, const char *cluster_key,
+					     const char *app_label, unsigned int n, gfp_t gfp);
+void aios_http_pool_destroy(struct aios_http_pool *p);
+struct aios_http_client *aios_http_pool_get(struct aios_http_pool *p);
+void aios_http_pool_put(struct aios_http_pool *p, struct aios_http_client *c);
+void aios_http_pool_set_timeout_ms(struct aios_http_pool *p, unsigned int ms);
+void aios_http_pool_get_stats(struct aios_http_pool *p, u64 *timeouts, u64 *reconnects);
+unsigned int aios_http_pool_size(struct aios_http_pool *p);
 
 #endif /* AIOS_HTTP_API_H */

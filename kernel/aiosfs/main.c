@@ -52,5 +52,5 @@ module_exit(aiosfs_exit);
 MODULE_AUTHOR("AIOS");
 MODULE_DESCRIPTION("AIOS POSIX filesystem prototype (AlmaLinux 9)");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.3.0");
+MODULE_VERSION("0.4.0");
 MODULE_SOFTDEP("pre: aios_http");

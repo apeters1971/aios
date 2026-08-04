@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Page-cache buffered I/O + writeback for aiosfs (AlmaLinux 9 / 5.14).
+ * Page-cache buffered I/O + writeback + O_DIRECT for aiosfs (AlmaLinux 9 / 5.14).
  *
  * Reads fill pages via aios_io_read; dirty pages are flushed by writepage /
- * writepages through aios_io_write. Userspace sees generic_file_read_iter /
- * generic_file_write_iter.
+ * writepages through aios_io_write. Userspace sees aios_file_read_iter /
+ * aios_file_write_iter (buffered default; IOCB_DIRECT bypasses page cache).
  */
 #include "aiosfs.h"
 
+#include <linux/falloc.h>
 #include <linux/pagemap.h>
+#include <linux/slab.h>
+#include <linux/uio.h>
 #include <linux/writeback.h>
+
+#define AIOS_DIO_CHUNK (256u * 1024u)
 
 static int aios_readpage(struct file *file, struct page *page)
 {
@@ -92,6 +97,11 @@ static int aios_writepages_cb(struct page *page, struct writeback_control *wbc, 
 
 static int aios_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
+	struct inode *inode = mapping->host;
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+
+	if (info->backend == AIOS_BACKEND_HTTP && info->http_pool)
+		return aios_http_writepages(mapping, wbc);
 	return write_cache_pages(mapping, wbc, aios_writepages_cb, NULL);
 }
 
@@ -174,6 +184,159 @@ const struct address_space_operations aios_aops = {
 	.write_begin = aios_write_begin,
 	.write_end = aios_write_end,
 };
+
+static ssize_t aios_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool write)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	loff_t pos = iocb->ki_pos;
+	size_t total = iov_iter_count(iter);
+	size_t chunk = min_t(size_t, total, AIOS_DIO_CHUNK);
+	void *buf;
+	ssize_t done = 0;
+	int err = 0;
+
+	if (!total)
+		return 0;
+
+	buf = kvmalloc(chunk, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	while (iov_iter_count(iter)) {
+		size_t n = min_t(size_t, iov_iter_count(iter), chunk);
+		size_t got = 0;
+
+		if (write) {
+			if (copy_from_iter(buf, n, iter) != n) {
+				err = -EFAULT;
+				break;
+			}
+			err = aios_io_write(inode, pos, buf, n);
+			if (err)
+				break;
+			got = n;
+		} else {
+			err = aios_io_read(inode, pos, buf, n, &got);
+			if (err)
+				break;
+			if (!got)
+				break;
+			if (copy_to_iter(buf, got, iter) != got) {
+				err = -EFAULT;
+				break;
+			}
+		}
+		pos += got;
+		done += got;
+		if (!write && got < n)
+			break;
+	}
+
+	kvfree(buf);
+	if (done) {
+		iocb->ki_pos = pos;
+		if (write && pos > i_size_read(inode)) {
+			i_size_write(inode, pos);
+			mark_inode_dirty(inode);
+		}
+		return done;
+	}
+	return err ? err : 0;
+}
+
+ssize_t aios_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+	if (iocb->ki_flags & IOCB_DIRECT) {
+		struct inode *inode = file_inode(iocb->ki_filp);
+		loff_t size = i_size_read(inode);
+		size_t count = iov_iter_count(to);
+		int err;
+
+		if (!count || iocb->ki_pos >= size)
+			return 0;
+		if (iocb->ki_pos + (loff_t)count > size)
+			iov_iter_truncate(to, size - iocb->ki_pos);
+		count = iov_iter_count(to);
+		if (!count)
+			return 0;
+
+		err = invalidate_inode_pages2_range(inode->i_mapping,
+						   iocb->ki_pos >> PAGE_SHIFT,
+						   (iocb->ki_pos + count - 1) >> PAGE_SHIFT);
+		if (err)
+			return err;
+		return aios_direct_IO(iocb, to, false);
+	}
+	return generic_file_read_iter(iocb, to);
+}
+
+ssize_t aios_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	if (iocb->ki_flags & IOCB_DIRECT) {
+		struct file *file = iocb->ki_filp;
+		struct inode *inode = file_inode(file);
+		ssize_t ret;
+		int err;
+
+		inode_lock(inode);
+		ret = generic_write_checks(iocb, from);
+		if (ret > 0) {
+			size_t count = iov_iter_count(from);
+
+			err = file_remove_privs(file);
+			if (!err)
+				err = file_update_time(file);
+			if (err) {
+				ret = err;
+			} else if (!count) {
+				ret = 0;
+			} else {
+				loff_t endbyte = iocb->ki_pos + count - 1;
+
+				err = invalidate_inode_pages2_range(inode->i_mapping,
+								    iocb->ki_pos >> PAGE_SHIFT,
+								    endbyte >> PAGE_SHIFT);
+				if (err)
+					ret = err;
+				else
+					ret = aios_direct_IO(iocb, from, true);
+			}
+		}
+		inode_unlock(inode);
+		return ret;
+	}
+	return generic_file_write_iter(iocb, from);
+}
+
+long aios_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	int err;
+
+	if (offset < 0 || len <= 0)
+		return -EINVAL;
+	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+		return -EOPNOTSUPP;
+	if ((mode & FALLOC_FL_PUNCH_HOLE) && !(mode & FALLOC_FL_KEEP_SIZE))
+		return -EOPNOTSUPP;
+	if (!(mode & FALLOC_FL_PUNCH_HOLE))
+		return -EOPNOTSUPP; /* prealloc not implemented */
+
+	if (!S_ISREG(inode->i_mode))
+		return -ENODEV;
+
+	inode_lock(inode);
+	if (info->backend == AIOS_BACKEND_HTTP) {
+		err = aios_http_io_punch(inode, offset, len);
+		if (!err)
+			truncate_pagecache_range(inode, offset, offset + len - 1);
+	} else {
+		err = -EOPNOTSUPP;
+	}
+	inode_unlock(inode);
+	return err;
+}
 
 int aios_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
