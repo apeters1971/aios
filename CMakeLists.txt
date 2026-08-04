@@ -111,6 +111,9 @@ add_library(aios_core STATIC
 target_include_directories(aios_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+target_compile_definitions(aios_core PRIVATE
+  "AIOS_ADMIN_WEB_DEFAULT=\"${CMAKE_CURRENT_SOURCE_DIR}/web/admin\""
+)
 target_link_libraries(aios_core PUBLIC
   Threads::Threads
   Boost::headers
@@ -281,3 +284,4 @@ install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION bin)
 install(TARGETS aios_client aios_posix ARCHIVE DESTINATION lib)
 install(FILES src/posix/aios_posix.h DESTINATION include/aios)
 install(FILES config/aiosd.example.yaml DESTINATION share/aios)
+install(DIRECTORY web/admin DESTINATION share/aios)

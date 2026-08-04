@@ -14,15 +14,45 @@ admin_metrics_public: true
 aiosd --cluster-key "$KEY" --admin --admin-metrics-public ...
 ```
 
+## Web UI
+
+Open **`http://HOST:PORT/admin/`** in a browser (same `http_listen`).
+
+1. Sign in with the **cluster key** (password field).
+2. A session cookie (`aios_admin`, HttpOnly, SameSite=Strict, 12h) authenticates subsequent `/admin/api/*` calls.
+3. Panels: Overview (OPS), Cluster peers, Config (read-only; secrets redacted), Actions (toggle `admin_metrics_public`, run transitions, run repair).
+
+Static assets live in [`web/admin/`](../web/admin/) (installed to `share/aios/admin`). Override search path with **`AIOS_ADMIN_WEB`**.
+
+Logout: `POST /admin/logout`.
+
 ## HTTP endpoints
 
-All admin JSON routes still require the normal AIOS HMAC Authorization header, except `GET /metrics` when `admin_metrics_public` is true.
+### Browser / session
+
+| Path | Auth | Response |
+|------|------|----------|
+| `GET /admin/`, `/admin/index.html`, `app.js`, `style.css`, `aios-icon.png` | none | Web UI assets |
+| `POST /admin/login` | body `{"cluster_key"}` | Sets session cookie |
+| `POST /admin/logout` | session optional | Clears cookie |
+| `GET /admin/api/status` | cookie **or** HMAC | Same as `/admin/status` |
+| `GET /admin/api/ops` | cookie **or** HMAC | Same as `/admin/ops` |
+| `GET /admin/api/config` | cookie **or** HMAC | Same as `/admin/config` |
+| `GET /admin/api/cluster` | cookie **or** HMAC | Same as `/admin/cluster` |
+| `GET /admin/api/transitions` | cookie **or** HMAC | Transition rules |
+| `POST /admin/api/transitions/run` | cookie **or** HMAC | One transition tick |
+| `POST /admin/api/repair/run` | cookie **or** HMAC | One repair tick |
+| `POST /admin/api/settings` | cookie **or** HMAC | `{admin_metrics_public: bool}` (in-memory) |
+
+### Legacy JSON (CLI / HMAC)
+
+All of these require the normal AIOS HMAC Authorization header, except `GET /metrics` when `admin_metrics_public` is true.
 
 | Path | Response |
 |------|----------|
 | `GET /admin/status` | Node identity, map epoch, membership, local `ops` |
 | `GET /admin/ops` | `{node_id, ops, ops_by_label}` |
-| `GET /admin/config` | Effective config (`cluster_key` → `"***"`). Read-only; changes need restart. |
+| `GET /admin/config` | Effective config (`cluster_key` → `"***"`). Most changes need restart; `admin_metrics_public` can be toggled via `/admin/api/settings`. |
 | `GET /admin/cluster` | Local status + `admin_peers` (`node_id`, `http_addr`) for cluster scrape |
 | `GET /admin/transitions` | Configured storage-class `transition_rules` + intervals |
 | `POST /admin/transitions/run` | Run one local transition tick; returns `{matched,migrated,drained,failed}` |
@@ -66,7 +96,7 @@ Console commands: `status`, `ops`, `config`, `cluster`, `metrics`, `help`, `quit
 
 ## Prometheus
 
-Point Prometheus at an admin node's `/metrics`. Prefer `admin_metrics_public: true` plus network ACLs, or configure a scraper that signs AIOS HMAC.
+Point Prometheus at an admin node's `/metrics`. Prefer `admin_metrics_public: true` plus network ACLs, or configure a scraper that signs AIOS HMAC. The web UI Actions tab can toggle public metrics at runtime (in-memory; not persisted to YAML).
 
 Example metric names: `aios_http_requests_total`, `aios_ops_put_total`, `aios_ops_get_bytes_total`, `aios_gossip_rounds_total`, `aios_repair_repaired_total`.
 

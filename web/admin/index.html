@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AIOS Admin</title>
+  <link rel="icon" type="image/png" href="/admin/aios-icon.png" />
+  <link rel="stylesheet" href="/admin/style.css" />
+</head>
+<body>
+  <div id="login-view" class="login-view hidden">
+    <div class="login-panel">
+      <img class="login-brand" src="/admin/aios-icon.png" alt="AIOS" width="160" height="160" />
+      <h1 class="login-title">AIOS</h1>
+      <p class="login-sub">Admin console — enter the cluster key to continue.</p>
+      <form id="login-form" autocomplete="off">
+        <label class="field">
+          <span>Cluster key</span>
+          <input id="cluster-key" type="password" name="cluster_key" required spellcheck="false" />
+        </label>
+        <button type="submit" class="btn primary">Sign in</button>
+        <p id="login-error" class="error" hidden></p>
+      </form>
+    </div>
+  </div>
+
+  <div id="app-view" class="app-view hidden">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/admin/aios-icon.png" alt="" width="40" height="40" />
+        <div>
+          <strong>AIOS Admin</strong>
+          <span id="node-label" class="muted"></span>
+        </div>
+      </div>
+      <nav class="tabs" id="tabs">
+        <button type="button" data-tab="overview" class="tab active">Overview</button>
+        <button type="button" data-tab="cluster" class="tab">Cluster</button>
+        <button type="button" data-tab="config" class="tab">Config</button>
+        <button type="button" data-tab="actions" class="tab">Actions</button>
+      </nav>
+      <button type="button" id="logout-btn" class="btn ghost">Log out</button>
+    </header>
+
+    <main class="main">
+      <section id="tab-overview" class="panel">
+        <h2>Overview</h2>
+        <div id="overview-cards" class="cards"></div>
+        <h3>Operations</h3>
+        <div id="ops-table" class="table-wrap"></div>
+      </section>
+
+      <section id="tab-cluster" class="panel hidden">
+        <h2>Cluster</h2>
+        <div id="cluster-table" class="table-wrap"></div>
+      </section>
+
+      <section id="tab-config" class="panel hidden">
+        <h2>Configuration</h2>
+        <p class="note">Effective runtime config. Most fields require a daemon restart to change. Secrets are redacted.</p>
+        <pre id="config-json" class="code-block"></pre>
+      </section>
+
+      <section id="tab-actions" class="panel hidden">
+        <h2>Actions</h2>
+        <div class="action-grid">
+          <div class="action-card">
+            <h3>Prometheus metrics</h3>
+            <p class="muted">When public, <code>GET /metrics</code> skips HMAC (restrict the port).</p>
+            <label class="toggle">
+              <input type="checkbox" id="metrics-public" />
+              <span>admin_metrics_public</span>
+            </label>
+            <button type="button" id="save-settings" class="btn primary">Save</button>
+          </div>
+          <div class="action-card">
+            <h3>Storage-class transitions</h3>
+            <p class="muted">Run one local transition tick now.</p>
+            <button type="button" id="run-transitions" class="btn primary">Run transitions</button>
+            <pre id="transitions-result" class="code-block small"></pre>
+          </div>
+          <div class="action-card">
+            <h3>Repair</h3>
+            <p class="muted">Scan local objects and push missing replicas.</p>
+            <button type="button" id="run-repair" class="btn primary">Run repair</button>
+            <pre id="repair-result" class="code-block small"></pre>
+          </div>
+        </div>
+        <p id="action-error" class="error" hidden></p>
+      </section>
+    </main>
+  </div>
+
+  <script src="/admin/app.js"></script>
+</body>
+</html>

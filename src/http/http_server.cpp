@@ -5,6 +5,7 @@
 #include "net/framing.hpp"
 #include "object/object_layout.hpp"
 #include "object/pubsub.hpp"
+#include "object/repair.hpp"
 #include "object/transition.hpp"
 #include "util/auth.hpp"
 #include "util/base64.hpp"
@@ -26,6 +27,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifndef AIOS_ADMIN_WEB_DEFAULT
+#define AIOS_ADMIN_WEB_DEFAULT ""
+#endif
 
 namespace fs = std::filesystem;
 
@@ -347,6 +352,129 @@ bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& 
   }
 }
 
+constexpr std::int64_t kAdminSessionTtlMs = 12LL * 60 * 60 * 1000;
+constexpr const char* kAdminCookie = "aios_admin";
+
+bool const_time_eq(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+  }
+  return diff == 0;
+}
+
+std::string cookie_get(const std::unordered_map<std::string, std::string>& headers,
+                       const std::string& name) {
+  const auto raw = header_get(headers, "cookie");
+  std::size_t i = 0;
+  while (i < raw.size()) {
+    while (i < raw.size() && (raw[i] == ' ' || raw[i] == ';')) ++i;
+    auto eq = raw.find('=', i);
+    auto semi = raw.find(';', i);
+    if (eq == std::string::npos) break;
+    if (semi == std::string::npos) semi = raw.size();
+    if (eq < semi) {
+      auto k = raw.substr(i, eq - i);
+      auto v = raw.substr(eq + 1, semi - eq - 1);
+      if (k == name) return v;
+    }
+    i = semi;
+  }
+  return {};
+}
+
+std::string make_admin_session(const std::string& cluster_key) {
+  const auto exp = std::to_string(now_ms() + kAdminSessionTtlMs);
+  const auto sig = hmac_sha256_hex(cluster_key, std::string("aios-admin-v1\n") + exp);
+  return exp + "." + sig;
+}
+
+bool verify_admin_session(const std::string& token, const std::string& cluster_key) {
+  auto dot = token.find('.');
+  if (dot == std::string::npos || dot == 0 || dot + 1 >= token.size()) return false;
+  const auto exp_s = token.substr(0, dot);
+  const auto sig = token.substr(dot + 1);
+  std::int64_t exp = 0;
+  try {
+    exp = std::stoll(exp_s);
+  } catch (...) {
+    return false;
+  }
+  if (exp < now_ms()) return false;
+  const auto expect = hmac_sha256_hex(cluster_key, std::string("aios-admin-v1\n") + exp_s);
+  return const_time_eq(expect, sig);
+}
+
+std::filesystem::path find_admin_web_root() {
+  if (const char* env = std::getenv("AIOS_ADMIN_WEB"); env && *env) {
+    std::filesystem::path p(env);
+    if (std::filesystem::is_directory(p)) return p;
+  }
+  const char* defaults = AIOS_ADMIN_WEB_DEFAULT;
+  if (defaults && *defaults) {
+    std::filesystem::path p(defaults);
+    if (std::filesystem::is_directory(p)) return p;
+  }
+  for (const char* cand : {"web/admin", "../web/admin", "share/aios/admin",
+                           "../share/aios/admin"}) {
+    std::filesystem::path p(cand);
+    if (std::filesystem::is_directory(p)) return std::filesystem::absolute(p);
+  }
+  return {};
+}
+
+bool is_admin_static_path(const std::string& path) {
+  return path == "/admin" || path == "/admin/" || path == "/admin/index.html" ||
+         path == "/admin/app.js" || path == "/admin/style.css" ||
+         path == "/admin/aios-icon.png";
+}
+
+std::string admin_static_content_type(const std::string& path) {
+  if (path.size() >= 5 && path.substr(path.size() - 5) == ".html") return "text/html; charset=utf-8";
+  if (path.size() >= 3 && path.substr(path.size() - 3) == ".js")
+    return "application/javascript; charset=utf-8";
+  if (path.size() >= 4 && path.substr(path.size() - 4) == ".css") return "text/css; charset=utf-8";
+  if (path.size() >= 4 && path.substr(path.size() - 4) == ".png") return "image/png";
+  return "application/octet-stream";
+}
+
+bool serve_admin_static(tcp::socket& sock, const std::string& path, bool keep_alive) {
+  auto root = find_admin_web_root();
+  if (root.empty()) {
+    write_json(sock, 503, "Service Unavailable",
+               {{"error", "admin web assets not found (set AIOS_ADMIN_WEB)"}}, keep_alive);
+    return true;
+  }
+  std::string rel = "index.html";
+  if (path == "/admin/app.js") rel = "app.js";
+  else if (path == "/admin/style.css") rel = "style.css";
+  else if (path == "/admin/aios-icon.png") rel = "aios-icon.png";
+  else if (path == "/admin/index.html" || path == "/admin" || path == "/admin/") rel = "index.html";
+  else {
+    write_json(sock, 404, "Not Found", {{"error", "unknown admin asset"}}, keep_alive);
+    return true;
+  }
+  auto file = root / rel;
+  std::error_code ec;
+  file = std::filesystem::weakly_canonical(file, ec);
+  auto root_c = std::filesystem::weakly_canonical(root, ec);
+  if (ec || file.string().rfind(root_c.string(), 0) != 0 ||
+      !std::filesystem::is_regular_file(file)) {
+    write_json(sock, 404, "Not Found", {{"error", "asset missing"}}, keep_alive);
+    return true;
+  }
+  std::ifstream in(file, std::ios::binary);
+  if (!in) {
+    write_json(sock, 404, "Not Found", {{"error", "asset unreadable"}}, keep_alive);
+    return true;
+  }
+  std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  write_response(sock, 200, "OK", {{"Content-Type", admin_static_content_type(path)}},
+                 reinterpret_cast<const std::uint8_t*>(data.data()), data.size(), keep_alive);
+  return true;
+}
+
 }  // namespace
 
 nlohmann::json HttpServer::admin_config_json() const {
@@ -405,8 +533,11 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"max_versions", c.max_versions},
       {"clone_required", c.clone_required},
       {"max_object_bytes", c.max_object_bytes},
-      {"admin", c.admin},
-      {"admin_metrics_public", c.admin_metrics_public},
+      {"admin", cfg_.admin},
+      {"admin_metrics_public", cfg_.admin_metrics_public},
+      {"s3_listen", c.s3_listen},
+      {"s3_volume", c.s3_volume},
+      {"s3_access_key", c.s3_access_key},
   };
 }
 
@@ -575,34 +706,91 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     AppLabelScope label_scope(app_label);
     objects_.ops().note_http_request();
 
-    // Prometheus scrape may skip HMAC when admin_metrics_public is set.
     const bool metrics_public =
         cfg_.admin && cfg_.admin_metrics_public && method == "GET" && path == "/metrics";
+    const bool admin_static = cfg_.admin && method == "GET" && is_admin_static_path(path);
+    const bool admin_login = cfg_.admin && method == "POST" && path == "/admin/login";
+    const bool admin_logout = cfg_.admin && method == "POST" && path == "/admin/logout";
+    const bool admin_api = path.rfind("/admin/api/", 0) == 0;
+    const bool skip_hmac = metrics_public || admin_static || admin_login || admin_logout;
 
-    // Auth
-    if (!metrics_public) {
+    bool authed = skip_hmac;
+    if (!skip_hmac) {
       const bool unsigned_payload =
           header_get(headers, "x-aios-content-sha256") == "UNSIGNED-PAYLOAD";
       const std::string payload_hash =
           unsigned_payload ? "UNSIGNED-PAYLOAD" : sha256_hex(body.data(), body.size());
       auto auth = http_auth_verify(method, target, headers, payload_hash, cfg_.cluster_key,
                                    cfg_.auth_skew_ms);
-      if (!auth.ok) {
+      if (auth.ok) {
+        authed = true;
+      } else if (admin_api && cfg_.admin) {
+        const auto tok = cookie_get(headers, kAdminCookie);
+        if (!tok.empty() && verify_admin_session(tok, cfg_.cluster_key)) authed = true;
+        else {
+          write_json(*sock, 401, "Unauthorized",
+                     {{"error", auth.error.empty() ? "login required" : auth.error}}, keep_alive);
+          continue;
+        }
+      } else {
         write_json(*sock, 401, "Unauthorized", {{"error", auth.error}}, keep_alive);
         continue;
       }
     }
+    (void)authed;
 
     auto preds = parse_preconditions(headers);
     auto attrs = parse_attrs(headers);
 
-    // Admin console API (only when node started with admin: true / --admin).
+    // Admin console API / web UI (only when node started with admin: true / --admin).
     if (path.rfind("/admin", 0) == 0 || path == "/metrics") {
       if (!cfg_.admin) {
         write_json(*sock, 404, "Not Found",
                    {{"error", "admin API disabled (set admin: true)"}}, keep_alive);
         continue;
       }
+
+      if (admin_static) {
+        serve_admin_static(*sock, path, keep_alive);
+        continue;
+      }
+
+      if (admin_login) {
+        std::string key;
+        try {
+          const std::string raw = body.empty()
+                                      ? "{}"
+                                      : std::string(reinterpret_cast<const char*>(body.data()),
+                                                    body.size());
+          auto j = nlohmann::json::parse(raw);
+          if (j.contains("cluster_key") && j["cluster_key"].is_string())
+            key = j["cluster_key"].get<std::string>();
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+          continue;
+        }
+        if (!const_time_eq(key, cfg_.cluster_key)) {
+          write_json(*sock, 401, "Unauthorized", {{"error", "invalid cluster key"}}, keep_alive);
+          continue;
+        }
+        const auto token = make_admin_session(cfg_.cluster_key);
+        write_response(*sock, 200, "OK",
+                       {{"Content-Type", "application/json"},
+                        {"Set-Cookie", std::string(kAdminCookie) + "=" + token +
+                                           "; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200"}},
+                       reinterpret_cast<const std::uint8_t*>(R"({"ok":true})"), 11, keep_alive);
+        continue;
+      }
+
+      if (admin_logout) {
+        write_response(*sock, 200, "OK",
+                       {{"Content-Type", "application/json"},
+                        {"Set-Cookie", std::string(kAdminCookie) +
+                                           "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"}},
+                       reinterpret_cast<const std::uint8_t*>(R"({"ok":true})"), 11, keep_alive);
+        continue;
+      }
+
       if (method == "GET" && path == "/metrics") {
         const auto body_txt = objects_.ops().to_prometheus(cfg_.node_id);
         write_response(*sock, 200, "OK",
@@ -611,22 +799,8 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                        keep_alive);
         continue;
       }
-      if (method == "GET" && path == "/admin/status") {
-        write_json(*sock, 200, "OK", admin_status_json(), keep_alive);
-        continue;
-      }
-      if (method == "GET" && path == "/admin/ops") {
-        auto payload = objects_.ops().to_admin_json();
-        payload["node_id"] = cfg_.node_id;
-        write_json(*sock, 200, "OK", payload, keep_alive);
-        continue;
-      }
-      if (method == "GET" && path == "/admin/config") {
-        write_json(*sock, 200, "OK", admin_config_json(), keep_alive);
-        continue;
-      }
-      if (method == "GET" && path == "/admin/cluster") {
-        // Local membership + map + ops; console scrapes peers for cluster-wide totals.
+
+      auto write_cluster = [&]() {
         nlohmann::json peers = nlohmann::json::array();
         std::unordered_set<std::string> seen;
         for (const auto& m : membership_.snapshot()) {
@@ -643,9 +817,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                     {"status", admin_status_json()},
                     {"admin_peers", peers}},
                    keep_alive);
-        continue;
-      }
-      if (method == "GET" && path == "/admin/transitions") {
+      };
+
+      auto write_transitions = [&]() {
         nlohmann::json rules = nlohmann::json::array();
         for (const auto& r : cfg_.transition_rules) {
           nlohmann::json jr = {{"prefix", r.prefix}, {"from", r.from}, {"to", r.to}};
@@ -657,9 +831,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                     {"transition_interval_ms", cfg_.transition_interval_ms},
                     {"transition_batch_oids", cfg_.transition_batch_oids}},
                    keep_alive);
-        continue;
-      }
-      if (method == "POST" && path == "/admin/transitions/run") {
+      };
+
+      auto run_transitions_handler = [&]() {
         const auto stats = run_transitions(
             cfg_, objects_.advertise(), objects_.map(), objects_.stores(),
             static_cast<std::size_t>(std::max(1, cfg_.transition_batch_oids)));
@@ -670,6 +844,69 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                     {"drained", stats.drained},
                     {"failed", stats.failed}},
                    keep_alive);
+      };
+
+      if (method == "GET" && (path == "/admin/status" || path == "/admin/api/status")) {
+        write_json(*sock, 200, "OK", admin_status_json(), keep_alive);
+        continue;
+      }
+      if (method == "GET" && (path == "/admin/ops" || path == "/admin/api/ops")) {
+        auto payload = objects_.ops().to_admin_json();
+        payload["node_id"] = cfg_.node_id;
+        write_json(*sock, 200, "OK", payload, keep_alive);
+        continue;
+      }
+      if (method == "GET" && (path == "/admin/config" || path == "/admin/api/config")) {
+        write_json(*sock, 200, "OK", admin_config_json(), keep_alive);
+        continue;
+      }
+      if (method == "GET" && (path == "/admin/cluster" || path == "/admin/api/cluster")) {
+        write_cluster();
+        continue;
+      }
+      if (method == "GET" &&
+          (path == "/admin/transitions" || path == "/admin/api/transitions")) {
+        write_transitions();
+        continue;
+      }
+      if (method == "POST" &&
+          (path == "/admin/transitions/run" || path == "/admin/api/transitions/run")) {
+        run_transitions_handler();
+        continue;
+      }
+      if (method == "POST" && path == "/admin/api/repair/run") {
+        const auto stats = run_repair(
+            cfg_, objects_.advertise(), objects_.map(), objects_.stores(),
+            static_cast<std::size_t>(std::max(1, cfg_.repair_batch_oids)));
+        write_json(*sock, 200, "OK",
+                   {{"oids_scanned", stats.oids_scanned},
+                    {"under_replicated", stats.under_replicated},
+                    {"repaired", stats.repaired},
+                    {"failed", stats.failed}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "POST" && path == "/admin/api/settings") {
+        try {
+          const std::string raw = body.empty()
+                                      ? "{}"
+                                      : std::string(reinterpret_cast<const char*>(body.data()),
+                                                    body.size());
+          auto j = nlohmann::json::parse(raw);
+          if (j.contains("admin_metrics_public")) {
+            if (!j["admin_metrics_public"].is_boolean()) {
+              write_json(*sock, 400, "Bad Request",
+                         {{"error", "admin_metrics_public must be boolean"}}, keep_alive);
+              continue;
+            }
+            cfg_.admin_metrics_public = j["admin_metrics_public"].get<bool>();
+          }
+          write_json(*sock, 200, "OK",
+                     {{"ok", true}, {"admin_metrics_public", cfg_.admin_metrics_public}},
+                     keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
         continue;
       }
       write_json(*sock, 404, "Not Found", {{"error", "unknown admin path"}}, keep_alive);

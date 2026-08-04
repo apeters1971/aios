@@ -65,3 +65,4 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # Admin console + Prometheus (only on nodes that should expose ops/config):
 # admin: true
 # admin_metrics_public: true   # GET /metrics without HMAC (restrict network access)
+# Web UI: http://HOST:7480/admin/  (login with cluster_key; assets in web/admin or AIOS_ADMIN_WEB)

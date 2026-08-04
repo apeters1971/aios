@@ -217,6 +217,54 @@ int test_admin() {
              "prom app_label series");
     }
 
+    // Web UI static + cluster-key session login
+    {
+      auto idx = http_request("127.0.0.1", "19381", "GET", "/admin/", {}, "", key,
+                              /*auth=*/false);
+      expect(idx.status == 200, "admin index.html without HMAC");
+      expect(idx.body.find("AIOS") != std::string::npos, "admin html has brand");
+
+      auto bad_login =
+          http_request("127.0.0.1", "19381", "POST", "/admin/login",
+                       {{"content-type", "application/json"}},
+                       R"({"cluster_key":"wrong"})", key, /*auth=*/false);
+      expect(bad_login.status == 401, "bad cluster key rejected");
+
+      auto login = http_request("127.0.0.1", "19381", "POST", "/admin/login",
+                                {{"content-type", "application/json"}},
+                                std::string("{\"cluster_key\":\"") + key + "\"}", key,
+                                /*auth=*/false);
+      expect(login.status == 200, "login ok");
+      auto set_cookie = login.headers.count("set-cookie") ? login.headers["set-cookie"] : "";
+      expect(set_cookie.find("aios_admin=") != std::string::npos, "session cookie set");
+      std::string cookie = set_cookie;
+      auto semi = cookie.find(';');
+      if (semi != std::string::npos) cookie = cookie.substr(0, semi);
+
+      auto api = http_request("127.0.0.1", "19381", "GET", "/admin/api/status",
+                              {{"cookie", cookie}}, "", key, /*auth=*/false);
+      expect(api.status == 200, "cookie session status");
+      try {
+        auto j = nlohmann::json::parse(api.body);
+        expect(j.value("admin", false), "api status.admin");
+      } catch (...) {
+        expect(false, "api status json");
+      }
+
+      auto settings = http_request(
+          "127.0.0.1", "19381", "POST", "/admin/api/settings",
+          {{"cookie", cookie}, {"content-type", "application/json"}},
+          R"({"admin_metrics_public":false})", key, /*auth=*/false);
+      expect(settings.status == 200, "settings toggle");
+      auto met_priv = http_request("127.0.0.1", "19381", "GET", "/metrics", {}, "", key,
+                                   /*auth=*/false);
+      expect(met_priv.status == 401, "metrics private after toggle");
+      // restore public for cleanliness
+      http_request("127.0.0.1", "19381", "POST", "/admin/api/settings",
+                   {{"cookie", cookie}, {"content-type", "application/json"}},
+                   R"({"admin_metrics_public":true})", key, /*auth=*/false);
+    }
+
     ioc.stop();
     th.join();
   }

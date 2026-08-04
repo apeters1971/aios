@@ -1,5 +1,9 @@
 # AIOS
 
+<p align="center">
+  <img src="web/admin/aios-icon.png" alt="AIOS" width="160" height="160" />
+</p>
+
 AIOS is a small C++20 **cluster object store**: durable objects on local filesystems, gossip membership, **consistent-hash placement** with storage classes, and a placement-aware HTTP API.
 
 Clients talk to the **primary** for an object (HTTP or TCP++); the primary replicates or erasure-codes across the acting set. There are no pools or placement groups—layout and storage class are chosen **per object version** at write time.
@@ -78,7 +82,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 **Ops**
 
 - Status JSON file, HMAC shared-secret auth on gossip/RPC/HTTP
-- Admin console + Prometheus (`/admin/*`, `/metrics`); application labels for per-workload OPS
+- Admin web UI + JSON API + Prometheus (`/admin/`, `/admin/api/*`, `/metrics`); login with cluster key; application labels for per-workload OPS
 - Optional Intel ISA-L Reed–Solomon for EC with `m > 1`
 
 **Kernel (AlmaLinux 9 / 5.14)**
@@ -229,7 +233,11 @@ status_file: "/tmp/aios-a.json"
 
 ### Admin & monitoring
 
-Enable on selected nodes with `admin: true` / `--admin`. That exposes `/admin/status|ops|config|cluster|transitions` and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers. `POST /admin/transitions/run` forces one local class-migration tick.
+Enable on selected nodes with `admin: true` / `--admin`.
+
+**Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config panels, plus actions (toggle public metrics, run transitions, run repair). Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
+
+Also exposes JSON (`/admin/status|ops|config|cluster|…`, cookie-aware `/admin/api/*`) and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers.
 
 ```bash
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin status
@@ -598,7 +606,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 |-----|-------|
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
 | [`proto/s3.md`](proto/s3.md) | S3-compatible API (FS-backed, SigV4) |
-| [`proto/admin.md`](proto/admin.md) | Admin console, OPS counters, Prometheus `/metrics` |
+| [`proto/admin.md`](proto/admin.md) | Admin web UI, OPS counters, Prometheus `/metrics` |
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
