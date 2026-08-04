@@ -212,6 +212,19 @@ if(AIOS_HAVE_FUSE)
   install(TARGETS aios-fuse RUNTIME DESTINATION bin)
 endif()
 
+# Userspace bridge for the AlmaLinux 9 aiosfs kernel prototype (kernel/aiosfs).
+option(AIOS_WITH_KBRIDGE "Build aios-kbridge userspace daemon for aiosfs.ko" ON)
+if(AIOS_WITH_KBRIDGE)
+  add_executable(aios-kbridge tools/aios_kbridge.cpp)
+  target_include_directories(aios-kbridge PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/kernel
+  )
+  target_link_libraries(aios-kbridge PRIVATE aios_posix)
+  install(TARGETS aios-kbridge RUNTIME DESTINATION bin)
+  install(FILES kernel/aios_kabi.h DESTINATION include/aios)
+endif()
+
 enable_testing()
 add_executable(aios_tests
   tests/test_framing.cpp

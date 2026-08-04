@@ -13,6 +13,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
 | `aios-fuse` | FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
+| `aiosfs.ko` + `aios-kbridge` | AlmaLinux 9 VFS prototype (out-of-tree module + userspace bridge) |
 
 Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
@@ -32,6 +33,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 - [Tools](#tools)
 - [STL-like C++ client](#stl-like-c-client)
 - [POSIX filesystem + FUSE3](#posix-filesystem--fuse3)
+- [Kernel prototype (AlmaLinux 9)](#kernel-prototype-almalinux-9)
 - [Authentication](#authentication)
 - [Logging](#logging)
 - [Documentation](#documentation)
@@ -482,6 +484,19 @@ aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 
 ---
 
+## Kernel prototype (AlmaLinux 9)
+
+Out-of-tree module `aiosfs.ko` (el9 / kernel 5.14) registers `mount -t aios` and upcalls through `/dev/aios_bridge` to **`aios-kbridge`** (built with the rest of the tree). Build/load steps: [`kernel/README.md`](kernel/README.md).
+
+```bash
+# on AlmaLinux 9
+cd kernel/aiosfs && make && sudo insmod ./aiosfs.ko
+sudo ./build/aios-kbridge &
+sudo mount -t aios none /mnt/aios -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
+```
+
+---
+
 ## Authentication
 
 Every daemon and HTTP client in a cluster must share `cluster_key`.
@@ -513,6 +528,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
 | [`proto/posix_fuse.md`](proto/posix_fuse.md) | POSIX C ABI, striping, FUSE3 mount |
+| [`kernel/README.md`](kernel/README.md) | AlmaLinux 9 `aiosfs` kernel prototype |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 
 Run the unit suite after changes:

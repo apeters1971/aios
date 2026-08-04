@@ -86,8 +86,12 @@ aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 
 Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `stripe_width`, `app_label`.
 
+## Kernel prototype (AlmaLinux 9)
+
+Out-of-tree module `kernel/aiosfs` (`mount -t aios`) upcalls to userspace `aios-kbridge` over `/dev/aios_bridge` using [`kernel/aios_kabi.h`](../kernel/aios_kabi.h). The bridge calls the same `aios_posix_*` ABI. See [`kernel/README.md`](../kernel/README.md).
+
 ## Library
 
 - `libaios_posix` — ABI implementation over `Session`
 - `libaios_client` — HTTP session (`put_bytes`, `delete_object`, `list_prefix`, …)
-- Header install: `include/aios/aios_posix.h`
+- Header install: `include/aios/aios_posix.h` (+ `aios_kabi.h` when kbridge is enabled)
