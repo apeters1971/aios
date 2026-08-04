@@ -78,7 +78,7 @@ Canonical string:
 
 ### Cross-object transactions
 
-Coordinator is the primary for object `txn/{id}`. Prepare installs a new version on each oid’s primary/replicas but leaves the tip unchanged, so tip GET cannot see ops until commit. Commit publishes tips in **oid-sorted** order; a publish failure aborts remaining ops and marks the txn `aborted` (already-published tips stay visible — v1 torn window). Large staged PUTs in a txn require the request to land on the oid primary (same node as coordinator when that oid is local). Wrong coordinator → **307** like other mutating APIs.
+Coordinator is the primary for object `txn/{id}`. Prepare installs a new version on each oid’s primary/replicas but leaves the tip unchanged, so tip GET cannot see ops until commit. Commit publishes tips in **oid-sorted** order; a publish failure aborts remaining ops and marks the txn `aborted` (already-published tips stay visible — v1 torn window). Large staged PUTs in a txn require the request to land on the oid primary (same node as coordinator when that oid is local). Wrong coordinator → **307** like other mutating APIs. Prepare accepts the same precondition headers as ordinary `PUT`/`DELETE` and `x-aios-lock-token` (forwarded to the oid primary, including over RPC).
 
 ### Erasure coding / layout
 

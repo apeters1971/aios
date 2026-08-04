@@ -154,11 +154,29 @@ int test_posix_fs() {
   expect(aios_posix_flock(fs, file_ino, LOCK_EX | LOCK_NB) == 0, "flock reentrant renew");
   expect(aios_posix_flock(fs, file_ino, LOCK_UN) == 0, "flock un");
 
-  expect(aios_posix_unlink(fs, dir_ino, "renamed.txt") == 0, "unlink one");
-  expect(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 2, "nlink after unlink");
-  expect(aios_posix_unlink(fs, dir_ino, "alias.txt") == 0, "unlink two");
-  expect(aios_posix_unlink(fs, dir2, "cross.txt") == 0, "unlink last");
+  // Cross-directory rename (multi-object txn).
+  expect(aios_posix_mkdir(fs, 1, "dir3", 0755, &st) == 0, "mkdir dir3");
+  const uint64_t dir3 = st.ino;
+  expect(aios_posix_rename(fs, dir_ino, "alias.txt", dir3, "moved.txt") == 0, "cross rename");
+  expect(aios_posix_lookup(fs, dir_ino, "alias.txt", &looked) == -ENOENT, "src gone");
+  expect(aios_posix_lookup(fs, dir3, "moved.txt", &looked) == 0 && looked.ino == file_ino,
+         "dst present");
+  expect(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 3, "nlink unchanged by rename");
+  // Replace at destination via cross-dir rename.
+  expect(aios_posix_create(fs, dir3, "victim.txt", 0644, &st) == 0, "victim");
+  const uint64_t victim = st.ino;
+  expect(aios_posix_rename(fs, dir_ino, "renamed.txt", dir3, "victim.txt") == 0,
+         "cross rename replace");
+  expect(aios_posix_getattr(fs, victim, &st) == -ENOENT, "victim unlinked");
+  expect(aios_posix_lookup(fs, dir3, "victim.txt", &looked) == 0 && looked.ino == file_ino,
+         "replaced name");
+  expect(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 3, "nlink after replace move");
+
+  expect(aios_posix_unlink(fs, dir2, "cross.txt") == 0, "unlink cross");
+  expect(aios_posix_unlink(fs, dir3, "moved.txt") == 0, "unlink moved");
+  expect(aios_posix_unlink(fs, dir3, "victim.txt") == 0, "unlink last");
   expect(aios_posix_getattr(fs, file_ino, &st) == -ENOENT, "inode gone");
+  expect(aios_posix_rmdir(fs, 1, "dir3") == 0, "rmdir dir3");
   expect(aios_posix_rmdir(fs, 1, "dir2") == 0, "rmdir dir2");
   expect(aios_posix_rmdir(fs, 1, "dir") == 0, "rmdir");
 

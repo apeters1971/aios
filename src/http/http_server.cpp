@@ -950,16 +950,22 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           continue;
         }
         if (method == "PUT") {
+          std::optional<std::string> lock_token;
+          {
+            const auto t = header_get(headers, "x-aios-lock-token");
+            if (!t.empty()) lock_token = t;
+          }
           ApiResult r;
           if (!upload_path.empty()) {
             r = objects_.api_txn_prepare_put_file(txn_id, oid, upload_path, content_length,
-                                                  upload_crc, attrs, preds, std::nullopt);
+                                                  upload_crc, attrs, preds, std::nullopt,
+                                                  lock_token);
             std::error_code rec;
             fs::remove(upload_path, rec);
             upload_path.clear();
           } else {
             r = objects_.api_txn_prepare_put(txn_id, oid, body.data(), body.size(), attrs,
-                                             preds, std::nullopt);
+                                             preds, std::nullopt, lock_token);
           }
           if (!r.ok) {
             write_api_error(*sock, r, target, keep_alive);
@@ -973,7 +979,12 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           continue;
         }
         if (method == "DELETE") {
-          auto r = objects_.api_txn_prepare_delete(txn_id, oid, preds);
+          std::optional<std::string> lock_token;
+          {
+            const auto t = header_get(headers, "x-aios-lock-token");
+            if (!t.empty()) lock_token = t;
+          }
+          auto r = objects_.api_txn_prepare_delete(txn_id, oid, preds, lock_token);
           if (!r.ok) {
             write_api_error(*sock, r, target, keep_alive);
             continue;

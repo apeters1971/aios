@@ -49,10 +49,22 @@ Stored in inode JSON as `xattrs: { name: base64(value) }` (opaque bytes). ABI: `
 
 `aios_posix_flock(ino, op)` maps `LOCK_SH` / `LOCK_EX` / `LOCK_UN` (+ optional `LOCK_NB`) onto exclusive AIOS object locks on the inode OID. Shared and exclusive are both exclusive at the cluster layer. Tokens are tracked per mount and released on `LOCK_UN` / unmount / inode delete. Non-blocking contention returns `-EWOULDBLOCK`.
 
+## Cross-directory rename
+
+Uses the cluster **multi-object transaction** API (`POST /txn` … commit):
+
+1. Lock both directories’ `meta` + `log` oids (sorted) so changelog appends cannot interleave.
+2. Reload dentries under those locks.
+3. Prepare a **compact rewrite** of each directory tip (`snap` = full map, empty `log`, updated `meta`) plus parent inode mtime/`nlink` updates (and optional victim inode delete / nlink drop).
+4. `commit` publishes tips in oid-sorted order.
+
+Same-directory rename remains a single changelog `Rename` op. Commit still has the general `/txn` v1 torn-window if publish fails mid-commit (see [`http.md`](http.md)).
+
 ## Consistency notes (intentional POSIX relaxations)
 
-- **Cross-directory `rename` / `link`** is best-effort: not a multi-object transaction. A crash can leave two names or a wrong `nlink` until repair.
+- **Cross-directory `link`** is still best-effort (not multi-object atomic).
 - **`fsync`** drops the local inode cache; chunk PUTs are already durable per-object, not a multi-object transaction.
+- Victim file **chunk GC** after a replacing cross-dir rename runs after commit (directory tips are consistent first).
 
 ## C ABI
 

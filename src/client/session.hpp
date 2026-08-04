@@ -106,6 +106,19 @@ class Session {
   void lock_release(const std::string& oid, const std::string& token);
   bool lock_try_acquire(const std::string& oid, std::string& token_out, int ttl_ms = 30000);
 
+  // Cross-object transactions (HTTP /txn). Prepare uses aios.posix.cas like put_bytes
+  // when expected_cas is set. Pass lock_token when the oid is locked by this client.
+  std::string txn_begin();
+  void txn_prepare_put(const std::string& txn_id, const std::string& oid,
+                       const std::string& body,
+                       std::optional<std::uint64_t> expected_cas = std::nullopt,
+                       const std::optional<std::string>& lock_token = std::nullopt,
+                       const std::unordered_map<std::string, std::string>& attrs = {});
+  void txn_prepare_delete(const std::string& txn_id, const std::string& oid,
+                          const std::optional<std::string>& lock_token = std::nullopt);
+  void txn_commit(const std::string& txn_id);
+  void txn_abort(const std::string& txn_id);
+
   static std::string url_encode_oid(const std::string& oid);
   static std::string stl_oid(const std::string& type, const std::string& name);
 

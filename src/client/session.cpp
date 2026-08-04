@@ -56,6 +56,33 @@ void throw_http(const HttpResponse& resp, const std::string& what) {
   throw client_error(code, msg);
 }
 
+// Fills CAS headers for aios.posix.cas. Returns new cas (expected+1), or 0 if unused.
+std::uint64_t apply_posix_cas_headers(Session& session, const std::string& oid,
+                                      std::optional<std::uint64_t> expected_cas,
+                                      std::unordered_map<std::string, std::string>& headers) {
+  if (!expected_cas.has_value()) return 0;
+  const std::uint64_t new_cas = *expected_cas + 1;
+  headers["x-aios-attr-aios.posix.cas"] = std::to_string(new_cas);
+  if (*expected_cas == 0) {
+    auto head = session.head_object(oid);
+    if (!head.exists) {
+      headers["if-none-match"] = "*";
+    } else {
+      auto it = head.attrs.find("aios.posix.cas");
+      if (it == head.attrs.end()) {
+        headers["if-match"] = "*";
+        headers["x-aios-if-attr-absent"] = "aios.posix.cas";
+      } else {
+        throw client_error("conflict", "posix cas mismatch (expected 0)");
+      }
+    }
+  } else {
+    headers["if-match"] = "*";
+    headers["x-aios-if-attr-eq"] = "aios.posix.cas=" + std::to_string(*expected_cas);
+  }
+  return new_cas;
+}
+
 }  // namespace
 
 Session::Session(SessionConfig cfg) : cfg_(std::move(cfg)) {
@@ -279,28 +306,7 @@ std::uint64_t Session::put_bytes(const std::string& oid, const std::string& body
   for (const auto& [k, v] : attrs) {
     headers["x-aios-attr-" + k] = v;
   }
-  std::uint64_t new_cas = 0;
-  if (expected_cas.has_value()) {
-    new_cas = *expected_cas + 1;
-    headers["x-aios-attr-aios.posix.cas"] = std::to_string(new_cas);
-    if (*expected_cas == 0) {
-      auto head = head_object(oid);
-      if (!head.exists) {
-        headers["if-none-match"] = "*";
-      } else {
-        auto it = head.attrs.find("aios.posix.cas");
-        if (it == head.attrs.end()) {
-          headers["if-match"] = "*";
-          headers["x-aios-if-attr-absent"] = "aios.posix.cas";
-        } else {
-          throw client_error("conflict", "posix cas mismatch (expected 0)");
-        }
-      }
-    } else {
-      headers["if-match"] = "*";
-      headers["x-aios-if-attr-eq"] = "aios.posix.cas=" + std::to_string(*expected_cas);
-    }
-  }
+  const std::uint64_t new_cas = apply_posix_cas_headers(*this, oid, expected_cas, headers);
   if (lock_token) headers["x-aios-lock-token"] = *lock_token;
   const auto path = "/o/" + url_encode_oid(oid);
   auto resp = request("PUT", path, headers, body);
@@ -470,6 +476,70 @@ void Session::lock_release(const std::string& oid, const std::string& token) {
   const auto path = "/o/" + url_encode_oid(oid) + "/lock";
   auto resp = request("DELETE", path, headers);
   if (resp.status != 204 && resp.status != 200) throw_http(resp, "lock_release");
+}
+
+std::string Session::txn_begin() {
+  auto resp = request("POST", "/txn");
+  if (resp.status != 201 && resp.status != 200) throw_http(resp, "txn_begin");
+  try {
+    auto j = nlohmann::json::parse(resp.body);
+    auto id = j.value("txn_id", "");
+    if (id.empty()) throw client_error("http", "txn_begin missing txn_id");
+    return id;
+  } catch (const client_error&) {
+    throw;
+  } catch (...) {
+    throw client_error("http", "bad txn_begin response");
+  }
+}
+
+void Session::txn_prepare_put(const std::string& txn_id, const std::string& oid,
+                              const std::string& body,
+                              std::optional<std::uint64_t> expected_cas,
+                              const std::optional<std::string>& lock_token,
+                              const std::unordered_map<std::string, std::string>& attrs) {
+  if (txn_id.empty() || oid.empty()) throw client_error("bad_request", "txn_prepare_put args");
+  if (body.size() > kMaxBodyBytes) {
+    throw client_error("payload_too_large", "txn_prepare_put exceeds 16 MiB");
+  }
+  std::unordered_map<std::string, std::string> headers;
+  headers["content-type"] = "application/octet-stream";
+  for (const auto& [k, v] : attrs) {
+    headers["x-aios-attr-" + k] = v;
+  }
+  apply_posix_cas_headers(*this, oid, expected_cas, headers);
+  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  const auto path = "/txn/" + url_encode_oid(txn_id) + "/o/" + url_encode_oid(oid);
+  auto resp = request("PUT", path, headers, body);
+  if (resp.status != 200 && resp.status != 201 && resp.status != 204) {
+    throw_http(resp, "txn_prepare_put");
+  }
+}
+
+void Session::txn_prepare_delete(const std::string& txn_id, const std::string& oid,
+                                 const std::optional<std::string>& lock_token) {
+  if (txn_id.empty() || oid.empty()) {
+    throw client_error("bad_request", "txn_prepare_delete args");
+  }
+  std::unordered_map<std::string, std::string> headers;
+  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  const auto path = "/txn/" + url_encode_oid(txn_id) + "/o/" + url_encode_oid(oid);
+  auto resp = request("DELETE", path, headers);
+  if (resp.status != 200 && resp.status != 201 && resp.status != 204) {
+    throw_http(resp, "txn_prepare_delete");
+  }
+}
+
+void Session::txn_commit(const std::string& txn_id) {
+  if (txn_id.empty()) throw client_error("bad_request", "empty txn_id");
+  auto resp = request("POST", "/txn/" + url_encode_oid(txn_id) + "/commit");
+  if (resp.status != 200) throw_http(resp, "txn_commit");
+}
+
+void Session::txn_abort(const std::string& txn_id) {
+  if (txn_id.empty()) throw client_error("bad_request", "empty txn_id");
+  auto resp = request("POST", "/txn/" + url_encode_oid(txn_id) + "/abort");
+  if (resp.status != 200 && resp.status != 204) throw_http(resp, "txn_abort");
 }
 
 }  // namespace aios

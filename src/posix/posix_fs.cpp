@@ -298,6 +298,225 @@ void DirTable::compact_if_needed() {
   store_meta();
 }
 
+void DirTable::plan_compact_bodies(std::string& meta_out, std::string& snap_out,
+                                   std::string& log_out) const {
+  uint64_t next = next_op_;
+  if (next < 2) next = 2;
+  const uint64_t snap_op = next - 1;
+  nlohmann::json entries = nlohmann::json::object();
+  for (const auto& [n, i] : entries_) entries[n] = i;
+  snap_out = nlohmann::json{{"entries", entries}}.dump();
+  log_out.clear();
+  meta_out = nlohmann::json{{"aios_posix_dir", 1},
+                            {"next_op", next},
+                            {"log_bytes", 0},
+                            {"snapshot_op", snap_op},
+                            {"snapshot_oid", snap_oid_}}
+                 .dump();
+}
+
+namespace {
+
+struct HeldLocks {
+  Session* session{nullptr};
+  std::vector<std::pair<std::string, std::string>> held;  // oid, token
+
+  ~HeldLocks() {
+    if (!session) return;
+    for (auto it = held.rbegin(); it != held.rend(); ++it) {
+      try {
+        session->lock_release(it->first, it->second);
+      } catch (...) {
+      }
+    }
+  }
+
+  void acquire_sorted(std::vector<std::string> oids, int ttl_ms = 30000) {
+    std::sort(oids.begin(), oids.end());
+    oids.erase(std::unique(oids.begin(), oids.end()), oids.end());
+    for (const auto& oid : oids) {
+      held.emplace_back(oid, session->lock_acquire(oid, ttl_ms));
+    }
+  }
+
+  std::optional<std::string> token_for(const std::string& oid) const {
+    for (const auto& [o, t] : held) {
+      if (o == oid) return t;
+    }
+    return std::nullopt;
+  }
+};
+
+void txn_put_dir(Session& session, const std::string& txn_id, DirTable& dir,
+                 const HeldLocks& locks) {
+  std::string meta, snap, log;
+  dir.plan_compact_bodies(meta, snap, log);
+  session.txn_prepare_put(txn_id, dir.snap_oid(), snap, std::nullopt,
+                          locks.token_for(dir.snap_oid()));
+  session.txn_prepare_put(txn_id, dir.log_oid(), log, std::nullopt,
+                          locks.token_for(dir.log_oid()));
+  session.txn_prepare_put(txn_id, dir.meta_oid(), meta, dir.meta_cas(),
+                          locks.token_for(dir.meta_oid()));
+}
+
+}  // namespace
+
+int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_name,
+                     uint64_t new_parent, const std::string& new_name) {
+  if (old_name.empty() || new_name.empty() || old_name.find('/') != std::string::npos ||
+      new_name.find('/') != std::string::npos) {
+    return -EINVAL;
+  }
+
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    DirTable old_dir(st.session, st.volume, old_parent);
+    DirTable new_dir(st.session, st.volume, new_parent);
+    old_dir.load();
+    new_dir.load();
+
+    auto it = old_dir.entries().find(old_name);
+    if (it == old_dir.entries().end()) return -ENOENT;
+    const uint64_t ino = it->second;
+    if (ino == new_parent) return -EINVAL;  // would create cycle
+
+    auto moved = load_inode(st, ino);
+    if (!moved.exists) return -ENOENT;
+
+    uint64_t victim_ino = 0;
+    InodeMeta victim;
+    if (new_dir.entries().count(new_name)) {
+      victim_ino = new_dir.entries().at(new_name);
+      if (victim_ino == ino) {
+        // Same inode already linked at destination name: just drop source name.
+      } else {
+        victim = load_inode(st, victim_ino);
+        if (victim.exists && S_ISDIR(victim.mode)) return -EISDIR;
+        if (moved.exists && S_ISDIR(moved.mode) && victim.exists && S_ISREG(victim.mode)) {
+          return -ENOTDIR;
+        }
+      }
+    }
+
+    auto old_p = load_inode(st, old_parent);
+    auto new_p = load_inode(st, new_parent);
+    if (!old_p.exists || !new_p.exists) return -ENOENT;
+    if (!S_ISDIR(old_p.mode) || !S_ISDIR(new_p.mode)) return -ENOTDIR;
+
+    HeldLocks locks;
+    locks.session = &st.session;
+    std::vector<std::string> lock_oids = {old_dir.meta_oid(), old_dir.log_oid(),
+                                          new_dir.meta_oid(), new_dir.log_oid()};
+    try {
+      locks.acquire_sorted(std::move(lock_oids));
+    } catch (const client_error& e) {
+      if (e.code() == "lock_held") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+      throw;
+    }
+
+    // Reload under locks.
+    old_dir.load();
+    new_dir.load();
+    it = old_dir.entries().find(old_name);
+    if (it == old_dir.entries().end()) return -ENOENT;
+    if (it->second != ino) continue;  // raced
+    if (new_dir.entries().count(new_name)) {
+      const uint64_t cur_victim = new_dir.entries().at(new_name);
+      if (cur_victim != victim_ino && cur_victim != ino) continue;
+    } else if (victim_ino != 0 && victim_ino != ino) {
+      continue;  // victim disappeared; replan
+    }
+
+    old_p = load_inode(st, old_parent);
+    new_p = load_inode(st, new_parent);
+    moved = load_inode(st, ino);
+    if (victim_ino && victim_ino != ino) victim = load_inode(st, victim_ino);
+
+    // Apply dentry mutations in memory.
+    old_dir.mutable_entries().erase(old_name);
+    if (victim_ino && victim_ino != ino) new_dir.mutable_entries().erase(new_name);
+    new_dir.mutable_entries()[new_name] = ino;
+
+    const uint64_t ts = now_ns();
+    old_p.mtime_ns = old_p.ctime_ns = ts;
+    new_p.mtime_ns = new_p.ctime_ns = ts;
+    if (S_ISDIR(moved.mode)) {
+      if (old_p.nlink > 2) old_p.nlink -= 1;
+      new_p.nlink += 1;
+    }
+
+    std::string txn_id;
+    try {
+      txn_id = st.session.txn_begin();
+      txn_put_dir(st.session, txn_id, old_dir, locks);
+      txn_put_dir(st.session, txn_id, new_dir, locks);
+      st.session.txn_prepare_put(txn_id, ino_oid(st.volume, old_parent), inode_to_json(old_p),
+                                 old_p.cas);
+      st.session.txn_prepare_put(txn_id, ino_oid(st.volume, new_parent), inode_to_json(new_p),
+                                 new_p.cas);
+
+      bool delete_victim = false;
+      if (victim_ino && victim_ino != ino && victim.exists) {
+        if (victim.nlink > 1) {
+          victim.nlink -= 1;
+          victim.ctime_ns = ts;
+          st.session.txn_prepare_put(txn_id, ino_oid(st.volume, victim_ino),
+                                     inode_to_json(victim), victim.cas);
+        } else {
+          st.session.txn_prepare_delete(txn_id, ino_oid(st.volume, victim_ino));
+          delete_victim = true;
+        }
+      }
+
+      st.session.txn_commit(txn_id);
+      txn_id.clear();
+
+      old_p.cas += 1;
+      new_p.cas += 1;
+      old_p.exists = true;
+      new_p.exists = true;
+      if (victim_ino && victim_ino != ino && victim.exists && !delete_victim) {
+        victim.cas += 1;
+      }
+      {
+        std::lock_guard lock(st.mu);
+        st.inode_cache[old_parent] = old_p;
+        st.inode_cache[new_parent] = new_p;
+        if (victim_ino && victim_ino != ino) {
+          if (delete_victim) {
+            st.inode_cache.erase(victim_ino);
+          } else if (victim.exists) {
+            st.inode_cache[victim_ino] = victim;
+          }
+        }
+      }
+      if (delete_victim) {
+        // Chunk GC after commit (directory tips already consistent).
+        try {
+          truncate_file(st, victim_ino, 0);
+        } catch (...) {
+        }
+      }
+      return 0;
+    } catch (const client_error& e) {
+      if (!txn_id.empty()) {
+        try {
+          st.session.txn_abort(txn_id);
+        } catch (...) {
+        }
+      }
+      if (e.code() == "conflict" || e.code() == "lock_held") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+      return map_error(e);
+    }
+  }
+  return -EAGAIN;
+}
+
 InodeMeta load_inode(FsState& st, uint64_t ino) {
   {
     std::lock_guard lock(st.mu);
@@ -863,24 +1082,7 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
       dir.rename_same(old_name, new_name);
       return 0;
     }
-    // Cross-directory: best-effort non-atomic.
-    aios::posix::DirTable old_dir(fs->st->session, fs->st->volume, old_parent);
-    old_dir.load();
-    auto it = old_dir.entries().find(old_name);
-    if (it == old_dir.entries().end()) return -ENOENT;
-    const uint64_t ino = it->second;
-    aios::posix::DirTable new_dir(fs->st->session, fs->st->volume, new_parent);
-    new_dir.load();
-    if (new_dir.entries().count(new_name)) {
-      const uint64_t victim = new_dir.entries().at(new_name);
-      auto tm = aios::posix::load_inode(*fs->st, victim);
-      if (tm.exists && S_ISDIR(tm.mode)) return -EISDIR;
-      new_dir.unlink(new_name);
-      if (tm.exists) aios::posix::drop_nlink(*fs->st, victim);
-    }
-    new_dir.link(new_name, ino);
-    old_dir.unlink(old_name);
-    return 0;
+    return aios::posix::rename_cross_dir(*fs->st, old_parent, old_name, new_parent, new_name);
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
   }

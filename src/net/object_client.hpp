@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <vector>
 
+// AttrPrecondition via object_store.hpp
+
 // ObjectListResult / PreparedVersion via object_store.hpp
 
 namespace aios {
@@ -92,12 +94,16 @@ ObjectRpcResult object_prepare_put_remote(
     const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
     std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
     const std::uint8_t* data, std::size_t len,
-    const std::unordered_map<std::string, std::string>& attrs);
+    const std::unordered_map<std::string, std::string>& attrs,
+    const std::vector<AttrPrecondition>& preds = {},
+    const std::optional<std::string>& lock_token = std::nullopt);
 
 ObjectRpcResult object_prepare_delete_remote(
     const std::string& peer_addr, const std::string& local_node_id,
     const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
-    std::uint64_t epoch, const std::string& aios_path, const std::string& oid);
+    std::uint64_t epoch, const std::string& aios_path, const std::string& oid,
+    const std::vector<AttrPrecondition>& preds = {},
+    const std::optional<std::string>& lock_token = std::nullopt);
 
 // Ask a remote primary to publish a prepared seq (fans out to its replicas).
 ObjectRpcResult object_publish_prepared_remote(

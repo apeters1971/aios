@@ -73,6 +73,17 @@ class DirTable {
   void rename_same(const std::string& old_name, const std::string& new_name);
   void compact_if_needed();
 
+  // Mutable entry map for planning a transactional compact rewrite.
+  std::unordered_map<std::string, uint64_t>& mutable_entries() { return entries_; }
+  uint64_t meta_cas() const { return meta_cas_; }
+  const std::string& meta_oid() const { return meta_oid_; }
+  const std::string& log_oid() const { return log_oid_; }
+  const std::string& snap_oid() const { return snap_oid_; }
+
+  // Bodies for a compacted directory tip (snapshot holds full map, empty log).
+  void plan_compact_bodies(std::string& meta_out, std::string& snap_out,
+                           std::string& log_out) const;
+
  private:
   Session& session_;
   std::string vol_;
@@ -106,6 +117,10 @@ struct FsState {
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}
 };
+
+// Cross-directory rename via /txn (compact rewrite of both dir tips under locks).
+int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_name,
+                     uint64_t new_parent, const std::string& new_name);
 
 InodeMeta load_inode(FsState& st, uint64_t ino);
 void store_inode(FsState& st, InodeMeta& m);

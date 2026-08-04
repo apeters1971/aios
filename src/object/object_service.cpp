@@ -394,6 +394,39 @@ static std::unordered_map<std::string, std::string> parse_attrs_json(
   return attrs;
 }
 
+static std::vector<AttrPrecondition> parse_preds_json(const nlohmann::json& body) {
+  std::vector<AttrPrecondition> preds;
+  if (!body.contains("preconditions") || !body["preconditions"].is_array()) return preds;
+  for (const auto& j : body["preconditions"]) {
+    if (!j.is_object()) continue;
+    const std::string op = j.value("op", "");
+    AttrPrecondition p;
+    if (op == "eq") {
+      p.kind = AttrPrecondition::Kind::Eq;
+      p.key = j.value("key", "");
+      p.value = j.value("value", "");
+    } else if (op == "ne") {
+      p.kind = AttrPrecondition::Kind::Ne;
+      p.key = j.value("key", "");
+      p.value = j.value("value", "");
+    } else if (op == "absent") {
+      p.kind = AttrPrecondition::Kind::Absent;
+      p.key = j.value("key", "");
+    } else if (op == "present") {
+      p.kind = AttrPrecondition::Kind::Present;
+      p.key = j.value("key", "");
+    } else if (op == "must_exist") {
+      p.kind = AttrPrecondition::Kind::MustExist;
+    } else if (op == "must_not_exist") {
+      p.kind = AttrPrecondition::Kind::MustNotExist;
+    } else {
+      continue;
+    }
+    preds.push_back(std::move(p));
+  }
+  return preds;
+}
+
 Frame ObjectService::handle_put(const nlohmann::json& body) {
   Frame errf;
   if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
@@ -528,6 +561,19 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
+  const bool do_publish = body.value("publish", true);
+  std::optional<std::string> lock_token;
+  if (body.contains("lock_token") && body["lock_token"].is_string()) {
+    lock_token = body["lock_token"].get<std::string>();
+  }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) {
+    return reply_err(map_.epoch, lk.code, lk.error);
+  }
+  auto preds = parse_preds_json(body);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return reply_err(map_.epoch, "not_found", err);
+  if (pr == PrecondResult::Conflict) return reply_err(map_.epoch, "precondition_failed", err);
+
   PreparedVersion pv;
   if (is_redirect) {
     if (!store->prepare_redirect(oid, redirect_oid, attrs, true, pv, err)) {
@@ -538,7 +584,6 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     if (err == "crc32c mismatch") return reply_err(map_.epoch, "crc_mismatch", err);
     return reply_err(map_.epoch, "store_error", err);
   }
-  const bool do_publish = body.value("publish", true);
   ApiResult r = do_publish ? commit_prepared(store, placement, pv, data.data(), data.size(), attrs)
                            : install_prepared(store, placement, pv, data.data(), data.size(),
                                               attrs);
@@ -703,6 +748,18 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
+  std::optional<std::string> lock_token;
+  if (body.contains("lock_token") && body["lock_token"].is_string()) {
+    lock_token = body["lock_token"].get<std::string>();
+  }
+  if (auto lk = enforce_lock(oid, lock_token); !lk.ok) {
+    return reply_err(map_.epoch, lk.code, lk.error);
+  }
+  auto preds = parse_preds_json(body);
+  auto pr = check_preds_on(store, oid, preds, err);
+  if (pr == PrecondResult::NotFound) return reply_err(map_.epoch, "not_found", err);
+  if (pr == PrecondResult::Conflict) return reply_err(map_.epoch, "precondition_failed", err);
+
   PreparedVersion pv;
   if (!store->prepare_delete(oid, pv, err)) {
     if (err == "object not found") return reply_err(map_.epoch, "not_found", err);
@@ -2101,7 +2158,7 @@ ApiResult ObjectService::api_txn_prepare_put(
     auto remote = object_prepare_put_remote(
         placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
         cfg_.auth_skew_ms, map_.epoch, placement.acting_set[0].aios_path, oid, data, len,
-        put_attrs);
+        put_attrs, preds, lock_token);
     if (!remote.ok) {
       auto r = fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
       r.placement = placement;
@@ -2197,7 +2254,8 @@ ApiResult ObjectService::api_txn_prepare_delete(
   } else {
     auto remote = object_prepare_delete_remote(
         placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-        cfg_.auth_skew_ms, map_.epoch, placement.acting_set[0].aios_path, oid);
+        cfg_.auth_skew_ms, map_.epoch, placement.acting_set[0].aios_path, oid, preds,
+        lock_token);
     if (!remote.ok) {
       return fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
     }

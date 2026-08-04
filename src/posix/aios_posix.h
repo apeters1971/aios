@@ -70,7 +70,8 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name);
 int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                     uint64_t new_parent, const char* new_name);
 
-/* Cross-directory rename is best-effort non-atomic (see proto/posix_fuse.md). */
+/* Cross-directory rename uses a multi-object /txn compact rewrite of both
+ * directory tips (see proto/posix_fuse.md). Same-directory rename is one changelog op. */
 int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                       uint64_t new_parent, const char* new_name);
 
