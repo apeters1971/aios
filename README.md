@@ -469,8 +469,9 @@ Wire format, append, and API notes: [`proto/stl_client.md`](proto/stl_client.md)
 - **Inode 1** is `/`
 - Directories use an append-only **dentry changelog**
 - File data is **chunk-striped** (`posix/{vol}/data/{ino}/c/{chunk}`, default 1 MiB chunks, parallel PUTs bounded by `stripe_width`)
+- **xattrs** in inode meta, **hard links** (files only), **flock** via AIOS locks on the inode object
 
-Cross-directory `rename` is best-effort (not multi-object atomic). Details: [`proto/posix_fuse.md`](proto/posix_fuse.md).
+Cross-directory `rename` / `link` is best-effort (not multi-object atomic). Details: [`proto/posix_fuse.md`](proto/posix_fuse.md).
 
 When CMake finds **libfuse3**, it builds `aios-fuse`:
 

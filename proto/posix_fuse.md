@@ -10,10 +10,12 @@ Volume name from mount config (`volume`, default `default`):
 
 ```text
 posix/{vol}/super                 # next_ino, stripe defaults, uuid (CAS: aios.posix.cas)
-posix/{vol}/ino/{id}              # inode JSON meta
+posix/{vol}/ino/{id}              # inode JSON meta (incl. base64 xattrs map)
 posix/{vol}/dir/{id}/meta|log|snap  # directory dentry changelog
 posix/{vol}/data/{id}/c/{chunk}   # file data chunk (chunk = offset / stripe_unit)
 ```
+
+Inode locks for `flock` use the AIOS HTTP lock on `posix/{vol}/ino/{id}`.
 
 ## Striping
 
@@ -33,17 +35,31 @@ Append-only dentry changelog (same wire framing as STL `AOPk` records):
 
 Snapshot = JSON `{"entries":{name:ino,...}}`; auto-compact ~1 MiB.
 
+## Hard links
+
+- Regular files only (`link` on a directory returns `-EPERM`).
+- Same- or cross-directory: bump `nlink`, then append a `Link` dentry. Cross-directory is best-effort (not multi-object atomic).
+- Last `unlink` deletes inode meta and chunk objects.
+
+## Extended attributes
+
+Stored in inode JSON as `xattrs: { name: base64(value) }` (opaque bytes). ABI: `aios_posix_setxattr` / `getxattr` / `listxattr` / `removexattr` with `AIOS_POSIX_XATTR_CREATE` / `REPLACE`. Limits: name ≤ 255, value ≤ 64 KiB, ≤ 128 attrs per inode.
+
+## flock
+
+`aios_posix_flock(ino, op)` maps `LOCK_SH` / `LOCK_EX` / `LOCK_UN` (+ optional `LOCK_NB`) onto exclusive AIOS object locks on the inode OID. Shared and exclusive are both exclusive at the cluster layer. Tokens are tracked per mount and released on `LOCK_UN` / unmount / inode delete. Non-blocking contention returns `-EWOULDBLOCK`.
+
 ## Consistency notes (intentional POSIX relaxations)
 
-- **Cross-directory `rename` / replace** is best-effort: link into destination, then unlink source. A crash can leave two names or a dangling name.
+- **Cross-directory `rename` / `link`** is best-effort: not a multi-object transaction. A crash can leave two names or a wrong `nlink` until repair.
 - **`fsync`** drops the local inode cache; chunk PUTs are already durable per-object, not a multi-object transaction.
-- No multi-object ACID for `rename`/`link` across directories.
 
 ## C ABI
 
 ```c
 aios_posix_fs* aios_posix_mount(const aios_posix_config*, int* err_out);
 int aios_posix_lookup(fs, parent, name, &st);
+int aios_posix_link / setxattr / getxattr / listxattr / removexattr / flock;
 int aios_posix_read/write/truncate/...
 ```
 

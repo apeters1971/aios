@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
 #include <vector>
@@ -118,7 +119,47 @@ int test_posix_fs() {
   expect(aios_posix_lookup(fs, dir_ino, "file.txt", &looked) == -ENOENT, "old name gone");
   expect(aios_posix_lookup(fs, dir_ino, "renamed.txt", &looked) == 0, "new name");
 
-  expect(aios_posix_unlink(fs, dir_ino, "renamed.txt") == 0, "unlink");
+  // xattrs
+  const char* xa_name = "user.aios";
+  const char xa_val[] = "meta\0bin";
+  expect(aios_posix_setxattr(fs, file_ino, xa_name, xa_val, sizeof(xa_val), 0) == 0, "setxattr");
+  expect(aios_posix_setxattr(fs, file_ino, xa_name, "x", 1, AIOS_POSIX_XATTR_CREATE) < 0,
+         "xattr create fail");
+  char xbuf[32]{};
+  int xsz = aios_posix_getxattr(fs, file_ino, xa_name, nullptr, 0);
+  expect(xsz == static_cast<int>(sizeof(xa_val)), "getxattr size");
+  expect(aios_posix_getxattr(fs, file_ino, xa_name, xbuf, sizeof(xbuf)) == xsz, "getxattr");
+  expect(std::memcmp(xbuf, xa_val, sizeof(xa_val)) == 0, "xattr data");
+  char list[64]{};
+  int lsz = aios_posix_listxattr(fs, file_ino, list, sizeof(list));
+  expect(lsz > 0 && std::strstr(list, xa_name) != nullptr, "listxattr");
+  expect(aios_posix_removexattr(fs, file_ino, xa_name) == 0, "removexattr");
+  expect(aios_posix_getxattr(fs, file_ino, xa_name, nullptr, 0) < 0, "xattr gone");
+
+  // hard link (same dir) + second name across dirs
+  expect(aios_posix_mkdir(fs, 1, "dir2", 0755, &st) == 0, "mkdir dir2");
+  const uint64_t dir2 = st.ino;
+  expect(aios_posix_link(fs, dir_ino, "renamed.txt", dir_ino, "alias.txt") == 0, "hardlink same");
+  expect(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 2, "nlink 2");
+  expect(aios_posix_link(fs, dir_ino, "renamed.txt", dir2, "cross.txt") == 0, "hardlink cross");
+  expect(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 3, "nlink 3");
+  char r2[8]{};
+  size_t got2 = 0;
+  expect(aios_posix_lookup(fs, dir2, "cross.txt", &looked) == 0 && looked.ino == file_ino,
+         "cross lookup");
+  expect(aios_posix_read(fs, looked.ino, 0, r2, sizeof(r2), &got2) == 0 && got2 == 3, "via link");
+
+  // flock exclusive
+  expect(aios_posix_flock(fs, file_ino, LOCK_EX | LOCK_NB) == 0, "flock ex");
+  expect(aios_posix_flock(fs, file_ino, LOCK_EX | LOCK_NB) == 0, "flock reentrant renew");
+  expect(aios_posix_flock(fs, file_ino, LOCK_UN) == 0, "flock un");
+
+  expect(aios_posix_unlink(fs, dir_ino, "renamed.txt") == 0, "unlink one");
+  expect(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 2, "nlink after unlink");
+  expect(aios_posix_unlink(fs, dir_ino, "alias.txt") == 0, "unlink two");
+  expect(aios_posix_unlink(fs, dir2, "cross.txt") == 0, "unlink last");
+  expect(aios_posix_getattr(fs, file_ino, &st) == -ENOENT, "inode gone");
+  expect(aios_posix_rmdir(fs, 1, "dir2") == 0, "rmdir dir2");
   expect(aios_posix_rmdir(fs, 1, "dir") == 0, "rmdir");
 
   aios_posix_unmount(fs);

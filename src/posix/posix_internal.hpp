@@ -31,6 +31,7 @@ struct InodeMeta {
   uint32_t stripe_width{kDefaultStripeWidth};
   uint64_t cas{0};
   bool exists{false};
+  std::unordered_map<std::string, std::string> xattrs;  // name → raw bytes
 };
 
 struct SuperMeta {
@@ -100,6 +101,7 @@ struct FsState {
   SuperMeta super;
   std::mutex mu;
   std::unordered_map<uint64_t, InodeMeta> inode_cache;
+  std::unordered_map<uint64_t, std::string> flock_tokens;  // ino → lock token
 
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}
@@ -110,6 +112,8 @@ void store_inode(FsState& st, InodeMeta& m);
 uint64_t alloc_ino(FsState& st);
 void ensure_super(FsState& st);
 void ensure_root(FsState& st);
+void drop_nlink(FsState& st, uint64_t ino);
+void release_all_flocks(FsState& st);
 
 int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len, size_t* out_len);
 int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size_t len,

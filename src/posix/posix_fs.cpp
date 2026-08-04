@@ -2,6 +2,7 @@
 #include "posix/posix_internal.hpp"
 
 #include "client/changelog.hpp"
+#include "util/base64.hpp"
 #include "util/log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <errno.h>
 #include <memory>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
 #include <vector>
@@ -70,6 +72,21 @@ int map_error(const client_error& e) {
   return -EIO;
 }
 
+constexpr size_t kMaxXattrName = 255;
+constexpr size_t kMaxXattrValue = 64 * 1024;
+constexpr size_t kMaxXattrCount = 128;
+constexpr int kFlockTtlMs = 120000;
+#ifdef __APPLE__
+constexpr int kXattrMissing = ENOATTR;
+#else
+constexpr int kXattrMissing = ENODATA;
+#endif
+
+bool valid_xattr_name(const char* name) {
+  if (!name || !*name) return false;
+  return std::strlen(name) <= kMaxXattrName;
+}
+
 void fill_stat(const InodeMeta& m, aios_posix_stat* st) {
   if (!st) return;
   std::memset(st, 0, sizeof(*st));
@@ -102,6 +119,15 @@ InodeMeta inode_from_json(const std::string& body, uint64_t cas_hint) {
   m.stripe_unit = j.value("stripe_unit", kDefaultStripeUnit);
   m.stripe_width = j.value("stripe_width", kDefaultStripeWidth);
   m.cas = cas_hint;
+  if (j.contains("xattrs") && j["xattrs"].is_object()) {
+    for (auto it = j["xattrs"].begin(); it != j["xattrs"].end(); ++it) {
+      if (!it.value().is_string()) continue;
+      std::vector<uint8_t> raw;
+      std::string err;
+      if (!base64_decode(it.value().get<std::string>(), raw, err)) continue;
+      m.xattrs[it.key()] = std::string(reinterpret_cast<const char*>(raw.data()), raw.size());
+    }
+  }
   return m;
 }
 
@@ -118,6 +144,13 @@ std::string inode_to_json(const InodeMeta& m) {
                    {"ctime_ns", m.ctime_ns},
                    {"stripe_unit", m.stripe_unit},
                    {"stripe_width", m.stripe_width}};
+  if (!m.xattrs.empty()) {
+    nlohmann::json xa = nlohmann::json::object();
+    for (const auto& [k, v] : m.xattrs) {
+      xa[k] = base64_encode(reinterpret_cast<const uint8_t*>(v.data()), v.size());
+    }
+    j["xattrs"] = std::move(xa);
+  }
   return j.dump();
 }
 
@@ -360,6 +393,51 @@ void ensure_root(FsState& st) {
   dir.load();  // creates empty on first link
 }
 
+void drop_nlink(FsState& st, uint64_t ino) {
+  auto m = load_inode(st, ino);
+  if (!m.exists) return;
+  if (m.nlink > 1) {
+    m.nlink -= 1;
+    m.ctime_ns = now_ns();
+    store_inode(st, m);
+    return;
+  }
+  if (S_ISREG(m.mode)) {
+    truncate_file(st, ino, 0);
+  }
+  st.session.delete_object(ino_oid(st.volume, ino));
+  std::string flock_token;
+  {
+    std::lock_guard lock(st.mu);
+    st.inode_cache.erase(ino);
+    auto fit = st.flock_tokens.find(ino);
+    if (fit != st.flock_tokens.end()) {
+      flock_token = std::move(fit->second);
+      st.flock_tokens.erase(fit);
+    }
+  }
+  if (!flock_token.empty()) {
+    try {
+      st.session.lock_release(ino_oid(st.volume, ino), flock_token);
+    } catch (...) {
+    }
+  }
+}
+
+void release_all_flocks(FsState& st) {
+  std::unordered_map<uint64_t, std::string> held;
+  {
+    std::lock_guard lock(st.mu);
+    held.swap(st.flock_tokens);
+  }
+  for (const auto& [ino, token] : held) {
+    try {
+      st.session.lock_release(ino_oid(st.volume, ino), token);
+    } catch (...) {
+    }
+  }
+}
+
 int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len, size_t* out_len) {
   if (out_len) *out_len = 0;
   auto meta = load_inode(st, ino);
@@ -545,7 +623,11 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
   }
 }
 
-void aios_posix_unmount(aios_posix_fs* fs) { delete fs; }
+void aios_posix_unmount(aios_posix_fs* fs) {
+  if (!fs) return;
+  if (fs->st) aios::posix::release_all_flocks(*fs->st);
+  delete fs;
+}
 
 int aios_posix_lookup(aios_posix_fs* fs, uint64_t parent, const char* name,
                       aios_posix_stat* st_out) {
@@ -691,18 +773,41 @@ int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (m.exists && S_ISDIR(m.mode)) return -EISDIR;
     dir.unlink(name);
-    if (m.exists) {
-      if (m.nlink > 1) {
-        m.nlink -= 1;
-        m.ctime_ns = aios::posix::now_ns();
-        aios::posix::store_inode(*fs->st, m);
-      } else {
-        aios::posix::truncate_file(*fs->st, ino, 0);
-        fs->st->session.delete_object(aios::posix::ino_oid(fs->st->volume, ino));
-        std::lock_guard lock(fs->st->mu);
-        fs->st->inode_cache.erase(ino);
-      }
-    }
+    if (m.exists) aios::posix::drop_nlink(*fs->st, ino);
+    return 0;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+}
+
+int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
+                    uint64_t new_parent, const char* new_name) {
+  if (!fs || !old_name || !new_name || !*old_name || !*new_name) return -EINVAL;
+  if (std::strchr(new_name, '/')) return -EINVAL;
+  try {
+    aios::posix::DirTable old_dir(fs->st->session, fs->st->volume, old_parent);
+    old_dir.load();
+    auto it = old_dir.entries().find(old_name);
+    if (it == old_dir.entries().end()) return -ENOENT;
+    const uint64_t ino = it->second;
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (S_ISDIR(m.mode)) return -EPERM;
+
+    aios::posix::DirTable new_dir(fs->st->session, fs->st->volume, new_parent);
+    new_dir.load();
+    if (new_dir.entries().count(new_name)) return -EEXIST;
+    auto np = aios::posix::load_inode(*fs->st, new_parent);
+    if (!np.exists) return -ENOENT;
+    if (!S_ISDIR(np.mode)) return -ENOTDIR;
+
+    // Bump nlink before creating the new dentry (safer on crash).
+    m.nlink += 1;
+    m.ctime_ns = aios::posix::now_ns();
+    aios::posix::store_inode(*fs->st, m);
+    new_dir.link(new_name, ino);
+    np.mtime_ns = np.ctime_ns = m.ctime_ns;
+    aios::posix::store_inode(*fs->st, np);
     return 0;
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
@@ -749,9 +854,11 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
       if (dir.entries().count(new_name) && std::strcmp(old_name, new_name) != 0) {
         // Replace: unlink target first (file only).
         auto tit = dir.entries().find(new_name);
-        auto tm = aios::posix::load_inode(*fs->st, tit->second);
+        const uint64_t victim = tit->second;
+        auto tm = aios::posix::load_inode(*fs->st, victim);
         if (tm.exists && S_ISDIR(tm.mode)) return -EISDIR;
         dir.unlink(new_name);
+        if (tm.exists) aios::posix::drop_nlink(*fs->st, victim);
       }
       dir.rename_same(old_name, new_name);
       return 0;
@@ -765,9 +872,11 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
     aios::posix::DirTable new_dir(fs->st->session, fs->st->volume, new_parent);
     new_dir.load();
     if (new_dir.entries().count(new_name)) {
-      auto tm = aios::posix::load_inode(*fs->st, new_dir.entries().at(new_name));
+      const uint64_t victim = new_dir.entries().at(new_name);
+      auto tm = aios::posix::load_inode(*fs->st, victim);
       if (tm.exists && S_ISDIR(tm.mode)) return -EISDIR;
       new_dir.unlink(new_name);
+      if (tm.exists) aios::posix::drop_nlink(*fs->st, victim);
     }
     new_dir.link(new_name, ino);
     old_dir.unlink(old_name);
@@ -840,6 +949,152 @@ int aios_posix_statfs(aios_posix_fs* fs, aios_posix_statvfs* st_out) {
   st_out->ffree = st_out->files / 2;
   st_out->namemax = 255;
   return 0;
+}
+
+int aios_posix_setxattr(aios_posix_fs* fs, uint64_t ino, const char* name, const void* value,
+                        size_t size, int flags) {
+  if (!fs || !aios::posix::valid_xattr_name(name)) return -EINVAL;
+  if (size > aios::posix::kMaxXattrValue) return -E2BIG;
+  if (size > 0 && !value) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    const bool present = m.xattrs.count(name) != 0;
+    if ((flags & AIOS_POSIX_XATTR_CREATE) && present) return -EEXIST;
+    if ((flags & AIOS_POSIX_XATTR_REPLACE) && !present) return -aios::posix::kXattrMissing;
+    if (!present && m.xattrs.size() >= aios::posix::kMaxXattrCount) return -ENOSPC;
+    m.xattrs[name] = std::string(static_cast<const char*>(value), size);
+    m.ctime_ns = aios::posix::now_ns();
+    aios::posix::store_inode(*fs->st, m);
+    return 0;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+}
+
+int aios_posix_getxattr(aios_posix_fs* fs, uint64_t ino, const char* name, void* value,
+                        size_t size) {
+  if (!fs || !aios::posix::valid_xattr_name(name)) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    auto it = m.xattrs.find(name);
+    if (it == m.xattrs.end()) return -aios::posix::kXattrMissing;
+    if (size == 0) return static_cast<int>(it->second.size());
+    if (size < it->second.size()) return -ERANGE;
+    if (value && !it->second.empty()) {
+      std::memcpy(value, it->second.data(), it->second.size());
+    }
+    return static_cast<int>(it->second.size());
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+}
+
+int aios_posix_listxattr(aios_posix_fs* fs, uint64_t ino, char* list, size_t size) {
+  if (!fs) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    size_t need = 0;
+    for (const auto& [k, _] : m.xattrs) need += k.size() + 1;
+    if (size == 0) return static_cast<int>(need);
+    if (size < need) return -ERANGE;
+    if (!list && need > 0) return -EINVAL;
+    size_t off = 0;
+    for (const auto& [k, _] : m.xattrs) {
+      std::memcpy(list + off, k.data(), k.size());
+      off += k.size();
+      list[off++] = '\0';
+    }
+    return static_cast<int>(need);
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+}
+
+int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name) {
+  if (!fs || !aios::posix::valid_xattr_name(name)) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (!m.xattrs.erase(name)) return -aios::posix::kXattrMissing;
+    m.ctime_ns = aios::posix::now_ns();
+    aios::posix::store_inode(*fs->st, m);
+    return 0;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+}
+
+int aios_posix_flock(aios_posix_fs* fs, uint64_t ino, int op) {
+  if (!fs) return -EINVAL;
+  const int cmd = op & (LOCK_SH | LOCK_EX | LOCK_UN);
+  const bool nonblock = (op & LOCK_NB) != 0;
+  if (cmd != LOCK_SH && cmd != LOCK_EX && cmd != LOCK_UN) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    const std::string oid = aios::posix::ino_oid(fs->st->volume, ino);
+
+    if (cmd == LOCK_UN) {
+      std::string token;
+      {
+        std::lock_guard lock(fs->st->mu);
+        auto it = fs->st->flock_tokens.find(ino);
+        if (it == fs->st->flock_tokens.end()) return 0;
+        token = it->second;
+        fs->st->flock_tokens.erase(it);
+      }
+      try {
+        fs->st->session.lock_release(oid, token);
+      } catch (const aios::client_error& e) {
+        if (e.code() != "not_found") return aios::posix::map_error(e);
+      }
+      return 0;
+    }
+
+    // LOCK_SH and LOCK_EX both use exclusive cluster locks.
+    std::string held;
+    {
+      std::lock_guard lock(fs->st->mu);
+      auto it = fs->st->flock_tokens.find(ino);
+      if (it != fs->st->flock_tokens.end()) held = it->second;
+    }
+    if (!held.empty()) {
+      try {
+        fs->st->session.lock_renew(oid, held, aios::posix::kFlockTtlMs);
+        return 0;
+      } catch (const aios::client_error&) {
+        std::lock_guard lock(fs->st->mu);
+        auto it = fs->st->flock_tokens.find(ino);
+        if (it != fs->st->flock_tokens.end() && it->second == held) {
+          fs->st->flock_tokens.erase(it);
+        }
+      }
+    }
+
+    std::string token;
+    if (nonblock) {
+      if (!fs->st->session.lock_try_acquire(oid, token, aios::posix::kFlockTtlMs)) {
+        return -EWOULDBLOCK;
+      }
+    } else {
+      // Blocking: poll try_acquire.
+      for (int i = 0; i < 300; ++i) {
+        if (fs->st->session.lock_try_acquire(oid, token, aios::posix::kFlockTtlMs)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        token.clear();
+      }
+      if (token.empty()) return -EAGAIN;
+    }
+    std::lock_guard lock(fs->st->mu);
+    fs->st->flock_tokens[ino] = std::move(token);
+    return 0;
+  } catch (const aios::client_error& e) {
+    if (e.code() == "lock_held") return -EWOULDBLOCK;
+    return aios::posix::map_error(e);
+  }
 }
 
 }  // extern "C"

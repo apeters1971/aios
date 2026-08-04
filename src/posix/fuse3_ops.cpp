@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <string>
+#include <sys/file.h>
 #include <sys/stat.h>
 
 #ifdef __APPLE__
@@ -211,6 +212,17 @@ int posix_rename(const char* from, const char* to, unsigned int /*flags*/) {
   return aios_posix_rename(fs, op, on.c_str(), np, nn.c_str());
 }
 
+int posix_link(const char* from, const char* to) {
+  auto* fs = fs_handle();
+  uint64_t op = 0, np = 0;
+  std::string on, nn;
+  int rc = resolve_parent(fs, from, &op, &on);
+  if (rc) return rc;
+  rc = resolve_parent(fs, to, &np, &nn);
+  if (rc) return rc;
+  return aios_posix_link(fs, op, on.c_str(), np, nn.c_str());
+}
+
 int posix_open(const char* path, struct fuse_file_info* fi) {
   auto* fs = fs_handle();
   aios_posix_stat st{};
@@ -385,6 +397,73 @@ int posix_statfs(const char* /*path*/, struct statvfs* stbuf) {
 }
 #endif
 
+uint64_t path_ino(aios_posix_fs* fs, const char* path, struct fuse_file_info* fi) {
+  if (fi && fi->fh) return fi->fh;
+  aios_posix_stat st{};
+  int rc = lookup_path(fs, path, &st);
+  if (rc) return 0;
+  return st.ino;
+}
+
+#ifdef __APPLE__
+int posix_setxattr(const char* path, const char* name, const char* value, size_t size, int flags,
+                   uint32_t /*position*/) {
+  auto* fs = fs_handle();
+  aios_posix_stat st{};
+  int rc = lookup_path(fs, path, &st);
+  if (rc) return rc;
+  return aios_posix_setxattr(fs, st.ino, name, value, size, flags);
+}
+
+int posix_getxattr(const char* path, const char* name, char* value, size_t size,
+                   uint32_t /*position*/) {
+  auto* fs = fs_handle();
+  aios_posix_stat st{};
+  int rc = lookup_path(fs, path, &st);
+  if (rc) return rc;
+  return aios_posix_getxattr(fs, st.ino, name, value, size);
+}
+#else
+int posix_setxattr(const char* path, const char* name, const char* value, size_t size, int flags) {
+  auto* fs = fs_handle();
+  aios_posix_stat st{};
+  int rc = lookup_path(fs, path, &st);
+  if (rc) return rc;
+  return aios_posix_setxattr(fs, st.ino, name, value, size, flags);
+}
+
+int posix_getxattr(const char* path, const char* name, char* value, size_t size) {
+  auto* fs = fs_handle();
+  aios_posix_stat st{};
+  int rc = lookup_path(fs, path, &st);
+  if (rc) return rc;
+  return aios_posix_getxattr(fs, st.ino, name, value, size);
+}
+#endif
+
+int posix_listxattr(const char* path, char* list, size_t size) {
+  auto* fs = fs_handle();
+  aios_posix_stat st{};
+  int rc = lookup_path(fs, path, &st);
+  if (rc) return rc;
+  return aios_posix_listxattr(fs, st.ino, list, size);
+}
+
+int posix_removexattr(const char* path, const char* name) {
+  auto* fs = fs_handle();
+  aios_posix_stat st{};
+  int rc = lookup_path(fs, path, &st);
+  if (rc) return rc;
+  return aios_posix_removexattr(fs, st.ino, name);
+}
+
+int posix_flock(const char* path, struct fuse_file_info* fi, int op) {
+  auto* fs = fs_handle();
+  const uint64_t ino = path_ino(fs, path, fi);
+  if (!ino) return -ENOENT;
+  return aios_posix_flock(fs, ino, op);
+}
+
 }  // namespace
 
 fuse_operations aios_fuse_operations() {
@@ -396,6 +475,7 @@ fuse_operations aios_fuse_operations() {
   ops.unlink = posix_unlink;
   ops.rmdir = posix_rmdir;
   ops.rename = posix_rename;
+  ops.link = posix_link;
   ops.open = posix_open;
   ops.read = posix_read;
   ops.write = posix_write;
@@ -404,6 +484,11 @@ fuse_operations aios_fuse_operations() {
   ops.chmod = posix_chmod;
   ops.chown = posix_chown;
   ops.statfs = posix_statfs;
+  ops.setxattr = posix_setxattr;
+  ops.getxattr = posix_getxattr;
+  ops.listxattr = posix_listxattr;
+  ops.removexattr = posix_removexattr;
+  ops.flock = posix_flock;
 #ifdef __APPLE__
   ops.setattr = posix_setattr;
 #endif

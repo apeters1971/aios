@@ -66,6 +66,10 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
 int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name);
 int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name);
 
+/* Hard link. Directories are rejected (-EPERM). Cross-directory is best-effort. */
+int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
+                    uint64_t new_parent, const char* new_name);
+
 /* Cross-directory rename is best-effort non-atomic (see proto/posix_fuse.md). */
 int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                       uint64_t new_parent, const char* new_name);
@@ -100,6 +104,26 @@ typedef struct aios_posix_statvfs {
 } aios_posix_statvfs;
 
 int aios_posix_statfs(aios_posix_fs* fs, aios_posix_statvfs* st_out);
+
+/* Extended attributes (stored in inode JSON, values opaque bytes).
+ * flags: 0, or AIOS_POSIX_XATTR_CREATE / AIOS_POSIX_XATTR_REPLACE.
+ * get/list: size==0 returns required byte length; else write into buf or -ERANGE. */
+enum {
+  AIOS_POSIX_XATTR_CREATE = 1,
+  AIOS_POSIX_XATTR_REPLACE = 2,
+};
+
+int aios_posix_setxattr(aios_posix_fs* fs, uint64_t ino, const char* name, const void* value,
+                        size_t size, int flags);
+int aios_posix_getxattr(aios_posix_fs* fs, uint64_t ino, const char* name, void* value,
+                        size_t size);
+int aios_posix_listxattr(aios_posix_fs* fs, uint64_t ino, char* list, size_t size);
+int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name);
+
+/* Advisory flock via AIOS exclusive lock on the inode object.
+ * op uses flock(2) bits: LOCK_SH, LOCK_EX, LOCK_UN, optionally OR LOCK_NB.
+ * LOCK_SH is implemented as exclusive (cluster locks are exclusive-only). */
+int aios_posix_flock(aios_posix_fs* fs, uint64_t ino, int op);
 
 #ifdef __cplusplus
 }
