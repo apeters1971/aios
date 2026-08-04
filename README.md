@@ -235,7 +235,7 @@ status_file: "/tmp/aios-a.json"
 
 Enable on selected nodes with `admin: true` / `--admin`.
 
-**Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config / actions, plus **S3 credentials** (when `s3_listen` is enabled). Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
+**Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config / actions, plus **S3 credentials** (when `s3_listen` is enabled) and **Quotas** (soft uid/gid + project/subtree). Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
 
 Also exposes JSON (`/admin/status|ops|config|cluster|…`, cookie-aware `/admin/api/*`) and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers.
 
@@ -243,11 +243,12 @@ Also exposes JSON (`/admin/status|ops|config|cluster|…`, cookie-aware `/admin/
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin status
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin   # interactive console
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin s3-cred list
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin quota show
 ```
 
 Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters (QoS limits later).
 
-Details: [`proto/admin.md`](proto/admin.md).
+Soft quotas (uid/gid + optional project subtrees): [`proto/quota.md`](proto/quota.md). Details: [`proto/admin.md`](proto/admin.md).
 
 ---
 
@@ -630,6 +631,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
 | [`proto/s3.md`](proto/s3.md) | S3-compatible API (FS-backed, SigV4) |
 | [`proto/admin.md`](proto/admin.md) | Admin web UI, OPS counters, Prometheus `/metrics` |
+| [`proto/quota.md`](proto/quota.md) | Soft uid/gid + project (subtree) quotas |
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |

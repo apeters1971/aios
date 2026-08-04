@@ -2,8 +2,10 @@
 
 #include "client/session.hpp"
 #include "posix/aios_posix.h"
+#include "posix/quota_ledger.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -23,6 +25,7 @@ struct InodeMeta {
   uint32_t nlink{0};
   uint32_t uid{0};
   uint32_t gid{0};
+  uint32_t project_id{0};  // 0 = volume domain; inherited from parent on create
   uint64_t size{0};
   uint64_t atime_ns{0};
   uint64_t mtime_ns{0};
@@ -113,6 +116,7 @@ struct FsState {
   std::mutex mu;
   std::unordered_map<uint64_t, InodeMeta> inode_cache;
   std::unordered_map<uint64_t, std::string> flock_tokens;  // ino → lock token
+  std::unique_ptr<QuotaLedger> quota;
 
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}

@@ -152,6 +152,66 @@
       }
     }
     if (activeTab === "s3") await refreshS3();
+    if (activeTab === "quota") await refreshQuota();
+  }
+
+  function parseBytes(s) {
+    if (!s || !String(s).trim()) return null;
+    const m = String(s).trim().match(/^([0-9.]+)\s*([KMGT]?)$/i);
+    if (!m) return null;
+    const mul = { "": 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4 };
+    return Math.floor(Number(m[1]) * (mul[m[2].toUpperCase()] || 1));
+  }
+
+  function renderQuota(q) {
+    const urows = ((q && q.volume_uids) || [])
+      .map(
+        (r) =>
+          `<tr><td>${r.uid}</td><td>${fmt(r.used_bytes)}</td><td>${
+            r.limit_bytes == null ? "—" : fmt(r.limit_bytes)
+          }</td></tr>`
+      )
+      .join("");
+    document.getElementById("quota-vol-table").innerHTML =
+      `<table><thead><tr><th>UID</th><th>Used</th><th>Limit</th></tr></thead><tbody>${
+        urows || "<tr><td colspan=3>No uid quotas</td></tr>"
+      }</tbody></table>` +
+      (() => {
+        const grows = ((q && q.volume_gids) || [])
+          .map(
+            (r) =>
+              `<tr><td>${r.gid}</td><td>${fmt(r.used_bytes)}</td><td>${
+                r.limit_bytes == null ? "—" : fmt(r.limit_bytes)
+              }</td></tr>`
+          )
+          .join("");
+        return `<table style="margin-top:1rem"><thead><tr><th>GID</th><th>Used</th><th>Limit</th></tr></thead><tbody>${
+          grows || "<tr><td colspan=3>No gid quotas</td></tr>"
+        }</tbody></table>`;
+      })();
+    const prows = ((q && q.projects) || [])
+      .map(
+        (p) =>
+          `<tr><td>${p.id}</td><td>${p.name || ""}</td><td>${p.root_ino}</td><td>${fmt(
+            p.used_bytes
+          )}</td><td>${p.limit_bytes == null ? "—" : fmt(p.limit_bytes)}</td>
+          <td><button type="button" class="btn ghost quota-del" data-id="${p.id}">Delete</button></td></tr>`
+      )
+      .join("");
+    document.getElementById("quota-proj-table").innerHTML =
+      `<table><thead><tr><th>ID</th><th>Name</th><th>Root ino</th><th>Used</th><th>Limit</th><th></th></tr></thead><tbody>${
+        prows || "<tr><td colspan=6>No projects</td></tr>"
+      }</tbody></table>`;
+  }
+
+  async function refreshQuota() {
+    const { res, json } = await api("/admin/api/quota");
+    if (res.status === 401) {
+      showLogin("Session expired — sign in again.");
+      return;
+    }
+    if (res.ok) renderQuota(json);
+    else renderQuota({ volume_uids: [], volume_gids: [], projects: [] });
   }
 
   async function probeSession() {
@@ -191,6 +251,90 @@
     if (!btn) return;
     setTab(btn.dataset.tab);
     if (btn.dataset.tab === "s3") refreshS3().catch(() => {});
+    if (btn.dataset.tab === "quota") refreshQuota().catch(() => {});
+  });
+
+  document.getElementById("quota-set-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("quota-error");
+    errEl.hidden = true;
+    const uid = document.getElementById("quota-uid").value;
+    const gid = document.getElementById("quota-gid").value;
+    const raw = document.getElementById("quota-bytes").value;
+    const body = {};
+    if (uid !== "") body.uid = Number(uid);
+    else if (gid !== "") body.gid = Number(gid);
+    else {
+      errEl.hidden = false;
+      errEl.textContent = "UID or GID required";
+      return;
+    }
+    body.bytes = raw.trim() === "" ? null : parseBytes(raw);
+    const { res, json } = await api("/admin/api/quota/limits", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Set failed";
+      return;
+    }
+    await refreshQuota();
+  });
+
+  document.getElementById("quota-proj-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("quota-error");
+    errEl.hidden = true;
+    const name = document.getElementById("quota-proj-name").value.trim();
+    const root_ino = Number(document.getElementById("quota-proj-ino").value);
+    const bytes = parseBytes(document.getElementById("quota-proj-bytes").value);
+    const { res, json } = await api("/admin/api/quota/projects", {
+      method: "POST",
+      body: JSON.stringify({ name, root_ino, bytes }),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Create project failed";
+      return;
+    }
+    await refreshQuota();
+  });
+
+  document.getElementById("quota-proj-table").addEventListener("click", async (e) => {
+    const btn = e.target.closest(".quota-del");
+    if (!btn) return;
+    const id = btn.dataset.id;
+    if (!confirm(`Delete project ${id}?`)) return;
+    const { res, json } = await api(`/admin/api/quota/projects/${id}`, {
+      method: "DELETE",
+      body: "{}",
+    });
+    if (!res.ok) {
+      const errEl = document.getElementById("quota-error");
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Delete failed";
+      return;
+    }
+    await refreshQuota();
+  });
+
+  document.getElementById("quota-reconcile").addEventListener("click", async () => {
+    const errEl = document.getElementById("quota-error");
+    const out = document.getElementById("quota-result");
+    errEl.hidden = true;
+    const { res, json } = await api("/admin/api/quota/reconcile", {
+      method: "POST",
+      body: "{}",
+    });
+    out.classList.remove("hidden");
+    out.textContent = JSON.stringify(json, null, 2);
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Reconcile failed";
+      return;
+    }
+    await refreshQuota();
   });
 
   document.getElementById("s3-table").addEventListener("click", async (e) => {

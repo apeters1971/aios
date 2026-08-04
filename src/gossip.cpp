@@ -109,8 +109,11 @@ void GossipEngine::start() {
     if (!cfg_.s3_listen.empty()) {
       s3_iam_ = std::make_shared<S3IamStore>(cfg_, *object_service_);
     }
-    http_server_ =
-        std::make_unique<HttpServer>(ioc_, cfg_, *object_service_, membership_, s3_iam_);
+    if (cfg_.admin) {
+      quota_ = std::make_shared<QuotaAdminStore>(cfg_, *object_service_);
+    }
+    http_server_ = std::make_unique<HttpServer>(ioc_, cfg_, *object_service_, membership_,
+                                                s3_iam_, quota_);
     http_server_->start();
     if (cfg_.admin) {
       AIOS_LOG_INFO("admin API enabled on ", cfg_.http_listen,

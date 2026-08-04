@@ -565,12 +565,14 @@ nlohmann::json HttpServer::admin_status_json() const {
 }
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
-                       MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam)
+                       MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam,
+                       std::shared_ptr<QuotaAdminStore> quota)
     : ioc_(ioc),
       cfg_(std::move(cfg)),
       objects_(objects),
       membership_(membership),
       s3_iam_(std::move(s3_iam)),
+      quota_(std::move(quota)),
       acceptor_(ioc) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
@@ -990,6 +992,135 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           continue;
         }
         write_json(*sock, 200, "OK", {{"ok", true}, {"access_key_id", id}}, keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/api/quota") {
+        if (!quota_) {
+          write_json(*sock, 404, "Not Found", {{"error", "quota admin unavailable"}}, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", quota_->show(), keep_alive);
+        continue;
+      }
+      if (method == "PUT" && path == "/admin/api/quota/limits") {
+        if (!quota_) {
+          write_json(*sock, 404, "Not Found", {{"error", "quota admin unavailable"}}, keep_alive);
+          continue;
+        }
+        try {
+          const std::string raw = body.empty()
+                                      ? "{}"
+                                      : std::string(reinterpret_cast<const char*>(body.data()),
+                                                    body.size());
+          auto j = nlohmann::json::parse(raw);
+          std::string ierr;
+          bool ok = true;
+          if (j.contains("uid")) {
+            std::optional<std::uint64_t> bytes;
+            if (j.contains("bytes") && !j["bytes"].is_null())
+              bytes = j["bytes"].get<std::uint64_t>();
+            ok = quota_->set_volume_uid_limit(j["uid"].get<std::uint32_t>(), bytes, ierr);
+          } else if (j.contains("gid")) {
+            std::optional<std::uint64_t> bytes;
+            if (j.contains("bytes") && !j["bytes"].is_null())
+              bytes = j["bytes"].get<std::uint64_t>();
+            ok = quota_->set_volume_gid_limit(j["gid"].get<std::uint32_t>(), bytes, ierr);
+          } else {
+            write_json(*sock, 400, "Bad Request", {{"error", "uid or gid required"}}, keep_alive);
+            continue;
+          }
+          if (!ok) {
+            write_json(*sock, 400, "Bad Request", {{"error", ierr}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK", {{"ok", true}}, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "POST" && path == "/admin/api/quota/projects") {
+        if (!quota_) {
+          write_json(*sock, 404, "Not Found", {{"error", "quota admin unavailable"}}, keep_alive);
+          continue;
+        }
+        try {
+          const std::string raw = body.empty()
+                                      ? "{}"
+                                      : std::string(reinterpret_cast<const char*>(body.data()),
+                                                    body.size());
+          auto j = nlohmann::json::parse(raw);
+          std::optional<std::uint64_t> bytes;
+          if (j.contains("bytes") && !j["bytes"].is_null())
+            bytes = j["bytes"].get<std::uint64_t>();
+          std::uint32_t id = 0;
+          std::string ierr;
+          if (!quota_->create_project(j.value("name", ""), j.value("root_ino", 0ull), bytes, id,
+                                      ierr)) {
+            write_json(*sock, 400, "Bad Request", {{"error", ierr}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 201, "Created", {{"id", id}, {"ok", true}}, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if ((method == "DELETE" || method == "PUT") &&
+          path.rfind("/admin/api/quota/projects/", 0) == 0) {
+        if (!quota_) {
+          write_json(*sock, 404, "Not Found", {{"error", "quota admin unavailable"}}, keep_alive);
+          continue;
+        }
+        try {
+          const auto id = static_cast<std::uint32_t>(
+              std::stoul(path.substr(std::string("/admin/api/quota/projects/").size())));
+          std::string ierr;
+          if (method == "DELETE") {
+            if (!quota_->delete_project(id, ierr)) {
+              write_json(*sock, ierr == "not found" ? 404 : 400,
+                         ierr == "not found" ? "Not Found" : "Bad Request", {{"error", ierr}},
+                         keep_alive);
+              continue;
+            }
+            write_json(*sock, 200, "OK", {{"ok", true}}, keep_alive);
+            continue;
+          }
+          const std::string raw = body.empty()
+                                      ? "{}"
+                                      : std::string(reinterpret_cast<const char*>(body.data()),
+                                                    body.size());
+          auto j = nlohmann::json::parse(raw);
+          if (!j.contains("uid")) {
+            write_json(*sock, 400, "Bad Request", {{"error", "uid required"}}, keep_alive);
+            continue;
+          }
+          std::optional<std::uint64_t> bytes;
+          if (j.contains("bytes") && !j["bytes"].is_null())
+            bytes = j["bytes"].get<std::uint64_t>();
+          if (!quota_->set_project_uid_limit(id, j["uid"].get<std::uint32_t>(), bytes, ierr)) {
+            write_json(*sock, ierr == "project not found" ? 404 : 400,
+                       ierr == "project not found" ? "Not Found" : "Bad Request",
+                       {{"error", ierr}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK", {{"ok", true}}, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "bad project request"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "POST" && path == "/admin/api/quota/reconcile") {
+        if (!quota_) {
+          write_json(*sock, 404, "Not Found", {{"error", "quota admin unavailable"}}, keep_alive);
+          continue;
+        }
+        std::string ierr;
+        if (!quota_->reconcile(ierr)) {
+          write_json(*sock, 500, "Internal Server Error", {{"error", ierr}}, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", {{"ok", true}, {"quota", quota_->show()}}, keep_alive);
         continue;
       }
       write_json(*sock, 404, "Not Found", {{"error", "unknown admin path"}}, keep_alive);

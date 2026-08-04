@@ -112,6 +112,7 @@ InodeMeta inode_from_json(const std::string& body, uint64_t cas_hint) {
   m.nlink = j.value("nlink", static_cast<uint32_t>(1));
   m.uid = j.value("uid", static_cast<uint32_t>(0));
   m.gid = j.value("gid", static_cast<uint32_t>(0));
+  m.project_id = j.value("project_id", static_cast<uint32_t>(0));
   m.size = j.value("size", static_cast<uint64_t>(0));
   m.atime_ns = j.value("atime_ns", static_cast<uint64_t>(0));
   m.mtime_ns = j.value("mtime_ns", static_cast<uint64_t>(0));
@@ -138,6 +139,7 @@ std::string inode_to_json(const InodeMeta& m) {
                    {"nlink", m.nlink},
                    {"uid", m.uid},
                    {"gid", m.gid},
+                   {"project_id", m.project_id},
                    {"size", m.size},
                    {"atime_ns", m.atime_ns},
                    {"mtime_ns", m.mtime_ns},
@@ -499,6 +501,19 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
         } catch (...) {
         }
       }
+      // Reproject moved inode when crossing quota domains.
+      if (moved.project_id != new_p.project_id) {
+        const auto old_proj = moved.project_id;
+        moved.project_id = new_p.project_id;
+        moved.ctime_ns = ts;
+        try {
+          store_inode(st, moved);
+          if (st.quota) {
+            st.quota->note_reproject(old_proj, moved.project_id, moved.uid, moved.gid, moved.size);
+          }
+        } catch (...) {
+        }
+      }
       return 0;
     } catch (const client_error& e) {
       if (!txn_id.empty()) {
@@ -700,6 +715,11 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
   auto meta = load_inode(st, ino);
   if (!meta.exists) return -ENOENT;
   if (!S_ISREG(meta.mode)) return -EISDIR;
+  const uint64_t new_size_pre = std::max(meta.size, offset + static_cast<uint64_t>(len));
+  if (new_size_pre > meta.size && st.quota) {
+    const auto grow = static_cast<std::int64_t>(new_size_pre - meta.size);
+    if (!st.quota->may_grow(meta.project_id, meta.uid, meta.gid, grow)) return -EDQUOT;
+  }
   const uint64_t unit = meta.stripe_unit ? meta.stripe_unit : st.stripe_unit;
   const auto* in = static_cast<const uint8_t*>(buf);
   uint64_t pos = offset;
@@ -747,6 +767,7 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
     if (err.load() != 0) return err.load();
   }
 
+  const uint64_t old_size = meta.size;
   const uint64_t new_size = std::max(meta.size, offset + static_cast<uint64_t>(len));
   meta.size = new_size;
   meta.mtime_ns = now_ns();
@@ -756,6 +777,10 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
   } catch (const client_error& e) {
     return map_error(e);
   }
+  if (st.quota && new_size != old_size) {
+    st.quota->note_delta(meta.project_id, meta.uid, meta.gid,
+                         static_cast<std::int64_t>(new_size) - static_cast<std::int64_t>(old_size));
+  }
   if (out_len) *out_len = len;
   return 0;
 }
@@ -764,6 +789,11 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
   auto meta = load_inode(st, ino);
   if (!meta.exists) return -ENOENT;
   if (!S_ISREG(meta.mode)) return -EISDIR;
+  if (size > meta.size && st.quota) {
+    const auto grow = static_cast<std::int64_t>(size - meta.size);
+    if (!st.quota->may_grow(meta.project_id, meta.uid, meta.gid, grow)) return -EDQUOT;
+  }
+  const uint64_t old_size = meta.size;
   const uint64_t unit = meta.stripe_unit ? meta.stripe_unit : st.stripe_unit;
   if (size < meta.size) {
     const uint64_t first_drop = (size + unit - 1) / unit;
@@ -796,6 +826,10 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
     store_inode(st, meta);
   } catch (const client_error& e) {
     return map_error(e);
+  }
+  if (st.quota && size != old_size) {
+    st.quota->note_delta(meta.project_id, meta.uid, meta.gid,
+                         static_cast<std::int64_t>(size) - static_cast<std::int64_t>(old_size));
   }
   return 0;
 }
@@ -830,6 +864,7 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
     fs->st->stripe_width = cfg->stripe_width ? cfg->stripe_width : aios::posix::kDefaultStripeWidth;
     fs->st->default_uid = cfg->uid;
     fs->st->default_gid = cfg->gid;
+    fs->st->quota = std::make_unique<aios::posix::QuotaLedger>(fs->st->session, fs->st->volume);
     aios::posix::ensure_super(*fs->st);
     aios::posix::ensure_root(*fs->st);
     return fs;
@@ -844,7 +879,10 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
 
 void aios_posix_unmount(aios_posix_fs* fs) {
   if (!fs) return;
-  if (fs->st) aios::posix::release_all_flocks(*fs->st);
+  if (fs->st) {
+    if (fs->st->quota) fs->st->quota->flush();
+    aios::posix::release_all_flocks(*fs->st);
+  }
   delete fs;
 }
 
@@ -934,6 +972,7 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     m.nlink = 2;
     m.uid = fs->st->default_uid;
     m.gid = fs->st->default_gid;
+    m.project_id = pmeta.project_id;
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
@@ -967,6 +1006,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     m.nlink = 1;
     m.uid = fs->st->default_uid;
     m.gid = fs->st->default_gid;
+    m.project_id = pmeta.project_id;
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
@@ -1111,6 +1151,8 @@ int aios_posix_setattr(aios_posix_fs* fs, uint64_t ino, const aios_posix_stat* s
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
+    const auto old_uid = m.uid;
+    const auto old_gid = m.gid;
     if (to_set & AIOS_POSIX_SET_MODE) m.mode = (m.mode & S_IFMT) | (st->mode & 07777);
     if (to_set & AIOS_POSIX_SET_UID) m.uid = st->uid;
     if (to_set & AIOS_POSIX_SET_GID) m.gid = st->gid;
@@ -1118,6 +1160,10 @@ int aios_posix_setattr(aios_posix_fs* fs, uint64_t ino, const aios_posix_stat* s
     if (to_set & AIOS_POSIX_SET_ATIME) m.atime_ns = st->atime_ns;
     m.ctime_ns = aios::posix::now_ns();
     aios::posix::store_inode(*fs->st, m);
+    if (fs->st->quota && (to_set & (AIOS_POSIX_SET_UID | AIOS_POSIX_SET_GID)) &&
+        (old_uid != m.uid || old_gid != m.gid)) {
+      fs->st->quota->note_chown(m.project_id, old_uid, old_gid, m.uid, m.gid, m.size);
+    }
     if (to_set & AIOS_POSIX_SET_SIZE) {
       int rc = aios::posix::truncate_file(*fs->st, ino, st->size);
       if (rc) return rc;

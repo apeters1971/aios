@@ -39,6 +39,7 @@
         <button type="button" data-tab="config" class="tab">Config</button>
         <button type="button" data-tab="actions" class="tab">Actions</button>
         <button type="button" data-tab="s3" class="tab">S3 credentials</button>
+        <button type="button" data-tab="quota" class="tab">Quotas</button>
       </nav>
       <button type="button" id="logout-btn" class="btn ghost">Log out</button>
     </header>
@@ -104,6 +105,30 @@
         </form>
         <pre id="s3-secret" class="code-block small hidden"></pre>
         <p id="s3-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-quota" class="panel hidden">
+        <h2>Quotas</h2>
+        <p class="note">Soft delayed byte quotas per volume uid/gid and optional project (subtree) domains. Volume defaults to <code>s3_volume</code> when S3 is enabled, else <code>default</code>.</p>
+        <h3>Volume uid / gid</h3>
+        <div id="quota-vol-table" class="table-wrap"></div>
+        <form id="quota-set-form" class="s3-form">
+          <label class="field"><span>UID (or leave empty)</span><input id="quota-uid" type="number" min="0" /></label>
+          <label class="field"><span>GID (or leave empty)</span><input id="quota-gid" type="number" min="0" /></label>
+          <label class="field"><span>Bytes</span><input id="quota-bytes" placeholder="10G or empty to clear" /></label>
+          <button type="submit" class="btn primary">Set limit</button>
+        </form>
+        <h3>Projects</h3>
+        <div id="quota-proj-table" class="table-wrap"></div>
+        <form id="quota-proj-form" class="s3-form">
+          <label class="field"><span>Name</span><input id="quota-proj-name" required /></label>
+          <label class="field"><span>Root inode</span><input id="quota-proj-ino" type="number" min="1" required /></label>
+          <label class="field"><span>Bytes</span><input id="quota-proj-bytes" placeholder="20G" /></label>
+          <button type="submit" class="btn primary">Create project</button>
+        </form>
+        <button type="button" id="quota-reconcile" class="btn primary">Reconcile usage</button>
+        <pre id="quota-result" class="code-block small hidden"></pre>
+        <p id="quota-error" class="error" hidden></p>
       </section>
     </main>
   </div>

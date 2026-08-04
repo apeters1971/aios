@@ -106,6 +106,7 @@ add_library(aios_core STATIC
   src/http/http_server.cpp
   src/http/s3_auth.cpp
   src/http/s3_iam.cpp
+  src/http/quota_admin.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
 )
@@ -159,6 +160,7 @@ target_link_libraries(aios_client PUBLIC aios_core)
 
 add_library(aios_posix STATIC
   src/posix/posix_fs.cpp
+  src/posix/quota_ledger.cpp
 )
 target_include_directories(aios_posix PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -263,6 +265,7 @@ add_executable(aios_tests
   tests/test_http_auth.cpp
   tests/test_s3_auth.cpp
   tests/test_s3_iam.cpp
+  tests/test_quota.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
   tests/test_http_ec.cpp

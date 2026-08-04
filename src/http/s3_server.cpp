@@ -7,6 +7,7 @@
 
 #include <openssl/evp.h>
 
+#include <errno.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -216,6 +217,14 @@ void apply_owner(aios_posix_fs* fs, uint64_t ino, bool set_owner, uint32_t uid, 
   st.uid = uid;
   st.gid = gid;
   aios_posix_setattr(fs, ino, &st, AIOS_POSIX_SET_UID | AIOS_POSIX_SET_GID);
+}
+
+bool write_posix_err(tcp::socket& sock, int err, const std::string& path) {
+  if (err == -EDQUOT) {
+    write_s3_error(sock, 403, "QuotaExceeded", "quota exceeded", path);
+    return true;
+  }
+  return false;
 }
 
 int mkdir_p(aios_posix_fs* fs, const std::vector<std::string>& parts, uint64_t* ino_out,
@@ -1022,7 +1031,8 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       size_t wrote = 0;
       err = aios_posix_write(fs_, ino, 0, body.data(), body.size(), &wrote);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "write failed", path);
+        if (!write_posix_err(*sock, err, path))
+          write_s3_error(*sock, 500, "InternalError", "write failed", path);
         return;
       }
       if (auto ct = header_get(headers, "content-type"); !ct.empty()) {

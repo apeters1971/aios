@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -51,14 +52,13 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  admin [status|ops|config|cluster|metrics|console|s3-cred ...]\n"
+      << "  admin [status|ops|config|cluster|metrics|console|s3-cred|quota ...]\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
       << "  admin status|ops|config|cluster|metrics   one-shot\n"
-      << "  admin s3-cred list\n"
-      << "  admin s3-cred create --id ID --uid N --gid N --buckets b1[,b2...]\n"
-      << "  admin s3-cred delete --id ID\n"
+      << "  admin s3-cred list|create|delete ...\n"
+      << "  admin quota show|set|reconcile|project ...\n"
       << "\n"
       << "Follows HTTP 307 redirects to the primary (Location).\n"
       << "put/get stream file bytes (no full-object client buffer).\n";
@@ -686,6 +686,165 @@ int cmd_admin_s3_cred(std::string host, std::string port, const std::string& key
   return 2;
 }
 
+std::optional<std::uint64_t> parse_bytes_arg(const std::string& s) {
+  if (s.empty() || s == "clear" || s == "none" || s == "-") return std::nullopt;
+  char* end = nullptr;
+  double v = std::strtod(s.c_str(), &end);
+  if (end == s.c_str()) return std::nullopt;
+  std::uint64_t mul = 1;
+  if (*end == 'K' || *end == 'k') mul = 1024ull;
+  else if (*end == 'M' || *end == 'm') mul = 1024ull * 1024ull;
+  else if (*end == 'G' || *end == 'g') mul = 1024ull * 1024ull * 1024ull;
+  else if (*end == 'T' || *end == 't') mul = 1024ull * 1024ull * 1024ull * 1024ull;
+  else if (*end != '\0') return std::nullopt;
+  return static_cast<std::uint64_t>(v * static_cast<double>(mul));
+}
+
+int cmd_admin_quota(std::string host, std::string port, const std::string& key,
+                    const std::vector<std::string>& args) {
+  if (args.size() < 2) {
+    std::cerr << "usage: admin quota show|set|reconcile|project ...\n";
+    return 2;
+  }
+  const std::string action = args[1];
+  if (action == "show") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/quota", key);
+    if (r.status != 200) {
+      std::cerr << "quota show failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << r.body << "\n";
+    return 0;
+  }
+  if (action == "reconcile") {
+    auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                            "/admin/api/quota/reconcile", "{}", key);
+    if (r.status != 200) {
+      std::cerr << "quota reconcile failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << r.body << "\n";
+    return 0;
+  }
+  if (action == "set") {
+    std::optional<std::uint32_t> uid, gid;
+    std::optional<std::uint64_t> bytes;
+    bool clear = false;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      if (args[i] == "--uid" && i + 1 < args.size()) uid = static_cast<std::uint32_t>(std::stoul(args[++i]));
+      else if (args[i] == "--gid" && i + 1 < args.size())
+        gid = static_cast<std::uint32_t>(std::stoul(args[++i]));
+      else if (args[i] == "--bytes" && i + 1 < args.size()) {
+        auto b = parse_bytes_arg(args[++i]);
+        if (!b) clear = true;
+        else bytes = b;
+      } else if (args[i] == "--clear") clear = true;
+    }
+    if (!uid && !gid) {
+      std::cerr << "set requires --uid or --gid\n";
+      return 2;
+    }
+    nlohmann::json body;
+    if (uid) body["uid"] = *uid;
+    if (gid) body["gid"] = *gid;
+    if (clear) body["bytes"] = nullptr;
+    else if (bytes) body["bytes"] = *bytes;
+    else {
+      std::cerr << "set requires --bytes SIZE or --clear\n";
+      return 2;
+    }
+    auto r = admin_exchange(std::move(host), std::move(port), "PUT", "/admin/api/quota/limits",
+                            body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "quota set failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << "ok\n";
+    return 0;
+  }
+  if (action == "project") {
+    if (args.size() < 3) {
+      std::cerr << "usage: admin quota project create|delete|set ...\n";
+      return 2;
+    }
+    const std::string sub = args[2];
+    if (sub == "create") {
+      std::string name;
+      std::uint64_t root_ino = 0;
+      std::optional<std::uint64_t> bytes;
+      for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--name" && i + 1 < args.size()) name = args[++i];
+        else if (args[i] == "--root-ino" && i + 1 < args.size())
+          root_ino = std::stoull(args[++i]);
+        else if (args[i] == "--bytes" && i + 1 < args.size()) bytes = parse_bytes_arg(args[++i]);
+      }
+      nlohmann::json body{{"name", name}, {"root_ino", root_ino}};
+      if (bytes) body["bytes"] = *bytes;
+      auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                              "/admin/api/quota/projects", body.dump(), key);
+      if (r.status != 201 && r.status != 200) {
+        std::cerr << "project create failed status=" << r.status << " " << r.body << "\n";
+        return 1;
+      }
+      std::cout << r.body << "\n";
+      return 0;
+    }
+    if (sub == "delete") {
+      std::uint32_t id = 0;
+      for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--id" && i + 1 < args.size()) id = static_cast<std::uint32_t>(std::stoul(args[++i]));
+      }
+      auto r = admin_exchange(std::move(host), std::move(port), "DELETE",
+                              "/admin/api/quota/projects/" + std::to_string(id), {}, key);
+      if (r.status != 200) {
+        std::cerr << "project delete failed status=" << r.status << " " << r.body << "\n";
+        return 1;
+      }
+      std::cout << "ok\n";
+      return 0;
+    }
+    if (sub == "set") {
+      std::uint32_t id = 0;
+      std::optional<std::uint32_t> uid;
+      std::optional<std::uint64_t> bytes;
+      bool clear = false;
+      for (std::size_t i = 3; i < args.size(); ++i) {
+        if (args[i] == "--id" && i + 1 < args.size())
+          id = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (args[i] == "--uid" && i + 1 < args.size())
+          uid = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (args[i] == "--bytes" && i + 1 < args.size()) {
+          auto b = parse_bytes_arg(args[++i]);
+          if (!b) clear = true;
+          else bytes = b;
+        } else if (args[i] == "--clear")
+          clear = true;
+      }
+      if (id == 0 || !uid) {
+        std::cerr << "usage: admin quota project set --id ID --uid UID --bytes SIZE|--clear\n";
+        return 2;
+      }
+      nlohmann::json body{{"uid", *uid}};
+      if (clear) body["bytes"] = nullptr;
+      else if (bytes) body["bytes"] = *bytes;
+      else {
+        std::cerr << "project set requires --bytes SIZE or --clear\n";
+        return 2;
+      }
+      auto r = admin_exchange(std::move(host), std::move(port), "PUT",
+                              "/admin/api/quota/projects/" + std::to_string(id), body.dump(), key);
+      if (r.status != 200) {
+        std::cerr << "project set failed status=" << r.status << " " << r.body << "\n";
+        return 1;
+      }
+      std::cout << "ok\n";
+      return 0;
+    }
+  }
+  std::cerr << "unknown quota action\n";
+  return 2;
+}
+
 int run_admin_console(std::string host, std::string port, const std::string& key) {
   std::cout << "AIOS admin console  endpoint=" << host << ':' << port << "\n";
   admin_console_help();
@@ -865,6 +1024,7 @@ int main(int argc, char** argv) {
       if (sub == "metrics") return cmd_admin_metrics(host, port, args.cluster_key);
       if (sub == "s3-cred")
         return cmd_admin_s3_cred(host, port, args.cluster_key, args.positional);
+      if (sub == "quota") return cmd_admin_quota(host, port, args.cluster_key, args.positional);
       std::cerr << "unknown admin subcommand: " << sub << "\n";
       return 2;
     }

@@ -46,8 +46,14 @@ Logout: `POST /admin/logout`.
 | `GET /admin/api/s3/credentials` | cookie **or** HMAC | List S3 IAM keys (secrets redacted); requires `s3_listen` |
 | `POST /admin/api/s3/credentials` | cookie **or** HMAC | Create `{access_key_id, uid, gid, buckets[, secret]}` — secret returned once |
 | `DELETE /admin/api/s3/credentials/{id}` | cookie **or** HMAC | Remove IAM key |
+| `GET /admin/api/quota` | cookie **or** HMAC | Soft quota limits + usage |
+| `PUT /admin/api/quota/limits` | cookie **or** HMAC | `{uid\|gid, bytes\|null}` |
+| `POST /admin/api/quota/projects` | cookie **or** HMAC | `{name, root_ino, bytes?}` |
+| `PUT /admin/api/quota/projects/{id}` | cookie **or** HMAC | `{uid, bytes\|null}` project-uid limit |
+| `DELETE /admin/api/quota/projects/{id}` | cookie **or** HMAC | Remove project |
+| `POST /admin/api/quota/reconcile` | cookie **or** HMAC | Rebuild usage from inodes |
 
-CLI: `aios admin s3-cred list|create|delete`. Web UI: **S3 credentials** tab. See [`proto/s3.md`](s3.md).
+CLI: `aios admin s3-cred …`, `aios admin quota …`. Web UI: **S3 credentials** / **Quotas** tabs. See [`proto/s3.md`](s3.md), [`proto/quota.md`](quota.md).
 
 ### Legacy JSON (CLI / HMAC)
 

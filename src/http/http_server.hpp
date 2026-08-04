@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
 #include "membership.hpp"
 #include "object/object_service.hpp"
@@ -15,7 +16,8 @@ namespace aios {
 class HttpServer {
  public:
   HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
-             MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam = nullptr);
+             MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam = nullptr,
+             std::shared_ptr<QuotaAdminStore> quota = nullptr);
 
   void start();
 
@@ -32,6 +34,7 @@ class HttpServer {
   ObjectService& objects_;
   MembershipTable& membership_;
   std::shared_ptr<S3IamStore> s3_iam_;
+  std::shared_ptr<QuotaAdminStore> quota_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 
