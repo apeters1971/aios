@@ -6,7 +6,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 
 | Binary / lib | Role |
 |--------------|------|
-| `aiosd` | Cluster daemon (gossip, storage targets, object RPC, HTTP API, repair) |
+| `aiosd` | Cluster daemon (gossip, storage targets, object RPC, HTTP + optional S3 API, repair) |
 | `aios` | Thin HTTP client (put/get/del/stat/list/map/admin; follows `307`) |
 | `aios-bench` | Multithreaded HTTP create/update/read benchmark |
 | `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
@@ -16,7 +16,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
 ---
 
@@ -30,6 +30,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 - [Storage targets (`.aios`)](#storage-targets-aios)
 - [Placement, storage classes, and layout](#placement-storage-classes-and-layout)
 - [HTTP object API](#http-object-api)
+- [S3-compatible API](#s3-compatible-api)
 - [Local object store](#local-object-store)
 - [Tools](#tools)
 - [STL-like C++ client](#stl-like-c-client)
@@ -67,6 +68,12 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](pr
 - Enforced object locks (TTL leases)
 - Long-poll watches (per-oid and prefix)
 - Topic pub/sub (`/pubsub`: ephemeral, buffered, or durable)
+
+**S3 API** (`s3_listen`, optional)
+
+- AWS SigV4; access key = `s3_access_key`, secret = `cluster_key`
+- FS-backed via `libaios_posix` on `s3_volume` — buckets are directories, keys are files (shared with FUSE/`aiosfs`)
+- Core ops: buckets, objects, ListObjectsV2, CopyObject, multipart, Range GET
 
 **Ops**
 
@@ -342,6 +349,23 @@ Wrong primary → **307** with `Location` to the coordinator. Full contract: [`p
 
 ---
 
+## S3-compatible API
+
+Optional listener `s3_listen` (e.g. `0.0.0.0:7481`). Requires `http_listen` — S3 mounts `libaios_posix` against loopback HTTP so **buckets/keys are real directories/files** in `s3_volume` (default `s3`), shared with FUSE/`aiosfs`.
+
+```bash
+# aiosd: --s3-listen 0.0.0.0:7481 --s3-volume s3 --s3-access-key aios
+export AWS_ACCESS_KEY_ID=aios
+export AWS_SECRET_ACCESS_KEY="$KEY"   # cluster_key
+aws --endpoint-url http://127.0.0.1:7481 s3 mb s3://mybucket
+aws --endpoint-url http://127.0.0.1:7481 s3 cp ./file s3://mybucket/path/file
+# FUSE on the same volume sees /mybucket/path/file
+```
+
+Auth: AWS SigV4 (path-style). Details: [`proto/s3.md`](proto/s3.md).
+
+---
+
 ## Local object store
 
 Each `…/aios/` target holds a sharded hybrid store:
@@ -573,6 +597,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | Doc | Topic |
 |-----|-------|
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
+| [`proto/s3.md`](proto/s3.md) | S3-compatible API (FS-backed, SigV4) |
 | [`proto/admin.md`](proto/admin.md) | Admin console, OPS counters, Prometheus `/metrics` |
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |

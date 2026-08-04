@@ -198,6 +198,9 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["transition_batch_oids"])
       cfg.transition_batch_oids = root["transition_batch_oids"].as<int>();
     if (root["http_listen"]) cfg.http_listen = root["http_listen"].as<std::string>();
+    if (root["s3_listen"]) cfg.s3_listen = root["s3_listen"].as<std::string>();
+    if (root["s3_volume"]) cfg.s3_volume = root["s3_volume"].as<std::string>();
+    if (root["s3_access_key"]) cfg.s3_access_key = root["s3_access_key"].as<std::string>();
     if (root["http_body_sync"])
       cfg.http_body_sync = root["http_body_sync"].as<std::string>();
     if (root["max_versions"]) cfg.max_versions = root["max_versions"].as<int>();
@@ -365,6 +368,24 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       cfg.http_listen = v;
       continue;
     }
+    if (arg == "--s3-listen") {
+      const char* v = need("--s3-listen");
+      if (!v) return false;
+      cfg.s3_listen = v;
+      continue;
+    }
+    if (arg == "--s3-volume") {
+      const char* v = need("--s3-volume");
+      if (!v) return false;
+      cfg.s3_volume = v;
+      continue;
+    }
+    if (arg == "--s3-access-key") {
+      const char* v = need("--s3-access-key");
+      if (!v) return false;
+      cfg.s3_access_key = v;
+      continue;
+    }
     if (arg == "--admin") {
       cfg.admin = true;
       continue;
@@ -430,6 +451,20 @@ bool normalize_config(Config& cfg, std::string& err) {
   }
   for (auto& rule : cfg.transition_rules) {
     if (!validate_transition_rule(rule, cfg, err)) return false;
+  }
+  if (!cfg.s3_listen.empty()) {
+    if (cfg.http_listen.empty()) {
+      err = "s3_listen requires http_listen (S3 mounts libaios_posix via loopback HTTP)";
+      return false;
+    }
+    if (cfg.s3_volume.empty()) {
+      err = "s3_volume must be non-empty when s3_listen is set";
+      return false;
+    }
+    if (cfg.s3_access_key.empty()) {
+      err = "s3_access_key must be non-empty when s3_listen is set";
+      return false;
+    }
   }
   return true;
 }

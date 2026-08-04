@@ -104,6 +104,7 @@ add_library(aios_core STATIC
   src/object/transition.cpp
   src/http/http_auth.cpp
   src/http/http_server.cpp
+  src/http/s3_auth.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
 )
@@ -160,6 +161,15 @@ target_include_directories(aios_posix PUBLIC
 )
 target_link_libraries(aios_posix PUBLIC aios_client)
 
+# S3-compatible front-end (FS-backed). Separate from aios_core to avoid link cycle with aios_posix.
+add_library(aios_s3 STATIC
+  src/http/s3_server.cpp
+)
+target_include_directories(aios_s3 PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(aios_s3 PUBLIC aios_core aios_posix)
+
 # Optional FUSE3 mount helper.
 option(AIOS_WITH_FUSE "Build aios-fuse when libfuse3 is available" ON)
 set(AIOS_HAVE_FUSE OFF)
@@ -186,7 +196,7 @@ if(AIOS_WITH_FUSE)
 endif()
 
 add_executable(aiosd src/main.cpp)
-target_link_libraries(aiosd PRIVATE aios_core)
+target_link_libraries(aiosd PRIVATE aios_core aios_s3)
 
 add_executable(aios-bench tools/aios_bench.cpp)
 target_link_libraries(aios-bench PRIVATE aios_client)
@@ -247,6 +257,7 @@ add_executable(aios_tests
   tests/test_store_range.cpp
   tests/test_store_advanced.cpp
   tests/test_http_auth.cpp
+  tests/test_s3_auth.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
   tests/test_http_ec.cpp

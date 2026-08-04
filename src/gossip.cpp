@@ -114,6 +114,7 @@ void GossipEngine::start() {
     }
   }
 
+
   boost::asio::post(ioc_, [this] {
     for (const auto& p : cfg_.peers) {
       auto r = gossip_with_peer(ioc_, p, cfg_.node_id, advertise_addr(),

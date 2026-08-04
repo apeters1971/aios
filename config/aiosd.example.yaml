@@ -52,6 +52,10 @@ placement:
 # repair_interval_ms: 30000
 # repair_batch_oids: 256
 http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
+# S3-compatible API (FS-backed via libaios_posix on s3_volume; requires http_listen):
+# s3_listen: "0.0.0.0:7481"
+# s3_volume: s3                 # POSIX volume; buckets = top-level directories
+# s3_access_key: aios           # SigV4 access key; secret = cluster_key
 # http_body_sync: data
 # max_versions: 16            # retain newest N versions per oid
 # clone_required: true        # FS COW via FICLONE/clonefile; false allows full-copy fallback

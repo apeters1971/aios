@@ -11,12 +11,32 @@
 
 namespace aios {
 
-std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
+std::string hmac_sha256_raw(const std::string& key, const std::string& data) {
   unsigned char md[EVP_MAX_MD_SIZE];
   unsigned int md_len = 0;
   if (HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
            reinterpret_cast<const unsigned char*>(data.data()), data.size(), md,
            &md_len) == nullptr) {
+    return {};
+  }
+  return std::string(reinterpret_cast<char*>(md), md_len);
+}
+
+std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
+  const auto raw = hmac_sha256_raw(key, data);
+  if (raw.empty()) return {};
+  std::ostringstream oss;
+  oss << std::hex << std::setfill('0');
+  for (unsigned char c : raw) {
+    oss << std::setw(2) << static_cast<unsigned>(c);
+  }
+  return oss.str();
+}
+
+std::string sha256_hex(const std::string& data) {
+  unsigned char md[EVP_MAX_MD_SIZE];
+  unsigned int md_len = 0;
+  if (EVP_Digest(data.data(), data.size(), md, &md_len, EVP_sha256(), nullptr) != 1) {
     return {};
   }
   std::ostringstream oss;

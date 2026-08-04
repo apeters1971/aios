@@ -72,6 +72,12 @@ struct Config {
   int transition_batch_oids{64};
   // HTTP object API listen address; empty disables HTTP front-end.
   std::string http_listen{"0.0.0.0:7480"};
+  // S3-compatible API listen address; empty disables. Uses libaios_posix on s3_volume.
+  std::string s3_listen;
+  // POSIX volume backing S3 buckets (top-level dirs). Default "s3".
+  std::string s3_volume{"s3"};
+  // AWS SigV4 access key id; secret is always cluster_key.
+  std::string s3_access_key{"aios"};
   // Body durability for ranged FS puts: none | data | full (informational; store fsyncs).
   std::string http_body_sync{"data"};
   // Retain newest N object versions per oid (default 16).
