@@ -13,7 +13,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
 | `aios-fuse` | FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
-| `aiosfs.ko` + `aios-kbridge` | AlmaLinux 9 VFS prototype (out-of-tree module + userspace bridge) |
+| `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 
 Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
@@ -486,13 +486,13 @@ aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 
 ## Kernel prototype (AlmaLinux 9)
 
-Out-of-tree module `aiosfs.ko` (el9 / kernel 5.14) registers `mount -t aios` and upcalls through `/dev/aios_bridge` to **`aios-kbridge`** (built with the rest of the tree). Build/load steps: [`kernel/README.md`](kernel/README.md).
+Out-of-tree modules on el9 / kernel 5.14: **`aios_http.ko`** (HTTP + HMAC) and **`aiosfs.ko`** (`mount -t aios`). Use `backend=http` for a fully in-kernel path, or `backend=upcall` with **`aios-kbridge`**. Details: [`kernel/README.md`](kernel/README.md).
 
 ```bash
-# on AlmaLinux 9
-cd kernel/aiosfs && make && sudo insmod ./aiosfs.ko
-sudo ./build/aios-kbridge &
-sudo mount -t aios none /mnt/aios -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
+# on AlmaLinux 9 — in-kernel HTTP
+cd kernel && make && sudo insmod aios_http/aios_http.ko && sudo insmod aiosfs/aiosfs.ko
+sudo mount -t aios none /mnt/aios \
+  -o backend=http,endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
 ```
 
 ---

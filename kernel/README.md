@@ -1,59 +1,89 @@
-# aiosfs — AlmaLinux 9 kernel prototype
+# aiosfs — AlmaLinux 9 kernel modules
 
-First out-of-tree VFS prototype for **AlmaLinux 9 / RHEL 9** (kernel **5.14.x**).
+Out-of-tree VFS + HTTP client for **AlmaLinux 9 / RHEL 9** (kernel **5.14.x**).
 
-The kernel module does **not** speak HTTP. It registers filesystem type `aios` and a misc device `/dev/aios_bridge`. VFS operations are upcalled to userspace **`aios-kbridge`**, which calls `libaios_posix` (same ABI as FUSE).
+Two modules:
+
+| Module | Role |
+|--------|------|
+| [`aios_http/`](aios_http/) | In-kernel HTTP/1.1 + AIOS-HMAC-SHA256 client (`get`/`put`/`delete`/`head`/range, 307 redirects) |
+| [`aiosfs/`](aiosfs/) | Filesystem type `aios` with two backends |
 
 ```text
-mount -t aios  →  aiosfs.ko  ⇄  /dev/aios_bridge  ⇄  aios-kbridge  →  libaios_posix  →  cluster
+backend=upcall (default):
+  mount -t aios  →  aiosfs.ko  ⇄  /dev/aios_bridge  ⇄  aios-kbridge  →  libaios_posix  →  cluster
+
+backend=http:
+  mount -t aios  →  aiosfs.ko  →  aios_http.ko  →  TCP/HTTP  →  cluster
 ```
 
 ## Build (on AlmaLinux 9)
 
 ```bash
-# Kernel module
 sudo dnf install -y kernel-devel-$(uname -r) gcc make elfutils-libelf-devel
-cd kernel/aiosfs
-make
-sudo make install   # or: sudo insmod ./aiosfs.ko
+cd kernel
+make            # builds aios_http then aiosfs
+sudo make install
+# or: sudo insmod aios_http/aios_http.ko && sudo insmod aiosfs/aiosfs.ko
+```
 
-# Userspace bridge (from repo root, on the same host)
+Userspace bridge (only needed for `backend=upcall`):
+
+```bash
 cmake -S . -B build -DAIOS_WITH_KBRIDGE=ON
 cmake --build build --target aios-kbridge -j
 ```
 
-## Run
+## Run — in-kernel HTTP (no bridge)
 
 ```bash
-# 1) cluster up, then start the bridge (must be running before mount)
-sudo ./build/aios-kbridge
+sudo insmod kernel/aios_http/aios_http.ko
+sudo insmod kernel/aiosfs/aiosfs.ko
 
-# 2) mount
 sudo mkdir -p /mnt/aios
 sudo mount -t aios none /mnt/aios \
-  -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
+  -o backend=http,endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
 
-# 3) use as a normal filesystem
 ls /mnt/aios
 echo hi | sudo tee /mnt/aios/hello.txt
 
 sudo umount /mnt/aios
-sudo rmmod aiosfs
+sudo rmmod aiosfs aios_http
 ```
 
-Mount options: `endpoint`, `cluster_key` (required), `volume`, `app_label`, `stripe_unit`, `stripe_width`, `uid`, `gid`.
+Prefer a numeric IPv4 `endpoint=` (hostname resolution needs `CONFIG_DNS_RESOLVER`).
+
+## Run — upcall + aios-kbridge
+
+```bash
+sudo insmod kernel/aios_http/aios_http.ko   # still required (aiosfs links its API)
+sudo insmod kernel/aiosfs/aiosfs.ko
+sudo ./build/aios-kbridge
+
+sudo mount -t aios none /mnt/aios \
+  -o backend=upcall,endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
+```
+
+## Mount options
+
+| Option | Notes |
+|--------|--------|
+| `endpoint` | `HOST:PORT` (required) |
+| `cluster_key` | HMAC key (required) |
+| `backend` | `upcall` (default) or `http` |
+| `volume`, `app_label`, `stripe_unit`, `stripe_width`, `uid`, `gid` | same as userspace POSIX |
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| [`aios_kabi.h`](aios_kabi.h) | Shared request/reply opcodes + structs |
-| [`aiosfs/`](aiosfs/) | Out-of-tree module (`main`, `upcall`, `super`, `inode`) |
-| [`../tools/aios_kbridge.cpp`](../tools/aios_kbridge.cpp) | Userspace daemon |
+| [`aios_kabi.h`](aios_kabi.h) | Upcall request/reply ABI |
+| [`aios_http/`](aios_http/) | HTTP client module + [`aios_http_api.h`](aios_http/aios_http_api.h) exports |
+| [`aiosfs/`](aiosfs/) | VFS module (`main`, `upcall`, `super`, `inode`, `http_backend`, `io`, `pagecache`) |
+| [`../tools/aios_kbridge.cpp`](../tools/aios_kbridge.cpp) | Userspace daemon for `backend=upcall` |
 
 ## Status / limits (prototype)
 
-- Synchronous upcalls on the VFS path (no page cache writeback yet).
-- One daemon open on `/dev/aios_bridge` at a time.
-- Secure Boot: module must be signed or SB disabled for `insmod`.
-- Not a pure in-kernel HTTP client — that remains future work; this proves the VFS + `aios_posix` ABI seam on el9.
+- **Page cache**: both backends use buffered I/O (`generic_file_read_iter` / `generic_file_write_iter`) with `address_space_operations` writeback (`readpage` / `writepage` / `writepages`). `fsync` waits for dirty pages then syncs metadata (and upcall `AIOS_OP_FSYNC` when `backend=upcall`).
+- **`backend=http`**: mount, lookup, create/mkdir, unlink/rmdir, same-dir rename, read/write, setattr/truncate. Directory mutations rewrite compact snap+meta (compatible with libaios_posix). Cross-directory rename returns `-EOPNOTSUPP` (needs `/txn`; use `backend=upcall`).
+- Secure Boot: modules must be signed or SB disabled for `insmod`.

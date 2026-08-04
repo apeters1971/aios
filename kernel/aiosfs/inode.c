@@ -2,6 +2,7 @@
 #include "aiosfs.h"
 
 #include <linux/namei.h>
+#include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
 
@@ -35,12 +36,9 @@ struct inode *aios_iget(struct super_block *sb, const struct aios_kabi_stat *st)
 	if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &aios_dir_inode_ops;
 		inode->i_fop = &aios_dir_ops;
-	} else if (S_ISREG(inode->i_mode)) {
-		inode->i_op = &aios_file_inode_ops;
-		inode->i_fop = &aios_file_ops;
 	} else {
 		inode->i_op = &aios_file_inode_ops;
-		inode->i_fop = &aios_file_ops;
+		aios_setup_file_inode(inode);
 	}
 	unlock_new_inode(inode);
 	return inode;
@@ -316,6 +314,8 @@ static int aios_setattr(struct user_namespace *mnt_userns, struct dentry *dentry
 			  NULL, NULL);
 	if (err)
 		return err;
+	if (attr->ia_valid & ATTR_SIZE)
+		truncate_setsize(inode, attr->ia_size);
 	setattr_copy(mnt_userns, inode, attr);
 	mark_inode_dirty(inode);
 	return 0;
@@ -391,113 +391,30 @@ const struct file_operations aios_dir_ops = {
 	.llseek = generic_file_llseek,
 };
 
-static ssize_t aios_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
-{
-	struct inode *inode = file_inode(iocb->ki_filp);
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	size_t want = iov_iter_count(to);
-	struct aios_kabi_rw_in in;
-	struct aios_kabi_rw_out *hdr;
-	void *out = NULL;
-	u32 out_len = 0;
-	ssize_t done = 0;
-	int err;
-
-	if (!want)
-		return 0;
-	if (want > AIOS_KABI_MAX_PAYLOAD - sizeof(*hdr))
-		want = AIOS_KABI_MAX_PAYLOAD - sizeof(*hdr);
-
-	in.ino = inode->i_ino;
-	in.offset = iocb->ki_pos;
-	in.size = want;
-	in._pad = 0;
-
-	err = aios_upcall(info->conn, AIOS_OP_READ, info->mount_id, &in, sizeof(in),
-			  &out, &out_len);
-	if (err)
-		return err;
-	if (out_len < sizeof(*hdr)) {
-		kfree(out);
-		return -EIO;
-	}
-	hdr = out;
-	if (hdr->size > out_len - sizeof(*hdr)) {
-		kfree(out);
-		return -EIO;
-	}
-	done = copy_to_iter((char *)(hdr + 1), hdr->size, to);
-	iocb->ki_pos += done;
-	kfree(out);
-	return done;
-}
-
-static ssize_t aios_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
-{
-	struct inode *inode = file_inode(iocb->ki_filp);
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	size_t want = iov_iter_count(from);
-	size_t in_len;
-	struct aios_kabi_rw_in *in;
-	struct aios_kabi_rw_out *hdr;
-	void *buf;
-	void *out = NULL;
-	u32 out_len = 0;
-	ssize_t done;
-	int err;
-
-	if (!want)
-		return 0;
-	if (want > AIOS_KABI_MAX_PAYLOAD - sizeof(*in))
-		want = AIOS_KABI_MAX_PAYLOAD - sizeof(*in);
-
-	in_len = sizeof(*in) + want;
-	buf = kmalloc(in_len, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	in = buf;
-	in->ino = inode->i_ino;
-	in->offset = iocb->ki_pos;
-	in->size = want;
-	in->_pad = 0;
-	if (copy_from_iter(in + 1, want, from) != want) {
-		kfree(buf);
-		return -EFAULT;
-	}
-
-	err = aios_upcall(info->conn, AIOS_OP_WRITE, info->mount_id, buf, in_len, &out,
-			  &out_len);
-	kfree(buf);
-	if (err)
-		return err;
-	if (out_len < sizeof(*hdr)) {
-		kfree(out);
-		return -EIO;
-	}
-	hdr = out;
-	done = hdr->size;
-	iocb->ki_pos += done;
-	i_size_write(inode, max_t(loff_t, i_size_read(inode), iocb->ki_pos));
-	kfree(out);
-	return done;
-}
-
-static int aios_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+int aios_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file_inode(file);
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_kabi_ino_in in = { .ino = inode->i_ino };
+	int err;
 
-	return aios_upcall(info->conn, AIOS_OP_FSYNC, info->mount_id, &in, sizeof(in),
-			   NULL, NULL);
+	err = file_write_and_wait_range(file, start, end);
+	if (err)
+		return err;
+	inode_lock(inode);
+	err = sync_inode_metadata(inode, 1);
+	if (!err)
+		err = aios_io_fsync(inode);
+	inode_unlock(inode);
+	return err;
 }
 
 const struct file_operations aios_file_ops = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
-	.read_iter = aios_file_read_iter,
-	.write_iter = aios_file_write_iter,
-	.fsync = aios_fsync,
+	.read_iter = generic_file_read_iter,
+	.write_iter = generic_file_write_iter,
+	.mmap = generic_file_mmap,
+	.fsync = aios_file_fsync,
+	.splice_read = generic_file_splice_read,
 	.open = generic_file_open,
 };
 

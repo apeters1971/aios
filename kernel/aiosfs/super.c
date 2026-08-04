@@ -6,6 +6,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
+#include <linux/string.h>
 
 enum {
 	Opt_endpoint,
@@ -16,6 +17,7 @@ enum {
 	Opt_stripe_width,
 	Opt_uid,
 	Opt_gid,
+	Opt_backend,
 	Opt_err,
 };
 
@@ -28,6 +30,7 @@ static const match_table_t aios_tokens = {
 	{ Opt_stripe_width, "stripe_width=%u" },
 	{ Opt_uid, "uid=%u" },
 	{ Opt_gid, "gid=%u" },
+	{ Opt_backend, "backend=%s" },
 	{ Opt_err, NULL },
 };
 
@@ -89,6 +92,20 @@ static int aios_parse_options(char *options, struct aios_sb_info *info)
 			info->gid = v;
 			break;
 		}
+		case Opt_backend: {
+			char buf[16];
+
+			match_strlcpy(buf, &args[0], sizeof(buf));
+			if (!strcmp(buf, "upcall"))
+				info->backend = AIOS_BACKEND_UPCALL;
+			else if (!strcmp(buf, "http"))
+				info->backend = AIOS_BACKEND_HTTP;
+			else {
+				pr_err("aiosfs: backend= must be upcall or http\n");
+				return -EINVAL;
+			}
+			break;
+		}
 		default:
 			pr_err("aiosfs: unknown option '%s'\n", p);
 			return -EINVAL;
@@ -103,7 +120,7 @@ static void aios_put_super(struct super_block *sb)
 
 	if (!info)
 		return;
-	if (info->conn && info->mount_id >= 0) {
+	if (info->backend == AIOS_BACKEND_UPCALL && info->conn && info->mount_id >= 0) {
 		aios_upcall(info->conn, AIOS_OP_UMOUNT, info->mount_id, NULL, 0, NULL, NULL);
 		aios_conn_put(info->conn);
 		info->conn = NULL;
@@ -140,10 +157,14 @@ static int aios_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
-static int aios_show_options(struct seq_file *m, struct dentry *root)
+int aios_show_options(struct seq_file *m, struct dentry *root)
 {
 	struct aios_sb_info *info = AIOS_SB(root->d_sb);
 
+	if (info->backend == AIOS_BACKEND_HTTP)
+		seq_puts(m, ",backend=http");
+	else
+		seq_puts(m, ",backend=upcall");
 	if (info->endpoint[0])
 		seq_printf(m, ",endpoint=%s", info->endpoint);
 	if (info->volume[0])
@@ -161,6 +182,8 @@ static int aios_show_options(struct seq_file *m, struct dentry *root)
 const struct super_operations aios_super_ops = {
 	.statfs = aios_statfs,
 	.drop_inode = generic_delete_inode,
+	.evict_inode = aios_evict_inode,
+	.write_inode = aios_write_inode,
 	.put_super = aios_put_super,
 	.show_options = aios_show_options,
 };
@@ -250,7 +273,10 @@ static int aios_get_tree_fill(struct super_block *sb, struct fs_context *fc)
 	info->mount_id = -1;
 	info->conn = NULL;
 
-	err = aios_fill_super(sb, info);
+	if (info->backend == AIOS_BACKEND_HTTP)
+		err = aios_fill_super_http(sb, info);
+	else
+		err = aios_fill_super(sb, info);
 	if (err) {
 		kfree(info);
 		sb->s_fs_info = NULL;
@@ -294,6 +320,7 @@ int aios_init_fs_context(struct fs_context *fc)
 	if (!info)
 		return -ENOMEM;
 	info->mount_id = -1;
+	info->backend = AIOS_BACKEND_UPCALL;
 	strscpy(info->volume, "default", sizeof(info->volume));
 	fc->s_fs_info = info;
 	fc->ops = &aios_context_ops;

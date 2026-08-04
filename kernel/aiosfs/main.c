@@ -2,8 +2,9 @@
 /*
  * aiosfs — AlmaLinux 9 / RHEL 9 (kernel 5.14) VFS prototype for AIOS.
  *
- * Kernel half of the stack: VFS ops upcall through /dev/aios_bridge to
- * userspace aios-kbridge, which calls libaios_posix.
+ * Two backends:
+ *   backend=upcall (default) — /dev/aios_bridge → aios-kbridge → libaios_posix
+ *   backend=http — in-kernel path via aios_http.ko (HTTP + HMAC)
  */
 #include "aiosfs.h"
 
@@ -34,7 +35,7 @@ static int __init aiosfs_init(void)
 		aios_upcall_exit();
 		return err;
 	}
-	pr_info("aiosfs: loaded (prototype, use aios-kbridge + mount -t aios)\n");
+	pr_info("aiosfs: loaded (backend=upcall|http)\n");
 	return 0;
 }
 
@@ -51,4 +52,5 @@ module_exit(aiosfs_exit);
 MODULE_AUTHOR("AIOS");
 MODULE_DESCRIPTION("AIOS POSIX filesystem prototype (AlmaLinux 9)");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1.0");
+MODULE_VERSION("0.3.0");
+MODULE_SOFTDEP("pre: aios_http");
