@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "fs/fs_table.hpp"
 #include "http/http_server.hpp"
+#include "http/qos_admin.hpp"
 #include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
 #include "membership.hpp"
@@ -29,6 +30,7 @@ class GossipEngine {
   ObjectService& object_service() { return *object_service_; }
   std::shared_ptr<S3IamStore> s3_iam() const { return s3_iam_; }
   std::shared_ptr<QuotaAdminStore> quota() const { return quota_; }
+  std::shared_ptr<QosAdminStore> qos() const { return qos_; }
 
  private:
   void on_gossip_timer(const boost::system::error_code& ec);
@@ -54,6 +56,7 @@ class GossipEngine {
   std::unique_ptr<ObjectService> object_service_;
   std::shared_ptr<S3IamStore> s3_iam_;
   std::shared_ptr<QuotaAdminStore> quota_;
+  std::shared_ptr<QosAdminStore> qos_;
   std::unique_ptr<TcpServer> server_;
   std::unique_ptr<HttpServer> http_server_;
   boost::asio::steady_timer gossip_timer_;

@@ -31,6 +31,7 @@ int test_posix_fs();
 int test_s3_auth();
 int test_s3_iam();
 int test_quota();
+int test_qos();
 
 int main() {
   int failures = 0;
@@ -54,6 +55,7 @@ int main() {
   failures += test_s3_auth();
   failures += test_s3_iam();
   failures += test_quota();
+  failures += test_qos();
   failures += test_http_api();
   failures += test_http_wire();
   failures += test_http_ec();

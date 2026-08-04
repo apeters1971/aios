@@ -52,13 +52,14 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  admin [status|ops|config|cluster|metrics|console|s3-cred|quota ...]\n"
+      << "  admin [status|ops|config|cluster|metrics|console|s3-cred|quota|qos ...]\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
       << "  admin status|ops|config|cluster|metrics   one-shot\n"
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
+      << "  admin qos show|set|project ...\n"
       << "\n"
       << "Follows HTTP 307 redirects to the primary (Location).\n"
       << "put/get stream file bytes (no full-object client buffer).\n";
@@ -845,6 +846,108 @@ int cmd_admin_quota(std::string host, std::string port, const std::string& key,
   return 2;
 }
 
+int cmd_admin_qos(std::string host, std::string port, const std::string& key,
+                  const std::vector<std::string>& args) {
+  if (args.size() < 2) {
+    std::cerr << "usage: admin qos show|set|project ...\n";
+    return 2;
+  }
+  const std::string action = args[1];
+  if (action == "show") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/qos", key);
+    if (r.status != 200) {
+      std::cerr << "qos show failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << r.body << "\n";
+    return 0;
+  }
+  if (action == "set") {
+    std::optional<std::uint32_t> uid, gid;
+    std::optional<std::uint64_t> iops, bps;
+    bool clear = false;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      if (args[i] == "--uid" && i + 1 < args.size())
+        uid = static_cast<std::uint32_t>(std::stoul(args[++i]));
+      else if (args[i] == "--gid" && i + 1 < args.size())
+        gid = static_cast<std::uint32_t>(std::stoul(args[++i]));
+      else if (args[i] == "--iops" && i + 1 < args.size())
+        iops = std::stoull(args[++i]);
+      else if (args[i] == "--bps" && i + 1 < args.size())
+        bps = parse_bytes_arg(args[++i]);
+      else if (args[i] == "--clear")
+        clear = true;
+    }
+    if (!uid && !gid) {
+      std::cerr << "set requires --uid or --gid\n";
+      return 2;
+    }
+    if (!clear && !iops && !bps) {
+      std::cerr << "set requires --iops and/or --bps, or --clear\n";
+      return 2;
+    }
+    nlohmann::json body;
+    if (uid) body["uid"] = *uid;
+    if (gid) body["gid"] = *gid;
+    if (clear) body["clear"] = true;
+    if (iops) body["iops"] = *iops;
+    if (bps) body["bps"] = *bps;
+    auto r = admin_exchange(std::move(host), std::move(port), "PUT", "/admin/api/qos/limits",
+                            body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "qos set failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << "ok\n";
+    return 0;
+  }
+  if (action == "project") {
+    if (args.size() < 3 || args[2] != "set") {
+      std::cerr << "usage: admin qos project set --id ID [--uid UID] --iops N|--bps SIZE|--clear\n";
+      return 2;
+    }
+    std::uint32_t id = 0;
+    std::optional<std::uint32_t> uid;
+    std::optional<std::uint64_t> iops, bps;
+    bool clear = false;
+    for (std::size_t i = 3; i < args.size(); ++i) {
+      if (args[i] == "--id" && i + 1 < args.size())
+        id = static_cast<std::uint32_t>(std::stoul(args[++i]));
+      else if (args[i] == "--uid" && i + 1 < args.size())
+        uid = static_cast<std::uint32_t>(std::stoul(args[++i]));
+      else if (args[i] == "--iops" && i + 1 < args.size())
+        iops = std::stoull(args[++i]);
+      else if (args[i] == "--bps" && i + 1 < args.size())
+        bps = parse_bytes_arg(args[++i]);
+      else if (args[i] == "--clear")
+        clear = true;
+    }
+    if (id == 0) {
+      std::cerr << "project set requires --id\n";
+      return 2;
+    }
+    if (!clear && !iops && !bps) {
+      std::cerr << "project set requires --iops and/or --bps, or --clear\n";
+      return 2;
+    }
+    nlohmann::json body{{"project_id", id}};
+    if (uid) body["uid"] = *uid;
+    if (clear) body["clear"] = true;
+    if (iops) body["iops"] = *iops;
+    if (bps) body["bps"] = *bps;
+    auto r = admin_exchange(std::move(host), std::move(port), "PUT", "/admin/api/qos/limits",
+                            body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "qos project set failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << "ok\n";
+    return 0;
+  }
+  std::cerr << "unknown qos action\n";
+  return 2;
+}
+
 int run_admin_console(std::string host, std::string port, const std::string& key) {
   std::cout << "AIOS admin console  endpoint=" << host << ':' << port << "\n";
   admin_console_help();
@@ -1025,6 +1128,7 @@ int main(int argc, char** argv) {
       if (sub == "s3-cred")
         return cmd_admin_s3_cred(host, port, args.cluster_key, args.positional);
       if (sub == "quota") return cmd_admin_quota(host, port, args.cluster_key, args.positional);
+      if (sub == "qos") return cmd_admin_qos(host, port, args.cluster_key, args.positional);
       std::cerr << "unknown admin subcommand: " << sub << "\n";
       return 2;
     }

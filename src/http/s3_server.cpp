@@ -224,6 +224,10 @@ bool write_posix_err(tcp::socket& sock, int err, const std::string& path) {
     write_s3_error(sock, 403, "QuotaExceeded", "quota exceeded", path);
     return true;
   }
+  if (err == -EAGAIN) {
+    write_s3_error(sock, 503, "SlowDown", "qos rate limit exceeded", path);
+    return true;
+  }
   return false;
 }
 

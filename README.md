@@ -244,11 +244,12 @@ aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin status
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin   # interactive console
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin s3-cred list
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin quota show
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin qos show
 ```
 
-Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters (QoS limits later).
+Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters.
 
-Soft quotas (uid/gid + optional project subtrees): [`proto/quota.md`](proto/quota.md). Details: [`proto/admin.md`](proto/admin.md).
+Soft quotas (uid/gid + optional project subtrees): [`proto/quota.md`](proto/quota.md). Soft IOPS/bandwidth QoS (FUSE/S3): [`proto/qos.md`](proto/qos.md). Details: [`proto/admin.md`](proto/admin.md).
 
 ---
 
@@ -632,6 +633,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/s3.md`](proto/s3.md) | S3-compatible API (FS-backed, SigV4) |
 | [`proto/admin.md`](proto/admin.md) | Admin web UI, OPS counters, Prometheus `/metrics` |
 | [`proto/quota.md`](proto/quota.md) | Soft uid/gid + project (subtree) quotas |
+| [`proto/qos.md`](proto/qos.md) | Soft IOPS / bandwidth QoS (FUSE + S3) |
 | [`proto/README.md`](proto/README.md) | TCP++ framing, gossip, object RPC |
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |

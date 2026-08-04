@@ -2,6 +2,7 @@
 
 #include "client/session.hpp"
 #include "posix/aios_posix.h"
+#include "posix/qos_controller.hpp"
 #include "posix/quota_ledger.hpp"
 
 #include <cstdint>
@@ -117,6 +118,7 @@ struct FsState {
   std::unordered_map<uint64_t, InodeMeta> inode_cache;
   std::unordered_map<uint64_t, std::string> flock_tokens;  // ino → lock token
   std::unique_ptr<QuotaLedger> quota;
+  std::unique_ptr<QosController> qos;
 
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}

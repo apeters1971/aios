@@ -40,6 +40,7 @@
         <button type="button" data-tab="actions" class="tab">Actions</button>
         <button type="button" data-tab="s3" class="tab">S3 credentials</button>
         <button type="button" data-tab="quota" class="tab">Quotas</button>
+        <button type="button" data-tab="qos" class="tab">QoS</button>
       </nav>
       <button type="button" id="logout-btn" class="btn ghost">Log out</button>
     </header>
@@ -129,6 +130,33 @@
         <button type="button" id="quota-reconcile" class="btn primary">Reconcile usage</button>
         <pre id="quota-result" class="code-block small hidden"></pre>
         <p id="quota-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-qos" class="panel hidden">
+        <h2>QoS</h2>
+        <p class="note">Soft node-local IOPS and bandwidth limits for FUSE/S3 (posix). Uses the same uid/gid and project_id domains as quotas. Live rates come from local admit windows plus OPS counters.</p>
+        <h3>Monitoring</h3>
+        <div id="qos-mon" class="table-wrap"></div>
+        <h3>Volume uid / gid limits</h3>
+        <div id="qos-vol-table" class="table-wrap"></div>
+        <form id="qos-set-form" class="s3-form">
+          <label class="field"><span>UID</span><input id="qos-uid" type="number" min="0" /></label>
+          <label class="field"><span>GID</span><input id="qos-gid" type="number" min="0" /></label>
+          <label class="field"><span>IOPS</span><input id="qos-iops" type="number" min="0" placeholder="ops/s" /></label>
+          <label class="field"><span>Bandwidth</span><input id="qos-bps" placeholder="100M or empty" /></label>
+          <button type="submit" class="btn primary">Set limit</button>
+          <button type="button" id="qos-clear" class="btn ghost">Clear</button>
+        </form>
+        <h3>Project limits</h3>
+        <div id="qos-proj-table" class="table-wrap"></div>
+        <form id="qos-proj-form" class="s3-form">
+          <label class="field"><span>Project id</span><input id="qos-proj-id" type="number" min="1" required /></label>
+          <label class="field"><span>UID (optional)</span><input id="qos-proj-uid" type="number" min="0" /></label>
+          <label class="field"><span>IOPS</span><input id="qos-proj-iops" type="number" min="0" /></label>
+          <label class="field"><span>Bandwidth</span><input id="qos-proj-bps" placeholder="50M" /></label>
+          <button type="submit" class="btn primary">Set project limit</button>
+        </form>
+        <p id="qos-error" class="error" hidden></p>
       </section>
     </main>
   </div>

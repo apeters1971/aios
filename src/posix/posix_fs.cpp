@@ -680,6 +680,7 @@ int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len,
   if (offset >= meta.size || len == 0) return 0;
   const uint64_t end = std::min(offset + static_cast<uint64_t>(len), meta.size);
   const size_t want = static_cast<size_t>(end - offset);
+  if (st.qos && !st.qos->admit(meta.project_id, meta.uid, meta.gid, want)) return -EAGAIN;
   auto* out = static_cast<uint8_t*>(buf);
   std::memset(out, 0, want);
 
@@ -720,6 +721,7 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
     const auto grow = static_cast<std::int64_t>(new_size_pre - meta.size);
     if (!st.quota->may_grow(meta.project_id, meta.uid, meta.gid, grow)) return -EDQUOT;
   }
+  if (st.qos && !st.qos->admit(meta.project_id, meta.uid, meta.gid, len)) return -EAGAIN;
   const uint64_t unit = meta.stripe_unit ? meta.stripe_unit : st.stripe_unit;
   const auto* in = static_cast<const uint8_t*>(buf);
   uint64_t pos = offset;
@@ -865,6 +867,7 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
     fs->st->default_uid = cfg->uid;
     fs->st->default_gid = cfg->gid;
     fs->st->quota = std::make_unique<aios::posix::QuotaLedger>(fs->st->session, fs->st->volume);
+    fs->st->qos = std::make_unique<aios::posix::QosController>(fs->st->session, fs->st->volume);
     aios::posix::ensure_super(*fs->st);
     aios::posix::ensure_root(*fs->st);
     return fs;

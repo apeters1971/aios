@@ -153,6 +153,7 @@
     }
     if (activeTab === "s3") await refreshS3();
     if (activeTab === "quota") await refreshQuota();
+    if (activeTab === "qos") await refreshQos();
   }
 
   function parseBytes(s) {
@@ -246,12 +247,138 @@
     showLogin();
   });
 
+  function fmtRate(n) {
+    if (n == null || Number.isNaN(n)) return "—";
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + "G";
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+    return Number(n).toFixed(1);
+  }
+
+  function renderQos(q) {
+    const mon = (q && q.monitoring && q.monitoring.node) || {};
+    document.getElementById("qos-mon").innerHTML = `<table><thead><tr>
+      <th>Put IOPS</th><th>Get IOPS</th><th>Put B/s</th><th>Get B/s</th></tr></thead><tbody>
+      <tr><td>${fmtRate(mon.put_iops)}</td><td>${fmtRate(mon.get_iops)}</td>
+      <td>${fmtRate(mon.put_bps)}</td><td>${fmtRate(mon.get_bps)}</td></tr></tbody></table>`;
+    const urows = ((q && q.volume_uids) || [])
+      .map(
+        (r) =>
+          `<tr><td>${r.uid}</td><td>${r.limit_iops == null ? "—" : r.limit_iops}</td><td>${
+            r.limit_bps == null ? "—" : fmt(r.limit_bps)
+          }</td></tr>`
+      )
+      .join("");
+    const grows = ((q && q.volume_gids) || [])
+      .map(
+        (r) =>
+          `<tr><td>${r.gid}</td><td>${r.limit_iops == null ? "—" : r.limit_iops}</td><td>${
+            r.limit_bps == null ? "—" : fmt(r.limit_bps)
+          }</td></tr>`
+      )
+      .join("");
+    document.getElementById("qos-vol-table").innerHTML =
+      `<table><thead><tr><th>UID</th><th>IOPS</th><th>BPS</th></tr></thead><tbody>${
+        urows || "<tr><td colspan=3>No uid QoS</td></tr>"
+      }</tbody></table>` +
+      `<table style="margin-top:1rem"><thead><tr><th>GID</th><th>IOPS</th><th>BPS</th></tr></thead><tbody>${
+        grows || "<tr><td colspan=3>No gid QoS</td></tr>"
+      }</tbody></table>`;
+    const prows = ((q && q.projects) || [])
+      .map((p) => {
+        const u = (p.uids || [])
+          .map((x) => `uid ${x.uid}: ${x.limit_iops ?? "—"} iops / ${x.limit_bps == null ? "—" : fmt(x.limit_bps)}`)
+          .join("; ");
+        return `<tr><td>${p.id}</td><td>${p.limit_iops == null ? "—" : p.limit_iops}</td><td>${
+          p.limit_bps == null ? "—" : fmt(p.limit_bps)
+        }</td><td>${u || "—"}</td></tr>`;
+      })
+      .join("");
+    document.getElementById("qos-proj-table").innerHTML =
+      `<table><thead><tr><th>ID</th><th>IOPS</th><th>BPS</th><th>Per-uid</th></tr></thead><tbody>${
+        prows || "<tr><td colspan=4>No project QoS</td></tr>"
+      }</tbody></table>`;
+  }
+
+  async function refreshQos() {
+    const { res, json } = await api("/admin/api/qos");
+    if (res.status === 401) {
+      showLogin("Session expired — sign in again.");
+      return;
+    }
+    if (res.ok) renderQos(json);
+    else renderQos({ volume_uids: [], volume_gids: [], projects: [], monitoring: {} });
+  }
+
   document.getElementById("tabs").addEventListener("click", (e) => {
     const btn = e.target.closest(".tab");
     if (!btn) return;
     setTab(btn.dataset.tab);
     if (btn.dataset.tab === "s3") refreshS3().catch(() => {});
     if (btn.dataset.tab === "quota") refreshQuota().catch(() => {});
+    if (btn.dataset.tab === "qos") refreshQos().catch(() => {});
+  });
+
+  async function qosPutLimits(body) {
+    const errEl = document.getElementById("qos-error");
+    errEl.hidden = true;
+    const { res, json } = await api("/admin/api/qos/limits", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Set failed";
+      return;
+    }
+    await refreshQos();
+  }
+
+  document.getElementById("qos-set-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const uid = document.getElementById("qos-uid").value;
+    const gid = document.getElementById("qos-gid").value;
+    const body = {};
+    if (uid !== "") body.uid = Number(uid);
+    else if (gid !== "") body.gid = Number(gid);
+    else {
+      const errEl = document.getElementById("qos-error");
+      errEl.hidden = false;
+      errEl.textContent = "UID or GID required";
+      return;
+    }
+    const iops = document.getElementById("qos-iops").value;
+    const bps = document.getElementById("qos-bps").value;
+    if (iops !== "") body.iops = Number(iops);
+    if (bps.trim() !== "") body.bps = parseBytes(bps);
+    await qosPutLimits(body);
+  });
+
+  document.getElementById("qos-clear").addEventListener("click", async () => {
+    const uid = document.getElementById("qos-uid").value;
+    const gid = document.getElementById("qos-gid").value;
+    const body = { clear: true };
+    if (uid !== "") body.uid = Number(uid);
+    else if (gid !== "") body.gid = Number(gid);
+    else {
+      const errEl = document.getElementById("qos-error");
+      errEl.hidden = false;
+      errEl.textContent = "UID or GID required to clear";
+      return;
+    }
+    await qosPutLimits(body);
+  });
+
+  document.getElementById("qos-proj-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { project_id: Number(document.getElementById("qos-proj-id").value) };
+    const uid = document.getElementById("qos-proj-uid").value;
+    if (uid !== "") body.uid = Number(uid);
+    const iops = document.getElementById("qos-proj-iops").value;
+    const bps = document.getElementById("qos-proj-bps").value;
+    if (iops !== "") body.iops = Number(iops);
+    if (bps.trim() !== "") body.bps = parseBytes(bps);
+    await qosPutLimits(body);
   });
 
   document.getElementById("quota-set-form").addEventListener("submit", async (e) => {

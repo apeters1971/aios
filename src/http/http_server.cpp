@@ -566,13 +566,14 @@ nlohmann::json HttpServer::admin_status_json() const {
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
                        MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam,
-                       std::shared_ptr<QuotaAdminStore> quota)
+                       std::shared_ptr<QuotaAdminStore> quota, std::shared_ptr<QosAdminStore> qos)
     : ioc_(ioc),
       cfg_(std::move(cfg)),
       objects_(objects),
       membership_(membership),
       s3_iam_(std::move(s3_iam)),
       quota_(std::move(quota)),
+      qos_(std::move(qos)),
       acceptor_(ioc) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
@@ -1121,6 +1122,60 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           continue;
         }
         write_json(*sock, 200, "OK", {{"ok", true}, {"quota", quota_->show()}}, keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/api/qos") {
+        if (!qos_) {
+          write_json(*sock, 404, "Not Found", {{"error", "qos admin unavailable"}}, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", qos_->show(), keep_alive);
+        continue;
+      }
+      if (method == "PUT" && path == "/admin/api/qos/limits") {
+        if (!qos_) {
+          write_json(*sock, 404, "Not Found", {{"error", "qos admin unavailable"}}, keep_alive);
+          continue;
+        }
+        try {
+          const std::string raw = body.empty()
+                                      ? "{}"
+                                      : std::string(reinterpret_cast<const char*>(body.data()),
+                                                    body.size());
+          auto j = nlohmann::json::parse(raw);
+          std::string ierr;
+          std::optional<std::uint64_t> iops, bps;
+          bool clear_flag = j.value("clear", false);
+          if (j.contains("iops") && !j["iops"].is_null()) iops = j["iops"].get<std::uint64_t>();
+          if (j.contains("bps") && !j["bps"].is_null()) bps = j["bps"].get<std::uint64_t>();
+          if (!clear_flag && !iops && !bps) {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "iops and/or bps required (or clear=true)"}}, keep_alive);
+            continue;
+          }
+          bool ok = false;
+          if (j.contains("project_id")) {
+            std::optional<std::uint32_t> uid;
+            if (j.contains("uid")) uid = j["uid"].get<std::uint32_t>();
+            ok = qos_->set_project(j["project_id"].get<std::uint32_t>(), uid, iops, bps, clear_flag,
+                                   ierr);
+          } else if (j.contains("uid")) {
+            ok = qos_->set_volume_uid(j["uid"].get<std::uint32_t>(), iops, bps, clear_flag, ierr);
+          } else if (j.contains("gid")) {
+            ok = qos_->set_volume_gid(j["gid"].get<std::uint32_t>(), iops, bps, clear_flag, ierr);
+          } else {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "uid, gid, or project_id required"}}, keep_alive);
+            continue;
+          }
+          if (!ok) {
+            write_json(*sock, 400, "Bad Request", {{"error", ierr}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK", {{"ok", true}}, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
         continue;
       }
       write_json(*sock, 404, "Not Found", {{"error", "unknown admin path"}}, keep_alive);

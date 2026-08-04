@@ -52,8 +52,10 @@ Logout: `POST /admin/logout`.
 | `PUT /admin/api/quota/projects/{id}` | cookie **or** HMAC | `{uid, bytes\|null}` project-uid limit |
 | `DELETE /admin/api/quota/projects/{id}` | cookie **or** HMAC | Remove project |
 | `POST /admin/api/quota/reconcile` | cookie **or** HMAC | Rebuild usage from inodes |
+| `GET /admin/api/qos` | cookie **or** HMAC | Soft IOPS/BW limits + monitoring rates |
+| `PUT /admin/api/qos/limits` | cookie **or** HMAC | `{uid\|gid\|project_id, iops?, bps?, clear?}` |
 
-CLI: `aios admin s3-cred …`, `aios admin quota …`. Web UI: **S3 credentials** / **Quotas** tabs. See [`proto/s3.md`](s3.md), [`proto/quota.md`](quota.md).
+CLI: `aios admin s3-cred …`, `aios admin quota …`, `aios admin qos …`. Web UI: **S3 credentials** / **Quotas** / **QoS** tabs. See [`proto/s3.md`](s3.md), [`proto/quota.md`](quota.md), [`proto/qos.md`](qos.md).
 
 ### Legacy JSON (CLI / HMAC)
 
