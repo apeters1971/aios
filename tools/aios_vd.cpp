@@ -115,6 +115,7 @@ int cmd_map(int argc, char** argv) {
   std::snprintf(arg.cluster_key, sizeof(arg.cluster_key), "%s", key.c_str());
   std::snprintf(arg.pool, sizeof(arg.pool), "%s", pool.c_str());
   std::snprintf(arg.name, sizeof(arg.name), "%s", name.c_str());
+  if (app.empty()) app = "vbd";
   std::snprintf(arg.app_label, sizeof(arg.app_label), "%s", app.c_str());
   std::snprintf(arg.key_id, sizeof(arg.key_id), "%s", key_id.c_str());
   arg.size = size;

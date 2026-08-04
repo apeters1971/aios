@@ -2,6 +2,7 @@
 
 #include "http/http_auth.hpp"
 #include "metrics/app_label.hpp"
+#include "metrics/frontend_io.hpp"
 #include "net/framing.hpp"
 #include "object/object_layout.hpp"
 #include "object/pubsub.hpp"
@@ -859,6 +860,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
       if (method == "GET" && (path == "/admin/ops" || path == "/admin/api/ops")) {
         auto payload = objects_.ops().to_admin_json();
+        payload["io_frontends"] = io_frontends_admin_json(payload.value("ops_by_label", nlohmann::json::object()));
         payload["node_id"] = cfg_.node_id;
         write_json(*sock, 200, "OK", payload, keep_alive);
         continue;

@@ -2,6 +2,7 @@
 #include "posix/posix_internal.hpp"
 
 #include "client/changelog.hpp"
+#include "metrics/frontend_io.hpp"
 #include "util/base64.hpp"
 #include "util/log.hpp"
 
@@ -681,6 +682,7 @@ int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len,
   const uint64_t end = std::min(offset + static_cast<uint64_t>(len), meta.size);
   const size_t want = static_cast<size_t>(end - offset);
   if (st.qos && !st.qos->admit(meta.project_id, meta.uid, meta.gid, want)) return -EAGAIN;
+  aios::note_frontend_io(st.frontend_label, false, want);
   auto* out = static_cast<uint8_t*>(buf);
   std::memset(out, 0, want);
 
@@ -722,6 +724,7 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
     if (!st.quota->may_grow(meta.project_id, meta.uid, meta.gid, grow)) return -EDQUOT;
   }
   if (st.qos && !st.qos->admit(meta.project_id, meta.uid, meta.gid, len)) return -EAGAIN;
+  aios::note_frontend_io(st.frontend_label, true, len);
   const uint64_t unit = meta.stripe_unit ? meta.stripe_unit : st.stripe_unit;
   const auto* in = static_cast<const uint8_t*>(buf);
   uint64_t pos = offset;
@@ -858,7 +861,9 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
     aios::SessionConfig sc;
     sc.endpoint = cfg->endpoint;
     sc.cluster_key = cfg->cluster_key;
-    if (cfg->app_label) sc.app_label = cfg->app_label;
+    // Default frontend label "fs" so FUSE/posix object OPS and logical IO are separated from S3/VBD.
+    if (cfg->app_label && cfg->app_label[0]) sc.app_label = cfg->app_label;
+    else sc.app_label = aios::kFrontendFs;
     auto fs = new aios_posix_fs;
     fs->st = std::make_unique<FsState>(std::move(sc));
     fs->st->volume = (cfg->volume && cfg->volume[0]) ? cfg->volume : "default";
@@ -866,6 +871,8 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
     fs->st->stripe_width = cfg->stripe_width ? cfg->stripe_width : aios::posix::kDefaultStripeWidth;
     fs->st->default_uid = cfg->uid;
     fs->st->default_gid = cfg->gid;
+    fs->st->frontend_label = fs->st->session.app_label().empty() ? aios::kFrontendFs
+                                                                 : fs->st->session.app_label();
     fs->st->quota = std::make_unique<aios::posix::QuotaLedger>(fs->st->session, fs->st->volume);
     fs->st->qos = std::make_unique<aios::posix::QosController>(fs->st->session, fs->st->volume);
     aios::posix::ensure_super(*fs->st);

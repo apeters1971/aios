@@ -1,5 +1,6 @@
 #include "http/qos_admin.hpp"
 
+#include "metrics/frontend_io.hpp"
 #include "metrics/qos_rates.hpp"
 
 #include <chrono>
@@ -155,7 +156,8 @@ nlohmann::json QosAdminStore::monitoring_json() {
             {"put_bytes_total", put_b},
             {"get_bytes_total", get_b}}},
           {"ops_by_label", by_label},
-          {"observed", qos_observed_rates_json(volume())}};
+          {"observed", qos_observed_rates_json(volume())},
+          {"io_frontends", io_frontends_admin_json(by_label)}};
 }
 
 nlohmann::json QosAdminStore::show() {

@@ -85,6 +85,35 @@
       .join("");
     document.getElementById("ops-table").innerHTML =
       `<table><thead><tr><th>Counter</th><th>Value</th></tr></thead><tbody>${rows}</tbody></table>`;
+    const fe = (opsPayload && opsPayload.io_frontends && opsPayload.io_frontends.logical) || {};
+    const order = ["s3", "fs", "vbd"];
+    const keys = order.concat(Object.keys(fe).filter((k) => !order.includes(k)));
+    const frows = keys
+      .map((k) => {
+        const c = fe[k] || {};
+        return `<tr><td>${k}</td><td>${fmt(c.read_ops)}</td><td>${fmt(c.write_ops)}</td><td>${fmt(
+          c.read_bytes
+        )}</td><td>${fmt(c.write_bytes)}</td><td>${c.source || "—"}</td></tr>`;
+      })
+      .join("");
+    const vbd = (opsPayload && opsPayload.io_frontends && opsPayload.io_frontends.vbd_devices) || [];
+    const vrows = vbd
+      .map(
+        (d) =>
+          `<tr><td>aiosvd${d.dev_id}</td><td>${d.pool}/${d.name}</td><td>${fmt(
+            d.ops_read
+          )}</td><td>${fmt(d.ops_write)}</td><td>${fmt(d.bytes_read)}</td><td>${fmt(
+            d.bytes_written
+          )}</td></tr>`
+      )
+      .join("");
+    document.getElementById("io-frontends").innerHTML =
+      `<table><thead><tr><th>Frontend</th><th>Read ops</th><th>Write ops</th><th>Read bytes</th><th>Write bytes</th><th>Source</th></tr></thead><tbody>${
+        frows || "<tr><td colspan=6>No frontend IO yet</td></tr>"
+      }</tbody></table>` +
+      (vbd.length
+        ? `<table style="margin-top:1rem"><thead><tr><th>Device</th><th>Volume</th><th>Read ops</th><th>Write ops</th><th>Read bytes</th><th>Write bytes</th></tr></thead><tbody>${vrows}</tbody></table>`
+        : `<p class="muted" style="margin-top:0.75rem">No aiosvd devices on this node (module not loaded or none mapped).</p>`);
   }
 
   function renderCluster(cluster) {

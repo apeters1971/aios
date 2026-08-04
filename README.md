@@ -247,7 +247,7 @@ aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin quota show
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin qos show
 ```
 
-Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters.
+Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters. Reserved frontend labels: `s3`, `fs` (FUSE/posix), `vbd` (block) — see admin `io_frontends`.
 
 Soft quotas (uid/gid + optional project subtrees): [`proto/quota.md`](proto/quota.md). Soft IOPS/bandwidth QoS (FUSE/S3): [`proto/qos.md`](proto/qos.md). Details: [`proto/admin.md`](proto/admin.md).
 

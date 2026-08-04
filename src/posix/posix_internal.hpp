@@ -113,6 +113,7 @@ struct FsState {
   uint32_t stripe_width{kDefaultStripeWidth};
   uint32_t default_uid{0};
   uint32_t default_gid{0};
+  std::string frontend_label{"fs"};  // s3 | fs | custom (for IO monitoring)
   SuperMeta super;
   std::mutex mu;
   std::unordered_map<uint64_t, InodeMeta> inode_cache;

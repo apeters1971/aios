@@ -87,7 +87,8 @@ int main(int argc, char** argv) {
   cfg.endpoint = opt.endpoint.c_str();
   cfg.cluster_key = opt.cluster_key.c_str();
   cfg.volume = opt.volume.c_str();
-  cfg.app_label = opt.app_label.empty() ? nullptr : opt.app_label.c_str();
+  if (opt.app_label.empty()) opt.app_label = "fs";
+  cfg.app_label = opt.app_label.c_str();
   cfg.stripe_unit = opt.stripe_unit;
   cfg.stripe_width = opt.stripe_width;
   cfg.uid = static_cast<uint32_t>(::geteuid());

@@ -111,9 +111,11 @@ add_library(aios_core STATIC
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
   src/metrics/qos_rates.cpp
+  src/metrics/frontend_io.cpp
 )
 target_include_directories(aios_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_compile_definitions(aios_core PRIVATE
   "AIOS_ADMIN_WEB_DEFAULT=\"${CMAKE_CURRENT_SOURCE_DIR}/web/admin\""
@@ -270,6 +272,7 @@ add_executable(aios_tests
   tests/test_s3_iam.cpp
   tests/test_quota.cpp
   tests/test_qos.cpp
+  tests/test_frontend_io.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
   tests/test_http_ec.cpp

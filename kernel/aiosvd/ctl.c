@@ -114,8 +114,10 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 	if (IS_ERR(probe))
 		return PTR_ERR(probe);
 	aios_http_client_set_timeout_ms(probe, 30000);
-	if (arg->app_label[0])
-		aios_http_client_set_app_label(probe, arg->app_label);
+	/* Default app_label "vbd" so object OPS are separated from S3/FS in admin monitoring. */
+	if (!arg->app_label[0])
+		strscpy(arg->app_label, "vbd", sizeof(arg->app_label));
+	aios_http_client_set_app_label(probe, arg->app_label);
 
 	aiosvd_header_oid(arg->pool, arg->name, header_oid, sizeof(header_oid));
 
@@ -434,8 +436,9 @@ int aiosvd_clone(struct aiosvd_clone_arg *arg)
 		if (IS_ERR(http))
 			return PTR_ERR(http);
 		aios_http_client_set_timeout_ms(http, 30000);
-		if (map.app_label[0])
-			aios_http_client_set_app_label(http, map.app_label);
+		if (!map.app_label[0])
+			strscpy(map.app_label, "vbd", sizeof(map.app_label));
+		aios_http_client_set_app_label(http, map.app_label);
 
 		aiosvd_header_oid(arg->pool, arg->name, header_oid, sizeof(header_oid));
 		err = aiosvd_header_format(hdr_js, sizeof(hdr_js), arg->pool, arg->name, size,

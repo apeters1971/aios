@@ -111,6 +111,9 @@ static int aios_parse_options(char *options, struct aios_sb_info *info)
 			return -EINVAL;
 		}
 	}
+	/* Default app_label "fs" so object OPS are separated from S3/VBD. */
+	if (!info->app_label[0])
+		strscpy(info->app_label, "fs", sizeof(info->app_label));
 	return 0;
 }
 

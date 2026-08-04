@@ -89,6 +89,22 @@ Counters are also written into `status_file` under `ops` / `ops_by_label` when t
 
 Clients send `x-aios-app-label: <label>` (see [`http.md`](http.md)). Each distinct label gets its own counter bucket (max 256; further labels roll into `_overflow`). Totals always include labeled + unlabeled traffic; `ops_by_label` is the breakdown.
 
+**Reserved frontend labels** (defaults when unset):
+
+| Label | Frontend |
+|-------|----------|
+| `s3` | S3 API (posix mount inside aiosd) |
+| `fs` | FUSE / posix filesystem clients |
+| `vbd` | Block volumes (`aiosvd`) |
+
+### IO by frontend
+
+`GET /admin/ops` (and `/admin/api/ops`) includes `io_frontends`:
+
+- `logical` — S3/FS posix read/write ops+bytes; VBD aggregated from mapped `aiosvd` devices when `/dev/aiosvd_ctl` is present
+- `object_ops` — object-API OPS sliced by the same labels (chunk-level; higher than logical for striped FS/S3)
+- `vbd_devices` — per-device kernel counters (`ops_read` / `ops_write` / bytes / errors / …)
+
 Prometheus series add `app_label="…"` for per-label samples (node totals remain without that label).
 
 ## CLI console
