@@ -38,6 +38,7 @@
         <button type="button" data-tab="cluster" class="tab">Cluster</button>
         <button type="button" data-tab="config" class="tab">Config</button>
         <button type="button" data-tab="actions" class="tab">Actions</button>
+        <button type="button" data-tab="s3" class="tab">S3 credentials</button>
       </nav>
       <button type="button" id="logout-btn" class="btn ghost">Log out</button>
     </header>
@@ -87,6 +88,22 @@
           </div>
         </div>
         <p id="action-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-s3" class="panel hidden">
+        <h2>S3 credentials</h2>
+        <p class="note">Opaque access keys mapped to POSIX uid/gid and bucket allowlists. Persisted as cluster object <code>s3iam/&lt;volume&gt;</code>. The global <code>s3_access_key</code> / cluster key remains root.</p>
+        <div id="s3-table" class="table-wrap"></div>
+        <h3>Create</h3>
+        <form id="s3-create-form" class="s3-form">
+          <label class="field"><span>Access key id</span><input id="s3-id" required spellcheck="false" /></label>
+          <label class="field"><span>UID</span><input id="s3-uid" type="number" min="0" required value="1000" /></label>
+          <label class="field"><span>GID</span><input id="s3-gid" type="number" min="0" required value="1000" /></label>
+          <label class="field"><span>Buckets</span><input id="s3-buckets" required placeholder="photos, backups" spellcheck="false" /></label>
+          <button type="submit" class="btn primary">Create</button>
+        </form>
+        <pre id="s3-secret" class="code-block small hidden"></pre>
+        <p id="s3-error" class="error" hidden></p>
       </section>
     </main>
   </div>

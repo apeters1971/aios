@@ -13,9 +13,11 @@
 #include <cctype>
 #include <cstring>
 #include <ctime>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -208,7 +210,16 @@ int lookup_path(aios_posix_fs* fs, const std::vector<std::string>& parts, uint64
   return 0;
 }
 
-int mkdir_p(aios_posix_fs* fs, const std::vector<std::string>& parts, uint64_t* ino_out) {
+void apply_owner(aios_posix_fs* fs, uint64_t ino, bool set_owner, uint32_t uid, uint32_t gid) {
+  if (!set_owner) return;
+  aios_posix_stat st{};
+  st.uid = uid;
+  st.gid = gid;
+  aios_posix_setattr(fs, ino, &st, AIOS_POSIX_SET_UID | AIOS_POSIX_SET_GID);
+}
+
+int mkdir_p(aios_posix_fs* fs, const std::vector<std::string>& parts, uint64_t* ino_out,
+            bool set_owner = false, uint32_t uid = 0, uint32_t gid = 0) {
   uint64_t ino = kRootIno;
   for (const auto& p : parts) {
     aios_posix_stat st{};
@@ -216,6 +227,7 @@ int mkdir_p(aios_posix_fs* fs, const std::vector<std::string>& parts, uint64_t* 
     if (err == -ENOENT) {
       err = aios_posix_mkdir(fs, ino, p.c_str(), 0755, &st);
       if (err) return err;
+      apply_owner(fs, st.ino, set_owner, uid, gid);
     } else if (err) {
       return err;
     } else if (!S_ISDIR(st.mode)) {
@@ -229,7 +241,8 @@ int mkdir_p(aios_posix_fs* fs, const std::vector<std::string>& parts, uint64_t* 
 
 int resolve_parent(aios_posix_fs* fs, const std::string& bucket, const std::string& key,
                    bool create_dirs, uint64_t* parent_out, std::string* name_out,
-                   uint64_t* bucket_ino_out = nullptr) {
+                   uint64_t* bucket_ino_out = nullptr, bool set_owner = false, uint32_t uid = 0,
+                   uint32_t gid = 0) {
   if (!valid_bucket_name(bucket)) return -EINVAL;
   aios_posix_stat bst{};
   int err = aios_posix_lookup(fs, kRootIno, bucket.c_str(), &bst);
@@ -252,6 +265,7 @@ int resolve_parent(aios_posix_fs* fs, const std::string& bucket, const std::stri
         if (err == -ENOENT) {
           err = aios_posix_mkdir(fs, cur, p.c_str(), 0755, &st);
           if (err) return err;
+          apply_owner(fs, st.ino, set_owner, uid, gid);
         } else if (err) {
           return err;
         } else if (!S_ISDIR(st.mode)) {
@@ -271,12 +285,14 @@ int resolve_parent(aios_posix_fs* fs, const std::string& bucket, const std::stri
   return 0;
 }
 
-int ensure_file(aios_posix_fs* fs, uint64_t parent, const std::string& name, uint64_t* ino_out) {
+int ensure_file(aios_posix_fs* fs, uint64_t parent, const std::string& name, uint64_t* ino_out,
+                bool set_owner = false, uint32_t uid = 0, uint32_t gid = 0) {
   aios_posix_stat st{};
   int err = aios_posix_lookup(fs, parent, name.c_str(), &st);
   if (err == -ENOENT) {
     err = aios_posix_create(fs, parent, name.c_str(), 0644, &st);
     if (err) return err;
+    apply_owner(fs, st.ino, set_owner, uid, gid);
   } else if (err) {
     return err;
   } else if (!S_ISREG(st.mode)) {
@@ -374,10 +390,12 @@ std::string s3_loopback_http_endpoint(const std::string& http_listen) {
   return host + ":" + port;
 }
 
-S3Server::S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_http_endpoint)
+S3Server::S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_http_endpoint,
+                   std::shared_ptr<S3IamStore> iam)
     : ioc_(ioc),
       cfg_(std::move(cfg)),
       posix_endpoint_(std::move(posix_http_endpoint)),
+      iam_(std::move(iam)),
       acceptor_(ioc) {}
 
 S3Server::~S3Server() {
@@ -423,7 +441,9 @@ void S3Server::do_accept() {
   auto sock = std::make_shared<tcp::socket>(ioc_);
   acceptor_.async_accept(*sock, [this, sock](const boost::system::error_code& ec) {
     if (!ec) {
-      boost::asio::post(ioc_, [this, sock] { handle_session(sock); });
+      // Run off the io_context thread: handle_session blocks in libaios_posix, which
+      // performs synchronous HTTP back to http_listen on the same ioc.
+      std::thread([this, sock] { handle_session(sock); }).detach();
     }
     if (acceptor_.is_open()) do_accept();
   });
@@ -526,13 +546,34 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (canon_uri.empty()) canon_uri = "/";
     }
 
+    const std::string akid = s3_sigv4_access_key(headers);
+    bool is_root = false;
+    std::string secret;
+    std::optional<S3Credential> iam_cred;
+    if (!akid.empty() && akid == cfg_.s3_access_key) {
+      is_root = true;
+      secret = cfg_.cluster_key;
+    } else if (iam_ && !akid.empty()) {
+      iam_cred = iam_->find(akid);
+      if (iam_cred) secret = iam_cred->secret;
+    }
+    if (secret.empty()) {
+      write_s3_error(*sock, 403, "InvalidAccessKeyId", "Unknown access key", path);
+      return;
+    }
     auto auth = s3_sigv4_verify(method, canon_uri, canonical_query_string(query), headers,
-                                payload_hash, cfg_.s3_access_key, cfg_.cluster_key,
-                                cfg_.auth_skew_ms);
+                                payload_hash, akid, secret, cfg_.auth_skew_ms);
     if (!auth.ok) {
       write_s3_error(*sock, 403, "SignatureDoesNotMatch", auth.error, path);
       return;
     }
+    const bool set_owner = !is_root && iam_cred.has_value();
+    const uint32_t own_uid = set_owner ? iam_cred->uid : 0;
+    const uint32_t own_gid = set_owner ? iam_cred->gid : 0;
+    auto allow_bucket = [&](const std::string& b) -> bool {
+      if (is_root) return true;
+      return iam_cred && iam_->allows_bucket(*iam_cred, b);
+    };
 
     // Parse /bucket/key
     std::string bucket, key;
@@ -554,7 +595,8 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       std::ostringstream xml;
       xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
           << "<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-          << "<Owner><ID>aios</ID><DisplayName>aios</DisplayName></Owner><Buckets>";
+          << "<Owner><ID>" << xml_escape(akid)
+          << "</ID><DisplayName>" << xml_escape(akid) << "</DisplayName></Owner><Buckets>";
       uint64_t off = 0;
       aios_posix_dirent ents[64];
       for (;;) {
@@ -563,6 +605,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         for (int i = 0; i < n; ++i) {
           if (ents[i].name[0] == '.') continue;
           if (!S_ISDIR(ents[i].mode)) continue;
+          if (!allow_bucket(ents[i].name)) continue;
           aios_posix_stat st{};
           aios_posix_getattr(fs_, ents[i].ino, &st);
           xml << "<Bucket><Name>" << xml_escape(ents[i].name) << "</Name><CreationDate>"
@@ -576,6 +619,10 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
 
     if (bucket.empty()) {
       write_s3_error(*sock, 400, "InvalidRequest", "bucket required", path);
+      return;
+    }
+    if (!allow_bucket(bucket)) {
+      write_s3_error(*sock, 403, "AccessDenied", "bucket not allowed for this access key", path);
       return;
     }
 
@@ -596,6 +643,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 500, "InternalError", "mkdir failed", path);
         return;
       }
+      apply_owner(fs_, st.ino, set_owner, own_uid, own_gid);
       write_http(*sock, 200, "OK", {{"Location", "/" + bucket}}, {});
       return;
     }
@@ -700,7 +748,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (method == "PUT" && !key.empty() && key.back() == '/' && qmap.count("uploads") == 0 &&
         header_get(headers, "x-amz-copy-source").empty()) {
       auto parts = split_key(bucket + "/" + key);
-      int err = mkdir_p(fs_, parts, nullptr);
+      int err = mkdir_p(fs_, parts, nullptr, set_owner, own_uid, own_gid);
       if (err) {
         write_s3_error(*sock, 500, "InternalError", "mkdir failed", path);
         return;
@@ -802,13 +850,15 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       std::sort(parts.begin(), parts.end());
       uint64_t parent = 0;
       std::string name;
-      int err = resolve_parent(fs_, tbucket, tkey, true, &parent, &name);
+      int err =
+          resolve_parent(fs_, tbucket, tkey, true, &parent, &name, nullptr, set_owner, own_uid,
+                         own_gid);
       if (err) {
         write_s3_error(*sock, 500, "InternalError", "resolve target failed", path);
         return;
       }
       uint64_t fino = 0;
-      err = ensure_file(fs_, parent, name, &fino);
+      err = ensure_file(fs_, parent, name, &fino, set_owner, own_uid, own_gid);
       if (err) {
         write_s3_error(*sock, 500, "InternalError", "create target failed", path);
         return;
@@ -890,6 +940,10 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         return;
       }
       std::string sbucket = src.substr(0, slash), skey = src.substr(slash + 1);
+      if (!allow_bucket(sbucket)) {
+        write_s3_error(*sock, 403, "AccessDenied", "source bucket not allowed", path);
+        return;
+      }
       uint64_t sp = 0;
       std::string sname;
       int err = resolve_parent(fs_, sbucket, skey, false, &sp, &sname);
@@ -905,13 +959,14 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
       uint64_t dp = 0;
       std::string dname;
-      err = resolve_parent(fs_, bucket, key, true, &dp, &dname);
+      err = resolve_parent(fs_, bucket, key, true, &dp, &dname, nullptr, set_owner, own_uid,
+                          own_gid);
       if (err) {
         write_s3_error(*sock, 500, "InternalError", "dest resolve failed", path);
         return;
       }
       uint64_t dino = 0;
-      err = ensure_file(fs_, dp, dname, &dino);
+      err = ensure_file(fs_, dp, dname, &dino, set_owner, own_uid, own_gid);
       if (err) {
         write_s3_error(*sock, 500, "InternalError", "dest create failed", path);
         return;
@@ -951,13 +1006,14 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
       uint64_t parent = 0;
       std::string name;
-      int err = resolve_parent(fs_, bucket, key, true, &parent, &name);
+      int err = resolve_parent(fs_, bucket, key, true, &parent, &name, nullptr, set_owner, own_uid,
+                              own_gid);
       if (err) {
         write_s3_error(*sock, 500, "InternalError", "path resolve failed", path);
         return;
       }
       uint64_t ino = 0;
-      err = ensure_file(fs_, parent, name, &ino);
+      err = ensure_file(fs_, parent, name, &ino, set_owner, own_uid, own_gid);
       if (err) {
         write_s3_error(*sock, 500, "InternalError", "create failed", path);
         return;

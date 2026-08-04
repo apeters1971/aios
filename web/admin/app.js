@@ -101,6 +101,34 @@
       }</tbody></table>`;
   }
 
+  function renderS3(payload) {
+    const creds = (payload && payload.credentials) || [];
+    const rows = creds
+      .map((c) => {
+        const buckets = Array.isArray(c.buckets) ? c.buckets.join(", ") : "";
+        const id = c.access_key_id || "";
+        return `<tr>
+          <td>${id}</td><td>${fmt(c.uid)}</td><td>${fmt(c.gid)}</td><td>${buckets}</td>
+          <td><button type="button" class="btn ghost s3-del" data-id="${id}">Delete</button></td>
+        </tr>`;
+      })
+      .join("");
+    document.getElementById("s3-table").innerHTML =
+      `<table><thead><tr><th>Access key</th><th>UID</th><th>GID</th><th>Buckets</th><th></th></tr></thead><tbody>${
+        rows || "<tr><td colspan=5>No credentials (or S3 disabled on this node)</td></tr>"
+      }</tbody></table>`;
+  }
+
+  async function refreshS3() {
+    const { res, json } = await api("/admin/api/s3/credentials");
+    if (res.status === 401) {
+      showLogin("Session expired — sign in again.");
+      return;
+    }
+    if (res.ok) renderS3(json);
+    else if (res.status === 404) renderS3({ credentials: [] });
+  }
+
   async function refresh() {
     const [st, ops, cl, cfg] = await Promise.all([
       api("/admin/api/status"),
@@ -123,6 +151,7 @@
         mp.checked = cfg.json.admin_metrics_public;
       }
     }
+    if (activeTab === "s3") await refreshS3();
   }
 
   async function probeSession() {
@@ -161,6 +190,55 @@
     const btn = e.target.closest(".tab");
     if (!btn) return;
     setTab(btn.dataset.tab);
+    if (btn.dataset.tab === "s3") refreshS3().catch(() => {});
+  });
+
+  document.getElementById("s3-table").addEventListener("click", async (e) => {
+    const btn = e.target.closest(".s3-del");
+    if (!btn) return;
+    const id = btn.dataset.id;
+    if (!id || !confirm(`Delete S3 credential ${id}?`)) return;
+    const errEl = document.getElementById("s3-error");
+    errEl.hidden = true;
+    const { res, json } = await api(`/admin/api/s3/credentials/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      body: "{}",
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Delete failed";
+      return;
+    }
+    await refreshS3();
+  });
+
+  document.getElementById("s3-create-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("s3-error");
+    const secretEl = document.getElementById("s3-secret");
+    errEl.hidden = true;
+    secretEl.classList.add("hidden");
+    const access_key_id = document.getElementById("s3-id").value.trim();
+    const uid = Number(document.getElementById("s3-uid").value);
+    const gid = Number(document.getElementById("s3-gid").value);
+    const buckets = document.getElementById("s3-buckets").value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const { res, json } = await api("/admin/api/s3/credentials", {
+      method: "POST",
+      body: JSON.stringify({ access_key_id, uid, gid, buckets }),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Create failed";
+      return;
+    }
+    secretEl.classList.remove("hidden");
+    secretEl.textContent =
+      `Created ${json.access_key_id}\nsecret: ${json.secret}\n(store the secret now; it is not shown again)`;
+    document.getElementById("s3-id").value = "";
+    await refreshS3();
   });
 
   document.getElementById("save-settings").addEventListener("click", async () => {

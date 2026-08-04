@@ -565,8 +565,12 @@ nlohmann::json HttpServer::admin_status_json() const {
 }
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
-                       MembershipTable& membership)
-    : ioc_(ioc), cfg_(std::move(cfg)), objects_(objects), membership_(membership),
+                       MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam)
+    : ioc_(ioc),
+      cfg_(std::move(cfg)),
+      objects_(objects),
+      membership_(membership),
+      s3_iam_(std::move(s3_iam)),
       acceptor_(ioc) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
@@ -907,6 +911,85 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         } catch (...) {
           write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
         }
+        continue;
+      }
+      if (method == "GET" && path == "/admin/api/s3/credentials") {
+        if (!s3_iam_) {
+          write_json(*sock, 404, "Not Found",
+                     {{"error", "S3 IAM unavailable (enable s3_listen)"}}, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", s3_iam_->list_redacted(), keep_alive);
+        continue;
+      }
+      if (method == "POST" && path == "/admin/api/s3/credentials") {
+        if (!s3_iam_) {
+          write_json(*sock, 404, "Not Found",
+                     {{"error", "S3 IAM unavailable (enable s3_listen)"}}, keep_alive);
+          continue;
+        }
+        try {
+          const std::string raw = body.empty()
+                                      ? "{}"
+                                      : std::string(reinterpret_cast<const char*>(body.data()),
+                                                    body.size());
+          auto j = nlohmann::json::parse(raw);
+          S3Credential cred;
+          cred.access_key_id = j.value("access_key_id", "");
+          cred.secret = j.value("secret", "");
+          cred.uid = j.value("uid", 0u);
+          cred.gid = j.value("gid", 0u);
+          if (j.contains("buckets") && j["buckets"].is_array()) {
+            for (const auto& b : j["buckets"]) {
+              if (b.is_string()) cred.buckets.push_back(b.get<std::string>());
+            }
+          } else if (j.contains("buckets") && j["buckets"].is_string()) {
+            // Comma-separated convenience.
+            std::string s = j["buckets"].get<std::string>();
+            std::size_t i = 0;
+            while (i < s.size()) {
+              auto comma = s.find(',', i);
+              if (comma == std::string::npos) comma = s.size();
+              auto part = s.substr(i, comma - i);
+              while (!part.empty() && part.front() == ' ') part.erase(part.begin());
+              while (!part.empty() && part.back() == ' ') part.pop_back();
+              if (!part.empty()) cred.buckets.push_back(part);
+              i = comma + 1;
+            }
+          }
+          std::string ierr;
+          auto created = s3_iam_->create(std::move(cred), ierr);
+          if (!created) {
+            write_json(*sock, 400, "Bad Request", {{"error", ierr}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 201, "Created",
+                     {{"access_key_id", created->access_key_id},
+                      {"secret", created->secret},
+                      {"uid", created->uid},
+                      {"gid", created->gid},
+                      {"buckets", created->buckets}},
+                     keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "DELETE" && path.rfind("/admin/api/s3/credentials/", 0) == 0) {
+        if (!s3_iam_) {
+          write_json(*sock, 404, "Not Found",
+                     {{"error", "S3 IAM unavailable (enable s3_listen)"}}, keep_alive);
+          continue;
+        }
+        const auto id = path.substr(std::string("/admin/api/s3/credentials/").size());
+        std::string ierr;
+        if (!s3_iam_->remove(id, ierr)) {
+          const int status = (ierr == "not found") ? 404 : 400;
+          write_json(*sock, status, status == 404 ? "Not Found" : "Bad Request",
+                     {{"error", ierr}}, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", {{"ok", true}, {"access_key_id", id}}, keep_alive);
         continue;
       }
       write_json(*sock, 404, "Not Found", {{"error", "unknown admin path"}}, keep_alive);

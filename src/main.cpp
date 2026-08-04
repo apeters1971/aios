@@ -8,16 +8,20 @@
 #include <boost/asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <iostream>
 #include <memory>
+#include <thread>
 
 namespace {
 std::atomic<bool> g_stop{false};
 boost::asio::io_context* g_ioc = nullptr;
+std::unique_ptr<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> g_work;
 
 void on_signal(int) {
   g_stop.store(true);
+  g_work.reset();
   if (g_ioc) g_ioc->stop();
 }
 }  // namespace
@@ -44,7 +48,8 @@ int main(int argc, char** argv) {
         << "server-side primary replication, HTTP object API, and optional S3 API.\n"
         << "cluster_key is a shared secret (UUID recommended); Hello/Gossip/object\n"
         << "RPCs and HTTP Authorization use HMAC-SHA256. S3 uses AWS SigV4 with\n"
-        << "s3_access_key and secret=cluster_key (FS-backed via libaios_posix).\n"
+        << "global s3_access_key/cluster_key plus optional per-bucket IAM keys\n"
+        << "(FS-backed via libaios_posix).\n"
         << "--admin enables /admin/* and /metrics on http_listen.\n"
         << "--admin-metrics-public allows unauthenticated GET /metrics (scrape).\n";
     return 0;
@@ -53,9 +58,14 @@ int main(int argc, char** argv) {
   try {
     boost::asio::io_context ioc;
     g_ioc = &ioc;
+    g_work = std::make_unique<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>(
+        boost::asio::make_work_guard(ioc));
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
+
+    // Run the io_context before S3 starts: posix mount needs loopback HTTP.
+    std::thread ioc_thread([&] { ioc.run(); });
 
     MembershipTable membership;
     FsTable fs_table;
@@ -68,15 +78,22 @@ int main(int argc, char** argv) {
       if (endpoint.empty()) {
         throw std::runtime_error("cannot derive loopback HTTP endpoint for S3 posix mount");
       }
-      s3 = std::make_unique<S3Server>(ioc, cfg, endpoint);
+      s3 = std::make_unique<S3Server>(ioc, cfg, endpoint, engine.s3_iam());
       s3->start();
     }
 
     AIOS_LOG_INFO("aiosd running");
-    ioc.run();
+    while (!g_stop.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    g_work.reset();
+    ioc.stop();
+    if (ioc_thread.joinable()) ioc_thread.join();
     AIOS_LOG_INFO("aiosd stopped");
   } catch (const std::exception& e) {
     AIOS_LOG_ERROR("fatal: ", e.what());
+    g_work.reset();
+    if (g_ioc) g_ioc->stop();
     return 1;
   }
   return 0;

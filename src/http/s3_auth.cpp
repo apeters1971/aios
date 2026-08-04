@@ -72,6 +72,25 @@ std::string signing_key(const std::string& secret, const std::string& date, cons
 
 }  // namespace
 
+std::string s3_sigv4_access_key(const std::unordered_map<std::string, std::string>& headers) {
+  const std::string auth = header_get(headers, "authorization");
+  if (auth.rfind("AWS4-HMAC-SHA256 ", 0) != 0) return {};
+  const std::string rest = auth.substr(16);
+  std::string credential;
+  {
+    std::istringstream iss(rest);
+    std::string part;
+    while (std::getline(iss, part, ',')) {
+      part = trim(part);
+      if (part.rfind("Credential=", 0) == 0) credential = part.substr(11);
+    }
+  }
+  if (credential.empty()) return {};
+  auto slash = credential.find('/');
+  if (slash == std::string::npos || slash == 0) return {};
+  return credential.substr(0, slash);
+}
+
 std::string s3_uri_encode(const std::string& in, bool encode_slash) {
   static const char* hex = "0123456789ABCDEF";
   std::string out;

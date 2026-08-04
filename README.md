@@ -75,7 +75,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 
 **S3 API** (`s3_listen`, optional)
 
-- AWS SigV4; access key = `s3_access_key`, secret = `cluster_key`
+- AWS SigV4; global `s3_access_key`/`cluster_key` plus optional per-bucket IAM keys (uid/gid + allowlist)
 - FS-backed via `libaios_posix` on `s3_volume` — buckets are directories, keys are files (shared with FUSE/`aiosfs`)
 - Core ops: buckets, objects, ListObjectsV2, CopyObject, multipart, Range GET
 
@@ -235,13 +235,14 @@ status_file: "/tmp/aios-a.json"
 
 Enable on selected nodes with `admin: true` / `--admin`.
 
-**Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config panels, plus actions (toggle public metrics, run transitions, run repair). Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
+**Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config / actions, plus **S3 credentials** (when `s3_listen` is enabled). Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
 
 Also exposes JSON (`/admin/status|ops|config|cluster|…`, cookie-aware `/admin/api/*`) and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers.
 
 ```bash
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin status
 aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin   # interactive console
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin s3-cred list
 ```
 
 Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters (QoS limits later).
@@ -370,7 +371,29 @@ aws --endpoint-url http://127.0.0.1:7481 s3 cp ./file s3://mybucket/path/file
 # FUSE on the same volume sees /mybucket/path/file
 ```
 
-Auth: AWS SigV4 (path-style). Details: [`proto/s3.md`](proto/s3.md).
+### Auth and per-bucket credentials
+
+AWS SigV4, path-style only (`http://HOST:7481/bucket/key`).
+
+| Identity | Access key | Secret | Scope |
+|----------|------------|--------|-------|
+| Global (root) | `s3_access_key` (default `aios`) | `cluster_key` | All buckets; creates as uid/gid `0:0` |
+| IAM key | Opaque id (e.g. `photos-rw`) | Random (shown once) | Allowlisted buckets only; creates get that key’s **uid/gid** |
+
+Credentials are cluster-shared (CAS object `s3iam/<s3_volume>`). Manage them from the admin web UI (**S3 credentials** tab), HTTP (`/admin/api/s3/credentials`), or CLI:
+
+```bash
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin s3-cred create \
+  --id photos-rw --uid 1001 --gid 100 --buckets photos
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin s3-cred list
+aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin s3-cred delete --id photos-rw
+
+export AWS_ACCESS_KEY_ID=photos-rw
+export AWS_SECRET_ACCESS_KEY='…secret from create…'
+aws --endpoint-url http://127.0.0.1:7481 s3 ls s3://photos/
+```
+
+Details: [`proto/s3.md`](proto/s3.md).
 
 ---
 

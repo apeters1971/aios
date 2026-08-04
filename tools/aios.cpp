@@ -6,6 +6,8 @@
 
 #include <boost/asio.hpp>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -49,11 +51,14 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  admin [status|ops|config|cluster|metrics|console]\n"
+      << "  admin [status|ops|config|cluster|metrics|console|s3-cred ...]\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
       << "  admin status|ops|config|cluster|metrics   one-shot\n"
+      << "  admin s3-cred list\n"
+      << "  admin s3-cred create --id ID --uid N --gid N --buckets b1[,b2...]\n"
+      << "  admin s3-cred delete --id ID\n"
       << "\n"
       << "Follows HTTP 307 redirects to the primary (Location).\n"
       << "put/get stream file bytes (no full-object client buffer).\n";
@@ -529,6 +534,158 @@ void admin_console_help() {
   std::cout << "commands: status | ops | config | cluster | metrics | help | quit\n";
 }
 
+HttpResp admin_exchange(std::string host, std::string port, const std::string& method,
+                        const std::string& path, const std::string& json_body,
+                        const std::string& cluster_key) {
+  std::unordered_map<std::string, std::string> headers;
+  std::string tmp;
+  if (!json_body.empty()) {
+    headers["content-type"] = "application/json";
+    tmp = (fs::temp_directory_path() / ("aios-admin-" + std::to_string(::getpid()) + ".json"))
+              .string();
+    {
+      std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+      out << json_body;
+    }
+  }
+  auto r = http_exchange(std::move(host), std::move(port), method, path, headers, tmp, nullptr,
+                         cluster_key);
+  if (!tmp.empty()) {
+    std::error_code ec;
+    fs::remove(tmp, ec);
+  }
+  return r;
+}
+
+int cmd_admin_s3_cred(std::string host, std::string port, const std::string& key,
+                      const std::vector<std::string>& args) {
+  if (args.size() < 2) {
+    std::cerr << "usage: admin s3-cred list|create|delete ...\n";
+    return 2;
+  }
+  const std::string action = args[1];
+  if (action == "list") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/s3/credentials", key);
+    if (r.status < 0) {
+      std::cerr << r.error << "\n";
+      return 1;
+    }
+    if (r.status != 200) {
+      std::cerr << "s3-cred list failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    try {
+      auto j = nlohmann::json::parse(r.body);
+      auto creds = j.value("credentials", nlohmann::json::array());
+      if (creds.empty()) {
+        std::cout << "(no S3 credentials)\n";
+        return 0;
+      }
+      for (const auto& c : creds) {
+        std::cout << c.value("access_key_id", "") << "  uid=" << c.value("uid", 0)
+                  << " gid=" << c.value("gid", 0) << "  buckets=";
+        if (c.contains("buckets") && c["buckets"].is_array()) {
+          bool first = true;
+          for (const auto& b : c["buckets"]) {
+            if (!first) std::cout << ',';
+            first = false;
+            std::cout << b.get<std::string>();
+          }
+        }
+        std::cout << "\n";
+      }
+    } catch (...) {
+      std::cout << r.body << "\n";
+    }
+    return 0;
+  }
+
+  std::string id, buckets;
+  std::uint32_t uid = 0, gid = 0;
+  bool have_uid = false, have_gid = false;
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const auto& a = args[i];
+    auto need = [&](const char* name) -> const char* {
+      if (i + 1 >= args.size()) {
+        std::cerr << "missing value for " << name << "\n";
+        return nullptr;
+      }
+      return args[++i].c_str();
+    };
+    if (a == "--id") {
+      const char* v = need("--id");
+      if (!v) return 2;
+      id = v;
+    } else if (a == "--uid") {
+      const char* v = need("--uid");
+      if (!v) return 2;
+      uid = static_cast<std::uint32_t>(std::stoul(v));
+      have_uid = true;
+    } else if (a == "--gid") {
+      const char* v = need("--gid");
+      if (!v) return 2;
+      gid = static_cast<std::uint32_t>(std::stoul(v));
+      have_gid = true;
+    } else if (a == "--buckets") {
+      const char* v = need("--buckets");
+      if (!v) return 2;
+      buckets = v;
+    } else {
+      std::cerr << "unknown flag: " << a << "\n";
+      return 2;
+    }
+  }
+
+  if (action == "create") {
+    if (id.empty() || buckets.empty() || !have_uid || !have_gid) {
+      std::cerr << "create requires --id --uid --gid --buckets\n";
+      return 2;
+    }
+    nlohmann::json body{{"access_key_id", id}, {"uid", uid}, {"gid", gid}, {"buckets", buckets}};
+    auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                            "/admin/api/s3/credentials", body.dump(), key);
+    if (r.status < 0) {
+      std::cerr << r.error << "\n";
+      return 1;
+    }
+    if (r.status != 201 && r.status != 200) {
+      std::cerr << "s3-cred create failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    try {
+      auto j = nlohmann::json::parse(r.body);
+      std::cout << "access_key_id: " << j.value("access_key_id", "") << "\n"
+                << "secret:        " << j.value("secret", "") << "\n"
+                << "(store the secret now; it is not shown again)\n";
+    } catch (...) {
+      std::cout << r.body << "\n";
+    }
+    return 0;
+  }
+
+  if (action == "delete") {
+    if (id.empty()) {
+      std::cerr << "delete requires --id\n";
+      return 2;
+    }
+    auto r = admin_exchange(std::move(host), std::move(port), "DELETE",
+                            "/admin/api/s3/credentials/" + url_encode_oid(id), {}, key);
+    if (r.status < 0) {
+      std::cerr << r.error << "\n";
+      return 1;
+    }
+    if (r.status != 200) {
+      std::cerr << "s3-cred delete failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << "deleted " << id << "\n";
+    return 0;
+  }
+
+  std::cerr << "unknown s3-cred action: " << action << "\n";
+  return 2;
+}
+
 int run_admin_console(std::string host, std::string port, const std::string& key) {
   std::cout << "AIOS admin console  endpoint=" << host << ':' << port << "\n";
   admin_console_help();
@@ -706,6 +863,8 @@ int main(int argc, char** argv) {
       if (sub == "config") return cmd_admin_config(host, port, args.cluster_key);
       if (sub == "cluster") return cmd_admin_cluster(host, port, args.cluster_key);
       if (sub == "metrics") return cmd_admin_metrics(host, port, args.cluster_key);
+      if (sub == "s3-cred")
+        return cmd_admin_s3_cred(host, port, args.cluster_key, args.positional);
       std::cerr << "unknown admin subcommand: " << sub << "\n";
       return 2;
     }

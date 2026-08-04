@@ -43,6 +43,11 @@ Logout: `POST /admin/logout`.
 | `POST /admin/api/transitions/run` | cookie **or** HMAC | One transition tick |
 | `POST /admin/api/repair/run` | cookie **or** HMAC | One repair tick |
 | `POST /admin/api/settings` | cookie **or** HMAC | `{admin_metrics_public: bool}` (in-memory) |
+| `GET /admin/api/s3/credentials` | cookie **or** HMAC | List S3 IAM keys (secrets redacted); requires `s3_listen` |
+| `POST /admin/api/s3/credentials` | cookie **or** HMAC | Create `{access_key_id, uid, gid, buckets[, secret]}` — secret returned once |
+| `DELETE /admin/api/s3/credentials/{id}` | cookie **or** HMAC | Remove IAM key |
+
+CLI: `aios admin s3-cred list|create|delete`. Web UI: **S3 credentials** tab. See [`proto/s3.md`](s3.md).
 
 ### Legacy JSON (CLI / HMAC)
 

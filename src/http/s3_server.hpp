@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "http/s3_iam.hpp"
 
 #include <boost/asio.hpp>
 
@@ -15,7 +16,8 @@ namespace aios {
 class S3Server {
  public:
   // posix_http_endpoint: HOST:PORT for aios_posix_mount (usually 127.0.0.1:<http port>).
-  S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_http_endpoint);
+  S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_http_endpoint,
+           std::shared_ptr<S3IamStore> iam = nullptr);
   ~S3Server();
 
   S3Server(const S3Server&) = delete;
@@ -30,6 +32,7 @@ class S3Server {
   boost::asio::io_context& ioc_;
   Config cfg_;
   std::string posix_endpoint_;
+  std::shared_ptr<S3IamStore> iam_;
   aios_posix_fs* fs_{nullptr};
   boost::asio::ip::tcp::acceptor acceptor_;
 };

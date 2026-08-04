@@ -29,6 +29,7 @@ int test_admin();
 int test_placement();
 int test_posix_fs();
 int test_s3_auth();
+int test_s3_iam();
 
 int main() {
   int failures = 0;
@@ -50,6 +51,7 @@ int main() {
   failures += test_object_service_advanced();
   failures += test_http_auth();
   failures += test_s3_auth();
+  failures += test_s3_iam();
   failures += test_http_api();
   failures += test_http_wire();
   failures += test_http_ec();

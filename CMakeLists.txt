@@ -105,6 +105,7 @@ add_library(aios_core STATIC
   src/http/http_auth.cpp
   src/http/http_server.cpp
   src/http/s3_auth.cpp
+  src/http/s3_iam.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
 )
@@ -261,6 +262,7 @@ add_executable(aios_tests
   tests/test_store_advanced.cpp
   tests/test_http_auth.cpp
   tests/test_s3_auth.cpp
+  tests/test_s3_iam.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
   tests/test_http_ec.cpp
@@ -277,7 +279,7 @@ add_executable(aios_tests
   tests/test_posix_fs.cpp
   tests/test_main.cpp
 )
-target_link_libraries(aios_tests PRIVATE aios_client aios_posix)
+target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3)
 add_test(NAME aios_tests COMMAND aios_tests)
 
 install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION bin)

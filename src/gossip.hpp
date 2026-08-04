@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "fs/fs_table.hpp"
 #include "http/http_server.hpp"
+#include "http/s3_iam.hpp"
 #include "membership.hpp"
 #include "net/server.hpp"
 #include "object/object_service.hpp"
@@ -25,6 +26,7 @@ class GossipEngine {
   const ClusterMap& cluster_map() const { return cluster_map_; }
   LocalStores& local_stores() { return local_stores_; }
   ObjectService& object_service() { return *object_service_; }
+  std::shared_ptr<S3IamStore> s3_iam() const { return s3_iam_; }
 
  private:
   void on_gossip_timer(const boost::system::error_code& ec);
@@ -48,6 +50,7 @@ class GossipEngine {
   ClusterMap cluster_map_;
   LocalStores local_stores_;
   std::unique_ptr<ObjectService> object_service_;
+  std::shared_ptr<S3IamStore> s3_iam_;
   std::unique_ptr<TcpServer> server_;
   std::unique_ptr<HttpServer> http_server_;
   boost::asio::steady_timer gossip_timer_;
