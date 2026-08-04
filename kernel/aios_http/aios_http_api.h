@@ -43,4 +43,19 @@ int aios_http_delete(struct aios_http_client *c, const char *oid);
 int aios_http_get_range(struct aios_http_client *c, const char *oid, u64 start, u64 end,
 			struct aios_http_buf *body);
 
+/* Object locks (POST/DELETE /o/{oid}/lock). token_out must be >= 128 bytes. */
+int aios_http_lock_acquire(struct aios_http_client *c, const char *oid, int ttl_ms,
+			   char *token_out, size_t token_len);
+int aios_http_lock_release(struct aios_http_client *c, const char *oid, const char *token);
+
+/* Cross-object transactions (/txn). cas_inout NULL = unconditional prepare. */
+int aios_http_txn_begin(struct aios_http_client *c, char *txn_id_out, size_t txn_id_len);
+int aios_http_txn_prepare_put(struct aios_http_client *c, const char *txn_id, const char *oid,
+			      const void *body, size_t len, const char *lock_token,
+			      u64 *cas_inout);
+int aios_http_txn_prepare_delete(struct aios_http_client *c, const char *txn_id, const char *oid,
+				 const char *lock_token);
+int aios_http_txn_commit(struct aios_http_client *c, const char *txn_id);
+int aios_http_txn_abort(struct aios_http_client *c, const char *txn_id);
+
 #endif /* AIOS_HTTP_API_H */

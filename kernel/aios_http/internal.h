@@ -41,4 +41,14 @@ u64 aios_http_attr_u64(const char *hdrs, const char *attr_name);
 int aios_http_parse_location(const char *loc, char *host, size_t host_len, char *port,
 			     size_t port_len, char *path, size_t path_len);
 
+int aios_http_encode_oid(const char *oid, char *out, size_t out_len);
+int aios_http_map_status(int status);
+
+/* Build aios.posix.cas precondition headers. new_cas_out receives expected+1. */
+int aios_http_fill_posix_cas(struct aios_http_client *c, const char *oid, u64 expected_cas,
+			     char *out, size_t out_len, u64 *new_cas_out);
+
+int aios_http_json_string(const char *js, size_t js_len, const char *key, char *out,
+			  size_t out_len);
+
 #endif /* AIOS_HTTP_INTERNAL_H */

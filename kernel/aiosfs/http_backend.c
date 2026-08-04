@@ -8,10 +8,12 @@
 #include "../aios_http/aios_http_api.h"
 
 #include <linux/ctype.h>
+#include <linux/delay.h>
 #include <linux/mm.h>
 #include <linux/namei.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/statfs.h>
 #include <linux/string.h>
 #include <linux/uio.h>
@@ -390,7 +392,8 @@ static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt)
 	return err;
 }
 
-static int dir_store_compact(struct aios_sb_info *info, struct aios_dir_table *dt)
+/* Allocates *snap_out / *meta_out (caller kfree). Updates dt next_op/snapshot fields. */
+static int dir_plan_compact(struct aios_dir_table *dt, char **snap_out, char **meta_out)
 {
 	char *snap = NULL;
 	char *meta = NULL;
@@ -399,14 +402,14 @@ static int dir_store_compact(struct aios_sb_info *info, struct aios_dir_table *d
 	unsigned int i;
 	u64 next = dt->next_op < 2 ? 2 : dt->next_op;
 	u64 snap_op = next - 1;
-	int err;
 
 	snap_cap = 32 + dt->count * (AIOS_KABI_NAME_MAX + 32);
 	snap = kmalloc(snap_cap, GFP_KERNEL);
 	meta = kmalloc(512, GFP_KERNEL);
 	if (!snap || !meta) {
-		err = -ENOMEM;
-		goto out;
+		kfree(snap);
+		kfree(meta);
+		return -ENOMEM;
 	}
 	pos = scnprintf(snap, snap_cap, "{\"entries\":{");
 	for (i = 0; i < dt->count; i++) {
@@ -419,19 +422,125 @@ static int dir_store_compact(struct aios_sb_info *info, struct aios_dir_table *d
 		  "{\"aios_posix_dir\":1,\"next_op\":%llu,\"log_bytes\":0,"
 		  "\"snapshot_op\":%llu,\"snapshot_oid\":\"%s\"}",
 		  (unsigned long long)next, (unsigned long long)snap_op, dt->snap_oid);
+	dt->next_op = next;
+	dt->log_bytes = 0;
+	dt->snapshot_op = snap_op;
+	*snap_out = snap;
+	*meta_out = meta;
+	return 0;
+}
 
+static int dir_store_compact(struct aios_sb_info *info, struct aios_dir_table *dt)
+{
+	char *snap = NULL;
+	char *meta = NULL;
+	u64 cas;
+	int err;
+
+	err = dir_plan_compact(dt, &snap, &meta);
+	if (err)
+		return err;
 	err = aios_http_put(info->http, dt->snap_oid, snap, strlen(snap), NULL, NULL);
 	if (err)
 		goto out;
 	err = aios_http_put(info->http, dt->log_oid, "", 0, NULL, NULL);
 	if (err)
 		goto out;
-	err = aios_http_put(info->http, dt->meta_oid, meta, strlen(meta), NULL, &dt->meta_cas);
-	if (!err) {
-		dt->next_op = next;
-		dt->log_bytes = 0;
-		dt->snapshot_op = snap_op;
+	cas = dt->meta_cas;
+	err = aios_http_put(info->http, dt->meta_oid, meta, strlen(meta), NULL, &cas);
+	if (!err)
+		dt->meta_cas = cas;
+out:
+	kfree(snap);
+	kfree(meta);
+	return err;
+}
+
+struct aios_held_lock {
+	char oid[160];
+	char token[128];
+};
+
+static int held_lock_cmp(const void *a, const void *b)
+{
+	return strcmp(((const struct aios_held_lock *)a)->oid,
+		      ((const struct aios_held_lock *)b)->oid);
+}
+
+static void release_held_locks(struct aios_sb_info *info, struct aios_held_lock *locks,
+			       unsigned int n)
+{
+	while (n--) {
+		if (locks[n].token[0])
+			aios_http_lock_release(info->http, locks[n].oid, locks[n].token);
+		locks[n].token[0] = '\0';
 	}
+}
+
+static int acquire_sorted_locks(struct aios_sb_info *info, struct aios_held_lock *locks,
+				unsigned int *n_inout)
+{
+	unsigned int n = *n_inout;
+	unsigned int i;
+	int err;
+
+	sort(locks, n, sizeof(*locks), held_lock_cmp, NULL);
+	/* Dedup adjacent identical oids. */
+	for (i = 1; i < n;) {
+		if (!strcmp(locks[i].oid, locks[i - 1].oid)) {
+			memmove(&locks[i], &locks[i + 1], (n - i - 1) * sizeof(*locks));
+			n--;
+		} else {
+			i++;
+		}
+	}
+	*n_inout = n;
+	for (i = 0; i < n; i++) {
+		err = aios_http_lock_acquire(info->http, locks[i].oid, 30000, locks[i].token,
+					     sizeof(locks[i].token));
+		if (err) {
+			release_held_locks(info, locks, i);
+			return err;
+		}
+	}
+	return 0;
+}
+
+static const char *token_for(struct aios_held_lock *locks, unsigned int n, const char *oid)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		if (!strcmp(locks[i].oid, oid))
+			return locks[i].token;
+	}
+	return NULL;
+}
+
+static int txn_put_dir(struct aios_sb_info *info, const char *txn_id, struct aios_dir_table *dt,
+		       struct aios_held_lock *locks, unsigned int nlocks)
+{
+	char *snap = NULL;
+	char *meta = NULL;
+	u64 meta_cas;
+	int err;
+
+	err = dir_plan_compact(dt, &snap, &meta);
+	if (err)
+		return err;
+	err = aios_http_txn_prepare_put(info->http, txn_id, dt->snap_oid, snap, strlen(snap),
+					token_for(locks, nlocks, dt->snap_oid), NULL);
+	if (err)
+		goto out;
+	err = aios_http_txn_prepare_put(info->http, txn_id, dt->log_oid, "", 0,
+					token_for(locks, nlocks, dt->log_oid), NULL);
+	if (err)
+		goto out;
+	meta_cas = dt->meta_cas;
+	err = aios_http_txn_prepare_put(info->http, txn_id, dt->meta_oid, meta, strlen(meta),
+					token_for(locks, nlocks, dt->meta_oid), &meta_cas);
+	if (!err)
+		dt->meta_cas = meta_cas;
 out:
 	kfree(snap);
 	kfree(meta);
@@ -1016,20 +1125,312 @@ out:
 	return err;
 }
 
+static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const char *old_name,
+				const char *new_name)
+{
+	struct aios_dir_table dt;
+	int err;
+
+	err = dir_table_init(&dt, info->volume, parent);
+	if (err)
+		return err;
+	err = dir_load(info, &dt);
+	if (err)
+		goto out;
+	if (dir_find(&dt, old_name, NULL)) {
+		err = -ENOENT;
+		goto out;
+	}
+	err = apply_dir_op(&dt, AIOS_HTTP_OP_RENAME, old_name, new_name);
+	if (err)
+		goto out;
+	err = dir_store_compact(info, &dt);
+out:
+	dir_table_free(&dt);
+	return err;
+}
+
+static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, const char *old_name,
+				 u64 new_parent, const char *new_name)
+{
+	int attempt;
+	int err = -EAGAIN;
+
+	for (attempt = 0; attempt < 8; attempt++) {
+		struct aios_dir_table old_dir, new_dir;
+		struct aios_inode_meta moved, victim, old_p, new_p;
+		struct aios_held_lock locks[4];
+		char txn_id[128];
+		char oid[160];
+		char js[512];
+		u64 ino, victim_ino = 0;
+		u64 ts;
+		u64 old_cas, new_cas, victim_cas = 0;
+		u64 victim_size = 0, victim_unit = AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+		bool delete_victim = false;
+		bool victim_exists = false;
+		unsigned int nlocks = 4;
+
+		memset(&victim, 0, sizeof(victim));
+		err = dir_table_init(&old_dir, info->volume, old_parent);
+		if (err)
+			return err;
+		err = dir_table_init(&new_dir, info->volume, new_parent);
+		if (err) {
+			dir_table_free(&old_dir);
+			return err;
+		}
+		err = dir_load(info, &old_dir);
+		if (err)
+			goto next;
+		err = dir_load(info, &new_dir);
+		if (err)
+			goto next;
+
+		err = dir_find(&old_dir, old_name, &ino);
+		if (err)
+			goto next;
+		if (ino == new_parent) {
+			err = -EINVAL;
+			goto next;
+		}
+		err = load_inode(info, ino, &moved);
+		if (err)
+			goto next;
+
+		if (!dir_find(&new_dir, new_name, &victim_ino)) {
+			if (victim_ino != ino) {
+				err = load_inode(info, victim_ino, &victim);
+				if (err && err != -ENOENT)
+					goto next;
+				victim_exists = !err && victim.exists;
+				err = 0;
+				if (victim_exists && S_ISDIR(victim.mode)) {
+					err = -EISDIR;
+					goto next;
+				}
+				if (S_ISDIR(moved.mode) && victim_exists && S_ISREG(victim.mode)) {
+					err = -ENOTDIR;
+					goto next;
+				}
+			}
+		} else {
+			victim_ino = 0;
+		}
+
+		err = load_inode(info, old_parent, &old_p);
+		if (err)
+			goto next;
+		err = load_inode(info, new_parent, &new_p);
+		if (err)
+			goto next;
+		if (!S_ISDIR(old_p.mode) || !S_ISDIR(new_p.mode)) {
+			err = -ENOTDIR;
+			goto next;
+		}
+
+		strscpy(locks[0].oid, old_dir.meta_oid, sizeof(locks[0].oid));
+		strscpy(locks[1].oid, old_dir.log_oid, sizeof(locks[1].oid));
+		strscpy(locks[2].oid, new_dir.meta_oid, sizeof(locks[2].oid));
+		strscpy(locks[3].oid, new_dir.log_oid, sizeof(locks[3].oid));
+		locks[0].token[0] = locks[1].token[0] = locks[2].token[0] =
+			locks[3].token[0] = '\0';
+
+		err = acquire_sorted_locks(info, locks, &nlocks);
+		if (err == -EAGAIN) {
+			dir_table_free(&old_dir);
+			dir_table_free(&new_dir);
+			msleep(20);
+			continue;
+		}
+		if (err)
+			goto next;
+
+		/* Reload under locks. */
+		err = dir_load(info, &old_dir);
+		if (err)
+			goto unlock;
+		err = dir_load(info, &new_dir);
+		if (err)
+			goto unlock;
+		{
+			u64 cur_ino = 0;
+
+			err = dir_find(&old_dir, old_name, &cur_ino);
+			if (err)
+				goto unlock;
+			if (cur_ino != ino) {
+				release_held_locks(info, locks, nlocks);
+				dir_table_free(&old_dir);
+				dir_table_free(&new_dir);
+				continue;
+			}
+		}
+		{
+			u64 cur_victim = 0;
+			int fe = dir_find(&new_dir, new_name, &cur_victim);
+
+			if (!fe) {
+				if (cur_victim != victim_ino && cur_victim != ino) {
+					release_held_locks(info, locks, nlocks);
+					dir_table_free(&old_dir);
+					dir_table_free(&new_dir);
+					continue;
+				}
+			} else if (victim_ino && victim_ino != ino) {
+				release_held_locks(info, locks, nlocks);
+				dir_table_free(&old_dir);
+				dir_table_free(&new_dir);
+				continue;
+			}
+		}
+
+		err = load_inode(info, old_parent, &old_p);
+		if (err)
+			goto unlock;
+		err = load_inode(info, new_parent, &new_p);
+		if (err)
+			goto unlock;
+		err = load_inode(info, ino, &moved);
+		if (err)
+			goto unlock;
+		if (victim_ino && victim_ino != ino) {
+			err = load_inode(info, victim_ino, &victim);
+			victim_exists = !err && victim.exists;
+			if (err && err != -ENOENT)
+				goto unlock;
+			err = 0;
+		}
+
+		apply_dir_op(&old_dir, AIOS_HTTP_OP_UNLINK, old_name, NULL);
+		if (victim_ino && victim_ino != ino)
+			apply_dir_op(&new_dir, AIOS_HTTP_OP_UNLINK, new_name, NULL);
+		{
+			char inos[32];
+
+			snprintf(inos, sizeof(inos), "%llu", (unsigned long long)ino);
+			apply_dir_op(&new_dir, AIOS_HTTP_OP_LINK, new_name, inos);
+		}
+
+		ts = now_ns();
+		old_p.mtime_ns = old_p.ctime_ns = ts;
+		new_p.mtime_ns = new_p.ctime_ns = ts;
+		if (S_ISDIR(moved.mode)) {
+			if (old_p.nlink > 2)
+				old_p.nlink -= 1;
+			new_p.nlink += 1;
+		}
+
+		txn_id[0] = '\0';
+		err = aios_http_txn_begin(info->http, txn_id, sizeof(txn_id));
+		if (err)
+			goto unlock;
+
+		err = txn_put_dir(info, txn_id, &old_dir, locks, nlocks);
+		if (err)
+			goto abort;
+		err = txn_put_dir(info, txn_id, &new_dir, locks, nlocks);
+		if (err)
+			goto abort;
+
+		err = inode_to_json(&old_p, js, sizeof(js));
+		if (err)
+			goto abort;
+		oid_ino(info->volume, old_parent, oid, sizeof(oid));
+		old_cas = old_p.cas;
+		err = aios_http_txn_prepare_put(info->http, txn_id, oid, js, strlen(js), NULL,
+						&old_cas);
+		if (err)
+			goto abort;
+
+		err = inode_to_json(&new_p, js, sizeof(js));
+		if (err)
+			goto abort;
+		oid_ino(info->volume, new_parent, oid, sizeof(oid));
+		new_cas = new_p.cas;
+		err = aios_http_txn_prepare_put(info->http, txn_id, oid, js, strlen(js), NULL,
+						&new_cas);
+		if (err)
+			goto abort;
+
+		delete_victim = false;
+		if (victim_ino && victim_ino != ino && victim_exists) {
+			oid_ino(info->volume, victim_ino, oid, sizeof(oid));
+			if (victim.nlink > 1) {
+				victim.nlink -= 1;
+				victim.ctime_ns = ts;
+				err = inode_to_json(&victim, js, sizeof(js));
+				if (err)
+					goto abort;
+				victim_cas = victim.cas;
+				err = aios_http_txn_prepare_put(info->http, txn_id, oid, js,
+								strlen(js), NULL, &victim_cas);
+				if (err)
+					goto abort;
+			} else {
+				if (S_ISREG(victim.mode)) {
+					victim_size = victim.size;
+					victim_unit = victim.stripe_unit ? victim.stripe_unit :
+									  AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+				}
+				err = aios_http_txn_prepare_delete(info->http, txn_id, oid, NULL);
+				if (err)
+					goto abort;
+				delete_victim = true;
+			}
+		}
+
+		err = aios_http_txn_commit(info->http, txn_id);
+		if (err)
+			goto abort;
+		txn_id[0] = '\0';
+
+		release_held_locks(info, locks, nlocks);
+		dir_table_free(&old_dir);
+		dir_table_free(&new_dir);
+
+		if (delete_victim && victim_ino && victim_size) {
+			u64 chunks = (victim_size + victim_unit - 1) / victim_unit;
+			u64 c;
+
+			for (c = 0; c < chunks; c++) {
+				oid_chunk(info->volume, victim_ino, c, oid, sizeof(oid));
+				aios_http_delete(info->http, oid);
+			}
+		}
+		return 0;
+
+abort:
+		if (txn_id[0])
+			aios_http_txn_abort(info->http, txn_id);
+unlock:
+		release_held_locks(info, locks, nlocks);
+next:
+		dir_table_free(&old_dir);
+		dir_table_free(&new_dir);
+		if (err == -ENOENT || err == -EINVAL || err == -EISDIR || err == -ENOTDIR)
+			return err;
+		if (err == -EAGAIN) {
+			msleep(20);
+			continue;
+		}
+		if (err)
+			return err;
+	}
+	return -EAGAIN;
+}
+
 static int http_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
 		       struct dentry *old_dentry, struct inode *new_dir,
 		       struct dentry *new_dentry, unsigned int flags)
 {
 	struct aios_sb_info *info = AIOS_SB(old_dir->i_sb);
-	struct aios_dir_table dt;
 	char old_name[AIOS_KABI_NAME_MAX + 1];
 	char new_name[AIOS_KABI_NAME_MAX + 1];
 	int err;
 
 	if (flags)
 		return -EINVAL;
-	if (old_dir != new_dir)
-		return -EOPNOTSUPP; /* cross-dir needs /txn; use backend=upcall */
 	if (old_dentry->d_name.len > AIOS_KABI_NAME_MAX ||
 	    new_dentry->d_name.len > AIOS_KABI_NAME_MAX)
 		return -ENAMETOOLONG;
@@ -1037,25 +1438,15 @@ static int http_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
 	old_name[old_dentry->d_name.len] = '\0';
 	memcpy(new_name, new_dentry->d_name.name, new_dentry->d_name.len);
 	new_name[new_dentry->d_name.len] = '\0';
+	if (strchr(old_name, '/') || strchr(new_name, '/'))
+		return -EINVAL;
 
 	mutex_lock(&info->http_mu);
-	err = dir_table_init(&dt, info->volume, old_dir->i_ino);
-	if (err)
-		goto out;
-	err = dir_load(info, &dt);
-	if (err)
-		goto out_dt;
-	if (dir_find(&dt, old_name, NULL)) {
-		err = -ENOENT;
-		goto out_dt;
-	}
-	err = apply_dir_op(&dt, AIOS_HTTP_OP_RENAME, old_name, new_name);
-	if (err)
-		goto out_dt;
-	err = dir_store_compact(info, &dt);
-out_dt:
-	dir_table_free(&dt);
-out:
+	if (old_dir->i_ino == new_dir->i_ino)
+		err = http_rename_same_dir(info, old_dir->i_ino, old_name, new_name);
+	else
+		err = http_rename_cross_dir(info, old_dir->i_ino, old_name, new_dir->i_ino,
+					    new_name);
 	mutex_unlock(&info->http_mu);
 	return err;
 }

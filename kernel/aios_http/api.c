@@ -70,38 +70,50 @@ void aios_http_client_set_app_label(struct aios_http_client *c, const char *labe
 }
 EXPORT_SYMBOL_GPL(aios_http_client_set_app_label);
 
-int aios_http_oid_path(const char *oid, char *oid_path_out, size_t out_len)
+int aios_http_encode_oid(const char *oid, char *out, size_t out_len)
 {
 	static const char *hex = "0123456789ABCDEF";
-	char enc[1024];
 	size_t ei = 0;
 	size_t i;
 
-	if (!oid || !oid_path_out)
+	if (!oid || !out || !out_len)
 		return -EINVAL;
 	for (i = 0; oid[i]; i++) {
 		unsigned char ch = (unsigned char)oid[i];
 
 		if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
-			if (ei + 1 >= sizeof(enc))
+			if (ei + 1 >= out_len)
 				return -ENAMETOOLONG;
-			enc[ei++] = ch;
+			out[ei++] = ch;
 		} else {
-			if (ei + 3 >= sizeof(enc))
+			if (ei + 3 >= out_len)
 				return -ENAMETOOLONG;
-			enc[ei++] = '%';
-			enc[ei++] = hex[ch >> 4];
-			enc[ei++] = hex[ch & 0xf];
+			out[ei++] = '%';
+			out[ei++] = hex[ch >> 4];
+			out[ei++] = hex[ch & 0xf];
 		}
 	}
-	enc[ei] = '\0';
+	out[ei] = '\0';
+	return 0;
+}
+
+int aios_http_oid_path(const char *oid, char *oid_path_out, size_t out_len)
+{
+	char enc[1024];
+	int err;
+
+	if (!oid_path_out)
+		return -EINVAL;
+	err = aios_http_encode_oid(oid, enc, sizeof(enc));
+	if (err)
+		return err;
 	if (snprintf(oid_path_out, out_len, "/o/%s", enc) >= (int)out_len)
 		return -ENAMETOOLONG;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(aios_http_oid_path);
 
-static int map_http_status(int status)
+int aios_http_map_status(int status)
 {
 	if (status == 200 || status == 201 || status == 204 || status == 206)
 		return 0;
@@ -114,6 +126,72 @@ static int map_http_status(int status)
 	if (status == 400)
 		return -EINVAL;
 	return -EIO;
+}
+
+int aios_http_json_string(const char *js, size_t js_len, const char *key, char *out,
+			  size_t out_len)
+{
+	char pat[80];
+	const char *p;
+	const char *end;
+	size_t i;
+
+	if (!js || !key || !out || !out_len)
+		return -EINVAL;
+	if (snprintf(pat, sizeof(pat), "\"%s\":\"", key) >= (int)sizeof(pat))
+		return -EINVAL;
+	end = js + js_len;
+	p = strnstr(js, pat, js_len);
+	if (!p)
+		return -ENOENT;
+	p += strlen(pat);
+	for (i = 0; p < end && *p && *p != '"' && i + 1 < out_len; i++, p++)
+		out[i] = *p;
+	if (p >= end || *p != '"')
+		return -EINVAL;
+	out[i] = '\0';
+	return 0;
+}
+
+int aios_http_fill_posix_cas(struct aios_http_client *c, const char *oid, u64 expected_cas,
+			     char *out, size_t out_len, u64 *new_cas_out)
+{
+	u64 new_cas = expected_cas + 1;
+	int n;
+
+	if (!out || !out_len || !new_cas_out)
+		return -EINVAL;
+	*new_cas_out = new_cas;
+	if (expected_cas == 0) {
+		u64 existing_cas = 0;
+		int he = aios_http_head(c, oid, NULL, &existing_cas);
+
+		if (he == -ENOENT) {
+			n = snprintf(out, out_len,
+				     "If-None-Match: *\r\n"
+				     "x-aios-attr-aios.posix.cas: %llu\r\n",
+				     (unsigned long long)new_cas);
+		} else if (he == 0 && existing_cas == 0) {
+			n = snprintf(out, out_len,
+				     "If-Match: *\r\n"
+				     "x-aios-if-attr-absent: aios.posix.cas\r\n"
+				     "x-aios-attr-aios.posix.cas: %llu\r\n",
+				     (unsigned long long)new_cas);
+		} else if (he == 0) {
+			return -EAGAIN;
+		} else {
+			return he;
+		}
+	} else {
+		n = snprintf(out, out_len,
+			     "If-Match: *\r\n"
+			     "x-aios-if-attr-eq: aios.posix.cas=%llu\r\n"
+			     "x-aios-attr-aios.posix.cas: %llu\r\n",
+			     (unsigned long long)expected_cas, (unsigned long long)new_cas);
+	}
+	if (n < 0 || (size_t)n >= out_len)
+		return -EOVERFLOW;
+	return 0;
 }
 
 static int apply_redirect(struct aios_http_client *c, const char *location, char *cur_path,
@@ -242,7 +320,7 @@ int aios_http_get(struct aios_http_client *c, const char *oid, struct aios_http_
 		aios_http_buf_free(body);
 		return -ENOENT;
 	}
-	err = map_http_status(status);
+	err = aios_http_map_status(status);
 	if (err)
 		return err;
 	if (cas_out)
@@ -268,7 +346,7 @@ int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u
 		return err;
 	if (status == 404)
 		return -ENOENT;
-	err = map_http_status(status);
+	err = aios_http_map_status(status);
 	if (err)
 		return err;
 	if (size_out) {
@@ -308,7 +386,7 @@ int aios_http_get_range(struct aios_http_client *c, const char *oid, u64 start, 
 	}
 	if (status == 416)
 		return -ERANGE;
-	return map_http_status(status);
+	return aios_http_map_status(status);
 }
 EXPORT_SYMBOL_GPL(aios_http_get_range);
 
@@ -329,34 +407,10 @@ int aios_http_put(struct aios_http_client *c, const char *oid, const void *body,
 
 	cas_hdrs[0] = '\0';
 	if (cas_inout) {
-		new_cas = *cas_inout + 1;
-		if (*cas_inout == 0) {
-			u64 existing_cas = 0;
-			int he = aios_http_head(c, oid, NULL, &existing_cas);
-
-			if (he == -ENOENT) {
-				snprintf(cas_hdrs, sizeof(cas_hdrs),
-					 "If-None-Match: *\r\n"
-					 "x-aios-attr-aios.posix.cas: %llu\r\n",
-					 (unsigned long long)new_cas);
-			} else if (he == 0 && existing_cas == 0) {
-				snprintf(cas_hdrs, sizeof(cas_hdrs),
-					 "If-Match: *\r\n"
-					 "x-aios-if-attr-absent: aios.posix.cas\r\n"
-					 "x-aios-attr-aios.posix.cas: %llu\r\n",
-					 (unsigned long long)new_cas);
-			} else if (he == 0) {
-				return -EAGAIN;
-			} else {
-				return he;
-			}
-		} else {
-			snprintf(cas_hdrs, sizeof(cas_hdrs),
-				 "If-Match: *\r\n"
-				 "x-aios-if-attr-eq: aios.posix.cas=%llu\r\n"
-				 "x-aios-attr-aios.posix.cas: %llu\r\n",
-				 (unsigned long long)*cas_inout, (unsigned long long)new_cas);
-		}
+		err = aios_http_fill_posix_cas(c, oid, *cas_inout, cas_hdrs, sizeof(cas_hdrs),
+					       &new_cas);
+		if (err)
+			return err;
 	}
 
 	if (extra_hdrs && extra_hdrs[0])
@@ -374,7 +428,7 @@ int aios_http_put(struct aios_http_client *c, const char *oid, const void *body,
 	}
 	if (err)
 		return err;
-	err = map_http_status(status);
+	err = aios_http_map_status(status);
 	if (err)
 		return err;
 	if (cas_inout)
@@ -397,6 +451,6 @@ int aios_http_delete(struct aios_http_client *c, const char *oid)
 		return err;
 	if (status == 404)
 		return -ENOENT;
-	return map_http_status(status);
+	return aios_http_map_status(status);
 }
 EXPORT_SYMBOL_GPL(aios_http_delete);

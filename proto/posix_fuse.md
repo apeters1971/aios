@@ -90,7 +90,7 @@ Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `str
 
 Out-of-tree modules: `aios_http.ko` (in-kernel HTTP/HMAC) and `aiosfs.ko` (`mount -t aios`).
 
-- `backend=http` — VFS uses `aios_http` directly (same object layout as `libaios_posix`).
+- `backend=http` — VFS uses `aios_http` directly (same object layout as `libaios_posix`, including cross-directory rename via `/txn`).
 - `backend=upcall` (default) — upcalls to `aios-kbridge` over `/dev/aios_bridge` ([`kernel/aios_kabi.h`](../kernel/aios_kabi.h)), which calls the `aios_posix_*` ABI.
 
 See [`kernel/README.md`](../kernel/README.md).

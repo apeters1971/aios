@@ -78,12 +78,12 @@ sudo mount -t aios none /mnt/aios \
 | Path | Role |
 |------|------|
 | [`aios_kabi.h`](aios_kabi.h) | Upcall request/reply ABI |
-| [`aios_http/`](aios_http/) | HTTP client module + [`aios_http_api.h`](aios_http/aios_http_api.h) exports |
+| [`aios_http/`](aios_http/) | HTTP client module + locks/`/txn` + [`aios_http_api.h`](aios_http/aios_http_api.h) exports |
 | [`aiosfs/`](aiosfs/) | VFS module (`main`, `upcall`, `super`, `inode`, `http_backend`, `io`, `pagecache`) |
 | [`../tools/aios_kbridge.cpp`](../tools/aios_kbridge.cpp) | Userspace daemon for `backend=upcall` |
 
 ## Status / limits (prototype)
 
 - **Page cache**: both backends use buffered I/O (`generic_file_read_iter` / `generic_file_write_iter`) with `address_space_operations` writeback (`readpage` / `writepage` / `writepages`). `fsync` waits for dirty pages then syncs metadata (and upcall `AIOS_OP_FSYNC` when `backend=upcall`).
-- **`backend=http`**: mount, lookup, create/mkdir, unlink/rmdir, same-dir rename, read/write, setattr/truncate. Directory mutations rewrite compact snap+meta (compatible with libaios_posix). Cross-directory rename returns `-EOPNOTSUPP` (needs `/txn`; use `backend=upcall`).
+- **`backend=http`**: mount, lookup, create/mkdir, unlink/rmdir, rename (including cross-directory via `/txn` + dir locks), read/write, setattr/truncate. Directory mutations rewrite compact snap+meta (compatible with libaios_posix).
 - Secure Boot: modules must be signed or SB disabled for `insmod`.

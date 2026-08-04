@@ -2,7 +2,7 @@
 #   make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 
 obj-m += aios_http.o
-aios_http-y := main.o auth.o client.o api.o
+aios_http-y := main.o auth.o client.o api.o txn.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
