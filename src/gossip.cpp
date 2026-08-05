@@ -117,9 +117,10 @@ void GossipEngine::start() {
     if (cfg_.admin) {
       quota_ = std::make_shared<QuotaAdminStore>(cfg_, *object_service_);
       qos_ = std::make_shared<QosAdminStore>(cfg_, *object_service_);
+      backup_policies_ = std::make_shared<BackupPolicyStore>(cfg_, *object_service_);
     }
     http_server_ = std::make_unique<HttpServer>(ioc_, cfg_, *object_service_, membership_,
-                                                s3_iam_, quota_, qos_);
+                                                s3_iam_, quota_, qos_, backup_policies_);
     http_server_->start();
     if (cfg_.admin) {
       AIOS_LOG_INFO("admin API enabled on ", cfg_.http_listen,
@@ -165,9 +166,15 @@ void GossipEngine::start() {
     archive_timer_.expires_after(std::chrono::milliseconds(cfg_.archive_interval_ms));
     archive_timer_.async_wait([this](auto ec) { on_archive_timer(ec); });
   }
-  if (cfg_.backup_interval_ms > 0 && !cfg_.backup_rules.empty()) {
-    backup_timer_.expires_after(std::chrono::milliseconds(cfg_.backup_interval_ms));
-    backup_timer_.async_wait([this](auto ec) { on_backup_timer(ec); });
+  {
+    const bool want_yaml = !cfg_.backup_rules.empty();
+    const bool want_live = backup_policies_ != nullptr;
+    int poll_ms = cfg_.backup_interval_ms;
+    if (want_live && (poll_ms <= 0 || (!want_yaml && poll_ms > 60000))) poll_ms = 60000;
+    if (poll_ms > 0 && (want_yaml || want_live)) {
+      backup_timer_.expires_after(std::chrono::milliseconds(poll_ms));
+      backup_timer_.async_wait([this](auto ec) { on_backup_timer(ec); });
+    }
   }
 
   AIOS_LOG_INFO("node ", cfg_.node_id, " advertise=", adv,
@@ -306,14 +313,19 @@ void GossipEngine::on_backup_timer(const boost::system::error_code& ec) {
   rebuild_cluster_map();
   const auto batch = static_cast<std::size_t>(std::max(1, cfg_.backup_batch_oids));
   const auto stats =
-      run_backup(cfg_, advertise_addr(), cluster_map_, local_stores_, *object_service_, batch);
+      run_backup(cfg_, advertise_addr(), cluster_map_, local_stores_, *object_service_, batch,
+                 backup_policies_.get(), false);
   if (stats.snaps_created > 0 || stats.bags_sealed > 0 || stats.drained > 0) {
     AIOS_LOG_INFO("backup rules=", stats.rules_run, " snaps=", stats.snaps_created,
                   " oids=", stats.oids_copied, " bags=", stats.bags_sealed,
                   " drained=", stats.drained, " pruned=", stats.pruned,
                   " failed=", stats.failed);
   }
-  backup_timer_.expires_after(std::chrono::milliseconds(cfg_.backup_interval_ms));
+  int poll_ms = cfg_.backup_interval_ms;
+  if (backup_policies_ && (poll_ms <= 0 || (cfg_.backup_rules.empty() && poll_ms > 60000)))
+    poll_ms = 60000;
+  if (poll_ms <= 0) poll_ms = 60000;
+  backup_timer_.expires_after(std::chrono::milliseconds(poll_ms));
   backup_timer_.async_wait([this](auto e) { on_backup_timer(e); });
 }
 

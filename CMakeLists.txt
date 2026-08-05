@@ -164,6 +164,7 @@ add_library(aios_core STATIC
   src/http/s3_iam.cpp
   src/http/quota_admin.cpp
   src/http/qos_admin.cpp
+  src/http/backup_policy.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
   src/metrics/qos_rates.cpp

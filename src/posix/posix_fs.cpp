@@ -14,6 +14,7 @@
 #include <cstring>
 #include <errno.h>
 #include <memory>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <sys/file.h>
@@ -21,6 +22,7 @@
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aios {
@@ -1497,12 +1499,89 @@ int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name) {
   }
 }
 
+namespace {
+
+std::string normalize_snap_path(const char* path) {
+  if (!path || !*path) return "/";
+  std::string p(path);
+  if (p.front() != '/') p = "/" + p;
+  while (p.size() > 1 && p.back() == '/') p.pop_back();
+  return p;
+}
+
+int resolve_path_ino_local(aios_posix_fs* fs, const std::string& norm, uint64_t* out_ino) {
+  uint64_t ino = aios::posix::kRootIno;
+  if (norm == "/") {
+    *out_ino = ino;
+    return 0;
+  }
+  std::string rest = norm.substr(1);
+  while (!rest.empty()) {
+    const auto slash = rest.find('/');
+    const std::string comp = slash == std::string::npos ? rest : rest.substr(0, slash);
+    rest = slash == std::string::npos ? std::string() : rest.substr(slash + 1);
+    if (comp.empty() || comp == ".") continue;
+    if (comp == "..") return -EINVAL;
+    aios_posix_stat st{};
+    int rc = aios_posix_lookup(fs, ino, comp.c_str(), &st);
+    if (rc) return rc;
+    ino = st.ino;
+  }
+  *out_ino = ino;
+  return 0;
+}
+
+void collect_subtree_oids_session(aios::posix::FsState& st, uint64_t root_ino,
+                                  std::vector<std::string>& oids) {
+  oids.clear();
+  oids.push_back(aios::posix::super_oid(st.volume));
+  std::queue<uint64_t> q;
+  std::unordered_set<uint64_t> seen;
+  q.push(root_ino);
+  seen.insert(root_ino);
+  while (!q.empty()) {
+    const uint64_t ino = q.front();
+    q.pop();
+    auto m = aios::posix::load_inode(st, ino);
+    if (!m.exists) continue;
+    oids.push_back(aios::posix::ino_oid(st.volume, ino));
+    if (S_ISDIR(m.mode)) {
+      oids.push_back(aios::posix::dir_meta_oid(st.volume, ino));
+      oids.push_back(aios::posix::dir_log_oid(st.volume, ino));
+      oids.push_back(aios::posix::dir_snap_oid(st.volume, ino));
+      aios::posix::DirTable dt(st.session, st.volume, ino);
+      dt.load();
+      for (const auto& [name, child] : dt.entries()) {
+        (void)name;
+        if (seen.insert(child).second) q.push(child);
+      }
+    } else if (S_ISREG(m.mode)) {
+      const uint64_t stripe = m.stripe_unit ? m.stripe_unit : aios::posix::kDefaultStripeUnit;
+      const uint64_t nchunk = m.size == 0 ? 0 : (m.size + stripe - 1) / stripe;
+      for (uint64_t c = 0; c < nchunk; ++c) {
+        oids.push_back(aios::posix::chunk_oid(st.volume, ino, c));
+      }
+    }
+  }
+}
+
+}  // namespace
+
 int aios_posix_snapshot(aios_posix_fs* fs, char* snap_id_out, size_t snap_id_len) {
+  return aios_posix_snapshot_at(fs, "/", snap_id_out, snap_id_len);
+}
+
+int aios_posix_snapshot_at(aios_posix_fs* fs, const char* path, char* snap_id_out,
+                           size_t snap_id_len) {
   if (!fs || !fs->st || !snap_id_out || snap_id_len < 17) return -EINVAL;
   try {
     aios::posix::ensure_super(*fs->st);
     auto& st = *fs->st;
-    // Freeze
+    const std::string norm = normalize_snap_path(path);
+    uint64_t root_ino = aios::posix::kRootIno;
+    if (norm != "/") {
+      if (int rc = resolve_path_ino_local(fs, norm, &root_ino)) return rc;
+    }
     {
       aios::posix::SuperMeta m = st.super;
       m.frozen = true;
@@ -1523,26 +1602,41 @@ int aios_posix_snapshot(aios_posix_fs* fs, char* snap_id_out, size_t snap_id_len
     const std::string snap_prefix = live_prefix + ".snap/" + sid + "/";
     const std::string snap_marker = live_prefix + ".snap/";
     std::size_t copied = 0;
-    std::string cursor;
     try {
-      for (;;) {
-        auto page = st.session.list_prefix(live_prefix, 256, cursor);
-        for (const auto& e : page.objects) {
-          if (e.oid.rfind(snap_marker, 0) == 0) continue;
-          if (e.oid.size() < live_prefix.size()) continue;
-          const std::string dst = snap_prefix + e.oid.substr(live_prefix.size());
-          auto snap = st.session.get_object(e.oid);
-          if (!snap.exists) continue;
-          st.session.put_bytes(dst, snap.body, snap.attrs, std::nullopt);
-          ++copied;
+      std::vector<std::string> src_oids;
+      if (norm == "/") {
+        std::string cursor;
+        for (;;) {
+          auto page = st.session.list_prefix(live_prefix, 256, cursor);
+          for (const auto& e : page.objects) {
+            if (e.oid.rfind(snap_marker, 0) == 0) continue;
+            src_oids.push_back(e.oid);
+          }
+          if (page.next_cursor.empty()) break;
+          cursor = page.next_cursor;
         }
-        if (page.next_cursor.empty()) break;
-        cursor = page.next_cursor;
+      } else {
+        collect_subtree_oids_session(st, root_ino, src_oids);
       }
+      for (const auto& oid : src_oids) {
+        if (oid.size() < live_prefix.size()) continue;
+        const std::string dst = snap_prefix + oid.substr(live_prefix.size());
+        auto snap = st.session.get_object(oid);
+        if (!snap.exists) continue;
+        st.session.put_bytes(dst, snap.body, snap.attrs, std::nullopt);
+        ++copied;
+      }
+      using clock = std::chrono::system_clock;
+      const auto created_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  clock::now().time_since_epoch())
+                                  .count();
       nlohmann::json man{{"aios_backup_manifest", 1},
                          {"kind", "posix"},
                          {"volume", st.volume},
                          {"snap_id", sid},
+                         {"path", norm},
+                         {"root_ino", root_ino},
+                         {"created_ms", created_ms},
                          {"oids", copied}};
       st.session.put_bytes(snap_prefix + "manifest", man.dump(), {}, std::nullopt);
     } catch (...) {

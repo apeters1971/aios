@@ -146,6 +146,11 @@ int aios_posix_flock(aios_posix_fs* fs, uint64_t ino, int op);
  * Mutating ops return -EBUSY while the snapshot freeze is held. */
 int aios_posix_snapshot(aios_posix_fs* fs, char* snap_id_out, size_t snap_id_len);
 
+/* Like aios_posix_snapshot but limited to a volume-relative subtree path
+ * (e.g. "/home/alice"). NULL, "", or "/" snapshots the whole volume. */
+int aios_posix_snapshot_at(aios_posix_fs* fs, const char* path, char* snap_id_out,
+                           size_t snap_id_len);
+
 #ifdef __cplusplus
 }
 #endif

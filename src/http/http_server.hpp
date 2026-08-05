@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "http/backup_policy.hpp"
 #include "http/qos_admin.hpp"
 #include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
@@ -19,7 +20,8 @@ class HttpServer {
   HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
              MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam = nullptr,
              std::shared_ptr<QuotaAdminStore> quota = nullptr,
-             std::shared_ptr<QosAdminStore> qos = nullptr);
+             std::shared_ptr<QosAdminStore> qos = nullptr,
+             std::shared_ptr<BackupPolicyStore> backup_policies = nullptr);
 
   void start();
 
@@ -38,6 +40,7 @@ class HttpServer {
   std::shared_ptr<S3IamStore> s3_iam_;
   std::shared_ptr<QuotaAdminStore> quota_;
   std::shared_ptr<QosAdminStore> qos_;
+  std::shared_ptr<BackupPolicyStore> backup_policies_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 

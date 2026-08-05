@@ -108,10 +108,27 @@
           </div>
           <div class="action-card">
             <h3>Backup (POSIX / VBD)</h3>
-            <p class="muted">Snapshot then pack+drain. Rules are YAML-only (restart to change).</p>
+            <p class="muted">YAML rules (read-only below) run on interval. Live policies are editable and use daily UTC + GFS retention.</p>
             <pre id="backup-rules" class="code-block small">Loading…</pre>
-            <button type="button" id="run-backup" class="btn primary">Run backup</button>
+            <button type="button" id="run-backup" class="btn primary">Run backup now</button>
             <pre id="backup-result" class="code-block small"></pre>
+            <h4>Live policies</h4>
+            <div id="backup-policy-table" class="table-wrap"></div>
+            <form id="backup-policy-form" class="s3-form">
+              <label class="field"><span>ID (optional)</span><input id="bp-id" spellcheck="false" placeholder="auto" /></label>
+              <label class="field"><span>Volume</span><input id="bp-volume" spellcheck="false" value="default" required /></label>
+              <label class="field"><span>Path</span><input id="bp-path" spellcheck="false" value="/" placeholder="/ or /subdir" /></label>
+              <label class="field"><span>Daily at (UTC)</span><input id="bp-at" spellcheck="false" value="00:00" /></label>
+              <label class="field"><span>Keep days</span><input id="bp-keep-days" type="number" min="0" value="7" /></label>
+              <label class="field"><span>Keep monthly</span><input id="bp-keep-monthly" type="number" min="0" value="12" /></label>
+              <label class="field"><span>Tape sink</span><input id="bp-tape-sink" spellcheck="false" placeholder="none|external|s3|xrdcp" /></label>
+              <label class="field"><span>Tape URI prefix</span><input id="bp-tape-uri" spellcheck="false" /></label>
+              <label class="field"><span>Enabled</span>
+                <select id="bp-enabled"><option value="true">yes</option><option value="false">no</option></select>
+              </label>
+              <button type="submit" class="btn primary">Save policy</button>
+            </form>
+            <pre id="backup-policy-result" class="code-block small"></pre>
             <h4>Snapshot only</h4>
             <label class="field"><span>Kind</span>
               <select id="backup-snap-kind">
@@ -120,6 +137,7 @@
               </select>
             </label>
             <label class="field backup-posix-fields"><span>Volume</span><input id="backup-snap-volume" spellcheck="false" value="default" /></label>
+            <label class="field backup-posix-fields"><span>Path</span><input id="backup-snap-path" spellcheck="false" value="/" /></label>
             <label class="field backup-vbd-fields hidden"><span>Pool</span><input id="backup-snap-pool" spellcheck="false" /></label>
             <label class="field backup-vbd-fields hidden"><span>Name</span><input id="backup-snap-name" spellcheck="false" /></label>
             <label class="field backup-vbd-fields hidden"><span>Dest (optional)</span><input id="backup-snap-dest" spellcheck="false" /></label>

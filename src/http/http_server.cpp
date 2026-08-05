@@ -627,7 +627,8 @@ nlohmann::json HttpServer::admin_status_json() const {
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
                        MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam,
-                       std::shared_ptr<QuotaAdminStore> quota, std::shared_ptr<QosAdminStore> qos)
+                       std::shared_ptr<QuotaAdminStore> quota, std::shared_ptr<QosAdminStore> qos,
+                       std::shared_ptr<BackupPolicyStore> backup_policies)
     : ioc_(ioc),
       cfg_(std::move(cfg)),
       objects_(objects),
@@ -635,6 +636,7 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& 
       s3_iam_(std::move(s3_iam)),
       quota_(std::move(quota)),
       qos_(std::move(qos)),
+      backup_policies_(std::move(backup_policies)),
       acceptor_(ioc) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
@@ -1036,18 +1038,81 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                            {"tape_sink", r.tape_sink},
                            {"tape_uri_prefix", r.tape_uri_prefix}});
         }
+        nlohmann::json live = nlohmann::json::array();
+        if (backup_policies_) {
+          for (const auto& p : backup_policies_->list()) {
+            live.push_back(BackupPolicyStore::to_json(p));
+          }
+        }
         write_json(*sock, 200, "OK",
                    {{"backup_rules", rules},
+                    {"policies", live},
                     {"backup_interval_ms", cfg_.backup_interval_ms},
                     {"backup_batch_oids", cfg_.backup_batch_oids}},
                    keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/api/backup/policies") {
+        if (!backup_policies_) {
+          write_json(*sock, 503, "Unavailable", {{"error", "backup policies disabled"}},
+                     keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", backup_policies_->list_json(), keep_alive);
+        continue;
+      }
+      if (method == "POST" && path == "/admin/api/backup/policies") {
+        if (!backup_policies_) {
+          write_json(*sock, 503, "Unavailable", {{"error", "backup policies disabled"}},
+                     keep_alive);
+          continue;
+        }
+        try {
+          const std::string raw =
+              body.empty() ? "{}"
+                           : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+          auto j = nlohmann::json::parse(raw);
+          BackupPolicy p;
+          std::string err;
+          if (!BackupPolicyStore::from_json(j, p, err)) {
+            write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+            continue;
+          }
+          auto stored = backup_policies_->upsert(std::move(p), err);
+          if (!stored) {
+            write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK", {{"ok", true}, {"policy", BackupPolicyStore::to_json(*stored)}},
+                     keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "DELETE" && path.rfind("/admin/api/backup/policies/", 0) == 0) {
+        if (!backup_policies_) {
+          write_json(*sock, 503, "Unavailable", {{"error", "backup policies disabled"}},
+                     keep_alive);
+          continue;
+        }
+        const auto id = path.substr(std::string("/admin/api/backup/policies/").size());
+        std::string err;
+        if (!backup_policies_->remove(id, err)) {
+          write_json(*sock, err == "not found" ? 404 : 400,
+                     err == "not found" ? "Not Found" : "Bad Request", {{"error", err}},
+                     keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", {{"ok", true}, {"id", id}}, keep_alive);
         continue;
       }
       if (method == "POST" &&
           (path == "/admin/backup/run" || path == "/admin/api/backup/run")) {
         const auto stats = run_backup(
             cfg_, objects_.advertise(), objects_.map(), objects_.stores(), objects_,
-            static_cast<std::size_t>(std::max(1, cfg_.backup_batch_oids)));
+            static_cast<std::size_t>(std::max(1, cfg_.backup_batch_oids)),
+            backup_policies_.get(), true);
         write_json(*sock, 200, "OK",
                    {{"rules_run", stats.rules_run},
                     {"snaps_created", stats.snaps_created},
@@ -1070,9 +1135,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           std::string err;
           if (kind == "posix") {
             const std::string volume = j.value("volume", "");
+            const std::string snap_path = j.value("path", "/");
             std::string snap_id;
             std::size_t copied = 0;
-            if (!backup_snapshot_posix(objects_, volume, snap_id, err, &copied)) {
+            if (!backup_snapshot_posix(objects_, volume, snap_path, snap_id, err, &copied)) {
               write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
               continue;
             }
@@ -1080,6 +1146,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                        {{"ok", true},
                         {"kind", "posix"},
                         {"volume", volume},
+                        {"path", snap_path},
                         {"snap_id", snap_id},
                         {"prefix", "posix/" + volume + "/.snap/" + snap_id + "/"},
                         {"oids_copied", copied}},

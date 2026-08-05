@@ -74,6 +74,9 @@ placement:
 # archive_batch_oids: 64
 
 # Snapshot POSIX/VBD then pack+drain (see proto/backup.md).
+# YAML rules below run on backup_interval_ms with retain_snaps count retention.
+# Live policies (subtree path, daily UTC, GFS keep_days/keep_monthly) are edited via
+# CLI/UI and stored as cluster object backup/policies — both sources run.
 # backup_rules:
 #   - kind: posix
 #     volume: default

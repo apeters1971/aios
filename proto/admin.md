@@ -20,7 +20,7 @@ Open **`http://HOST:PORT/admin/`** in a browser (same `http_listen`).
 
 1. Sign in with the **cluster key** (password field).
 2. A session cookie (`aios_admin`, HttpOnly, SameSite=Strict, 12h) authenticates subsequent `/admin/api/*` calls.
-3. Panels: Overview (OPS), Cluster peers, Config (read-only; secrets redacted), Actions (metrics toggle, transitions, repair, archive pack/drain/recall, backup run/snapshot), S3 / Quotas / QoS.
+3. Panels: Overview (OPS), Cluster peers, Config (read-only; secrets redacted), Actions (metrics toggle, transitions, repair, archive pack/drain/recall, backup run/snapshot/live policies), S3 / Quotas / QoS.
 
 Static assets live in [`web/admin/`](../web/admin/) (installed to `share/aios/admin`). Override search path with **`AIOS_ADMIN_WEB`**.
 
@@ -71,11 +71,14 @@ aios admin archive drain
 aios admin archive recall cold/file
 aios admin backup show
 aios admin backup run
-aios admin backup snapshot posix --volume default
+aios admin backup snapshot posix --volume default --path /home
 aios admin backup snapshot vbd --pool rbd --name disk0
+aios admin backup policy set --volume default --path / --at 00:00 --keep-days 7 --keep-monthly 12
+aios admin backup policy list
+aios admin backup policy rm ID
 ```
 
-Archive/backup **rules** are configured in YAML (`archive_rules` / `backup_rules`) and require a daemon restart; the UI/CLI expose view + run actions only.
+Archive **rules** are YAML-only (restart to change). Backup has YAML `backup_rules` plus live policies in cluster object `backup/policies` (CLI/UI CRUD, daily UTC + GFS retention).
 
 ### Legacy JSON (CLI / HMAC)
 
@@ -93,9 +96,11 @@ All of these require the normal AIOS HMAC Authorization header, except `GET /met
 | `POST /admin/archive/run` | Pack tick; returns `{matched,packed,bags_sealed,failed}` |
 | `POST /admin/archive/drain` | Tape drain tick; returns `{bags_scanned,drained,skipped,failed}` |
 | `POST /admin/archive/recall` | Restore bag from tape if needed; rehydrate `{oid}` |
-| `GET /admin/backup` | Configured `backup_rules` + intervals |
-| `POST /admin/backup/run` | Snap → pack → drain → prune |
-| `POST /admin/backup/snapshot` | Create posix/vbd snapshot only |
+| `GET /admin/backup` | YAML `backup_rules` + live `policies` + intervals |
+| `GET/POST /admin/api/backup/policies` | List / upsert live policies |
+| `DELETE /admin/api/backup/policies/{id}` | Remove live policy |
+| `POST /admin/backup/run` | Force YAML + enabled live policies |
+| `POST /admin/backup/snapshot` | Create posix/vbd snapshot (`path` optional for posix) |
 | `GET /metrics` | Prometheus counters (`aios_*_total`) |
 
 ## OPS counters

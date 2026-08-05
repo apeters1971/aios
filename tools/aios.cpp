@@ -58,7 +58,7 @@ void usage() {
       << "  admin                 interactive console (default)\n"
       << "  admin status|ops|config|cluster|metrics   one-shot\n"
       << "  admin archive show|run|drain|recall OID\n"
-      << "  admin backup show|run|snapshot ...\n"
+      << "  admin backup show|run|snapshot|policy ...\n"
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
       << "  admin qos show|set|project ...\n"
@@ -660,14 +660,19 @@ int cmd_admin_backup(std::string host, std::string port, const std::string& key,
   }
   if (action == "snapshot") {
     if (args.size() < 3) {
-      std::cerr << "usage: admin backup snapshot posix --volume VOL\n"
+      std::cerr << "usage: admin backup snapshot posix --volume VOL [--path /subdir]\n"
                 << "       admin backup snapshot vbd --pool POOL --name NAME [--dest DEST]\n";
       return 2;
     }
     const std::string kind = args[2];
     nlohmann::json body{{"kind", kind}};
-    for (std::size_t i = 3; i + 1 < args.size(); ++i) {
+    for (std::size_t i = 3; i < args.size(); ++i) {
+      if (i + 1 >= args.size()) {
+        std::cerr << "missing value for " << args[i] << "\n";
+        return 2;
+      }
       if (args[i] == "--volume") body["volume"] = args[++i];
+      else if (args[i] == "--path") body["path"] = args[++i];
       else if (args[i] == "--pool") body["pool"] = args[++i];
       else if (args[i] == "--name") body["name"] = args[++i];
       else if (args[i] == "--dest") body["dest"] = args[++i];
@@ -693,7 +698,93 @@ int cmd_admin_backup(std::string host, std::string port, const std::string& key,
     std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
     return 0;
   }
-  std::cerr << "usage: admin backup show|run|snapshot ...\n";
+  if (action == "policy") {
+    const std::string sub = args.size() >= 3 ? args[2] : "list";
+    if (sub == "list") {
+      auto r = admin_get(std::move(host), std::move(port), "/admin/api/backup/policies", key);
+      if (r.status != 200) {
+        std::cerr << "backup policy list failed status=" << r.status << " " << r.body << "\n";
+        return 1;
+      }
+      std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+      return 0;
+    }
+    if (sub == "rm" || sub == "delete") {
+      if (args.size() < 4) {
+        std::cerr << "usage: admin backup policy rm ID\n";
+        return 2;
+      }
+      auto r = admin_exchange(std::move(host), std::move(port), "DELETE",
+                              "/admin/api/backup/policies/" + args[3], "", key);
+      if (r.status != 200) {
+        std::cerr << "backup policy rm failed status=" << r.status << " " << r.body << "\n";
+        return 1;
+      }
+      std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+      return 0;
+    }
+    if (sub == "set") {
+      nlohmann::json body{{"kind", "posix"},
+                          {"enabled", true},
+                          {"path", "/"},
+                          {"schedule", {{"at", "00:00"}, {"tz", "UTC"}}},
+                          {"retain", {{"keep_days", 7}, {"keep_monthly", 12}}},
+                          {"staging_class", "archive"}};
+      for (std::size_t i = 3; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--enable") {
+          body["enabled"] = true;
+          continue;
+        }
+        if (a == "--disable") {
+          body["enabled"] = false;
+          continue;
+        }
+        if (i + 1 >= args.size()) {
+          std::cerr << "missing value for " << a << "\n";
+          return 2;
+        }
+        const std::string v = args[++i];
+        if (a == "--id") body["id"] = v;
+        else if (a == "--kind") body["kind"] = v;
+        else if (a == "--volume") body["volume"] = v;
+        else if (a == "--path") body["path"] = v;
+        else if (a == "--pool") body["pool"] = v;
+        else if (a == "--name") body["name"] = v;
+        else if (a == "--at") body["schedule"]["at"] = v;
+        else if (a == "--keep-days") body["retain"]["keep_days"] = std::stoi(v);
+        else if (a == "--keep-monthly") body["retain"]["keep_monthly"] = std::stoi(v);
+        else if (a == "--from") body["from"] = v;
+        else if (a == "--staging-class") body["staging_class"] = v;
+        else if (a == "--tape-sink") body["tape_sink"] = v;
+        else if (a == "--tape-root") body["tape_root"] = v;
+        else if (a == "--tape-uri-prefix") body["tape_uri_prefix"] = v;
+        else if (a == "--tape-bin") body["tape_bin"] = v;
+        else if (a == "--tape-s3-endpoint") body["tape_s3_endpoint"] = v;
+        else if (a == "--tape-put-cmd") body["tape_put_cmd"] = v;
+        else if (a == "--tape-get-cmd") body["tape_get_cmd"] = v;
+        else {
+          std::cerr << "unknown flag: " << a << "\n";
+          return 2;
+        }
+      }
+      if (body.value("kind", "") == "posix" && body.value("volume", "").empty()) {
+        std::cerr << "backup policy set posix requires --volume\n";
+        return 2;
+      }
+      auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                              "/admin/api/backup/policies", body.dump(), key);
+      if (r.status != 200) {
+        std::cerr << "backup policy set failed status=" << r.status << " " << r.body << "\n";
+        return 1;
+      }
+      std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+      return 0;
+    }
+    std::cerr << "usage: admin backup policy list|set|rm ...\n";
+    return 2;
+  }
+  std::cerr << "usage: admin backup show|run|snapshot|policy ...\n";
   return 2;
 }
 

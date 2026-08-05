@@ -609,6 +609,51 @@
     }
   });
 
+  function renderBackupPolicies(policies) {
+    const wrap = document.getElementById("backup-policy-table");
+    if (!wrap) return;
+    const list = policies || [];
+    if (!list.length) {
+      wrap.innerHTML = "<p class=\"muted\">No live policies.</p>";
+      return;
+    }
+    let html =
+      "<table><thead><tr><th>ID</th><th>Volume</th><th>Path</th><th>At</th><th>Keep</th><th></th></tr></thead><tbody>";
+    for (const p of list) {
+      const at = (p.schedule && p.schedule.at) || p.at || "";
+      const kd = (p.retain && p.retain.keep_days) ?? p.keep_days ?? "";
+      const km = (p.retain && p.retain.keep_monthly) ?? p.keep_monthly ?? "";
+      const en = p.enabled === false ? " (off)" : "";
+      const id = p.id || "";
+      html += `<tr>
+        <td><code>${id}</code>${en}</td>
+        <td>${p.volume || ""}</td>
+        <td>${p.path || "/"}</td>
+        <td>${at} UTC</td>
+        <td>${kd}d / ${km}mo</td>
+        <td><button type="button" class="btn bp-del" data-id="${id}">Delete</button></td>
+      </tr>`;
+    }
+    html += "</tbody></table>";
+    wrap.innerHTML = html;
+    wrap.querySelectorAll(".bp-del").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-id");
+        actionError.hidden = true;
+        const { res, json } = await api("/admin/api/backup/policies/" + encodeURIComponent(id), {
+          method: "DELETE",
+        });
+        document.getElementById("backup-policy-result").textContent = JSON.stringify(json, null, 2);
+        if (!res.ok) {
+          actionError.hidden = false;
+          actionError.textContent = (json && json.error) || "Delete failed";
+        } else {
+          await refreshArchiveBackup();
+        }
+      });
+    });
+  }
+
   async function refreshArchiveBackup() {
     const [arch, bak] = await Promise.all([
       api("/admin/api/archive"),
@@ -639,8 +684,10 @@
         null,
         2
       );
+      renderBackupPolicies(bak.json.policies || []);
     } else {
       bakEl.textContent = (bak.json && bak.json.error) || "Failed to load backup rules";
+      renderBackupPolicies([]);
     }
   }
 
@@ -708,12 +755,51 @@
     }
   });
 
+  document.getElementById("backup-policy-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    actionError.hidden = true;
+    const body = {
+      kind: "posix",
+      volume: document.getElementById("bp-volume").value.trim(),
+      path: document.getElementById("bp-path").value.trim() || "/",
+      enabled: document.getElementById("bp-enabled").value === "true",
+      schedule: { at: document.getElementById("bp-at").value.trim() || "00:00", tz: "UTC" },
+      retain: {
+        keep_days: Number(document.getElementById("bp-keep-days").value) || 0,
+        keep_monthly: Number(document.getElementById("bp-keep-monthly").value) || 0,
+      },
+      staging_class: "archive",
+      tape_sink: document.getElementById("bp-tape-sink").value.trim(),
+      tape_uri_prefix: document.getElementById("bp-tape-uri").value.trim(),
+    };
+    const id = document.getElementById("bp-id").value.trim();
+    if (id) body.id = id;
+    if (!body.volume) {
+      actionError.hidden = false;
+      actionError.textContent = "Volume required";
+      return;
+    }
+    const { res, json } = await api("/admin/api/backup/policies", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    document.getElementById("backup-policy-result").textContent = JSON.stringify(json, null, 2);
+    if (!res.ok) {
+      actionError.hidden = false;
+      actionError.textContent = (json && json.error) || "Policy save failed";
+    } else {
+      document.getElementById("bp-id").value = "";
+      await refreshArchiveBackup();
+    }
+  });
+
   document.getElementById("run-backup-snapshot").addEventListener("click", async () => {
     actionError.hidden = true;
     const kind = document.getElementById("backup-snap-kind").value;
     const body = { kind };
     if (kind === "posix") {
       body.volume = document.getElementById("backup-snap-volume").value.trim();
+      body.path = document.getElementById("backup-snap-path").value.trim() || "/";
       if (!body.volume) {
         actionError.hidden = false;
         actionError.textContent = "Volume required";
