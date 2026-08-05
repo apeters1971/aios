@@ -49,6 +49,22 @@ placement:
 # transition_interval_ms: 30000
 # transition_batch_oids: 64
 
+# Pack many small tips into large bag objects (cold / tape path). See proto/archive.md.
+# archive_rules:
+#   - prefix: "cold/"
+#     from: hdd
+#     staging_class: archive
+#     min_age_days: 30
+#     min_bag_bytes: 68719476736   # 64 GiB
+#     max_bag_bytes: 274877906944  # 256 GiB
+#     max_members: 0
+#     tape_sink: none             # or external (requires tape_root)
+#     tape_root: /var/lib/aios/tape
+#     # tape_put_cmd: /usr/local/bin/aios-tape-put
+#     # tape_get_cmd: /usr/local/bin/aios-tape-get
+# archive_interval_ms: 30000
+# archive_batch_oids: 64
+
 # repair_interval_ms: 30000
 # repair_batch_oids: 256
 http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API

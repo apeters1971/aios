@@ -4,6 +4,8 @@
 #include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
 #include "net/object_client.hpp"
+#include "object/archive_bag.hpp"
+#include "object/archive_pack.hpp"
 #include "object/object_layout.hpp"
 #include "util/base64.hpp"
 #include "util/compression.hpp"
@@ -1196,6 +1198,12 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
+  {
+    auto tip_attrs = store->list_attrs(oid, err);
+    if (attrs_are_frozen(tip_attrs)) {
+      return fail("frozen", "object is archived/frozen; recall before mutate");
+    }
+  }
   auto pr = check_preds_on(store, oid, preds, err);
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
@@ -1267,6 +1275,12 @@ ApiResult ObjectService::api_put_file(
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
+  {
+    auto tip_attrs = store->list_attrs(oid, err);
+    if (attrs_are_frozen(tip_attrs)) {
+      return fail("frozen", "object is archived/frozen; recall before mutate");
+    }
+  }
   auto pr = check_preds_on(store, oid, preds, err);
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
@@ -1410,6 +1424,9 @@ ApiResult ObjectService::api_put_range(
 
   {
     auto tip_attrs = store->list_attrs(oid, err);
+    if (attrs_are_frozen(tip_attrs)) {
+      return fail("frozen", "object is archived/frozen; recall before mutate");
+    }
     if (attrs_are_ec(tip_attrs)) {
       return fail("bad_request", "ranged put not supported for erasure-coded objects");
     }
@@ -1637,6 +1654,70 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     r.placement = placement;
     r.redirect_oid = info->redirect_oid;
     r.code = "redirect";
+    return r;
+  }
+
+  if (attrs_are_frozen(attrs)) {
+    const std::string st = archive_state_for_attrs(attrs);
+    if (st == kArchiveStateOnTape || st == kArchiveStateRestoring) {
+      ApiResult r;
+      r.ok = false;
+      r.code = "restoring";
+      r.error = "archived object is on tape / restoring";
+      r.epoch = map_.epoch;
+      r.info = info;
+      r.attrs = attrs;
+      r.placement = placement;
+      if (auto it = attrs.find(kBagLengthAttr); it != attrs.end()) {
+        try {
+          info->size = std::stoull(it->second);
+        } catch (...) {
+        }
+      }
+      return r;
+    }
+    std::vector<std::uint8_t> member;
+    std::string ferr;
+    if (!read_frozen_member(cfg_, advertise_, map_, stores_, attrs, member, ferr)) {
+      if (ferr == "restoring") {
+        ApiResult r;
+        r.ok = false;
+        r.code = "restoring";
+        r.error = ferr;
+        r.epoch = map_.epoch;
+        r.info = info;
+        r.attrs = attrs;
+        return r;
+      }
+      return fail("store_error", ferr);
+    }
+    ApiResult r;
+    r.ok = true;
+    r.epoch = map_.epoch;
+    r.info = info;
+    r.attrs = attrs;
+    r.placement = placement;
+    r.info->size = member.size();
+    // Optional range.
+    if (offset.has_value()) {
+      const std::uint64_t off = *offset;
+      if (off >= member.size()) {
+        r.data = std::vector<std::uint8_t>{};
+      } else {
+        std::size_t len = member.size() - static_cast<std::size_t>(off);
+        if (end_inclusive.has_value()) {
+          const std::uint64_t end =
+              std::min(*end_inclusive, static_cast<std::uint64_t>(member.size() - 1));
+          if (end >= off) len = static_cast<std::size_t>(end - off + 1);
+          else len = 0;
+        }
+        r.data = std::vector<std::uint8_t>(member.begin() + static_cast<std::ptrdiff_t>(off),
+                                           member.begin() + static_cast<std::ptrdiff_t>(off + len));
+      }
+    } else {
+      r.data = std::move(member);
+    }
+    ops_.note_get(r.data ? r.data->size() : 0);
     return r;
   }
 

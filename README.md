@@ -729,6 +729,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
 | [`proto/posix_fuse.md`](proto/posix_fuse.md) | POSIX C ABI, striping, FUSE3 mount |
 | [`proto/xrd_oss.md`](proto/xrd_oss.md) | XRootD OSS plugin (`libXrdAios`) |
+| [`proto/archive.md`](proto/archive.md) | Cold archive: pack tips into bags (tape-friendly) |
 | [`kernel/README.md`](kernel/README.md) | AlmaLinux 9 modules: `aios_http` / `aiosfs` / `aiosvd`, DKMS |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 | [`config/xrootd.aios.example.cf`](config/xrootd.aios.example.cf) | Example XRootD config for `libXrdAios` |

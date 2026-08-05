@@ -15,6 +15,7 @@
 #include <boost/asio.hpp>
 
 #include <memory>
+#include <string>
 
 namespace aios {
 
@@ -38,6 +39,7 @@ class GossipEngine {
   void on_status_timer(const boost::system::error_code& ec);
   void on_repair_timer(const boost::system::error_code& ec);
   void on_transition_timer(const boost::system::error_code& ec);
+  void on_archive_timer(const boost::system::error_code& ec);
   void run_scan();
   void rebuild_cluster_map();
   void sync_local_stores();
@@ -64,6 +66,7 @@ class GossipEngine {
   boost::asio::steady_timer status_timer_;
   boost::asio::steady_timer repair_timer_;
   boost::asio::steady_timer transition_timer_;
+  boost::asio::steady_timer archive_timer_;
 };
 
 }  // namespace aios

@@ -41,6 +41,10 @@ Logout: `POST /admin/logout`.
 | `GET /admin/api/cluster` | cookie **or** HMAC | Same as `/admin/cluster` |
 | `GET /admin/api/transitions` | cookie **or** HMAC | Transition rules |
 | `POST /admin/api/transitions/run` | cookie **or** HMAC | One transition tick |
+| `GET /admin/api/archive` | cookie **or** HMAC | Archive (pack-to-bag) rules |
+| `POST /admin/api/archive/run` | cookie **or** HMAC | One archive pack tick |
+| `POST /admin/api/archive/drain` | cookie **or** HMAC | Drain staged bags to tape_root / tape_put_cmd |
+| `POST /admin/api/archive/recall` | cookie **or** HMAC | `{oid}` restore bag if needed, rehydrate tip |
 | `POST /admin/api/repair/run` | cookie **or** HMAC | One repair tick |
 | `POST /admin/api/settings` | cookie **or** HMAC | `{admin_metrics_public: bool}` (in-memory) |
 | `GET /admin/api/s3/credentials` | cookie **or** HMAC | List S3 IAM keys (secrets redacted); requires `s3_listen` |
@@ -69,6 +73,10 @@ All of these require the normal AIOS HMAC Authorization header, except `GET /met
 | `GET /admin/cluster` | Local status + `admin_peers` (`node_id`, `http_addr`) for cluster scrape |
 | `GET /admin/transitions` | Configured storage-class `transition_rules` + intervals |
 | `POST /admin/transitions/run` | Run one local transition tick; returns `{matched,migrated,drained,failed}` |
+| `GET /admin/archive` | Configured `archive_rules` + intervals |
+| `POST /admin/archive/run` | Pack tick; returns `{matched,packed,bags_sealed,failed}` |
+| `POST /admin/archive/drain` | Tape drain tick; returns `{bags_scanned,drained,skipped,failed}` |
+| `POST /admin/archive/recall` | Restore bag from tape if needed; rehydrate `{oid}` |
 | `GET /metrics` | Prometheus counters (`aios_*_total`) |
 
 ## OPS counters

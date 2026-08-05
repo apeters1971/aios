@@ -28,6 +28,22 @@ struct TransitionRule {
   std::optional<std::string> ec_codec;
 };
 
+// Pack many small tips into large bag objects, then stub members (cold/tape path).
+struct ArchiveRule {
+  std::string prefix;
+  std::string from;                 // source storage_class of candidates
+  std::string staging_class{"archive"};  // class for bag bodies
+  int min_age_days{0};
+  std::uint64_t min_bag_bytes{64ull * 1024ull * 1024ull * 1024ull};  // 64 GiB
+  std::uint64_t max_bag_bytes{256ull * 1024ull * 1024ull * 1024ull}; // 256 GiB
+  int max_members{0};               // 0 = unlimited
+  int max_open_ms{-1};              // 0 = seal undersized bags each tick; -1 = wait for min
+  std::string tape_sink;            // empty/"none" = disk bags only; "external" = drain to tape
+  std::string tape_root;            // required when tape_sink=external (fs library / HSM mount)
+  std::string tape_put_cmd;         // optional: exec <bag_oid> <local_path> → stdout URI
+  std::string tape_get_cmd;         // optional: exec <uri> <local_path>
+};
+
 struct Config {
   std::string node_id;
   std::string listen{"0.0.0.0:7400"};
@@ -65,11 +81,15 @@ struct Config {
   std::vector<LayoutRule> layout_rules;
   // Prefix → class transition policies.
   std::vector<TransitionRule> transition_rules;
+  // Prefix → archive (pack-to-bag) policies.
+  std::vector<ArchiveRule> archive_rules;
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};
   int transition_interval_ms{30000};
   int transition_batch_oids{64};
+  int archive_interval_ms{30000};
+  int archive_batch_oids{64};
   // HTTP object API listen address; empty disables HTTP front-end.
   std::string http_listen{"0.0.0.0:7480"};
   // S3-compatible API listen address; empty disables. Uses libaios_posix on s3_volume.

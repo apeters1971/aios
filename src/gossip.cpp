@@ -3,6 +3,8 @@
 #include "fs/aios_scan.hpp"
 #include "net/client.hpp"
 #include "node_id.hpp"
+#include "object/archive_pack.hpp"
+#include "object/archive_tape.hpp"
 #include "object/repair.hpp"
 #include "object/transition.hpp"
 #include "util/log.hpp"
@@ -27,7 +29,8 @@ GossipEngine::GossipEngine(boost::asio::io_context& ioc, Config cfg,
       scan_timer_(ioc),
       status_timer_(ioc),
       repair_timer_(ioc),
-      transition_timer_(ioc) {
+      transition_timer_(ioc),
+      archive_timer_(ioc) {
   object_service_ = std::make_unique<ObjectService>(cfg_, cluster_map_, local_stores_);
 }
 
@@ -156,6 +159,10 @@ void GossipEngine::start() {
     transition_timer_.expires_after(std::chrono::milliseconds(cfg_.transition_interval_ms));
     transition_timer_.async_wait([this](auto ec) { on_transition_timer(ec); });
   }
+  if (cfg_.archive_interval_ms > 0 && !cfg_.archive_rules.empty()) {
+    archive_timer_.expires_after(std::chrono::milliseconds(cfg_.archive_interval_ms));
+    archive_timer_.async_wait([this](auto ec) { on_archive_timer(ec); });
+  }
 
   AIOS_LOG_INFO("node ", cfg_.node_id, " advertise=", adv,
                 " peers=", cfg_.peers.size(), " auth=hmac-sha256",
@@ -267,6 +274,25 @@ void GossipEngine::on_transition_timer(const boost::system::error_code& ec) {
   }
   transition_timer_.expires_after(std::chrono::milliseconds(cfg_.transition_interval_ms));
   transition_timer_.async_wait([this](auto e) { on_transition_timer(e); });
+}
+
+void GossipEngine::on_archive_timer(const boost::system::error_code& ec) {
+  if (ec) return;
+  rebuild_cluster_map();
+  const auto batch = static_cast<std::size_t>(std::max(1, cfg_.archive_batch_oids));
+  const auto stats = run_archive(cfg_, advertise_addr(), cluster_map_, local_stores_, batch);
+  if (stats.matched > 0 || stats.bags_sealed > 0 || stats.packed > 0) {
+    AIOS_LOG_INFO("archive scanned=", stats.oids_scanned, " matched=", stats.matched,
+                  " packed=", stats.packed, " bags=", stats.bags_sealed,
+                  " failed=", stats.failed);
+  }
+  const auto drain = run_archive_drain(cfg_, advertise_addr(), cluster_map_, local_stores_, batch);
+  if (drain.drained > 0 || drain.failed > 0) {
+    AIOS_LOG_INFO("archive drain scanned=", drain.bags_scanned, " drained=", drain.drained,
+                  " skipped=", drain.skipped, " failed=", drain.failed);
+  }
+  archive_timer_.expires_after(std::chrono::milliseconds(cfg_.archive_interval_ms));
+  archive_timer_.async_wait([this](auto e) { on_archive_timer(e); });
 }
 
 void GossipEngine::write_status() {

@@ -6,6 +6,8 @@
 #include "net/framing.hpp"
 #include "object/object_layout.hpp"
 #include "object/pubsub.hpp"
+#include "object/archive_pack.hpp"
+#include "object/archive_tape.hpp"
 #include "object/repair.hpp"
 #include "object/transition.hpp"
 #include "util/auth.hpp"
@@ -216,6 +218,8 @@ int status_for(const ApiResult& r) {
   if (r.code == "crc_mismatch") return 400;
   if (r.code == "range_unsatisfiable") return 416;
   if (r.code == "not_primary") return 307;
+  if (r.code == "restoring") return 503;
+  if (r.code == "frozen") return 409;
   if (r.code == "no_targets") return 503;
   if (r.code == "quorum_failed") return 503;
   if (r.code == "bad_request") return 400;
@@ -329,6 +333,14 @@ void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& p
                      bool keep_alive) {
   if (r.code == "not_primary") {
     write_not_primary(sock, path_q, r, keep_alive);
+    return;
+  }
+  if (r.code == "restoring") {
+    const auto j =
+        nlohmann::json({{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}).dump();
+    write_response(sock, 503, "Service Unavailable",
+                   {{"Content-Type", "application/json"}, {"Retry-After", "30"}},
+                   reinterpret_cast<const std::uint8_t*>(j.data()), j.size(), keep_alive);
     return;
   }
   write_json(sock, status_for(r), "Error",
@@ -498,6 +510,21 @@ nlohmann::json HttpServer::admin_config_json() const {
     if (r.ec_codec) jr["ec_codec"] = *r.ec_codec;
     transitions.push_back(std::move(jr));
   }
+  nlohmann::json archives = nlohmann::json::array();
+  for (const auto& r : c.archive_rules) {
+    archives.push_back({{"prefix", r.prefix},
+                        {"from", r.from},
+                        {"staging_class", r.staging_class},
+                        {"min_age_days", r.min_age_days},
+                        {"min_bag_bytes", r.min_bag_bytes},
+                        {"max_bag_bytes", r.max_bag_bytes},
+                        {"max_members", r.max_members},
+                        {"max_open_ms", r.max_open_ms},
+                        {"tape_sink", r.tape_sink},
+                        {"tape_root", r.tape_root},
+                        {"tape_put_cmd", r.tape_put_cmd},
+                        {"tape_get_cmd", r.tape_get_cmd}});
+  }
   return nlohmann::json{
       {"node_id", c.node_id},
       {"listen", c.listen},
@@ -526,10 +553,13 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"max_replica_count", c.max_replica_count},
       {"layout_rules", std::move(rules)},
       {"transition_rules", std::move(transitions)},
+      {"archive_rules", std::move(archives)},
       {"repair_interval_ms", c.repair_interval_ms},
       {"repair_batch_oids", c.repair_batch_oids},
       {"transition_interval_ms", c.transition_interval_ms},
       {"transition_batch_oids", c.transition_batch_oids},
+      {"archive_interval_ms", c.archive_interval_ms},
+      {"archive_batch_oids", c.archive_batch_oids},
       {"http_body_sync", c.http_body_sync},
       {"max_versions", c.max_versions},
       {"clone_required", c.clone_required},
@@ -885,6 +915,83 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (method == "POST" &&
           (path == "/admin/transitions/run" || path == "/admin/api/transitions/run")) {
         run_transitions_handler();
+        continue;
+      }
+      if (method == "GET" && (path == "/admin/archive" || path == "/admin/api/archive")) {
+        nlohmann::json rules = nlohmann::json::array();
+        for (const auto& r : cfg_.archive_rules) {
+          rules.push_back({{"prefix", r.prefix},
+                           {"from", r.from},
+                           {"staging_class", r.staging_class},
+                           {"min_age_days", r.min_age_days},
+                           {"min_bag_bytes", r.min_bag_bytes},
+                           {"max_bag_bytes", r.max_bag_bytes},
+                           {"max_members", r.max_members},
+                           {"max_open_ms", r.max_open_ms},
+                           {"tape_sink", r.tape_sink},
+                           {"tape_root", r.tape_root},
+                           {"tape_put_cmd", r.tape_put_cmd},
+                           {"tape_get_cmd", r.tape_get_cmd}});
+        }
+        write_json(*sock, 200, "OK",
+                   {{"archive_rules", rules},
+                    {"archive_interval_ms", cfg_.archive_interval_ms},
+                    {"archive_batch_oids", cfg_.archive_batch_oids}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "POST" &&
+          (path == "/admin/archive/run" || path == "/admin/api/archive/run")) {
+        const auto stats = run_archive(
+            cfg_, objects_.advertise(), objects_.map(), objects_.stores(),
+            static_cast<std::size_t>(std::max(1, cfg_.archive_batch_oids)));
+        write_json(*sock, 200, "OK",
+                   {{"oids_scanned", stats.oids_scanned},
+                    {"matched", stats.matched},
+                    {"packed", stats.packed},
+                    {"bags_sealed", stats.bags_sealed},
+                    {"failed", stats.failed}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "POST" &&
+          (path == "/admin/archive/drain" || path == "/admin/api/archive/drain")) {
+        const auto stats = run_archive_drain(
+            cfg_, objects_.advertise(), objects_.map(), objects_.stores(),
+            static_cast<std::size_t>(std::max(1, cfg_.archive_batch_oids)));
+        write_json(*sock, 200, "OK",
+                   {{"bags_scanned", stats.bags_scanned},
+                    {"drained", stats.drained},
+                    {"skipped", stats.skipped},
+                    {"failed", stats.failed}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "POST" &&
+          (path == "/admin/archive/recall" || path == "/admin/api/archive/recall")) {
+        try {
+          const std::string raw =
+              body.empty() ? "{}"
+                           : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+          auto j = nlohmann::json::parse(raw);
+          const std::string oid = j.value("oid", "");
+          if (oid.empty()) {
+            write_json(*sock, 400, "Bad Request", {{"error", "oid required"}}, keep_alive);
+            continue;
+          }
+          std::string err;
+          if (!recall_archived_oid(cfg_, objects_.advertise(), objects_.map(), objects_.stores(),
+                                   oid, err)) {
+            const int st = (err == "restoring") ? 503 : 400;
+            write_json(*sock, st, st == 503 ? "Service Unavailable" : "Bad Request",
+                       {{"error", err}, {"code", err == "restoring" ? "restoring" : "bad_request"}},
+                       keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK", {{"ok", true}, {"oid", oid}}, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
         continue;
       }
       if (method == "POST" && path == "/admin/api/repair/run") {

@@ -101,8 +101,13 @@ Client-driven transition: full PUT with `x-aios-storage-class` for the destinati
 
 Attrs win: place using tip `aios.storage_class` (and `n`); heal under-replication / missing EC shards on that class ring. During transition, may also consider `storage_class_prev`.
 
+## Cold archive (packed bags)
+
+Do **not** transition 1:1 onto tape. For cold data, use [`archive.md`](archive.md): pack many tips into large `archive/bag/*` objects, leave frozen stubs, then drain bag bodies to `tape_root` (or an external put/get command).
+
 ## Related docs
 
 - HTTP API: [`http.md`](http.md)
 - TCP++ wire format: [`README.md`](README.md)
 - Admin: [`admin.md`](admin.md)
+- Cold archive: [`archive.md`](archive.md)
