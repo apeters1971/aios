@@ -64,6 +64,12 @@ std::string super_to_json(const SuperMeta& m);
 
 void fill_stat(const InodeMeta& m, aios_posix_stat* st);
 
+// want: bitmask using S_IROTH=4, S_IWOTH=2, S_IXOTH=1 (same as low triad).
+int check_access(const aios_posix_cred& cred, const InodeMeta& m, int want);
+// Sticky-bit unlink/rename replace: 0 or -EACCES.
+int check_sticky_unlink(const aios_posix_cred& cred, const InodeMeta& parent,
+                        const InodeMeta& victim);
+
 // Directory name → ino map loaded from changelog.
 class DirTable {
  public:

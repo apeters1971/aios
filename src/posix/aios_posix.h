@@ -21,9 +21,15 @@ typedef struct aios_posix_config {
   const char* app_label;    /* optional */
   uint64_t stripe_unit;     /* 0 => 1 MiB */
   uint32_t stripe_width;    /* 0 => 4 (max in-flight chunk ops) */
-  uint32_t uid;             /* default owner for creates */
+  uint32_t uid;             /* default owner / caller when unset on thread */
   uint32_t gid;
 } aios_posix_config;
+
+/* Per-request caller identity (thread-local for this mount). */
+typedef struct aios_posix_cred {
+  uint32_t uid;
+  uint32_t gid;
+} aios_posix_cred;
 
 typedef struct aios_posix_stat {
   uint64_t ino;
@@ -49,6 +55,15 @@ typedef struct aios_posix_dirent {
 
 aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out);
 void aios_posix_unmount(aios_posix_fs* fs);
+
+/* Thread-scoped caller for subsequent ops on this mount (gateways/FUSE/OFS).
+ * When unset, mount config uid/gid are used. uid 0 bypasses mode checks. */
+void aios_posix_set_caller(aios_posix_fs* fs, uint32_t uid, uint32_t gid);
+void aios_posix_clear_caller(aios_posix_fs* fs);
+aios_posix_cred aios_posix_get_caller(const aios_posix_fs* fs);
+
+/* amode: R_OK / W_OK / X_OK (from unistd.h); F_OK checks existence only. */
+int aios_posix_access(aios_posix_fs* fs, uint64_t ino, int amode);
 
 int aios_posix_lookup(aios_posix_fs* fs, uint64_t parent, const char* name,
                       aios_posix_stat* st_out);

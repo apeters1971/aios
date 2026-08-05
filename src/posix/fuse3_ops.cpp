@@ -3,9 +3,11 @@
 
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <string>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef __APPLE__
 #include <sys/mount.h>
@@ -17,7 +19,10 @@
 namespace {
 
 aios_posix_fs* fs_handle() {
-  return static_cast<aios_posix_fs*>(fuse_get_context()->private_data);
+  auto* ctx = fuse_get_context();
+  auto* fs = static_cast<aios_posix_fs*>(ctx->private_data);
+  if (fs) aios_posix_set_caller(fs, static_cast<uint32_t>(ctx->uid), static_cast<uint32_t>(ctx->gid));
+  return fs;
 }
 
 int lookup_path(aios_posix_fs* fs, const char* path, aios_posix_stat* st_out) {
@@ -229,6 +234,18 @@ int posix_open(const char* path, struct fuse_file_info* fi) {
   int rc = lookup_path(fs, path, &st);
   if (rc) return rc;
   if (!S_ISREG(st.mode)) return -EISDIR;
+  int amode = 0;
+  if (fi) {
+    const int acc = fi->flags & O_ACCMODE;
+    if (acc == O_RDONLY || acc == O_RDWR) amode |= R_OK;
+    if (acc == O_WRONLY || acc == O_RDWR) amode |= W_OK;
+  } else {
+    amode = R_OK;
+  }
+  if (amode) {
+    rc = aios_posix_access(fs, st.ino, amode);
+    if (rc) return rc;
+  }
   if (fi) fi->fh = st.ino;
   return 0;
 }

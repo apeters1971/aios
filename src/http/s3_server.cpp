@@ -441,10 +441,22 @@ void S3Server::start() {
   if (!fs_) {
     throw std::runtime_error("S3: aios_posix_mount failed: " + std::to_string(err));
   }
-  // Ensure multipart staging root exists.
+  // Shared volume root: sticky + world-writable so IAM callers can CreateBucket
+  // while only owners (or root) may remove others' buckets.
+  {
+    aios_posix_stat rst{};
+    if (aios_posix_getattr(fs_, kRootIno, &rst) == 0) {
+      rst.mode = (rst.mode & S_IFMT) | 01777;
+      aios_posix_setattr(fs_, kRootIno, &rst, AIOS_POSIX_SET_MODE);
+    }
+  }
+  // Multipart staging: world-accessible so IAM principals can upload parts.
   aios_posix_stat st{};
   if (aios_posix_lookup(fs_, kRootIno, kMultipartDir, &st) == -ENOENT) {
-    aios_posix_mkdir(fs_, kRootIno, kMultipartDir, 0700, &st);
+    aios_posix_mkdir(fs_, kRootIno, kMultipartDir, 0777, &st);
+  } else {
+    st.mode = (st.mode & S_IFMT) | 0777;
+    aios_posix_setattr(fs_, st.ino, &st, AIOS_POSIX_SET_MODE);
   }
 
   std::string host, port;
@@ -608,6 +620,8 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     const bool set_owner = !is_root && iam_cred.has_value();
     const uint32_t own_uid = set_owner ? iam_cred->uid : 0;
     const uint32_t own_gid = set_owner ? iam_cred->gid : 0;
+    // Thread-scoped POSIX caller: IAM principal or root (0:0).
+    aios_posix_set_caller(fs_, is_root ? 0u : own_uid, is_root ? 0u : own_gid);
     auto allow_bucket = [&](const std::string& b) -> bool {
       if (is_root) return true;
       return iam_cred && iam_->allows_bucket(*iam_cred, b);

@@ -11,6 +11,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -179,6 +180,39 @@ int test_posix_fs() {
   expect(aios_posix_rmdir(fs, 1, "dir3") == 0, "rmdir dir3");
   expect(aios_posix_rmdir(fs, 1, "dir2") == 0, "rmdir dir2");
   expect(aios_posix_rmdir(fs, 1, "dir") == 0, "rmdir");
+
+  // Caller credentials: ownership + mode checks.
+  // Parent must be world-writable so non-mount uids can create under root (0755).
+  aios_posix_set_caller(fs, 0, 0);
+  expect(aios_posix_mkdir(fs, 1, "priv", 0777, &st) == 0, "mkdir staging");
+  const uint64_t priv = st.ino;
+  aios_posix_set_caller(fs, 2000, 2000);
+  auto cred = aios_posix_get_caller(fs);
+  expect(cred.uid == 2000 && cred.gid == 2000, "get_caller");
+  expect(aios_posix_create(fs, priv, "secret", 0600, &st) == 0, "create as A");
+  const uint64_t secret = st.ino;
+  expect(st.uid == 2000 && st.gid == 2000, "create owned by caller");
+  expect(aios_posix_write(fs, secret, 0, "ok", 2, &wrote) == 0 && wrote == 2, "A write");
+  expect(aios_posix_read(fs, secret, 0, buf, sizeof(buf), &got) == 0 && got == 2, "A read");
+
+  aios_posix_set_caller(fs, 3000, 3000);
+  expect(aios_posix_read(fs, secret, 0, buf, sizeof(buf), &got) == -EACCES, "B read EACCES");
+  expect(aios_posix_write(fs, secret, 0, "no", 2, &wrote) == -EACCES, "B write EACCES");
+  expect(aios_posix_access(fs, secret, R_OK) == -EACCES, "B access R");
+  expect(aios_posix_access(fs, secret, W_OK) == -EACCES, "B access W");
+
+  aios_posix_set_caller(fs, 0, 0);
+  expect(aios_posix_read(fs, secret, 0, buf, sizeof(buf), &got) == 0 && got == 2, "root read");
+  expect(aios_posix_write(fs, secret, 0, "rz", 2, &wrote) == 0, "root write");
+  expect(aios_posix_access(fs, secret, R_OK | W_OK) == 0, "root access");
+
+  aios_posix_set_caller(fs, 2000, 2000);
+  expect(aios_posix_unlink(fs, priv, "secret") == 0, "A unlink");
+  aios_posix_set_caller(fs, 0, 0);
+  expect(aios_posix_rmdir(fs, 1, "priv") == 0, "root rmdir");
+  aios_posix_clear_caller(fs);
+  cred = aios_posix_get_caller(fs);
+  expect(cred.uid == 1000 && cred.gid == 1000, "clear → mount defaults");
 
   aios_posix_unmount(fs);
   return failures();

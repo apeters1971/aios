@@ -17,6 +17,8 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 namespace aios {
@@ -102,6 +104,29 @@ void fill_stat(const InodeMeta& m, aios_posix_stat* st) {
   st->ctime_ns = m.ctime_ns;
   st->stripe_unit = m.stripe_unit;
   st->stripe_width = m.stripe_width;
+}
+
+int check_access(const aios_posix_cred& cred, const InodeMeta& m, int want) {
+  if (want == 0) return 0;
+  if (cred.uid == 0) return 0;  // root
+  const unsigned mode = m.mode & 0777;
+  unsigned bits = 0;
+  if (cred.uid == m.uid)
+    bits = (mode >> 6) & 7u;
+  else if (cred.gid == m.gid)
+    bits = (mode >> 3) & 7u;
+  else
+    bits = mode & 7u;
+  if ((static_cast<int>(bits) & want) == want) return 0;
+  return -EACCES;
+}
+
+int check_sticky_unlink(const aios_posix_cred& cred, const InodeMeta& parent,
+                        const InodeMeta& victim) {
+  if (cred.uid == 0) return 0;
+  if ((parent.mode & S_ISVTX) == 0) return 0;
+  if (cred.uid == parent.uid || cred.uid == victim.uid) return 0;
+  return -EACCES;
 }
 
 InodeMeta inode_from_json(const std::string& body, uint64_t cas_hint) {
@@ -849,7 +874,67 @@ struct aios_posix_fs {
   std::unique_ptr<FsState> st;
 };
 
+namespace {
+
+struct CallerSlot {
+  bool set{false};
+  uint32_t uid{0};
+  uint32_t gid{0};
+};
+
+thread_local std::unordered_map<const aios_posix_fs*, CallerSlot> g_tls_callers;
+
+aios_posix_cred effective_caller(const aios_posix_fs* fs) {
+  aios_posix_cred c{};
+  if (!fs || !fs->st) return c;
+  c.uid = fs->st->default_uid;
+  c.gid = fs->st->default_gid;
+  auto it = g_tls_callers.find(fs);
+  if (it != g_tls_callers.end() && it->second.set) {
+    c.uid = it->second.uid;
+    c.gid = it->second.gid;
+  }
+  return c;
+}
+
+constexpr int kWantR = 4;
+constexpr int kWantW = 2;
+constexpr int kWantX = 1;
+
+}  // namespace
+
 extern "C" {
+
+void aios_posix_set_caller(aios_posix_fs* fs, uint32_t uid, uint32_t gid) {
+  if (!fs) return;
+  auto& slot = g_tls_callers[fs];
+  slot.set = true;
+  slot.uid = uid;
+  slot.gid = gid;
+}
+
+void aios_posix_clear_caller(aios_posix_fs* fs) {
+  if (!fs) return;
+  g_tls_callers.erase(fs);
+}
+
+aios_posix_cred aios_posix_get_caller(const aios_posix_fs* fs) { return effective_caller(fs); }
+
+int aios_posix_access(aios_posix_fs* fs, uint64_t ino, int amode) {
+  if (!fs) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (amode == F_OK) return 0;
+    int want = 0;
+    if (amode & R_OK) want |= kWantR;
+    if (amode & W_OK) want |= kWantW;
+    if (amode & X_OK) want |= kWantX;
+    return aios::posix::check_access(effective_caller(fs), m, want);
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+}
 
 aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
   if (err_out) *err_out = 0;
@@ -889,6 +974,7 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
 
 void aios_posix_unmount(aios_posix_fs* fs) {
   if (!fs) return;
+  g_tls_callers.erase(fs);
   if (fs->st) {
     if (fs->st->quota) fs->st->quota->flush();
     aios::posix::release_all_flocks(*fs->st);
@@ -909,6 +995,7 @@ int aios_posix_lookup(aios_posix_fs* fs, uint64_t parent, const char* name,
     auto pmeta = aios::posix::load_inode(*fs->st, parent);
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
+    if (int ac = aios::posix::check_access(effective_caller(fs), pmeta, kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
     dir.load();
     auto it = dir.entries().find(name);
@@ -938,6 +1025,7 @@ int aios_posix_readdir(aios_posix_fs* fs, uint64_t ino, uint64_t* offset,
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
     if (!S_ISDIR(m.mode)) return -ENOTDIR;
+    if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, ino);
     dir.load();
     std::vector<std::pair<std::string, uint64_t>> items;
@@ -971,6 +1059,8 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     auto pmeta = aios::posix::load_inode(*fs->st, parent);
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
+    const auto cred = effective_caller(fs);
+    if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
     dir.load();
     if (dir.entries().count(name)) return -EEXIST;
@@ -980,8 +1070,8 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     m.ino = ino;
     m.mode = S_IFDIR | (mode & 0777);
     m.nlink = 2;
-    m.uid = fs->st->default_uid;
-    m.gid = fs->st->default_gid;
+    m.uid = cred.uid;
+    m.gid = cred.gid;
     m.project_id = pmeta.project_id;
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
@@ -1005,6 +1095,8 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     auto pmeta = aios::posix::load_inode(*fs->st, parent);
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
+    const auto cred = effective_caller(fs);
+    if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
     dir.load();
     if (dir.entries().count(name)) return -EEXIST;
@@ -1014,8 +1106,8 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     m.ino = ino;
     m.mode = S_IFREG | (mode & 0777);
     m.nlink = 1;
-    m.uid = fs->st->default_uid;
-    m.gid = fs->st->default_gid;
+    m.uid = cred.uid;
+    m.gid = cred.gid;
     m.project_id = pmeta.project_id;
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
@@ -1034,6 +1126,11 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
 int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
   if (!fs || !name) return -EINVAL;
   try {
+    auto pmeta = aios::posix::load_inode(*fs->st, parent);
+    if (!pmeta.exists) return -ENOENT;
+    if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
+    const auto cred = effective_caller(fs);
+    if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
     dir.load();
     auto it = dir.entries().find(name);
@@ -1041,6 +1138,9 @@ int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
     const uint64_t ino = it->second;
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (m.exists && S_ISDIR(m.mode)) return -EISDIR;
+    if (m.exists) {
+      if (int ac = aios::posix::check_sticky_unlink(cred, pmeta, m)) return ac;
+    }
     dir.unlink(name);
     if (m.exists) aios::posix::drop_nlink(*fs->st, ino);
     return 0;
@@ -1054,6 +1154,11 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
   if (!fs || !old_name || !new_name || !*old_name || !*new_name) return -EINVAL;
   if (std::strchr(new_name, '/')) return -EINVAL;
   try {
+    const auto cred = effective_caller(fs);
+    auto op = aios::posix::load_inode(*fs->st, old_parent);
+    if (!op.exists) return -ENOENT;
+    if (!S_ISDIR(op.mode)) return -ENOTDIR;
+    if (int ac = aios::posix::check_access(cred, op, kWantX)) return ac;
     aios::posix::DirTable old_dir(fs->st->session, fs->st->volume, old_parent);
     old_dir.load();
     auto it = old_dir.entries().find(old_name);
@@ -1069,6 +1174,7 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
     auto np = aios::posix::load_inode(*fs->st, new_parent);
     if (!np.exists) return -ENOENT;
     if (!S_ISDIR(np.mode)) return -ENOTDIR;
+    if (int ac = aios::posix::check_access(cred, np, kWantW | kWantX)) return ac;
 
     // Bump nlink before creating the new dentry (safer on crash).
     m.nlink += 1;
@@ -1086,6 +1192,11 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
 int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
   if (!fs || !name) return -EINVAL;
   try {
+    auto pmeta = aios::posix::load_inode(*fs->st, parent);
+    if (!pmeta.exists) return -ENOENT;
+    if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
+    const auto cred = effective_caller(fs);
+    if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
     dir.load();
     auto it = dir.entries().find(name);
@@ -1093,12 +1204,13 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     const uint64_t ino = it->second;
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists || !S_ISDIR(m.mode)) return -ENOTDIR;
+    if (int ac = aios::posix::check_sticky_unlink(cred, pmeta, m)) return ac;
     aios::posix::DirTable child(fs->st->session, fs->st->volume, ino);
     child.load();
     if (!child.entries().empty()) return -ENOTEMPTY;
     dir.unlink(name);
     fs->st->session.delete_object(aios::posix::ino_oid(fs->st->volume, ino));
-    auto pmeta = aios::posix::load_inode(*fs->st, parent);
+    pmeta = aios::posix::load_inode(*fs->st, parent);
     if (pmeta.exists && pmeta.nlink > 2) {
       pmeta.nlink -= 1;
       pmeta.mtime_ns = pmeta.ctime_ns = aios::posix::now_ns();
@@ -1116,21 +1228,59 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
                       uint64_t new_parent, const char* new_name) {
   if (!fs || !old_name || !new_name) return -EINVAL;
   try {
+    const auto cred = effective_caller(fs);
+    auto op_meta = aios::posix::load_inode(*fs->st, old_parent);
+    if (!op_meta.exists) return -ENOENT;
+    if (!S_ISDIR(op_meta.mode)) return -ENOTDIR;
+    if (int ac = aios::posix::check_access(cred, op_meta, kWantW | kWantX)) return ac;
+    auto np_meta = aios::posix::load_inode(*fs->st, new_parent);
+    if (!np_meta.exists) return -ENOENT;
+    if (!S_ISDIR(np_meta.mode)) return -ENOTDIR;
+    if (int ac = aios::posix::check_access(cred, np_meta, kWantW | kWantX)) return ac;
+
     if (old_parent == new_parent) {
       aios::posix::DirTable dir(fs->st->session, fs->st->volume, old_parent);
       dir.load();
-      if (!dir.entries().count(old_name)) return -ENOENT;
+      auto oit = dir.entries().find(old_name);
+      if (oit == dir.entries().end()) return -ENOENT;
+      auto src = aios::posix::load_inode(*fs->st, oit->second);
+      if (src.exists) {
+        if (int ac = aios::posix::check_sticky_unlink(cred, op_meta, src)) return ac;
+      }
       if (dir.entries().count(new_name) && std::strcmp(old_name, new_name) != 0) {
         // Replace: unlink target first (file only).
         auto tit = dir.entries().find(new_name);
         const uint64_t victim = tit->second;
         auto tm = aios::posix::load_inode(*fs->st, victim);
         if (tm.exists && S_ISDIR(tm.mode)) return -EISDIR;
+        if (tm.exists) {
+          if (int ac = aios::posix::check_sticky_unlink(cred, op_meta, tm)) return ac;
+        }
         dir.unlink(new_name);
         if (tm.exists) aios::posix::drop_nlink(*fs->st, victim);
       }
       dir.rename_same(old_name, new_name);
       return 0;
+    }
+    // Cross-dir: sticky checks on source and optional victim.
+    {
+      aios::posix::DirTable dir(fs->st->session, fs->st->volume, old_parent);
+      dir.load();
+      auto oit = dir.entries().find(old_name);
+      if (oit == dir.entries().end()) return -ENOENT;
+      auto src = aios::posix::load_inode(*fs->st, oit->second);
+      if (src.exists) {
+        if (int ac = aios::posix::check_sticky_unlink(cred, op_meta, src)) return ac;
+      }
+      aios::posix::DirTable ndir(fs->st->session, fs->st->volume, new_parent);
+      ndir.load();
+      auto tit = ndir.entries().find(new_name);
+      if (tit != ndir.entries().end()) {
+        auto tm = aios::posix::load_inode(*fs->st, tit->second);
+        if (tm.exists) {
+          if (int ac = aios::posix::check_sticky_unlink(cred, np_meta, tm)) return ac;
+        }
+      }
     }
     return aios::posix::rename_cross_dir(*fs->st, old_parent, old_name, new_parent, new_name);
   } catch (const aios::client_error& e) {
@@ -1141,17 +1291,38 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
 int aios_posix_read(aios_posix_fs* fs, uint64_t ino, uint64_t offset, void* buf, size_t len,
                     size_t* out_len) {
   if (!fs || !buf) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
   return aios::posix::read_file(*fs->st, ino, offset, buf, len, out_len);
 }
 
 int aios_posix_write(aios_posix_fs* fs, uint64_t ino, uint64_t offset, const void* buf,
                      size_t len, size_t* out_len) {
   if (!fs || !buf) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantW)) return ac;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
   return aios::posix::write_file(*fs->st, ino, offset, buf, len, out_len);
 }
 
 int aios_posix_truncate(aios_posix_fs* fs, uint64_t ino, uint64_t size) {
   if (!fs) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantW)) return ac;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
   return aios::posix::truncate_file(*fs->st, ino, size);
 }
 
@@ -1161,6 +1332,16 @@ int aios_posix_setattr(aios_posix_fs* fs, uint64_t ino, const aios_posix_stat* s
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
+    const auto cred = effective_caller(fs);
+    if (to_set & (AIOS_POSIX_SET_UID | AIOS_POSIX_SET_GID)) {
+      if (cred.uid != 0) return -EPERM;
+    }
+    if (to_set & AIOS_POSIX_SET_MODE) {
+      if (cred.uid != 0 && cred.uid != m.uid) return -EPERM;
+    }
+    if (to_set & (AIOS_POSIX_SET_SIZE | AIOS_POSIX_SET_MTIME | AIOS_POSIX_SET_ATIME)) {
+      if (int ac = aios::posix::check_access(cred, m, kWantW)) return ac;
+    }
     const auto old_uid = m.uid;
     const auto old_gid = m.gid;
     if (to_set & AIOS_POSIX_SET_MODE) m.mode = (m.mode & S_IFMT) | (st->mode & 07777);
@@ -1217,6 +1398,10 @@ int aios_posix_setxattr(aios_posix_fs* fs, uint64_t ino, const char* name, const
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
+    const auto cred = effective_caller(fs);
+    if (cred.uid != 0 && cred.uid != m.uid) {
+      if (int ac = aios::posix::check_access(cred, m, kWantW)) return ac;
+    }
     const bool present = m.xattrs.count(name) != 0;
     if ((flags & AIOS_POSIX_XATTR_CREATE) && present) return -EEXIST;
     if ((flags & AIOS_POSIX_XATTR_REPLACE) && !present) return -aios::posix::kXattrMissing;
@@ -1236,6 +1421,7 @@ int aios_posix_getxattr(aios_posix_fs* fs, uint64_t ino, const char* name, void*
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
+    if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
     auto it = m.xattrs.find(name);
     if (it == m.xattrs.end()) return -aios::posix::kXattrMissing;
     if (size == 0) return static_cast<int>(it->second.size());
@@ -1254,6 +1440,7 @@ int aios_posix_listxattr(aios_posix_fs* fs, uint64_t ino, char* list, size_t siz
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
+    if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
     size_t need = 0;
     for (const auto& [k, _] : m.xattrs) need += k.size() + 1;
     if (size == 0) return static_cast<int>(need);
@@ -1276,6 +1463,10 @@ int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name) {
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
+    const auto cred = effective_caller(fs);
+    if (cred.uid != 0 && cred.uid != m.uid) {
+      if (int ac = aios::posix::check_access(cred, m, kWantW)) return ac;
+    }
     if (!m.xattrs.erase(name)) return -aios::posix::kXattrMissing;
     m.ctime_ns = aios::posix::now_ns();
     aios::posix::store_inode(*fs->st, m);
@@ -1293,6 +1484,10 @@ int aios_posix_flock(aios_posix_fs* fs, uint64_t ino, int op) {
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
+    if (cmd != LOCK_UN) {
+      const int want = (cmd == LOCK_EX) ? kWantW : kWantR;
+      if (int ac = aios::posix::check_access(effective_caller(fs), m, want)) return ac;
+    }
     const std::string oid = aios::posix::ino_oid(fs->st->volume, ino);
 
     if (cmd == LOCK_UN) {

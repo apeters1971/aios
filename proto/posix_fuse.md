@@ -66,10 +66,34 @@ Same-directory rename remains a single changelog `Rename` op. Commit still has t
 - **`fsync`** drops the local inode cache; chunk PUTs are already durable per-object, not a multi-object transaction.
 - Victim file **chunk GC** after a replacing cross-dir rename runs after commit (directory tips are consistent first).
 
+## Caller credentials and mode checks
+
+Gateways (FUSE, S3, future XRootD OFS) set a **thread-scoped caller** before ops:
+
+```c
+typedef struct aios_posix_cred { uint32_t uid; uint32_t gid; } aios_posix_cred;
+
+void aios_posix_set_caller(aios_posix_fs* fs, uint32_t uid, uint32_t gid);
+void aios_posix_clear_caller(aios_posix_fs* fs);  /* revert to mount defaults */
+aios_posix_cred aios_posix_get_caller(const aios_posix_fs* fs);
+int aios_posix_access(aios_posix_fs* fs, uint64_t ino, int amode);  /* R_OK/W_OK/X_OK/F_OK */
+```
+
+- Stored **thread-local**, keyed by `fs*` (multi-mount safe).
+- If unset on a thread: fall back to mount `aios_posix_config.uid/gid` (single-principal clients).
+- **uid 0** bypasses mode checks (root). Primary **gid only** (no supplementary groups / ACLs yet).
+- `create` / `mkdir` own new inodes as the caller.
+- Reads/writes/truncates require R/W vs mode; directory mutations need W+X on the parent; sticky bit (`S_ISVTX`) restricts unlink/rename of others’ entries; `chmod` is owner/root, `chown` is root-only.
+- Cluster object HMAC auth is unchanged (mount = trusted client). Callers are an application-layer principal for POSIX mode bits.
+
+**FUSE** sets the caller from `fuse_get_context()->uid/gid` on each op. **S3** sets IAM `uid`/`gid`, or `0:0` for the root access key. The S3 volume root is mode `1777` (sticky) so IAM principals can create buckets they own; multipart staging is `0777`.
+
 ## C ABI
 
 ```c
 aios_posix_fs* aios_posix_mount(const aios_posix_config*, int* err_out);
+void aios_posix_set_caller / clear_caller / get_caller;
+int aios_posix_access(fs, ino, amode);
 int aios_posix_lookup(fs, parent, name, &st);
 int aios_posix_link / setxattr / getxattr / listxattr / removexattr / flock;
 int aios_posix_read/write/truncate/...
@@ -84,7 +108,7 @@ Errors are **negative errno**. The ABI avoids Boost/STL so a future kernel port 
 aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 ```
 
-Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `stripe_width`, `app_label`.
+Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `stripe_width`, `app_label`. Process credentials from the kernel (`fuse_get_context`) drive permission checks.
 
 ## Kernel prototype (AlmaLinux 9)
 
