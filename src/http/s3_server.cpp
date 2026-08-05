@@ -3,6 +3,7 @@
 #include "cuobject/cuobject_endpoint.hpp"
 #include "cuobject/cuobject_s3_xfer.hpp"
 #include "http/s3_auth.hpp"
+#include "http/s3_range.hpp"
 #include "posix/aios_posix.h"
 #include "util/auth.hpp"
 #include "util/log.hpp"
@@ -1121,33 +1122,15 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 404, "NoSuchKey", "The specified key does not exist", path);
         return;
       }
-      uint64_t start = 0, end = st.size ? st.size - 1 : 0;
-      bool ranged = false;
-      if (auto rg = header_get(headers, "range"); !rg.empty() && method == "GET") {
-        // bytes=START-END
-        if (rg.rfind("bytes=", 0) == 0) {
-          auto rest = rg.substr(6);
-          auto dash = rest.find('-');
-          if (dash != std::string::npos) {
-            try {
-              start = rest.substr(0, dash).empty() ? 0 : std::stoull(rest.substr(0, dash));
-              if (dash + 1 < rest.size()) end = std::stoull(rest.substr(dash + 1));
-              else end = st.size ? st.size - 1 : 0;
-              ranged = true;
-            } catch (...) {
-            }
-          }
+      S3RangeParseResult ranges;
+      if (method == "GET") {
+        ranges = parse_s3_byte_ranges(header_get(headers, "range"), st.size);
+        if (ranges.unsatisfiable) {
+          write_s3_error(*sock, 416, "InvalidRange", "Requested range not satisfiable", path);
+          return;
         }
       }
-      if (st.size == 0) {
-        start = 0;
-        end = 0;
-      } else if (start >= st.size) {
-        write_s3_error(*sock, 416, "InvalidRange", "Requested range not satisfiable", path);
-        return;
-      }
-      if (end >= st.size) end = st.size - 1;
-      uint64_t len = st.size == 0 ? 0 : (end - start + 1);
+      const bool ranged = ranges.present && !ranges.ranges.empty();
 
       std::unordered_map<std::string, std::string> rh = {
           {"Content-Type", "application/octet-stream"},
@@ -1158,6 +1141,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       char ctbuf[256];
       int ctl = aios_posix_getxattr(fs_, st.ino, kXattrContentType, ctbuf, sizeof(ctbuf));
       if (ctl > 0) rh["Content-Type"] = std::string(ctbuf, ctl);
+      const std::string object_ctype = rh["Content-Type"];
 
       if (method == "HEAD") {
         rh["Content-Length"] = std::to_string(st.size);
@@ -1165,16 +1149,56 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         return;
       }
 
-      std::string out;
-      out.resize(static_cast<std::size_t>(len));
-      if (len) {
+      auto read_span = [&](std::uint64_t start, std::uint64_t end, std::string& out) -> bool {
+        const std::uint64_t len = end >= start ? (end - start + 1) : 0;
+        out.resize(static_cast<std::size_t>(len));
+        if (!len) return true;
         size_t got = 0;
-        err = aios_posix_read(fs_, st.ino, start, out.data(), static_cast<size_t>(len), &got);
-        if (err) {
-          write_s3_error(*sock, 500, "InternalError", "read failed", path);
-          return;
-        }
+        int rerr =
+            aios_posix_read(fs_, st.ino, start, out.data(), static_cast<size_t>(len), &got);
+        if (rerr) return false;
         out.resize(got);
+        return true;
+      };
+
+      // Multi-range → multipart/byteranges (RFC 7233).
+      if (ranged && ranges.ranges.size() > 1) {
+        std::vector<std::string> parts;
+        parts.reserve(ranges.ranges.size());
+        for (const auto& br : ranges.ranges) {
+          std::string part;
+          if (!read_span(br.start, br.end, part)) {
+            write_s3_error(*sock, 500, "InternalError", "read failed", path);
+            return;
+          }
+          parts.push_back(std::move(part));
+        }
+        const std::string boundary = "aiosboundary" + std::to_string(st.ino) + "x" +
+                                     std::to_string(st.size) + "x" +
+                                     std::to_string(ranges.ranges.size());
+        auto body = build_s3_multipart_byteranges(boundary, object_ctype, st.size, ranges.ranges,
+                                                  parts);
+        rh["Content-Type"] = "multipart/byteranges; boundary=" + boundary;
+        write_http(*sock, 206, "Partial Content", rh, body);
+        return;
+      }
+
+      std::uint64_t start = 0;
+      std::uint64_t end = st.size ? st.size - 1 : 0;
+      if (ranged) {
+        start = ranges.ranges[0].start;
+        end = ranges.ranges[0].end;
+      } else if (st.size == 0) {
+        start = 0;
+        end = 0;
+      }
+
+      std::string out;
+      if (st.size == 0 && !ranged) {
+        out.clear();
+      } else if (!read_span(start, end, out)) {
+        write_s3_error(*sock, 500, "InternalError", "read failed", path);
+        return;
       }
 
       // Whole-object RDMA GET (no Range): push host buffer to client GPU/system memory.

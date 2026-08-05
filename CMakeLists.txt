@@ -251,6 +251,7 @@ endif()
 # S3-compatible front-end (FS-backed). Separate from aios_core to avoid link cycle with aios_posix.
 add_library(aios_s3 STATIC
   src/http/s3_server.cpp
+  src/http/s3_range.cpp
 )
 target_include_directories(aios_s3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -355,6 +356,7 @@ add_executable(aios_tests
   tests/test_frontend_io.cpp
   tests/test_compression.cpp
   tests/test_cuobject_s3.cpp
+  tests/test_s3_range.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
   tests/test_http_ec.cpp
