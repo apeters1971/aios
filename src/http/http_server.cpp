@@ -529,6 +529,25 @@ nlohmann::json HttpServer::admin_config_json() const {
                         {"tape_put_cmd", r.tape_put_cmd},
                         {"tape_get_cmd", r.tape_get_cmd}});
   }
+  nlohmann::json backups = nlohmann::json::array();
+  for (const auto& r : c.backup_rules) {
+    backups.push_back({{"kind", r.kind},
+                       {"volume", r.volume},
+                       {"pool", r.pool},
+                       {"name", r.name},
+                       {"retain_snaps", r.retain_snaps},
+                       {"from", r.from},
+                       {"staging_class", r.staging_class},
+                       {"max_bag_bytes", r.max_bag_bytes},
+                       {"max_members", r.max_members},
+                       {"tape_sink", r.tape_sink},
+                       {"tape_root", r.tape_root},
+                       {"tape_uri_prefix", r.tape_uri_prefix},
+                       {"tape_bin", r.tape_bin},
+                       {"tape_s3_endpoint", r.tape_s3_endpoint},
+                       {"tape_put_cmd", r.tape_put_cmd},
+                       {"tape_get_cmd", r.tape_get_cmd}});
+  }
   return nlohmann::json{
       {"node_id", c.node_id},
       {"listen", c.listen},
@@ -558,12 +577,15 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"layout_rules", std::move(rules)},
       {"transition_rules", std::move(transitions)},
       {"archive_rules", std::move(archives)},
+      {"backup_rules", std::move(backups)},
       {"repair_interval_ms", c.repair_interval_ms},
       {"repair_batch_oids", c.repair_batch_oids},
       {"transition_interval_ms", c.transition_interval_ms},
       {"transition_batch_oids", c.transition_batch_oids},
       {"archive_interval_ms", c.archive_interval_ms},
       {"archive_batch_oids", c.archive_batch_oids},
+      {"backup_interval_ms", c.backup_interval_ms},
+      {"backup_batch_oids", c.backup_batch_oids},
       {"http_body_sync", c.http_body_sync},
       {"max_versions", c.max_versions},
       {"clone_required", c.clone_required},

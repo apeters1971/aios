@@ -94,6 +94,38 @@
             <button type="button" id="run-repair" class="btn primary">Run repair</button>
             <pre id="repair-result" class="code-block small"></pre>
           </div>
+          <div class="action-card">
+            <h3>Cold archive</h3>
+            <p class="muted">Pack tips into bags, drain to tape, or recall one oid. Rules are YAML-only (restart to change).</p>
+            <pre id="archive-rules" class="code-block small">Loading…</pre>
+            <div class="btn-row">
+              <button type="button" id="run-archive" class="btn primary">Run pack</button>
+              <button type="button" id="run-archive-drain" class="btn">Drain</button>
+            </div>
+            <pre id="archive-result" class="code-block small"></pre>
+            <label class="field"><span>Recall oid</span><input id="archive-recall-oid" spellcheck="false" placeholder="cold/file" /></label>
+            <button type="button" id="run-archive-recall" class="btn">Recall</button>
+          </div>
+          <div class="action-card">
+            <h3>Backup (POSIX / VBD)</h3>
+            <p class="muted">Snapshot then pack+drain. Rules are YAML-only (restart to change).</p>
+            <pre id="backup-rules" class="code-block small">Loading…</pre>
+            <button type="button" id="run-backup" class="btn primary">Run backup</button>
+            <pre id="backup-result" class="code-block small"></pre>
+            <h4>Snapshot only</h4>
+            <label class="field"><span>Kind</span>
+              <select id="backup-snap-kind">
+                <option value="posix">posix</option>
+                <option value="vbd">vbd</option>
+              </select>
+            </label>
+            <label class="field backup-posix-fields"><span>Volume</span><input id="backup-snap-volume" spellcheck="false" value="default" /></label>
+            <label class="field backup-vbd-fields hidden"><span>Pool</span><input id="backup-snap-pool" spellcheck="false" /></label>
+            <label class="field backup-vbd-fields hidden"><span>Name</span><input id="backup-snap-name" spellcheck="false" /></label>
+            <label class="field backup-vbd-fields hidden"><span>Dest (optional)</span><input id="backup-snap-dest" spellcheck="false" /></label>
+            <button type="button" id="run-backup-snapshot" class="btn">Create snapshot</button>
+            <pre id="backup-snapshot-result" class="code-block small"></pre>
+          </div>
         </div>
         <p id="action-error" class="error" hidden></p>
       </section>

@@ -208,6 +208,7 @@
     if (activeTab === "s3") await refreshS3();
     if (activeTab === "quota") await refreshQuota();
     if (activeTab === "qos") await refreshQos();
+    if (activeTab === "actions") await refreshArchiveBackup();
   }
 
   function parseBytes(s) {
@@ -371,6 +372,7 @@
     if (btn.dataset.tab === "s3") refreshS3().catch(() => {});
     if (btn.dataset.tab === "quota") refreshQuota().catch(() => {});
     if (btn.dataset.tab === "qos") refreshQos().catch(() => {});
+    if (btn.dataset.tab === "actions") refreshArchiveBackup().catch(() => {});
   });
 
   async function qosPutLimits(body) {
@@ -604,6 +606,138 @@
     if (!res.ok) {
       actionError.hidden = false;
       actionError.textContent = (json && json.error) || "Repair failed";
+    }
+  });
+
+  async function refreshArchiveBackup() {
+    const [arch, bak] = await Promise.all([
+      api("/admin/api/archive"),
+      api("/admin/api/backup"),
+    ]);
+    const archEl = document.getElementById("archive-rules");
+    const bakEl = document.getElementById("backup-rules");
+    if (arch.res.ok && arch.json) {
+      archEl.textContent = JSON.stringify(
+        {
+          archive_interval_ms: arch.json.archive_interval_ms,
+          archive_batch_oids: arch.json.archive_batch_oids,
+          archive_rules: arch.json.archive_rules || [],
+        },
+        null,
+        2
+      );
+    } else {
+      archEl.textContent = (arch.json && arch.json.error) || "Failed to load archive rules";
+    }
+    if (bak.res.ok && bak.json) {
+      bakEl.textContent = JSON.stringify(
+        {
+          backup_interval_ms: bak.json.backup_interval_ms,
+          backup_batch_oids: bak.json.backup_batch_oids,
+          backup_rules: bak.json.backup_rules || [],
+        },
+        null,
+        2
+      );
+    } else {
+      bakEl.textContent = (bak.json && bak.json.error) || "Failed to load backup rules";
+    }
+  }
+
+  function syncBackupSnapFields() {
+    const kind = document.getElementById("backup-snap-kind").value;
+    document.querySelectorAll(".backup-posix-fields").forEach((el) => {
+      el.classList.toggle("hidden", kind !== "posix");
+    });
+    document.querySelectorAll(".backup-vbd-fields").forEach((el) => {
+      el.classList.toggle("hidden", kind !== "vbd");
+    });
+  }
+
+  document.getElementById("backup-snap-kind").addEventListener("change", syncBackupSnapFields);
+  syncBackupSnapFields();
+
+  document.getElementById("run-archive").addEventListener("click", async () => {
+    actionError.hidden = true;
+    const { res, json } = await api("/admin/api/archive/run", { method: "POST", body: "{}" });
+    document.getElementById("archive-result").textContent = JSON.stringify(json, null, 2);
+    if (!res.ok) {
+      actionError.hidden = false;
+      actionError.textContent = (json && json.error) || "Archive pack failed";
+    }
+  });
+
+  document.getElementById("run-archive-drain").addEventListener("click", async () => {
+    actionError.hidden = true;
+    const { res, json } = await api("/admin/api/archive/drain", { method: "POST", body: "{}" });
+    document.getElementById("archive-result").textContent = JSON.stringify(json, null, 2);
+    if (!res.ok) {
+      actionError.hidden = false;
+      actionError.textContent = (json && json.error) || "Archive drain failed";
+    }
+  });
+
+  document.getElementById("run-archive-recall").addEventListener("click", async () => {
+    actionError.hidden = true;
+    const oid = document.getElementById("archive-recall-oid").value.trim();
+    if (!oid) {
+      actionError.hidden = false;
+      actionError.textContent = "Recall oid required";
+      return;
+    }
+    const { res, json } = await api("/admin/api/archive/recall", {
+      method: "POST",
+      body: JSON.stringify({ oid }),
+    });
+    document.getElementById("archive-result").textContent = JSON.stringify(json, null, 2);
+    if (!res.ok) {
+      actionError.hidden = false;
+      actionError.textContent = (json && json.error) || "Archive recall failed";
+    }
+  });
+
+  document.getElementById("run-backup").addEventListener("click", async () => {
+    actionError.hidden = true;
+    const { res, json } = await api("/admin/api/backup/run", { method: "POST", body: "{}" });
+    document.getElementById("backup-result").textContent = JSON.stringify(json, null, 2);
+    if (!res.ok) {
+      actionError.hidden = false;
+      actionError.textContent = (json && json.error) || "Backup run failed";
+    } else {
+      await refreshArchiveBackup();
+    }
+  });
+
+  document.getElementById("run-backup-snapshot").addEventListener("click", async () => {
+    actionError.hidden = true;
+    const kind = document.getElementById("backup-snap-kind").value;
+    const body = { kind };
+    if (kind === "posix") {
+      body.volume = document.getElementById("backup-snap-volume").value.trim();
+      if (!body.volume) {
+        actionError.hidden = false;
+        actionError.textContent = "Volume required";
+        return;
+      }
+    } else {
+      body.pool = document.getElementById("backup-snap-pool").value.trim();
+      body.name = document.getElementById("backup-snap-name").value.trim();
+      const dest = document.getElementById("backup-snap-dest").value.trim();
+      if (dest) body.dest = dest;
+      if (!body.pool || !body.name) {
+        actionError.hidden = false;
+        actionError.textContent = "Pool and name required";
+        return;
+      }
+    }
+    const { res, json } = await api("/admin/api/backup/snapshot", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    document.getElementById("backup-snapshot-result").textContent = JSON.stringify(json, null, 2);
+    if (!res.ok) {
+      actionError.hidden = false;
+      actionError.textContent = (json && json.error) || "Snapshot failed";
     }
   });
 

@@ -20,7 +20,7 @@ Open **`http://HOST:PORT/admin/`** in a browser (same `http_listen`).
 
 1. Sign in with the **cluster key** (password field).
 2. A session cookie (`aios_admin`, HttpOnly, SameSite=Strict, 12h) authenticates subsequent `/admin/api/*` calls.
-3. Panels: Overview (OPS), Cluster peers, Config (read-only; secrets redacted), Actions (toggle `admin_metrics_public`, run transitions, run repair).
+3. Panels: Overview (OPS), Cluster peers, Config (read-only; secrets redacted), Actions (metrics toggle, transitions, repair, archive pack/drain/recall, backup run/snapshot), S3 / Quotas / QoS.
 
 Static assets live in [`web/admin/`](../web/admin/) (installed to `share/aios/admin`). Override search path with **`AIOS_ADMIN_WEB`**.
 
@@ -62,7 +62,20 @@ Logout: `POST /admin/logout`.
 | `GET /admin/api/qos` | cookie **or** HMAC | Soft IOPS/BW limits + monitoring rates |
 | `PUT /admin/api/qos/limits` | cookie **or** HMAC | `{uid\|gid\|project_id, iops?, bps?, clear?}` |
 
-CLI: `aios admin s3-cred …`, `aios admin quota …`, `aios admin qos …`. Web UI: **S3 credentials** / **Quotas** / **QoS** tabs. See [`proto/s3.md`](s3.md), [`proto/quota.md`](quota.md), [`proto/qos.md`](qos.md).
+CLI: `aios admin archive …`, `aios admin backup …`, `aios admin s3-cred …`, `aios admin quota …`, `aios admin qos …`. Web UI: **Actions** (archive/backup), **S3 credentials** / **Quotas** / **QoS** tabs. See [`archive.md`](archive.md), [`backup.md`](backup.md), [`s3.md`](s3.md), [`quota.md`](quota.md), [`qos.md`](qos.md).
+
+```bash
+aios admin archive show
+aios admin archive run
+aios admin archive drain
+aios admin archive recall cold/file
+aios admin backup show
+aios admin backup run
+aios admin backup snapshot posix --volume default
+aios admin backup snapshot vbd --pool rbd --name disk0
+```
+
+Archive/backup **rules** are configured in YAML (`archive_rules` / `backup_rules`) and require a daemon restart; the UI/CLI expose view + run actions only.
 
 ### Legacy JSON (CLI / HMAC)
 

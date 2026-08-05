@@ -52,11 +52,13 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  admin [status|ops|config|cluster|metrics|console|s3-cred|quota|qos ...]\n"
+      << "  admin [status|ops|config|cluster|metrics|console|archive|backup|s3-cred|quota|qos ...]\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
       << "  admin status|ops|config|cluster|metrics   one-shot\n"
+      << "  admin archive show|run|drain|recall OID\n"
+      << "  admin backup show|run|snapshot ...\n"
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
       << "  admin qos show|set|project ...\n"
@@ -553,7 +555,10 @@ int cmd_admin_cluster(std::string host, std::string port, const std::string& key
 }
 
 void admin_console_help() {
-  std::cout << "commands: status | ops | config | cluster | metrics | help | quit\n";
+  std::cout << "commands: status | ops | config | cluster | metrics | archive | backup | "
+               "help | quit\n"
+            << "  archive [show|run|drain]\n"
+            << "  backup [show|run]\n";
 }
 
 HttpResp admin_exchange(std::string host, std::string port, const std::string& method,
@@ -577,6 +582,119 @@ HttpResp admin_exchange(std::string host, std::string port, const std::string& m
     fs::remove(tmp, ec);
   }
   return r;
+}
+
+int cmd_admin_archive(std::string host, std::string port, const std::string& key,
+                      const std::vector<std::string>& args) {
+  // args[0]=="archive"; args[1]=action
+  const std::string action = args.size() >= 2 ? args[1] : "show";
+  if (action == "show") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/archive", key);
+    if (r.status != 200) {
+      std::cerr << "archive show failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "run") {
+    auto r = admin_exchange(std::move(host), std::move(port), "POST", "/admin/api/archive/run",
+                            "{}", key);
+    if (r.status != 200) {
+      std::cerr << "archive run failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "drain") {
+    auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                            "/admin/api/archive/drain", "{}", key);
+    if (r.status != 200) {
+      std::cerr << "archive drain failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "recall") {
+    if (args.size() < 3) {
+      std::cerr << "usage: admin archive recall OID\n";
+      return 2;
+    }
+    nlohmann::json body{{"oid", args[2]}};
+    auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                            "/admin/api/archive/recall", body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "archive recall failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  std::cerr << "usage: admin archive show|run|drain|recall OID\n";
+  return 2;
+}
+
+int cmd_admin_backup(std::string host, std::string port, const std::string& key,
+                     const std::vector<std::string>& args) {
+  const std::string action = args.size() >= 2 ? args[1] : "show";
+  if (action == "show") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/backup", key);
+    if (r.status != 200) {
+      std::cerr << "backup show failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "run") {
+    auto r = admin_exchange(std::move(host), std::move(port), "POST", "/admin/api/backup/run",
+                            "{}", key);
+    if (r.status != 200) {
+      std::cerr << "backup run failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "snapshot") {
+    if (args.size() < 3) {
+      std::cerr << "usage: admin backup snapshot posix --volume VOL\n"
+                << "       admin backup snapshot vbd --pool POOL --name NAME [--dest DEST]\n";
+      return 2;
+    }
+    const std::string kind = args[2];
+    nlohmann::json body{{"kind", kind}};
+    for (std::size_t i = 3; i + 1 < args.size(); ++i) {
+      if (args[i] == "--volume") body["volume"] = args[++i];
+      else if (args[i] == "--pool") body["pool"] = args[++i];
+      else if (args[i] == "--name") body["name"] = args[++i];
+      else if (args[i] == "--dest") body["dest"] = args[++i];
+      else {
+        std::cerr << "unknown flag: " << args[i] << "\n";
+        return 2;
+      }
+    }
+    if (kind == "posix" && !body.contains("volume")) {
+      std::cerr << "backup snapshot posix requires --volume\n";
+      return 2;
+    }
+    if (kind == "vbd" && (!body.contains("pool") || !body.contains("name"))) {
+      std::cerr << "backup snapshot vbd requires --pool and --name\n";
+      return 2;
+    }
+    auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                            "/admin/api/backup/snapshot", body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "backup snapshot failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  std::cerr << "usage: admin backup show|run|snapshot ...\n";
+  return 2;
 }
 
 int cmd_admin_s3_cred(std::string host, std::string port, const std::string& key,
@@ -995,7 +1113,23 @@ int run_admin_console(std::string host, std::string port, const std::string& key
     else if (line == "config") rc = cmd_admin_config(host, port, key);
     else if (line == "cluster") rc = cmd_admin_cluster(host, port, key);
     else if (line == "metrics") rc = cmd_admin_metrics(host, port, key);
-    else {
+    else if (line == "archive" || line.rfind("archive ", 0) == 0) {
+      std::vector<std::string> a{"archive"};
+      if (line.size() > 7) {
+        std::istringstream iss(line.substr(8));
+        std::string tok;
+        while (iss >> tok) a.push_back(tok);
+      }
+      rc = cmd_admin_archive(host, port, key, a);
+    } else if (line == "backup" || line.rfind("backup ", 0) == 0) {
+      std::vector<std::string> a{"backup"};
+      if (line.size() > 6) {
+        std::istringstream iss(line.substr(7));
+        std::string tok;
+        while (iss >> tok) a.push_back(tok);
+      }
+      rc = cmd_admin_backup(host, port, key, a);
+    } else {
       std::cout << "unknown: " << line << "\n";
       admin_console_help();
       continue;
@@ -1146,6 +1280,10 @@ int main(int argc, char** argv) {
       if (sub == "config") return cmd_admin_config(host, port, args.cluster_key);
       if (sub == "cluster") return cmd_admin_cluster(host, port, args.cluster_key);
       if (sub == "metrics") return cmd_admin_metrics(host, port, args.cluster_key);
+      if (sub == "archive")
+        return cmd_admin_archive(host, port, args.cluster_key, args.positional);
+      if (sub == "backup")
+        return cmd_admin_backup(host, port, args.cluster_key, args.positional);
       if (sub == "s3-cred")
         return cmd_admin_s3_cred(host, port, args.cluster_key, args.positional);
       if (sub == "quota") return cmd_admin_quota(host, port, args.cluster_key, args.positional);

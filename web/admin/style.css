@@ -304,7 +304,27 @@ tr:last-child td { border-bottom: 0; }
 }
 
 .action-card h3 { margin: 0 0 0.4rem; }
+.action-card h4 { margin: 1rem 0 0.4rem; font-size: 0.95rem; }
 .action-card .btn { width: auto; margin-top: 0.75rem; }
+.action-card .btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+.action-card .btn-row .btn { margin-top: 0; }
+.action-card .field { margin-top: 0.75rem; }
+.action-card .field select {
+  display: block;
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: inherit;
+  color: inherit;
+  font: inherit;
+}
 
 .toggle {
   display: flex;
