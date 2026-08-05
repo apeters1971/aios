@@ -112,11 +112,14 @@ bool seal_bag(const Config& cfg, const std::string& advertise, const ClusterMap&
     ++stats.packed;
   }
 
-  if (rule.tape_sink == "external") {
-    // Mark on_tape; body stays staged until run_archive_drain copies it to tape_root.
+  if (rule.tape_sink == "external" || rule.tape_sink == "s3" || rule.tape_sink == "xrdcp") {
+    // Mark on_tape; body stays staged until run_archive_drain copies out.
     bag_attrs[kArchiveStateAttr] = kArchiveStateOnTape;
-    bag_attrs[kTapeSinkAttr] = "external";
-    bag_attrs[kTapeRootAttr] = rule.tape_root;
+    bag_attrs[kTapeSinkAttr] = rule.tape_sink;
+    if (!rule.tape_root.empty()) bag_attrs[kTapeRootAttr] = rule.tape_root;
+    if (!rule.tape_uri_prefix.empty()) bag_attrs[kTapeUriPrefixAttr] = rule.tape_uri_prefix;
+    if (!rule.tape_bin.empty()) bag_attrs[kTapeBinAttr] = rule.tape_bin;
+    if (!rule.tape_s3_endpoint.empty()) bag_attrs[kTapeS3EndpointAttr] = rule.tape_s3_endpoint;
     bag_attrs[kContentSha256Attr] = sha256_hex_bytes(bag_bytes.data(), bag_bytes.size());
     install_replica_version(cfg, advertise, map, stores, dest, bag_id, bag_bytes, bag_attrs);
     for (const auto& m : decoded.members) {

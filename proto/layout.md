@@ -103,7 +103,7 @@ Attrs win: place using tip `aios.storage_class` (and `n`); heal under-replicatio
 
 ## Cold archive (packed bags)
 
-Do **not** transition 1:1 onto tape. For cold data, use [`archive.md`](archive.md): pack many tips into large `archive/bag/*` objects, leave frozen stubs, then drain bag bodies to `tape_root` (or an external put/get command).
+Do **not** transition 1:1 onto tape. For cold data, use [`archive.md`](archive.md): pack many tips into large `archive/bag/*` objects, leave frozen stubs, then drain bag bodies via `tape_sink` (`external` / `s3` / `xrdcp`).
 
 ## Related docs
 

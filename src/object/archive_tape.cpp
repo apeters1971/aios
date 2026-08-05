@@ -6,9 +6,7 @@
 #include "object/object_layout.hpp"
 #include "util/log.hpp"
 
-#include <cerrno>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sys/wait.h>
@@ -19,6 +17,10 @@ namespace aios {
 namespace {
 
 namespace fs = std::filesystem;
+
+bool tape_sink_drains(const std::string& sink) {
+  return sink == "external" || sink == "s3" || sink == "xrdcp";
+}
 
 std::string safe_bag_filename(const std::string& bag_id) {
   std::string out;
@@ -33,6 +35,19 @@ std::string safe_bag_filename(const std::string& bag_id) {
   }
   if (out.empty()) out = "bag";
   return out;
+}
+
+std::string join_uri_prefix(std::string prefix, const std::string& name) {
+  if (prefix.empty()) return name;
+  if (prefix.back() != '/') prefix.push_back('/');
+  return prefix + name;
+}
+
+std::string attr_or(const std::unordered_map<std::string, std::string>& attrs, const char* key,
+                    const std::string& fallback) {
+  auto it = attrs.find(key);
+  if (it != attrs.end() && !it->second.empty()) return it->second;
+  return fallback;
 }
 
 bool write_file_atomic(const fs::path& dest, const std::uint8_t* data, std::size_t len,
@@ -98,7 +113,7 @@ bool read_file_bytes(const fs::path& path, std::vector<std::uint8_t>& out, std::
   return true;
 }
 
-// argv[0]=cmd, then args. Captures stdout (first line → out_line).
+// argv = {cmd, args...}. Uses execvp so PATH binaries (aws, xrdcp) work.
 bool run_external(const std::string& cmd, const std::vector<std::string>& args,
                   std::string& out_line, std::string& err) {
   if (cmd.empty()) {
@@ -121,11 +136,12 @@ bool run_external(const std::string& cmd, const std::vector<std::string>& args,
     close(pipefd[0]);
     dup2(pipefd[1], STDOUT_FILENO);
     close(pipefd[1]);
+    // Keep stderr for operator logs; parent only checks exit status.
     std::vector<char*> argv;
     argv.push_back(const_cast<char*>(cmd.c_str()));
     for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
     argv.push_back(nullptr);
-    execv(cmd.c_str(), argv.data());
+    execvp(cmd.c_str(), argv.data());
     _exit(127);
   }
   close(pipefd[1]);
@@ -142,8 +158,8 @@ bool run_external(const std::string& cmd, const std::vector<std::string>& args,
     return false;
   }
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    err = "tape command failed (exit " +
-          std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1) + ")";
+    const int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    err = "tape command failed (exit " + std::to_string(code) + "): " + cmd;
     return false;
   }
   const auto nl = captured.find('\n');
@@ -158,6 +174,14 @@ fs::path resolve_tape_path(const std::string& tape_root, const std::string& uri)
   fs::path p(uri);
   if (p.is_absolute()) return p;
   return fs::path(tape_root) / p;
+}
+
+fs::path scratch_base(const std::unordered_map<std::string, std::string>& bag_attrs,
+                      const ArchiveRule* rule) {
+  const std::string root =
+      attr_or(bag_attrs, kTapeRootAttr, rule ? rule->tape_root : std::string{});
+  if (!root.empty()) return fs::path(root) / ".staging";
+  return fs::temp_directory_path() / "aios-tape-scratch";
 }
 
 bool local_bag_tip(LocalStores& stores, const std::string& bag_id, ObjectInfo& info,
@@ -175,15 +199,92 @@ bool local_bag_tip(LocalStores& stores, const std::string& bag_id, ObjectInfo& i
   return false;
 }
 
+bool put_via_s3(const std::unordered_map<std::string, std::string>& bag_attrs,
+                const std::string& bag_id, const fs::path& local, const ArchiveRule* rule,
+                std::string& uri_out, std::string& err) {
+  const std::string prefix =
+      attr_or(bag_attrs, kTapeUriPrefixAttr, rule ? rule->tape_uri_prefix : std::string{});
+  if (prefix.empty()) {
+    err = "tape_uri_prefix not set";
+    return false;
+  }
+  const std::string uri = join_uri_prefix(prefix, safe_bag_filename(bag_id));
+  const std::string bin =
+      attr_or(bag_attrs, kTapeBinAttr, rule && !rule->tape_bin.empty() ? rule->tape_bin : "aws");
+  const std::string endpoint =
+      attr_or(bag_attrs, kTapeS3EndpointAttr, rule ? rule->tape_s3_endpoint : std::string{});
+  std::vector<std::string> args{"s3", "cp", local.string(), uri};
+  if (!endpoint.empty()) {
+    args.push_back("--endpoint-url");
+    args.push_back(endpoint);
+  }
+  std::string line;
+  if (!run_external(bin, args, line, err)) return false;
+  uri_out = uri;
+  return true;
+}
+
+bool get_via_s3(const std::unordered_map<std::string, std::string>& bag_attrs,
+                const std::string& uri, const fs::path& local, const ArchiveRule* rule,
+                std::string& err) {
+  const std::string bin =
+      attr_or(bag_attrs, kTapeBinAttr, rule && !rule->tape_bin.empty() ? rule->tape_bin : "aws");
+  const std::string endpoint =
+      attr_or(bag_attrs, kTapeS3EndpointAttr, rule ? rule->tape_s3_endpoint : std::string{});
+  std::vector<std::string> args{"s3", "cp", uri, local.string()};
+  if (!endpoint.empty()) {
+    args.push_back("--endpoint-url");
+    args.push_back(endpoint);
+  }
+  std::string line;
+  return run_external(bin, args, line, err);
+}
+
+bool put_via_xrdcp(const std::unordered_map<std::string, std::string>& bag_attrs,
+                   const std::string& bag_id, const fs::path& local, const ArchiveRule* rule,
+                   std::string& uri_out, std::string& err) {
+  const std::string prefix =
+      attr_or(bag_attrs, kTapeUriPrefixAttr, rule ? rule->tape_uri_prefix : std::string{});
+  if (prefix.empty()) {
+    err = "tape_uri_prefix not set";
+    return false;
+  }
+  const std::string uri = join_uri_prefix(prefix, safe_bag_filename(bag_id));
+  const std::string bin = attr_or(
+      bag_attrs, kTapeBinAttr, rule && !rule->tape_bin.empty() ? rule->tape_bin : "xrdcp");
+  // -f overwrite, -s silent
+  std::string line;
+  if (!run_external(bin, {"-f", "-s", local.string(), uri}, line, err)) return false;
+  uri_out = uri;
+  return true;
+}
+
+bool get_via_xrdcp(const std::unordered_map<std::string, std::string>& bag_attrs,
+                   const std::string& uri, const fs::path& local, const ArchiveRule* rule,
+                   std::string& err) {
+  const std::string bin = attr_or(
+      bag_attrs, kTapeBinAttr, rule && !rule->tape_bin.empty() ? rule->tape_bin : "xrdcp");
+  std::string line;
+  return run_external(bin, {"-f", "-s", uri, local.string()}, line, err);
+}
+
 }  // namespace
 
 const ArchiveRule* find_tape_rule_for_attrs(
     const Config& cfg, const std::unordered_map<std::string, std::string>& attrs) {
+  auto sink_it = attrs.find(kTapeSinkAttr);
+  const std::string sink = sink_it == attrs.end() ? std::string{} : sink_it->second;
   auto root = attrs.find(kTapeRootAttr);
+  auto prefix = attrs.find(kTapeUriPrefixAttr);
   const ArchiveRule* fallback = nullptr;
   for (const auto& rule : cfg.archive_rules) {
-    if (rule.tape_sink != "external") continue;
+    if (!tape_sink_drains(rule.tape_sink)) continue;
+    if (!sink.empty() && rule.tape_sink != sink) continue;
     if (!fallback) fallback = &rule;
+    if (prefix != attrs.end() && !prefix->second.empty() &&
+        rule.tape_uri_prefix == prefix->second) {
+      return &rule;
+    }
     if (root != attrs.end() && !root->second.empty() && rule.tape_root == root->second) {
       return &rule;
     }
@@ -194,11 +295,24 @@ const ArchiveRule* find_tape_rule_for_attrs(
 bool tape_put_bag(const std::unordered_map<std::string, std::string>& bag_attrs,
                   const std::string& bag_id, const std::vector<std::uint8_t>& body,
                   const ArchiveRule* rule, std::string& uri_out, std::string& err) {
-  auto trit = bag_attrs.find(kTapeRootAttr);
+  const std::string sink =
+      attr_or(bag_attrs, kTapeSinkAttr, rule ? rule->tape_sink : std::string{});
+
+  if (sink == "s3" || sink == "xrdcp") {
+    const fs::path scratch = scratch_base(bag_attrs, rule);
+    const fs::path tmp = scratch / (safe_bag_filename(bag_id) + ".put");
+    if (!write_file_atomic(tmp, body.data(), body.size(), err)) return false;
+    bool ok = false;
+    if (sink == "s3") ok = put_via_s3(bag_attrs, bag_id, tmp, rule, uri_out, err);
+    else ok = put_via_xrdcp(bag_attrs, bag_id, tmp, rule, uri_out, err);
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    return ok;
+  }
+
+  // external: custom cmd or filesystem under tape_root
   const std::string tape_root =
-      (trit != bag_attrs.end() && !trit->second.empty())
-          ? trit->second
-          : (rule ? rule->tape_root : std::string{});
+      attr_or(bag_attrs, kTapeRootAttr, rule ? rule->tape_root : std::string{});
   if (tape_root.empty()) {
     err = "tape_root not set";
     return false;
@@ -239,11 +353,31 @@ bool tape_get_bag(const std::unordered_map<std::string, std::string>& bag_attrs,
     err = "missing aios.tape_uri";
     return false;
   }
-  auto trit = bag_attrs.find(kTapeRootAttr);
+  const std::string sink =
+      attr_or(bag_attrs, kTapeSinkAttr, rule ? rule->tape_sink : std::string{});
+
+  if (sink == "s3" || sink == "xrdcp") {
+    const fs::path scratch = scratch_base(bag_attrs, rule);
+    std::error_code ec;
+    fs::create_directories(scratch, ec);
+    const fs::path tmp = scratch / (safe_bag_filename(bag_id) + ".get");
+    bool ok = false;
+    if (sink == "s3") ok = get_via_s3(bag_attrs, uri_it->second, tmp, rule, err);
+    else ok = get_via_xrdcp(bag_attrs, uri_it->second, tmp, rule, err);
+    if (!ok) {
+      fs::remove(tmp, ec);
+      return false;
+    }
+    if (!read_file_bytes(tmp, body_out, err)) {
+      fs::remove(tmp, ec);
+      return false;
+    }
+    fs::remove(tmp, ec);
+    return true;
+  }
+
   const std::string tape_root =
-      (trit != bag_attrs.end() && !trit->second.empty())
-          ? trit->second
-          : (rule ? rule->tape_root : std::string{});
+      attr_or(bag_attrs, kTapeRootAttr, rule ? rule->tape_root : std::string{});
   const std::string get_cmd = rule ? rule->tape_get_cmd : std::string{};
   if (!get_cmd.empty()) {
     if (tape_root.empty()) {
@@ -326,7 +460,6 @@ bool drain_one_bag(const Config& cfg, const std::string& advertise, const Cluste
   auto sink = attrs.find(kTapeSinkAttr);
   if (sink == attrs.end() || sink->second.empty()) return false;
   if (info.size == 0) {
-    // Already drained (or never staged).
     return attrs.count(kTapeUriAttr) > 0 && !attrs[kTapeUriAttr].empty();
   }
 

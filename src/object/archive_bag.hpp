@@ -16,6 +16,9 @@ inline constexpr const char* kArchiveStateAttr = "aios.archive_state";
 inline constexpr const char* kTapeSinkAttr = "aios.tape_sink";
 inline constexpr const char* kTapeRootAttr = "aios.tape_root";
 inline constexpr const char* kTapeUriAttr = "aios.tape_uri";
+inline constexpr const char* kTapeUriPrefixAttr = "aios.tape_uri_prefix";
+inline constexpr const char* kTapeBinAttr = "aios.tape_bin";
+inline constexpr const char* kTapeS3EndpointAttr = "aios.tape_s3_endpoint";
 
 inline constexpr const char* kArchiveStateBagged = "bagged";
 inline constexpr const char* kArchiveStateOnTape = "on_tape";

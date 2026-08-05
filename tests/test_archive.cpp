@@ -4,10 +4,28 @@
 #include "object/object_layout.hpp"
 #include "test_helpers.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
+
+namespace {
+
+void write_executable(const std::filesystem::path& path, const std::string& body) {
+  std::filesystem::create_directories(path.parent_path());
+  {
+    std::ofstream out(path);
+    out << body;
+  }
+  std::filesystem::permissions(
+      path, std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+                std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+                std::filesystem::perms::others_exec);
+}
+
+}  // namespace
 
 int test_archive() {
   using namespace aios;
@@ -219,6 +237,222 @@ int test_archive() {
     auto g2 = fx.svc->api_get("cold/t2", std::nullopt, std::nullopt, {});
     expect(g2.ok && g2.data && std::string(g2.data->begin(), g2.data->end()) == b2,
            "get t2 after tape recall");
+  }
+
+  // s3 driver via fake `aws s3 cp`.
+  {
+    DualStoreFixture fx("archive-s3", 2, 2, "nvme");
+    std::filesystem::create_directories(fx.root / "a1" / "aios");
+    std::filesystem::create_directories(fx.root / "a2" / "aios");
+    const std::string a1 = (fx.root / "a1" / "aios").string();
+    const std::string a2 = (fx.root / "a2" / "aios").string();
+    const auto fake_root = fx.root / "fake-s3";
+    const auto bin = fx.root / "bin" / "fake-aws";
+    std::filesystem::create_directories(fake_root);
+    write_executable(bin,
+                     "#!/bin/sh\n"
+                     "set -e\n"
+                     "ROOT=\"${AIOS_FAKE_S3_ROOT:?}\"\n"
+                     "# argv: s3 cp SRC DST [--endpoint-url URL]\n"
+                     "[ \"$1\" = s3 ] && [ \"$2\" = cp ] || exit 3\n"
+                     "src=\"$3\"; dst=\"$4\"\n"
+                     "if echo \"$dst\" | grep -q '^s3://'; then\n"
+                     "  key=$(echo \"$dst\" | sed 's|^s3://||')\n"
+                     "  mkdir -p \"$(dirname \"$ROOT/$key\")\"\n"
+                     "  cp \"$src\" \"$ROOT/$key\"\n"
+                     "elif echo \"$src\" | grep -q '^s3://'; then\n"
+                     "  key=$(echo \"$src\" | sed 's|^s3://||')\n"
+                     "  cp \"$ROOT/$key\" \"$dst\"\n"
+                     "else\n"
+                     "  exit 2\n"
+                     "fi\n");
+    setenv("AIOS_FAKE_S3_ROOT", fake_root.string().c_str(), 1);
+
+    std::vector<AiosTarget> local{
+        make_target(fx.p1, "nvme"),
+        make_target(fx.p2, "nvme"),
+        make_target(a1, "archive"),
+        make_target(a2, "archive"),
+    };
+    fx.fs_table.set_local("node-a", local);
+    PlacementConfig pc;
+    pc.vnodes_per_target = fx.cfg.vnodes_per_target;
+    pc.min_vnodes = fx.cfg.min_vnodes;
+    pc.max_vnodes = fx.cfg.max_vnodes;
+    fx.map = ClusterMap::build(fx.membership, fx.fs_table, fx.cfg.replica_count, pc);
+    ObjectStoreOptions opts;
+    opts.shard_count = 4;
+    opts.clone_required = false;
+    opts.max_versions = 16;
+    fx.stores.sync_paths({fx.p1, fx.p2, a1, a2}, opts);
+
+    ArchiveRule rule;
+    rule.prefix = "cold/";
+    rule.from = "nvme";
+    rule.staging_class = "archive";
+    rule.min_bag_bytes = 1;
+    rule.max_members = 1;
+    rule.max_open_ms = 0;
+    rule.tape_sink = "s3";
+    rule.tape_uri_prefix = "s3://cold/bags/";
+    rule.tape_bin = bin.string();
+    rule.tape_s3_endpoint = "http://127.0.0.1:9";
+    rule.tape_root = (fx.root / "scratch").string();
+    fx.cfg.archive_rules.push_back(rule);
+
+    fx.svc = std::make_unique<ObjectService>(fx.cfg, fx.map, fx.stores);
+    fx.svc->set_advertise("127.0.0.1:7400");
+    LayoutRequest req;
+    req.storage_class = "nvme";
+    const char* body = "s3-bag-payload";
+    expect(fx.svc
+               ->api_put("cold/s3a", reinterpret_cast<const std::uint8_t*>(body),
+                         std::strlen(body), {}, true, {}, std::nullopt, req)
+               .ok,
+           "put s3a");
+    expect(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1,
+           "s3 bag sealed");
+    expect(run_archive_drain(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).drained >= 1,
+           "s3 drained");
+
+    std::string err;
+    std::string tape_uri;
+    for (const auto& path : fx.stores.paths()) {
+      auto* s = fx.stores.get(path);
+      if (!s) continue;
+      auto info = s->stat("cold/s3a", err);
+      if (!info || info->is_delete) continue;
+      auto attrs = s->list_attrs("cold/s3a", err);
+      for (const auto& p2 : fx.stores.paths()) {
+        auto* bagstore = fx.stores.get(p2);
+        if (!bagstore) continue;
+        auto bi = bagstore->stat(attrs[kBagIdAttr], err);
+        if (!bi || bi->is_delete) continue;
+        auto ba = bagstore->list_attrs(attrs[kBagIdAttr], err);
+        tape_uri = ba[kTapeUriAttr];
+        expect(bi->size == 0, "s3 staging reclaimed");
+        break;
+      }
+      break;
+    }
+    expect(tape_uri.rfind("s3://cold/bags/", 0) == 0, "s3 tape_uri");
+    const std::string key = tape_uri.substr(std::strlen("s3://"));
+    expect(std::filesystem::exists(fake_root / key), "fake s3 object");
+
+    expect(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/s3a", err),
+           "recall s3a");
+    auto g = fx.svc->api_get("cold/s3a", std::nullopt, std::nullopt, {});
+    expect(g.ok && g.data && std::string(g.data->begin(), g.data->end()) == body,
+           "get after s3 recall");
+  }
+
+  // xrdcp driver via fake binary.
+  {
+    DualStoreFixture fx("archive-xrdcp", 2, 2, "nvme");
+    std::filesystem::create_directories(fx.root / "a1" / "aios");
+    std::filesystem::create_directories(fx.root / "a2" / "aios");
+    const std::string a1 = (fx.root / "a1" / "aios").string();
+    const std::string a2 = (fx.root / "a2" / "aios").string();
+    const auto fake_root = fx.root / "fake-xrd";
+    const auto bin = fx.root / "bin" / "fake-xrdcp";
+    std::filesystem::create_directories(fake_root);
+    write_executable(bin,
+                     "#!/bin/sh\n"
+                     "set -e\n"
+                     "ROOT=\"${AIOS_FAKE_XRD_ROOT:?}\"\n"
+                     "while [ \"$1\" = -f ] || [ \"$1\" = -s ]; do shift; done\n"
+                     "src=\"$1\"; dst=\"$2\"\n"
+                     "to_local() { echo \"$1\" | sed -E 's|^x?root://[^/]+/*|/|'; }\n"
+                     "if echo \"$dst\" | grep -Eq '^x?root://'; then\n"
+                     "  rel=$(to_local \"$dst\")\n"
+                     "  mkdir -p \"$(dirname \"$ROOT$rel\")\"\n"
+                     "  cp \"$src\" \"$ROOT$rel\"\n"
+                     "elif echo \"$src\" | grep -Eq '^x?root://'; then\n"
+                     "  rel=$(to_local \"$src\")\n"
+                     "  cp \"$ROOT$rel\" \"$dst\"\n"
+                     "else\n"
+                     "  exit 2\n"
+                     "fi\n");
+    setenv("AIOS_FAKE_XRD_ROOT", fake_root.string().c_str(), 1);
+
+    std::vector<AiosTarget> local{
+        make_target(fx.p1, "nvme"),
+        make_target(fx.p2, "nvme"),
+        make_target(a1, "archive"),
+        make_target(a2, "archive"),
+    };
+    fx.fs_table.set_local("node-a", local);
+    PlacementConfig pc;
+    pc.vnodes_per_target = fx.cfg.vnodes_per_target;
+    pc.min_vnodes = fx.cfg.min_vnodes;
+    pc.max_vnodes = fx.cfg.max_vnodes;
+    fx.map = ClusterMap::build(fx.membership, fx.fs_table, fx.cfg.replica_count, pc);
+    ObjectStoreOptions opts;
+    opts.shard_count = 4;
+    opts.clone_required = false;
+    opts.max_versions = 16;
+    fx.stores.sync_paths({fx.p1, fx.p2, a1, a2}, opts);
+
+    ArchiveRule rule;
+    rule.prefix = "cold/";
+    rule.from = "nvme";
+    rule.staging_class = "archive";
+    rule.min_bag_bytes = 1;
+    rule.max_members = 1;
+    rule.max_open_ms = 0;
+    rule.tape_sink = "xrdcp";
+    rule.tape_uri_prefix = "root://eos.test//eos/archive/bags/";
+    rule.tape_bin = bin.string();
+    rule.tape_root = (fx.root / "scratch").string();
+    fx.cfg.archive_rules.push_back(rule);
+
+    fx.svc = std::make_unique<ObjectService>(fx.cfg, fx.map, fx.stores);
+    fx.svc->set_advertise("127.0.0.1:7400");
+    LayoutRequest req;
+    req.storage_class = "nvme";
+    const char* body = "xrd-bag-payload";
+    expect(fx.svc
+               ->api_put("cold/x1", reinterpret_cast<const std::uint8_t*>(body),
+                         std::strlen(body), {}, true, {}, std::nullopt, req)
+               .ok,
+           "put x1");
+    expect(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1,
+           "xrd bag sealed");
+    expect(run_archive_drain(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).drained >= 1,
+           "xrd drained");
+
+    std::string err;
+    std::string tape_uri;
+    for (const auto& path : fx.stores.paths()) {
+      auto* s = fx.stores.get(path);
+      if (!s) continue;
+      auto info = s->stat("cold/x1", err);
+      if (!info || info->is_delete) continue;
+      auto attrs = s->list_attrs("cold/x1", err);
+      for (const auto& p2 : fx.stores.paths()) {
+        auto* bagstore = fx.stores.get(p2);
+        if (!bagstore) continue;
+        auto bi = bagstore->stat(attrs[kBagIdAttr], err);
+        if (!bi || bi->is_delete) continue;
+        auto ba = bagstore->list_attrs(attrs[kBagIdAttr], err);
+        tape_uri = ba[kTapeUriAttr];
+        break;
+      }
+      break;
+    }
+    expect(tape_uri.rfind("root://eos.test//eos/archive/bags/", 0) == 0, "xrd tape_uri");
+    // root://eos.test//eos/archive/bags/NAME → eos/archive/bags/NAME under fake root
+    const std::string host_end = "root://eos.test/";
+    expect(tape_uri.size() > host_end.size(), "xrd uri length");
+    std::string rel = tape_uri.substr(host_end.size());
+    while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
+    expect(std::filesystem::exists(fake_root / rel), "fake xrd object");
+
+    expect(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/x1", err),
+           "recall x1");
+    auto g = fx.svc->api_get("cold/x1", std::nullopt, std::nullopt, {});
+    expect(g.ok && g.data && std::string(g.data->begin(), g.data->end()) == body,
+           "get after xrd recall");
   }
 
   return failures;

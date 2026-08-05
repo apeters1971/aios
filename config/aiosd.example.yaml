@@ -58,10 +58,18 @@ placement:
 #     min_bag_bytes: 68719476736   # 64 GiB
 #     max_bag_bytes: 274877906944  # 256 GiB
 #     max_members: 0
-#     tape_sink: none             # or external (requires tape_root)
-#     tape_root: /var/lib/aios/tape
+#     tape_sink: none             # none | external | s3 | xrdcp
+#     # external (fs / custom cmds):
+#     # tape_root: /var/lib/aios/tape
 #     # tape_put_cmd: /usr/local/bin/aios-tape-put
 #     # tape_get_cmd: /usr/local/bin/aios-tape-get
+#     # s3 (aws s3 cp):
+#     # tape_uri_prefix: s3://cold-archive/aios-bags/
+#     # tape_bin: aws
+#     # tape_s3_endpoint: https://s3.example
+#     # xrdcp:
+#     # tape_uri_prefix: root://eos.example//eos/archive/bags/
+#     # tape_bin: xrdcp
 # archive_interval_ms: 30000
 # archive_batch_oids: 64
 

@@ -522,6 +522,9 @@ nlohmann::json HttpServer::admin_config_json() const {
                         {"max_open_ms", r.max_open_ms},
                         {"tape_sink", r.tape_sink},
                         {"tape_root", r.tape_root},
+                        {"tape_uri_prefix", r.tape_uri_prefix},
+                        {"tape_bin", r.tape_bin},
+                        {"tape_s3_endpoint", r.tape_s3_endpoint},
                         {"tape_put_cmd", r.tape_put_cmd},
                         {"tape_get_cmd", r.tape_get_cmd}});
   }
@@ -930,6 +933,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                            {"max_open_ms", r.max_open_ms},
                            {"tape_sink", r.tape_sink},
                            {"tape_root", r.tape_root},
+                           {"tape_uri_prefix", r.tape_uri_prefix},
+                           {"tape_bin", r.tape_bin},
+                           {"tape_s3_endpoint", r.tape_s3_endpoint},
                            {"tape_put_cmd", r.tape_put_cmd},
                            {"tape_get_cmd", r.tape_get_cmd}});
         }

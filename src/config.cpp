@@ -136,8 +136,9 @@ bool validate_archive_rule(ArchiveRule& rule, std::string& err) {
     err = "archive_rules max_bag_bytes must be >= min_bag_bytes";
     return false;
   }
-  if (!rule.tape_sink.empty() && rule.tape_sink != "none" && rule.tape_sink != "external") {
-    err = "archive_rules tape_sink must be empty, none, or external";
+  if (!rule.tape_sink.empty() && rule.tape_sink != "none" && rule.tape_sink != "external" &&
+      rule.tape_sink != "s3" && rule.tape_sink != "xrdcp") {
+    err = "archive_rules tape_sink must be empty, none, external, s3, or xrdcp";
     return false;
   }
   if (rule.tape_sink == "none") rule.tape_sink.clear();
@@ -145,9 +146,27 @@ bool validate_archive_rule(ArchiveRule& rule, std::string& err) {
     err = "archive_rules tape_sink=external requires tape_root";
     return false;
   }
+  if (rule.tape_sink == "s3") {
+    if (rule.tape_uri_prefix.rfind("s3://", 0) != 0) {
+      err = "archive_rules tape_sink=s3 requires tape_uri_prefix starting with s3://";
+      return false;
+    }
+  }
+  if (rule.tape_sink == "xrdcp") {
+    if (rule.tape_uri_prefix.rfind("root://", 0) != 0 &&
+        rule.tape_uri_prefix.rfind("xroot://", 0) != 0) {
+      err = "archive_rules tape_sink=xrdcp requires tape_uri_prefix starting with root:// "
+            "or xroot://";
+      return false;
+    }
+  }
   if ((!rule.tape_put_cmd.empty() || !rule.tape_get_cmd.empty()) &&
       rule.tape_sink != "external") {
     err = "archive_rules tape_put_cmd/tape_get_cmd require tape_sink=external";
+    return false;
+  }
+  if (!rule.tape_s3_endpoint.empty() && rule.tape_sink != "s3") {
+    err = "archive_rules tape_s3_endpoint requires tape_sink=s3";
     return false;
   }
   return true;
@@ -337,6 +356,11 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
         if (node["max_open_ms"]) rule.max_open_ms = node["max_open_ms"].as<int>();
         if (node["tape_sink"]) rule.tape_sink = node["tape_sink"].as<std::string>();
         if (node["tape_root"]) rule.tape_root = node["tape_root"].as<std::string>();
+        if (node["tape_uri_prefix"])
+          rule.tape_uri_prefix = node["tape_uri_prefix"].as<std::string>();
+        if (node["tape_bin"]) rule.tape_bin = node["tape_bin"].as<std::string>();
+        if (node["tape_s3_endpoint"])
+          rule.tape_s3_endpoint = node["tape_s3_endpoint"].as<std::string>();
         if (node["tape_put_cmd"]) rule.tape_put_cmd = node["tape_put_cmd"].as<std::string>();
         if (node["tape_get_cmd"]) rule.tape_get_cmd = node["tape_get_cmd"].as<std::string>();
         cfg.archive_rules.push_back(std::move(rule));

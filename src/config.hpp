@@ -38,10 +38,14 @@ struct ArchiveRule {
   std::uint64_t max_bag_bytes{256ull * 1024ull * 1024ull * 1024ull}; // 256 GiB
   int max_members{0};               // 0 = unlimited
   int max_open_ms{-1};              // 0 = seal undersized bags each tick; -1 = wait for min
-  std::string tape_sink;            // empty/"none" = disk bags only; "external" = drain to tape
-  std::string tape_root;            // required when tape_sink=external (fs library / HSM mount)
-  std::string tape_put_cmd;         // optional: exec <bag_oid> <local_path> → stdout URI
-  std::string tape_get_cmd;         // optional: exec <uri> <local_path>
+  // empty/"none" | external (fs/cmd) | s3 (aws s3 cp) | xrdcp
+  std::string tape_sink;
+  std::string tape_root;            // fs sink dest, or local scratch for s3/xrdcp/cmd
+  std::string tape_uri_prefix;      // s3://bucket/prefix/ or root://host//path/ (s3|xrdcp)
+  std::string tape_bin;             // override binary (default aws / xrdcp)
+  std::string tape_s3_endpoint;     // optional --endpoint-url for aws s3 cp
+  std::string tape_put_cmd;         // external only: exec <bag_oid> <local_path> → stdout URI
+  std::string tape_get_cmd;         // external only: exec <uri> <local_path>
 };
 
 struct Config {
