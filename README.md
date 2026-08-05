@@ -52,7 +52,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/archive.md`](proto/archive.md) / [`proto/backup.md`](proto/backup.md) (cold archive & backup), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
 ---
 
@@ -66,6 +66,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - [Configuration](#configuration)
 - [Storage targets (`.aios`)](#storage-targets-aios)
 - [Placement, storage classes, and layout](#placement-storage-classes-and-layout)
+- [Cold archive and backup](#cold-archive-and-backup)
 - [HTTP object API](#http-object-api)
 - [S3-compatible API](#s3-compatible-api)
 - [Local object store](#local-object-store)
@@ -96,6 +97,8 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - Versioned objects (`max_versions`), attrs, ranged PUT/GET, delete markers, atomic append
 - Server-side **replica** or **erasure-coded** durability, with background repair
 - **Class transitions** (`transition_rules`): background tip migration between classes (e.g. `nvme` → `hdd`)
+- **Cold archive**: pack many tips into large bag objects, freeze stubs, optional ZSTD + AES-256-GCM, drain bags to tape/S3/XRootD
+- **Backup**: crash-consistent POSIX/VBD snapshots (whole volume or subtree), then pack + drain via the same bag path; YAML rules and live GFS policies
 
 **HTTP API** (`http_listen`, default `:7480`)
 
@@ -117,6 +120,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 
 - Status JSON file, HMAC shared-secret auth on gossip/RPC/HTTP
 - Admin web UI + JSON API + Prometheus (`/admin/`, `/admin/api/*`, `/metrics`); login with cluster key; application labels for per-workload OPS
+- Archive pack/drain/recall and backup run/snapshot/live policies from CLI and the Actions panel
 - Optional Intel ISA-L Reed–Solomon for EC with `m > 1`
 
 **Kernel (AlmaLinux 9 / 5.14)**
@@ -367,6 +371,98 @@ Full design: [`proto/layout.md`](proto/layout.md).
 
 ---
 
+## Cold archive and backup
+
+Warm class transitions stay **1:1** tip copies. The **cold** path packs many small tips into large **bag** objects (tape-friendly), leaves **frozen stubs**, then optionally drains bag bodies off the cluster. Backups snapshot POSIX/VBD trees first, then reuse the same pack/drain pipeline. Details: [`proto/archive.md`](proto/archive.md), [`proto/backup.md`](proto/backup.md).
+
+### Cold archive (packed bags)
+
+```text
+tips on `from` class  →  pack  →  archive/bag/{id} on staging_class
+                               →  each tip: empty body + freeze attrs
+                      drain →  bag copied via tape_sink → staging body reclaimed
+                     recall →  restore bag if needed → rehydrate tip
+```
+
+Configure with `archive_rules` (prefix, age, bag size bounds, staging class, optional compression/encryption and `tape_sink`):
+
+```yaml
+archive_rules:
+  - prefix: "cold/"
+    from: hdd
+    staging_class: archive
+    min_age_days: 30
+    min_bag_bytes: 68719476736    # 64 GiB
+    max_bag_bytes: 274877906944   # 256 GiB
+    tape_sink: s3                 # none | external | s3 | xrdcp
+    tape_uri_prefix: s3://cold-archive/aios-bags/
+    bag_compression: zstd         # none | zstd
+    bag_encryption: aes-256-gcm   # none | aes-256-gcm
+# bag_encryption_key: "<64 hex chars>"   # required when any rule encrypts
+archive_interval_ms: 30000
+```
+
+| `tape_sink` | Drain / recall |
+|-------------|----------------|
+| `none` | Bags stay on staging (`bagged`) |
+| `external` | Filesystem under `tape_root`, or custom put/get commands |
+| `s3` | `aws s3 cp` (or `tape_bin`) to `tape_uri_prefix` |
+| `xrdcp` | `xrdcp` to `root://…` / `xroot://…` URI prefix |
+
+Lifecycle: **seal** (`on_tape`, body still on staging) → **drain** (copy out, empty staging tip, set `aios.tape_uri`) → **recall** (fetch bag if empty, extract member, clear freeze). Transparent GET still serves members from a staged bag; `on_tape` / `restoring` returns HTTP **503** `Retry-After`; PUT on a frozen tip is **409**.
+
+Whole-bag transforms (order: AIAB encode → optional ZSTD → optional AES-256-GCM) use an **AITF** wrapper when compression or encryption is enabled.
+
+```bash
+aios admin archive show
+aios admin archive run      # pack tick
+aios admin archive drain    # copy bags out
+aios admin archive recall --oid <oid>
+```
+
+### Backup (snapshot then pack)
+
+Do **not** archive live `posix/` or `vd/` tips while mounted. Backup freezes/clones an immutable tree, packs that prefix into bags, then drains with the same `tape_sink` drivers.
+
+```text
+POSIX volume/subtree  → freeze → posix/{vol}/.snap/{id}/  → pack → drain
+VBD volume            → clone+seal → vd/{pool}/{dest}/    → pack → drain
+```
+
+Two policy sources (both run):
+
+1. **YAML `backup_rules`** — timer (`backup_interval_ms`), count retention (`retain_snaps`). Restart to change.
+2. **Live policies** — cluster object `backup/policies`; edit via CLI/UI without restart. Daily UTC schedule + GFS retention (`keep_days` + `keep_monthly`).
+
+```yaml
+backup_rules:
+  - kind: posix
+    volume: default
+    # path: /home          # optional subtree; omit or "/" = whole volume
+    retain_snaps: 3
+    from: nvme
+    staging_class: archive
+    tape_sink: s3
+    tape_uri_prefix: s3://backups/aios/
+    bag_compression: zstd
+    bag_encryption: aes-256-gcm
+backup_interval_ms: 3600000
+```
+
+Snapshots are **crash-consistent** object cuts (not guest `fsfreeze`). POSIX sets `super.frozen` during copy (mutating ops return `-EBUSY`); VBD clones stripes into a new sealed volume. Subtree `path` limits which oids are copied; freeze remains volume-wide.
+
+```bash
+aios admin backup show|run
+aios admin backup snapshot posix --volume default --path /home
+aios admin backup policy list|set|rm
+aios admin backup policy set --volume default --path /home --at 00:00 \
+  --keep-days 7 --keep-monthly 12 --tape-sink s3 --tape-uri-prefix s3://backups/aios/
+```
+
+Admin HTTP/UI: pack/drain/recall and backup run/snapshot/policies under `/admin` (see [`proto/admin.md`](proto/admin.md)).
+
+---
+
 ## HTTP object API
 
 Listen address: `http_listen` (empty disables HTTP). Bodies are raw octets. Auth: HMAC (see [Authentication](#authentication)).
@@ -576,7 +672,9 @@ Wire format, append, and API notes: [`proto/stl_client.md`](proto/stl_client.md)
 - **Inode 1** is `/`
 - Directories use an append-only **dentry changelog**
 - File data is **chunk-striped** (`posix/{vol}/data/{ino}/c/{chunk}`, default 1 MiB chunks, parallel PUTs bounded by `stripe_width`)
-- **xattrs** in inode meta, **hard links** (files only), **flock** via AIOS locks on the inode object
+- Stored **xattrs** in inode meta, **hard links** (files only), **flock** via AIOS locks on the inode object
+- **Parent pointers** (`parent_ino`) and lazy **recursive directory stats** (see below)
+- Volume / subtree **snapshots** for backup (`aios_posix_snapshot` / `snapshot_at`)
 
 Cross-directory `rename` uses a multi-object `/txn` compact rewrite of both directory tips; cross-directory `link` remains best-effort. Details: [`proto/posix_fuse.md`](proto/posix_fuse.md).
 
@@ -586,6 +684,33 @@ When CMake finds **libfuse3**, it builds `aios-fuse`:
 aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 # or: AIOS_ENDPOINT / AIOS_CLUSTER_KEY
 ```
+
+### Special / virtual attributes
+
+Ordinary extended attributes are opaque bytes in inode JSON (`user.*`, etc.). AIOS also maintains a few **filesystem-specific** fields:
+
+| Name | Where | Meaning |
+|------|--------|---------|
+| `aios.rbytes` | virtual xattr (dirs) | Recursive bytes under the directory (decimal) |
+| `aios.rfiles` | virtual xattr (dirs) | Recursive regular-file count |
+| `aios.rdirs` | virtual xattr (dirs) | Recursive subdirectory count |
+| `aios.rtime` | virtual xattr (dirs) | Newest mtime in the subtree (Unix seconds, decimal) |
+| `parent_ino` | inode meta / `aios_posix_stat` | Primary parent directory (`0` for root) |
+| `project_id` | inode meta | Quota/QoS project domain (inherited from parent on create) |
+
+**Recursive stats (`aios.r*`):** stored on directory inodes as `rbytes` / `rfiles` / `rdirs` / `rtime_ns`, not as persisted xattrs. Mutators mark the parent dirty; a mount-local timer (`rstat_interval_ms`, typically 60s; `0` disables) recomputes from children and cascades via `parent_ino`. Flush also runs on unmount and via `aios_posix_flush_rstats`. On directories, `listxattr` includes the four virtual names; `getxattr` returns decimal strings; `setxattr` / `removexattr` return `-EPERM`.
+
+```bash
+# After the rstat timer (or an explicit flush through the ABI):
+getfattr -n aios.rbytes /mnt/aios/home
+getfattr -d /mnt/aios/home    # includes aios.rbytes, aios.rfiles, aios.rdirs, aios.rtime
+```
+
+**Parent pointers:** every inode stores a primary `parent_ino` (create/mkdir/cross-dir rename). Extra hard links dirty the destination directory for rstat but do not change the primary parent; write/truncate dirty that parent only.
+
+**Projects:** `project_id` is copied from the parent on create and updated on cross-project rename. Soft uid/gid and project quotas / QoS use it — see [`proto/quota.md`](proto/quota.md), [`proto/qos.md`](proto/qos.md).
+
+**Object-store attrs** on cold-archived tips (`aios.frozen`, `aios.bag_id`, `aios.archive_state`, …) live on the underlying object tip, not as POSIX xattrs — see [Cold archive and backup](#cold-archive-and-backup).
 
 ---
 
