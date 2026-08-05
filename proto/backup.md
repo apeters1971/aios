@@ -21,9 +21,14 @@ backup_rules:
     staging_class: archive
     tape_sink: s3
     tape_uri_prefix: s3://backups/aios/
+    bag_compression: zstd
+    bag_encryption: aes-256-gcm
+# bag_encryption_key: "<64 hex chars>"   # cluster-wide; required for aes-256-gcm
 backup_interval_ms: 3600000
 backup_batch_oids: 256
 ```
+
+Bag compression/encryption uses the same whole-bag AITF path as cold archive ([`archive.md`](archive.md)).
 
 Live policy example (JSON in `backup/policies`):
 
@@ -40,7 +45,9 @@ Live policy example (JSON in `backup/policies`):
     "retain": { "keep_days": 7, "keep_monthly": 12 },
     "staging_class": "archive",
     "tape_sink": "s3",
-    "tape_uri_prefix": "s3://backups/aios/"
+    "tape_uri_prefix": "s3://backups/aios/",
+    "bag_compression": "zstd",
+    "bag_encryption": "aes-256-gcm"
   }]
 }
 ```

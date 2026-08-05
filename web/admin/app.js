@@ -771,6 +771,8 @@
       staging_class: "archive",
       tape_sink: document.getElementById("bp-tape-sink").value.trim(),
       tape_uri_prefix: document.getElementById("bp-tape-uri").value.trim(),
+      bag_compression: document.getElementById("bp-bag-compression").value,
+      bag_encryption: document.getElementById("bp-bag-encryption").value,
     };
     const id = document.getElementById("bp-id").value.trim();
     if (id) body.id = id;

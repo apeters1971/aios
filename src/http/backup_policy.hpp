@@ -36,6 +36,9 @@ struct BackupPolicy {
   std::string tape_s3_endpoint;
   std::string tape_put_cmd;
   std::string tape_get_cmd;
+  std::string bag_compression{"none"};
+  int bag_compression_level{0};
+  std::string bag_encryption{"none"};
   std::int64_t last_run_ms{0};
 };
 

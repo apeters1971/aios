@@ -123,6 +123,12 @@
               <label class="field"><span>Keep monthly</span><input id="bp-keep-monthly" type="number" min="0" value="12" /></label>
               <label class="field"><span>Tape sink</span><input id="bp-tape-sink" spellcheck="false" placeholder="none|external|s3|xrdcp" /></label>
               <label class="field"><span>Tape URI prefix</span><input id="bp-tape-uri" spellcheck="false" /></label>
+              <label class="field"><span>Bag compression</span>
+                <select id="bp-bag-compression"><option value="none">none</option><option value="zstd">zstd</option></select>
+              </label>
+              <label class="field"><span>Bag encryption</span>
+                <select id="bp-bag-encryption"><option value="none">none</option><option value="aes-256-gcm">aes-256-gcm</option></select>
+              </label>
               <label class="field"><span>Enabled</span>
                 <select id="bp-enabled"><option value="true">yes</option><option value="false">no</option></select>
               </label>

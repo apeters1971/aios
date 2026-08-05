@@ -70,6 +70,9 @@ ArchiveRule archive_rule_for_backup(const BackupRule& br, const std::string& pre
   ar.tape_s3_endpoint = br.tape_s3_endpoint;
   ar.tape_put_cmd = br.tape_put_cmd;
   ar.tape_get_cmd = br.tape_get_cmd;
+  ar.bag_compression = br.bag_compression;
+  ar.bag_compression_level = br.bag_compression_level;
+  ar.bag_encryption = br.bag_encryption;
   return ar;
 }
 
@@ -91,6 +94,9 @@ ArchiveRule archive_rule_for_policy(const BackupPolicy& bp, const std::string& p
   ar.tape_s3_endpoint = bp.tape_s3_endpoint;
   ar.tape_put_cmd = bp.tape_put_cmd;
   ar.tape_get_cmd = bp.tape_get_cmd;
+  ar.bag_compression = bp.bag_compression;
+  ar.bag_compression_level = bp.bag_compression_level;
+  ar.bag_encryption = bp.bag_encryption;
   return ar;
 }
 

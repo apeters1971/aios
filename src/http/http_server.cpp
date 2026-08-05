@@ -527,7 +527,10 @@ nlohmann::json HttpServer::admin_config_json() const {
                         {"tape_bin", r.tape_bin},
                         {"tape_s3_endpoint", r.tape_s3_endpoint},
                         {"tape_put_cmd", r.tape_put_cmd},
-                        {"tape_get_cmd", r.tape_get_cmd}});
+                        {"tape_get_cmd", r.tape_get_cmd},
+                        {"bag_compression", r.bag_compression},
+                        {"bag_compression_level", r.bag_compression_level},
+                        {"bag_encryption", r.bag_encryption}});
   }
   nlohmann::json backups = nlohmann::json::array();
   for (const auto& r : c.backup_rules) {
@@ -546,7 +549,10 @@ nlohmann::json HttpServer::admin_config_json() const {
                        {"tape_bin", r.tape_bin},
                        {"tape_s3_endpoint", r.tape_s3_endpoint},
                        {"tape_put_cmd", r.tape_put_cmd},
-                       {"tape_get_cmd", r.tape_get_cmd}});
+                       {"tape_get_cmd", r.tape_get_cmd},
+                       {"bag_compression", r.bag_compression},
+                       {"bag_compression_level", r.bag_compression_level},
+                       {"bag_encryption", r.bag_encryption}});
   }
   return nlohmann::json{
       {"node_id", c.node_id},
@@ -554,6 +560,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"http_listen", c.http_listen},
       {"peers", c.peers},
       {"cluster_key", "***"},
+      {"bag_encryption_key", c.bag_encryption_key.empty() ? "" : "***"},
       {"auth_skew_ms", c.auth_skew_ms},
       {"gossip_interval_ms", c.gossip_interval_ms},
       {"suspect_after_ms", c.suspect_after_ms},
@@ -962,7 +969,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                            {"tape_bin", r.tape_bin},
                            {"tape_s3_endpoint", r.tape_s3_endpoint},
                            {"tape_put_cmd", r.tape_put_cmd},
-                           {"tape_get_cmd", r.tape_get_cmd}});
+                           {"tape_get_cmd", r.tape_get_cmd},
+                           {"bag_compression", r.bag_compression},
+                           {"bag_compression_level", r.bag_compression_level},
+                           {"bag_encryption", r.bag_encryption}});
         }
         write_json(*sock, 200, "OK",
                    {{"archive_rules", rules},
@@ -1036,7 +1046,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                            {"from", r.from},
                            {"staging_class", r.staging_class},
                            {"tape_sink", r.tape_sink},
-                           {"tape_uri_prefix", r.tape_uri_prefix}});
+                           {"tape_uri_prefix", r.tape_uri_prefix},
+                           {"bag_compression", r.bag_compression},
+                           {"bag_encryption", r.bag_encryption}});
         }
         nlohmann::json live = nlohmann::json::array();
         if (backup_policies_) {

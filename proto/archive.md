@@ -23,6 +23,11 @@ archive_rules:
     max_members: 0                # 0 = unlimited
     max_open_ms: -1               # 0 = seal undersized bags each tick
     tape_sink: none               # none | external | s3 | xrdcp
+    bag_compression: none         # none | zstd (whole bag after AIAB encode)
+    bag_compression_level: 0      # 0 = use global compression_level
+    bag_encryption: none          # none | aes-256-gcm (after compress)
+# Shared AES-256 key (64 hex chars). Required when any rule uses bag_encryption.
+# bag_encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 archive_interval_ms: 30000
 archive_batch_oids: 64
 ```
@@ -83,6 +88,10 @@ Stored `aios.tape_uri` is the full remote URI (`s3://…` / `root://…`) or a p
 | `aios.tape_uri_prefix` | remote prefix snapshot (`s3` / `xrdcp`) |
 | `aios.tape_bin` / `aios.tape_s3_endpoint` | tool overrides snapshot |
 | `aios.tape_uri` | locator after successful drain |
+| `aios.bag.compression` | `none` \| `zstd` (stored bag body) |
+| `aios.bag.encryption` | `none` \| `aes-256-gcm` |
+
+Whole-bag transform order: AIAB encode → optional ZSTD → optional AES-256-GCM. Member offsets stay relative to plaintext AIAB. `aios.content_sha256` on the bag tip hashes the **stored** (possibly ciphertext) body.
 
 ## Runtime
 
@@ -103,6 +112,15 @@ Stored `aios.tape_uri` is the full remote URI (`s3://…` / `root://…`) or a p
 ## Bag format
 
 Binary `AIAB` v1: header → concatenated payloads → trailing index (`oid`, offset, length, sha256 hex, attrs JSON).
+
+When compression and/or encryption is enabled, the stored object is an **AITF** v1 wrapper:
+
+```text
+magic "AITF" | version u32 | flags u32 (bit0=zstd, bit1=aes-gcm)
+plain_len u64 | nonce[12] | payload (zstd and/or ciphertext||GCM-tag)
+```
+
+Plain AIAB bags (no transforms) remain readable unchanged.
 
 ## Related
 

@@ -3,6 +3,7 @@
 #include "object/archive_tape.hpp"
 #include "object/object_layout.hpp"
 #include "test_helpers.hpp"
+#include "util/compression.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,11 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+namespace {
+constexpr const char* kTestBagKey =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+}  // namespace
 
 namespace {
 
@@ -50,6 +56,64 @@ int test_archive() {
     expect(decoded.members[0].oid == "cold/a" && decoded.members[0].data.size() == 3, "m0");
     expect(decoded.members[1].oid == "cold/b" && decoded.members[1].data.size() == 4, "m1");
     expect(decoded.members[0].sha256_hex.size() == 64, "sha len");
+
+    // Plain transform is identity (no AITF).
+    {
+      BagTransformOpts opts;
+      std::vector<std::uint8_t> stored;
+      std::unordered_map<std::string, std::string> attrs;
+      expect(transform_bag_for_storage(bag, opts, "", stored, attrs, err), "xf none");
+      expect(stored == bag, "plain identity");
+      expect(!bag_body_is_transformed(stored.data(), stored.size()), "not AITF");
+      std::vector<std::uint8_t> plain;
+      expect(untransform_bag_from_storage(stored.data(), stored.size(), "", plain, err),
+             "unxf none");
+      expect(plain == bag, "plain roundtrip");
+    }
+
+    // AES-GCM only.
+    {
+      BagTransformOpts opts;
+      opts.encryption = "aes-256-gcm";
+      std::vector<std::uint8_t> stored;
+      std::unordered_map<std::string, std::string> attrs;
+      expect(transform_bag_for_storage(bag, opts, kTestBagKey, stored, attrs, err), "xf aes");
+      expect(bag_body_is_transformed(stored.data(), stored.size()), "AITF aes");
+      expect(attrs[kBagEncryptionAttr] == "aes-256-gcm", "enc attr");
+      std::vector<std::uint8_t> plain;
+      expect(untransform_bag_from_storage(stored.data(), stored.size(), kTestBagKey, plain, err),
+             "unxf aes");
+      expect(plain == bag, "aes roundtrip");
+      std::string bad_err;
+      expect(!untransform_bag_from_storage(
+                 stored.data(), stored.size(),
+                 "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", plain,
+                 bad_err),
+             "wrong key fails");
+    }
+
+#if defined(AIOS_HAVE_ZSTD) && AIOS_HAVE_ZSTD
+    // ZSTD only + zstd+aes.
+    if (zstd_available()) {
+      BagTransformOpts opts;
+      opts.compression = "zstd";
+      opts.compression_level = 3;
+      std::vector<std::uint8_t> stored;
+      std::unordered_map<std::string, std::string> attrs;
+      expect(transform_bag_for_storage(bag, opts, "", stored, attrs, err), "xf zstd");
+      expect(bag_body_is_transformed(stored.data(), stored.size()), "AITF zstd");
+      std::vector<std::uint8_t> plain;
+      expect(untransform_bag_from_storage(stored.data(), stored.size(), "", plain, err),
+             "unxf zstd");
+      expect(plain == bag, "zstd roundtrip");
+
+      opts.encryption = "aes-256-gcm";
+      expect(transform_bag_for_storage(bag, opts, kTestBagKey, stored, attrs, err), "xf both");
+      expect(untransform_bag_from_storage(stored.data(), stored.size(), kTestBagKey, plain, err),
+             "unxf both");
+      expect(plain == bag, "zstd+aes roundtrip");
+    }
+#endif
   }
 
   // Pack tips → bag stubs → GET from bag → recall rehydrate.
@@ -127,6 +191,70 @@ int test_archive() {
                std::string(g1b.data->begin(), g1b.data->end()) == b1,
            "get after recall");
     expect(!attrs_are_frozen(g1b.attrs), "not frozen after recall");
+  }
+
+  // Pack with AES-GCM (+ optional zstd) → GET frozen member still works.
+  {
+    DualStoreFixture fx("archive-xf", 2, 2, "nvme");
+    std::filesystem::create_directories(fx.root / "a1" / "aios");
+    std::filesystem::create_directories(fx.root / "a2" / "aios");
+    const std::string a1 = (fx.root / "a1" / "aios").string();
+    const std::string a2 = (fx.root / "a2" / "aios").string();
+    std::vector<AiosTarget> local{
+        make_target(fx.p1, "nvme"),
+        make_target(fx.p2, "nvme"),
+        make_target(a1, "archive"),
+        make_target(a2, "archive"),
+    };
+    fx.fs_table.set_local("node-a", local);
+    PlacementConfig pc;
+    pc.vnodes_per_target = fx.cfg.vnodes_per_target;
+    pc.min_vnodes = fx.cfg.min_vnodes;
+    pc.max_vnodes = fx.cfg.max_vnodes;
+    fx.map = ClusterMap::build(fx.membership, fx.fs_table, fx.cfg.replica_count, pc);
+    ObjectStoreOptions opts;
+    opts.shard_count = 4;
+    opts.clone_required = false;
+    opts.max_versions = 16;
+    fx.stores.sync_paths({fx.p1, fx.p2, a1, a2}, opts);
+
+    fx.cfg.bag_encryption_key = kTestBagKey;
+    ArchiveRule rule;
+    rule.prefix = "cold/";
+    rule.from = "nvme";
+    rule.staging_class = "archive";
+    rule.min_bag_bytes = 1;
+    rule.max_members = 2;
+    rule.max_open_ms = 0;
+    rule.bag_encryption = "aes-256-gcm";
+#if defined(AIOS_HAVE_ZSTD) && AIOS_HAVE_ZSTD
+    if (zstd_available()) rule.bag_compression = "zstd";
+#endif
+    fx.cfg.archive_rules.push_back(rule);
+
+    fx.svc = std::make_unique<ObjectService>(fx.cfg, fx.map, fx.stores);
+    fx.svc->set_advertise("127.0.0.1:7400");
+    LayoutRequest req;
+    req.storage_class = "nvme";
+    const char* b1 = "secret-payload-one";
+    const char* b2 = "secret-payload-two";
+    expect(fx.svc
+               ->api_put("cold/e1", reinterpret_cast<const std::uint8_t*>(b1), std::strlen(b1),
+                         {}, true, {}, std::nullopt, req)
+               .ok,
+           "put e1");
+    expect(fx.svc
+               ->api_put("cold/e2", reinterpret_cast<const std::uint8_t*>(b2), std::strlen(b2),
+                         {}, true, {}, std::nullopt, req)
+               .ok,
+           "put e2");
+
+    expect(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1,
+           "xf bag sealed");
+    auto g1 = fx.svc->api_get("cold/e1", std::nullopt, std::nullopt, {});
+    expect(g1.ok && g1.data && std::string(g1.data->begin(), g1.data->end()) == b1,
+           "get encrypted bag member");
+    expect(attrs_are_frozen(g1.attrs), "e1 frozen");
   }
 
   // Pack → drain to tape_root → GET busy → recall restores bag and rehydrates.

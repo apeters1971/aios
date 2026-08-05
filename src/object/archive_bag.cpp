@@ -1,5 +1,8 @@
 #include "object/archive_bag.hpp"
 
+#include "util/aes_gcm.hpp"
+#include "util/compression.hpp"
+
 #include <openssl/evp.h>
 
 #include <cstring>
@@ -211,6 +214,127 @@ bool decode_archive_bag(const std::uint8_t* data, std::size_t len, ArchiveBag& o
       m.data.assign(data + m.offset, data + m.offset + m.length);
     }
     out.members.push_back(std::move(m));
+  }
+  return true;
+}
+
+bool bag_body_is_transformed(const std::uint8_t* data, std::size_t len) {
+  return len >= 4 && std::memcmp(data, kBagXformMagic, 4) == 0;
+}
+
+bool transform_bag_for_storage(const std::vector<std::uint8_t>& plain, const BagTransformOpts& opts,
+                               const std::string& key_hex, std::vector<std::uint8_t>& stored_out,
+                               std::unordered_map<std::string, std::string>& attrs_out,
+                               std::string& err) {
+  const bool want_zstd = opts.compression == "zstd";
+  const bool want_aes = opts.encryption == "aes-256-gcm";
+  if (!want_zstd && opts.compression != "none" && !opts.compression.empty()) {
+    err = "bag_compression must be none or zstd";
+    return false;
+  }
+  if (!want_aes && opts.encryption != "none" && !opts.encryption.empty()) {
+    err = "bag_encryption must be none or aes-256-gcm";
+    return false;
+  }
+  attrs_out[kBagCompressionAttr] = want_zstd ? "zstd" : "none";
+  attrs_out[kBagEncryptionAttr] = want_aes ? "aes-256-gcm" : "none";
+
+  if (!want_zstd && !want_aes) {
+    stored_out = plain;
+    return true;
+  }
+
+  std::vector<std::uint8_t> mid = plain;
+  if (want_zstd) {
+    if (!zstd_available()) {
+      err = "bag_compression=zstd requires libzstd at build time";
+      return false;
+    }
+    std::vector<std::uint8_t> compressed;
+    if (!zstd_compress(plain.data(), plain.size(), opts.compression_level, compressed, err)) {
+      return false;
+    }
+    mid = std::move(compressed);
+  }
+
+  std::uint8_t nonce[kAesGcmNonceBytes]{};
+  std::vector<std::uint8_t> payload = mid;
+  if (want_aes) {
+    std::vector<std::uint8_t> key;
+    if (!parse_aes256_key_hex(key_hex, key, err)) return false;
+    if (!random_aes_gcm_nonce(nonce, err)) return false;
+    std::vector<std::uint8_t> ct;
+    if (!aes_256_gcm_encrypt(key.data(), key.size(), nonce, kAesGcmNonceBytes, mid.data(),
+                             mid.size(), ct, err)) {
+      return false;
+    }
+    payload = std::move(ct);
+  }
+
+  stored_out.clear();
+  stored_out.insert(stored_out.end(), kBagXformMagic, kBagXformMagic + 4);
+  write_u32(stored_out, kBagXformVersion);
+  std::uint32_t flags = 0;
+  if (want_zstd) flags |= kBagXformFlagZstd;
+  if (want_aes) flags |= kBagXformFlagAesGcm;
+  write_u32(stored_out, flags);
+  write_u64(stored_out, static_cast<std::uint64_t>(plain.size()));
+  stored_out.insert(stored_out.end(), nonce, nonce + kAesGcmNonceBytes);
+  stored_out.insert(stored_out.end(), payload.begin(), payload.end());
+  return true;
+}
+
+bool untransform_bag_from_storage(const std::uint8_t* stored, std::size_t stored_len,
+                                  const std::string& key_hex, std::vector<std::uint8_t>& plain_out,
+                                  std::string& err) {
+  if (!stored || stored_len < 4) {
+    err = "empty bag body";
+    return false;
+  }
+  if (!bag_body_is_transformed(stored, stored_len)) {
+    // Plain AIAB.
+    plain_out.assign(stored, stored + stored_len);
+    return true;
+  }
+  const std::uint8_t* p = stored;
+  const std::uint8_t* end = stored + stored_len;
+  p += 4;  // magic
+  std::uint32_t ver = 0, flags = 0;
+  std::uint64_t plain_len = 0;
+  if (!read_u32(p, end, ver) || ver != kBagXformVersion) {
+    err = "unsupported AITF version";
+    return false;
+  }
+  if (!read_u32(p, end, flags) || !read_u64(p, end, plain_len)) {
+    err = "truncated AITF header";
+    return false;
+  }
+  if (end - p < static_cast<std::ptrdiff_t>(kAesGcmNonceBytes)) {
+    err = "truncated AITF nonce";
+    return false;
+  }
+  const std::uint8_t* nonce = p;
+  p += kAesGcmNonceBytes;
+  const std::size_t payload_len = static_cast<std::size_t>(end - p);
+  std::vector<std::uint8_t> mid;
+  if (flags & kBagXformFlagAesGcm) {
+    std::vector<std::uint8_t> key;
+    if (!parse_aes256_key_hex(key_hex, key, err)) return false;
+    if (!aes_256_gcm_decrypt(key.data(), key.size(), nonce, kAesGcmNonceBytes, p, payload_len, mid,
+                             err)) {
+      return false;
+    }
+  } else {
+    mid.assign(p, end);
+  }
+  if (flags & kBagXformFlagZstd) {
+    if (!zstd_decompress(mid.data(), mid.size(), plain_len, plain_out, err)) return false;
+  } else {
+    if (mid.size() != plain_len) {
+      err = "AITF plain_len mismatch";
+      return false;
+    }
+    plain_out = std::move(mid);
   }
   return true;
 }

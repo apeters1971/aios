@@ -46,6 +46,9 @@ struct BackupRule {
   std::string tape_s3_endpoint;
   std::string tape_put_cmd;
   std::string tape_get_cmd;
+  std::string bag_compression{"none"};  // none | zstd
+  int bag_compression_level{0};         // 0 = use Config.compression_level
+  std::string bag_encryption{"none"};   // none | aes-256-gcm
 };
 
 // Pack many small tips into large bag objects, then stub members (cold/tape path).
@@ -66,6 +69,9 @@ struct ArchiveRule {
   std::string tape_s3_endpoint;     // optional --endpoint-url for aws s3 cp
   std::string tape_put_cmd;         // external only: exec <bag_oid> <local_path> → stdout URI
   std::string tape_get_cmd;         // external only: exec <uri> <local_path>
+  std::string bag_compression{"none"};  // none | zstd
+  int bag_compression_level{0};         // 0 = use Config.compression_level
+  std::string bag_encryption{"none"};   // none | aes-256-gcm
 };
 
 struct Config {
@@ -144,6 +150,8 @@ struct Config {
   std::string compression{"none"};
   int compression_level{3};                 // zstd level 1..22
   std::uint64_t compression_min_bytes{256}; // skip smaller objects
+  // 64 hex chars (AES-256) for archive bag encryption; empty disables encrypting seals.
+  std::string bag_encryption_key;
 };
 
 // Build dialable http host:port from TCP advertise + http_listen.

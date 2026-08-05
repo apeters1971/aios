@@ -125,6 +125,16 @@ bool BackupPolicyStore::validate(const BackupPolicy& p, std::string& err) {
     err = "keep_days/keep_monthly must be >= 0";
     return false;
   }
+  const auto comp = p.bag_compression.empty() ? "none" : p.bag_compression;
+  const auto enc = p.bag_encryption.empty() ? "none" : p.bag_encryption;
+  if (comp != "none" && comp != "zstd") {
+    err = "bag_compression must be none or zstd";
+    return false;
+  }
+  if (enc != "none" && enc != "aes-256-gcm") {
+    err = "bag_encryption must be none or aes-256-gcm";
+    return false;
+  }
   return true;
 }
 
@@ -149,6 +159,9 @@ nlohmann::json BackupPolicyStore::to_json(const BackupPolicy& p) {
           {"tape_s3_endpoint", p.tape_s3_endpoint},
           {"tape_put_cmd", p.tape_put_cmd},
           {"tape_get_cmd", p.tape_get_cmd},
+          {"bag_compression", p.bag_compression},
+          {"bag_compression_level", p.bag_compression_level},
+          {"bag_encryption", p.bag_encryption},
           {"last_run_ms", p.last_run_ms}};
 }
 
@@ -190,6 +203,11 @@ bool BackupPolicyStore::from_json(const nlohmann::json& j, BackupPolicy& p, std:
   p.tape_s3_endpoint = j.value("tape_s3_endpoint", "");
   p.tape_put_cmd = j.value("tape_put_cmd", "");
   p.tape_get_cmd = j.value("tape_get_cmd", "");
+  p.bag_compression = j.value("bag_compression", "none");
+  if (p.bag_compression.empty()) p.bag_compression = "none";
+  p.bag_compression_level = j.value("bag_compression_level", 0);
+  p.bag_encryption = j.value("bag_encryption", "none");
+  if (p.bag_encryption.empty()) p.bag_encryption = "none";
   p.last_run_ms = j.value("last_run_ms", static_cast<std::int64_t>(0));
   return validate(p, err);
 }

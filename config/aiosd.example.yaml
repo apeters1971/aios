@@ -70,6 +70,9 @@ placement:
 #     # xrdcp:
 #     # tape_uri_prefix: root://eos.example//eos/archive/bags/
 #     # tape_bin: xrdcp
+#     # bag_compression: zstd          # none | zstd
+#     # bag_encryption: aes-256-gcm    # none | aes-256-gcm
+# # bag_encryption_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # archive_interval_ms: 30000
 # archive_batch_oids: 64
 
@@ -85,6 +88,8 @@ placement:
 #     staging_class: archive
 #     tape_sink: s3
 #     tape_uri_prefix: s3://backups/aios/
+#     bag_compression: zstd
+#     bag_encryption: aes-256-gcm
 #   - kind: vbd
 #     pool: rbd
 #     name: disk0

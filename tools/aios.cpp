@@ -763,6 +763,9 @@ int cmd_admin_backup(std::string host, std::string port, const std::string& key,
         else if (a == "--tape-s3-endpoint") body["tape_s3_endpoint"] = v;
         else if (a == "--tape-put-cmd") body["tape_put_cmd"] = v;
         else if (a == "--tape-get-cmd") body["tape_get_cmd"] = v;
+        else if (a == "--bag-compression") body["bag_compression"] = v;
+        else if (a == "--bag-compression-level") body["bag_compression_level"] = std::stoi(v);
+        else if (a == "--bag-encryption") body["bag_encryption"] = v;
         else {
           std::cerr << "unknown flag: " << a << "\n";
           return 2;

@@ -169,6 +169,22 @@ bool validate_archive_rule(ArchiveRule& rule, std::string& err) {
     err = "archive_rules tape_s3_endpoint requires tape_sink=s3";
     return false;
   }
+  rule.bag_compression = lower_copy(rule.bag_compression);
+  rule.bag_encryption = lower_copy(rule.bag_encryption);
+  if (rule.bag_compression.empty()) rule.bag_compression = "none";
+  if (rule.bag_encryption.empty()) rule.bag_encryption = "none";
+  if (rule.bag_compression != "none" && rule.bag_compression != "zstd") {
+    err = "archive_rules bag_compression must be none or zstd";
+    return false;
+  }
+  if (rule.bag_encryption != "none" && rule.bag_encryption != "aes-256-gcm") {
+    err = "archive_rules bag_encryption must be none or aes-256-gcm";
+    return false;
+  }
+  if (rule.bag_compression_level < 0 || rule.bag_compression_level > 22) {
+    err = "archive_rules bag_compression_level must be 0..22";
+    return false;
+  }
   return true;
 }
 
@@ -205,6 +221,9 @@ bool validate_backup_rule(BackupRule& rule, std::string& err) {
   tape.tape_s3_endpoint = rule.tape_s3_endpoint;
   tape.tape_put_cmd = rule.tape_put_cmd;
   tape.tape_get_cmd = rule.tape_get_cmd;
+  tape.bag_compression = rule.bag_compression;
+  tape.bag_compression_level = rule.bag_compression_level;
+  tape.bag_encryption = rule.bag_encryption;
   tape.from = rule.from.empty() ? "nvme" : rule.from;
   tape.staging_class = rule.staging_class.empty() ? "archive" : rule.staging_class;
   tape.min_bag_bytes = 1;
@@ -214,6 +233,8 @@ bool validate_backup_rule(BackupRule& rule, std::string& err) {
     return false;
   }
   rule.tape_sink = tape.tape_sink;
+  rule.bag_compression = tape.bag_compression;
+  rule.bag_encryption = tape.bag_encryption;
   return true;
 }
 
@@ -411,6 +432,11 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
           rule.tape_s3_endpoint = node["tape_s3_endpoint"].as<std::string>();
         if (node["tape_put_cmd"]) rule.tape_put_cmd = node["tape_put_cmd"].as<std::string>();
         if (node["tape_get_cmd"]) rule.tape_get_cmd = node["tape_get_cmd"].as<std::string>();
+        if (node["bag_compression"])
+          rule.bag_compression = node["bag_compression"].as<std::string>();
+        if (node["bag_compression_level"])
+          rule.bag_compression_level = node["bag_compression_level"].as<int>();
+        if (node["bag_encryption"]) rule.bag_encryption = node["bag_encryption"].as<std::string>();
         cfg.archive_rules.push_back(std::move(rule));
       }
     }
@@ -449,9 +475,16 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
           rule.tape_s3_endpoint = node["tape_s3_endpoint"].as<std::string>();
         if (node["tape_put_cmd"]) rule.tape_put_cmd = node["tape_put_cmd"].as<std::string>();
         if (node["tape_get_cmd"]) rule.tape_get_cmd = node["tape_get_cmd"].as<std::string>();
+        if (node["bag_compression"])
+          rule.bag_compression = node["bag_compression"].as<std::string>();
+        if (node["bag_compression_level"])
+          rule.bag_compression_level = node["bag_compression_level"].as<int>();
+        if (node["bag_encryption"]) rule.bag_encryption = node["bag_encryption"].as<std::string>();
         cfg.backup_rules.push_back(std::move(rule));
       }
     }
+    if (root["bag_encryption_key"])
+      cfg.bag_encryption_key = root["bag_encryption_key"].as<std::string>();
   } catch (const std::exception& e) {
     err = e.what();
     return false;
@@ -689,6 +722,37 @@ bool normalize_config(Config& cfg, std::string& err) {
       err = "compression_level must be 1..22";
       return false;
     }
+  }
+  bool want_bag_enc = false;
+  bool want_bag_zstd = false;
+  for (const auto& r : cfg.archive_rules) {
+    if (r.bag_encryption == "aes-256-gcm") want_bag_enc = true;
+    if (r.bag_compression == "zstd") want_bag_zstd = true;
+  }
+  for (const auto& r : cfg.backup_rules) {
+    if (r.bag_encryption == "aes-256-gcm") want_bag_enc = true;
+    if (r.bag_compression == "zstd") want_bag_zstd = true;
+  }
+  if (want_bag_zstd) {
+#if !defined(AIOS_HAVE_ZSTD) || !AIOS_HAVE_ZSTD
+    err = "bag_compression=zstd requires libzstd at build time";
+    return false;
+#endif
+  }
+  if (!cfg.bag_encryption_key.empty()) {
+    if (cfg.bag_encryption_key.size() != 64) {
+      err = "bag_encryption_key must be 64 hex characters";
+      return false;
+    }
+    for (unsigned char c : cfg.bag_encryption_key) {
+      if (!std::isxdigit(c)) {
+        err = "bag_encryption_key must be hex";
+        return false;
+      }
+    }
+  } else if (want_bag_enc) {
+    err = "bag_encryption=aes-256-gcm requires bag_encryption_key";
+    return false;
   }
   return true;
 }

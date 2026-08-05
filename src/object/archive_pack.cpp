@@ -48,9 +48,30 @@ bool seal_bag(const Config& cfg, const std::string& advertise, const ClusterMap&
               ArchiveStats& stats) {
   if (members.empty()) return true;
   std::string err;
-  std::vector<std::uint8_t> bag_bytes;
-  if (!encode_archive_bag(members, bag_bytes, err)) {
+  std::vector<std::uint8_t> plain_bytes;
+  if (!encode_archive_bag(members, plain_bytes, err)) {
     AIOS_LOG_WARN("archive encode: ", err);
+    ++stats.failed;
+    members.clear();
+    return false;
+  }
+  // Decode plaintext to get member offsets (relative to AIAB body).
+  ArchiveBag decoded;
+  if (!decode_archive_bag(plain_bytes.data(), plain_bytes.size(), decoded, false, err)) {
+    ++stats.failed;
+    members.clear();
+    return false;
+  }
+  BagTransformOpts xopts;
+  xopts.compression = rule.bag_compression.empty() ? "none" : rule.bag_compression;
+  xopts.compression_level =
+      rule.bag_compression_level > 0 ? rule.bag_compression_level : cfg.compression_level;
+  xopts.encryption = rule.bag_encryption.empty() ? "none" : rule.bag_encryption;
+  std::vector<std::uint8_t> bag_bytes;
+  std::unordered_map<std::string, std::string> xattrs;
+  if (!transform_bag_for_storage(plain_bytes, xopts, cfg.bag_encryption_key, bag_bytes, xattrs,
+                                 err)) {
+    AIOS_LOG_WARN("archive bag transform: ", err);
     ++stats.failed;
     members.clear();
     return false;
@@ -77,15 +98,8 @@ bool seal_bag(const Config& cfg, const std::string& advertise, const ClusterMap&
   apply_layout_attrs(bag_attrs, layout);
   bag_attrs[kArchiveStateAttr] = kArchiveStateBagged;
   bag_attrs["aios.bag_members"] = std::to_string(members.size());
+  for (const auto& [k, v] : xattrs) bag_attrs[k] = v;
   if (!install_replica_version(cfg, advertise, map, stores, dest, bag_id, bag_bytes, bag_attrs)) {
-    ++stats.failed;
-    members.clear();
-    return false;
-  }
-
-  // Decode to get final offsets after encode.
-  ArchiveBag decoded;
-  if (!decode_archive_bag(bag_bytes.data(), bag_bytes.size(), decoded, false, err)) {
     ++stats.failed;
     members.clear();
     return false;
@@ -191,9 +205,14 @@ bool read_frozen_member(const Config& cfg, const std::string& advertise, const C
   const std::string sc = storage_class_for_attrs(bag_attrs, cfg.default_storage_class);
   const int n = placement_n_for_attrs(bag_attrs, map.replica_count);
   auto placement = place(bid->second, map, n, sc);
-  std::vector<std::uint8_t> bag;
-  if (!load_object_bytes(cfg, advertise, map, stores, placement, bid->second, bag, bag_attrs)) {
+  std::vector<std::uint8_t> stored;
+  if (!load_object_bytes(cfg, advertise, map, stores, placement, bid->second, stored, bag_attrs)) {
     err = "bag not available";
+    return false;
+  }
+  std::vector<std::uint8_t> bag;
+  if (!untransform_bag_from_storage(stored.data(), stored.size(), cfg.bag_encryption_key, bag,
+                                    err)) {
     return false;
   }
   if (offset + length > bag.size()) {
