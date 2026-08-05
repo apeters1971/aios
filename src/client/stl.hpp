@@ -9,5 +9,6 @@
 #include "client/mutex.hpp"
 #include "client/session.hpp"
 #include "client/set.hpp"
+#include "client/stl_codec.hpp"
 #include "client/string.hpp"
 #include "client/unordered_map.hpp"

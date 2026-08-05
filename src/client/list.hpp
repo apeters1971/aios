@@ -4,6 +4,8 @@
 #include "client/mode.hpp"
 #include "client/session.hpp"
 #include "client/stl_base.hpp"
+#include "client/stl_codec.hpp"
+#include "client/wire.hpp"
 
 #include <memory>
 #include <string>
@@ -11,47 +13,251 @@
 
 namespace aios {
 
-class list : public detail::StlBase {
+template <class T = std::string>
+class basic_list : public detail::StlBase {
  public:
-  list(Session& session, std::string name, sync_mode mode = sync_mode::async,
-       bool flush_on_destroy = true);
-  ~list();
+  using value_type = T;
 
-  list(const list&) = delete;
-  list& operator=(const list&) = delete;
+  basic_list(Session& session, std::string name, sync_mode mode = sync_mode::async,
+             bool flush_on_destroy = true)
+      : StlBase(session, "list", std::move(name), mode, flush_on_destroy),
+        impl_(std::make_unique<Impl>(session, "list", this->name())) {}
 
-  void load();
-  void flush();
-  void compact();
+  ~basic_list() {
+    if (flush_on_destroy() && mode() == sync_mode::async && dirty()) {
+      try {
+        flush();
+      } catch (...) {
+      }
+    }
+  }
 
-  void clear();
-  std::size_t size() const;
+  basic_list(const basic_list&) = delete;
+  basic_list& operator=(const basic_list&) = delete;
+
+  void load() {
+    if (mode() == sync_mode::async && dirty()) {
+      throw client_error("bad_request", "flush or discard before load");
+    }
+    impl_->pending.clear();
+    impl_->applied_op = 0;
+    local_.clear();
+    pull();
+    clear_dirty();
+  }
+
+  void flush() {
+    if (mode() != sync_mode::async) {
+      throw client_error("bad_request", "flush only valid in async mode");
+    }
+    if (!local_valid_) load();
+    if (!impl_->pending.empty()) {
+      impl_->log.append_ops(impl_->pending, mode());
+      auto m = impl_->log.load_meta();
+      if (m.next_op > 1) impl_->applied_op = m.next_op - 1;
+      impl_->pending.clear();
+    }
+    clear_dirty();
+    maybe_compact();
+  }
+
+  void compact() {
+    ensure_fresh_read();
+    if (mode() == sync_mode::async && dirty()) flush();
+    const auto body = wire::make_list_doc(to_wire(local_), mode(), "list").dump();
+    impl_->log.compact(body, mode(), impl_->applied_op);
+    auto m = impl_->log.load_meta();
+    impl_->applied_op = m.snapshot_op;
+  }
+
+  void clear() {
+    if (mode() == sync_mode::async && !local_valid_) {
+      local_.clear();
+      local_valid_ = true;
+    } else {
+      ensure_fresh_read();
+      local_.clear();
+    }
+    persist_op(changelog::Op::Clear, {});
+  }
+
+  std::size_t size() const {
+    ensure_fresh_read();
+    return local_.size();
+  }
   bool empty() const { return size() == 0; }
 
-  void push_back(const std::string& v);
-  void push_front(const std::string& v);
-  void pop_back();
-  void pop_front();
+  void push_back(const T& v) {
+    ensure_fresh_read();
+    local_.push_back(v);
+    persist_op(changelog::Op::PushBack, {stl_codec<T>::to_string(v)});
+  }
 
-  std::string& operator[](std::size_t i);
-  const std::string& operator[](std::size_t i) const;
-  std::string at(std::size_t i) const;
+  void push_front(const T& v) {
+    ensure_fresh_read();
+    local_.insert(local_.begin(), v);
+    persist_op(changelog::Op::PushFront, {stl_codec<T>::to_string(v)});
+  }
 
-  void insert(std::size_t index, const std::string& v);
-  void erase(std::size_t index);
+  void pop_back() {
+    ensure_fresh_read();
+    if (local_.empty()) throw client_error("bad_request", "pop_back on empty list");
+    local_.pop_back();
+    persist_op(changelog::Op::PopBack, {});
+  }
 
-  std::vector<std::string> snapshot() const;
+  void pop_front() {
+    ensure_fresh_read();
+    if (local_.empty()) throw client_error("bad_request", "pop_front on empty list");
+    local_.erase(local_.begin());
+    persist_op(changelog::Op::PopFront, {});
+  }
+
+  T& operator[](std::size_t i) {
+    ensure_fresh_read();
+    if (mode() == sync_mode::async) mark_dirty();
+    return local_.at(i);
+  }
+  const T& operator[](std::size_t i) const {
+    ensure_fresh_read();
+    return local_.at(i);
+  }
+  T at(std::size_t i) const {
+    ensure_fresh_read();
+    return local_.at(i);
+  }
+
+  void insert(std::size_t index, const T& v) {
+    ensure_fresh_read();
+    if (index > local_.size()) throw client_error("bad_request", "insert index out of range");
+    local_.insert(local_.begin() + static_cast<std::ptrdiff_t>(index), v);
+    persist_op(changelog::Op::Insert, {std::to_string(index), stl_codec<T>::to_string(v)});
+  }
+
+  void erase(std::size_t index) {
+    ensure_fresh_read();
+    if (index >= local_.size()) throw client_error("bad_request", "erase index out of range");
+    local_.erase(local_.begin() + static_cast<std::ptrdiff_t>(index));
+    persist_op(changelog::Op::EraseAt, {std::to_string(index)});
+  }
+
+  std::vector<T> snapshot() const {
+    ensure_fresh_read();
+    return local_;
+  }
 
  private:
-  void ensure_fresh_read() const;
-  void pull();
-  void persist_op(changelog::Op op, std::vector<std::string> args);
-  void maybe_compact();
+  struct Impl {
+    changelog::Log log;
+    std::uint64_t applied_op{0};
+    std::vector<changelog::Record> pending;
+    Impl(Session& s, const std::string& type, const std::string& name) : log(s, type, name) {}
+  };
 
-  struct Impl;
+  static std::size_t parse_index(const std::string& s) {
+    return static_cast<std::size_t>(std::stoull(s));
+  }
+
+  static std::vector<std::string> to_wire(const std::vector<T>& in) {
+    std::vector<std::string> out;
+    out.reserve(in.size());
+    for (const auto& v : in) out.push_back(stl_codec<T>::to_string(v));
+    return out;
+  }
+
+  static std::vector<T> from_wire(const std::vector<std::string>& in) {
+    std::vector<T> out;
+    out.reserve(in.size());
+    for (const auto& v : in) out.push_back(stl_codec<T>::from_string(v));
+    return out;
+  }
+
+  static void apply_op(std::vector<T>& local, const changelog::Record& r) {
+    using changelog::Op;
+    switch (r.op) {
+      case Op::PushBack:
+        if (!r.args.empty()) local.push_back(stl_codec<T>::from_string(r.args[0]));
+        break;
+      case Op::PushFront:
+        if (!r.args.empty()) local.insert(local.begin(), stl_codec<T>::from_string(r.args[0]));
+        break;
+      case Op::PopBack:
+        if (!local.empty()) local.pop_back();
+        break;
+      case Op::PopFront:
+        if (!local.empty()) local.erase(local.begin());
+        break;
+      case Op::Insert:
+        if (r.args.size() >= 2) {
+          const auto idx = parse_index(r.args[0]);
+          if (idx <= local.size()) {
+            local.insert(local.begin() + static_cast<std::ptrdiff_t>(idx),
+                         stl_codec<T>::from_string(r.args[1]));
+          }
+        }
+        break;
+      case Op::EraseAt:
+        if (!r.args.empty()) {
+          const auto idx = parse_index(r.args[0]);
+          if (idx < local.size()) {
+            local.erase(local.begin() + static_cast<std::ptrdiff_t>(idx));
+          }
+        }
+        break;
+      case Op::SetAt:
+        if (r.args.size() >= 2) {
+          const auto idx = parse_index(r.args[0]);
+          if (idx < local.size()) local[idx] = stl_codec<T>::from_string(r.args[1]);
+        }
+        break;
+      case Op::Clear:
+        local.clear();
+        break;
+      default:
+        break;
+    }
+  }
+
+  void ensure_fresh_read() const {
+    if (mode() == sync_mode::async && local_valid_) return;
+    const_cast<basic_list*>(this)->pull();
+  }
+
+  void pull() {
+    impl_->log.pull(
+        &impl_->applied_op,
+        [this](const std::string& snap) { local_ = from_wire(wire::parse_list_doc(snap, "list")); },
+        [this](const changelog::Record& r) { apply_op(local_, r); });
+    local_valid_ = true;
+  }
+
+  void persist_op(changelog::Op op, std::vector<std::string> args) {
+    if (mode() != sync_mode::sync) {
+      changelog::Record r;
+      r.op = op;
+      r.args = std::move(args);
+      impl_->pending.push_back(std::move(r));
+      mark_dirty();
+      return;
+    }
+    const auto id = impl_->log.append_op(op, std::move(args), mode());
+    impl_->applied_op = id;
+    maybe_compact();
+  }
+
+  void maybe_compact() {
+    try {
+      auto m = impl_->log.load_meta();
+      if (m.log_bytes > changelog::kAutoCompactBytes) compact();
+    } catch (...) {
+    }
+  }
+
   std::unique_ptr<Impl> impl_;
-  mutable std::vector<std::string> local_;
+  mutable std::vector<T> local_;
   mutable bool local_valid_{false};
 };
+
+using list = basic_list<std::string>;
 
 }  // namespace aios

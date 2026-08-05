@@ -10,7 +10,17 @@ C++ library target **`aios_client`**. Include [`src/client/stl.hpp`](../src/clie
 | `aios::map` / `unordered_map` / `set` / `list` / `deque` | Append-only **changelog** (below) | `aios_stl: 2` meta |
 | `aios::mutex` | HTTP lock API (no body) | Unchanged |
 
-Value type for map/list/deque elements is `std::string`.
+Wire/changelog values are always UTF-8 strings. The C++ API is templated:
+
+| Alias | Template | Local container |
+|-------|----------|-----------------|
+| `aios::map` | `basic_map<Key, Mapped>` | `std::map<Key, Mapped>` (native key order) |
+| `aios::unordered_map` | `basic_unordered_map<Key, Mapped>` | `std::unordered_map<Key, Mapped>` |
+| `aios::set` | `basic_set<Key>` | `std::set<Key>` |
+| `aios::list` | `basic_list<T>` | `std::vector<T>` |
+| `aios::deque` | `basic_deque<T>` | `std::vector<T>` |
+
+Aliases default to `std::string`. Codecs (`stl_codec<T>` in `stl_codec.hpp`) convert at the persistence boundary for `std::string`, `int`, `int64_t`, `uint64_t`, and `double`. Opening the same oid with a mismatched element type may fail decode on load. Ordered `basic_map` iterates in C++ key order (numeric keys sort numerically), not string lexicographic order.
 
 ## Changelog layout (containers)
 

@@ -505,12 +505,12 @@ Follows `307` redirects. Put/get stream file bytes (no full-object client buffer
 
 ## STL-like C++ client
 
-Library **`aios_client`** (`#include "client/stl.hpp"`) maps **named** STL-style objects onto the HTTP object API. Element/value type is `std::string`.
+Library **`aios_client`** (`#include "client/stl.hpp"`) maps **named** STL-style objects onto the HTTP object API. Containers are templated (`basic_map` / `basic_set` / …); aliases like `aios::map` default to `std::string`. Numeric keys/values use `stl_codec` and still persist as UTF-8 decimal strings on the wire.
 
 | Class | Role | Persistence |
 |-------|------|-------------|
 | `aios::string` | Persistent string | Whole JSON tip (`aios_stl: 1`) |
-| `aios::map` / `unordered_map` / `set` / `list` / `deque` | Containers | Append-only changelog via `POST /o/{oid}/append` (`aios_stl: 2`) |
+| `aios::map` / `unordered_map` / `set` / `list` / `deque` | Containers (`basic_*` templates) | Append-only changelog via `POST /o/{oid}/append` (`aios_stl: 2`) |
 | `aios::mutex` | Cluster-shared mutex (`BasicLockable`) | HTTP lock API |
 
 Changelog containers store meta at `stl/{type}/{name}`, an op log at `…/log`, and optional snapshot at `…/snap`. Call **`compact()`** (or rely on auto-compact past ~1 MiB) to snapshot and truncate the log. Opening a v1 whole-document tip migrates on open.
@@ -546,6 +546,10 @@ s.flush();
 aios::map m(sess, "users", aios::sync_mode::sync);
 m["alice"] = "1";
 m.compact();
+
+// Typed keys/values (still stored as decimal UTF-8 on the wire)
+aios::basic_map<std::int64_t, std::int64_t> counts(sess, "counts", aios::sync_mode::sync);
+counts.set(10, 42);
 
 aios::mutex mx(sess, "users");
 {

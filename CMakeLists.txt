@@ -210,11 +210,6 @@ add_library(aios_client STATIC
   src/client/wire.cpp
   src/client/changelog.cpp
   src/client/string.cpp
-  src/client/map.cpp
-  src/client/unordered_map.cpp
-  src/client/set.cpp
-  src/client/list.cpp
-  src/client/deque.cpp
   src/client/mutex.cpp
 )
 target_include_directories(aios_client PUBLIC

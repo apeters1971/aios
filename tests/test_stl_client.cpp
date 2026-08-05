@@ -8,8 +8,10 @@
 #include <boost/asio.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -244,6 +246,53 @@ int test_stl_client() {
     // Re-read from cluster
     map m3(a, "race", sync_mode::sync, false);
     expect(m3.contains("a") && m3.contains("b"), "both sync inserts visible");
+  }
+
+  // Typed containers: numeric keys/values, wire still UTF-8 strings
+  {
+    HttpFixture hf("aios-stl-typed");
+    Session a(hf.cfg());
+    Session b(hf.cfg());
+
+    basic_map<std::int64_t, std::int64_t> m1(a, "nums", sync_mode::async, false);
+    m1.set(10, 100);
+    m1.set(2, 20);
+    m1.flush();
+    auto snap = m1.snapshot();
+    expect(snap.begin()->first == 2 && std::next(snap.begin())->first == 10,
+           "typed map numeric key order");
+    m1.compact();
+
+    basic_map<std::int64_t, std::int64_t> m2(b, "nums", sync_mode::sync, false);
+    expect(m2.at(10) == 100 && m2.at(2) == 20, "typed map peer load");
+    // Peer string map sees decimal keys
+    map sm(b, "nums", sync_mode::sync, false);
+    expect(sm.at("10") == "100" && sm.at("2") == "20", "typed map wire is decimal strings");
+
+    basic_unordered_map<std::int64_t, std::int64_t> um(a, "uhash", sync_mode::sync, false);
+    um.set(7, 77);
+    basic_unordered_map<std::int64_t, std::int64_t> um2(b, "uhash", sync_mode::sync, false);
+    expect(um2.at(7) == 77, "typed umap round-trip");
+
+    basic_set<std::int64_t> s1(a, "ints", sync_mode::sync, false);
+    expect(s1.insert(5) && s1.insert(1), "typed set insert");
+    basic_set<std::int64_t> s2(b, "ints", sync_mode::sync, false);
+    expect(s2.contains(5) && s2.contains(1), "typed set peer");
+    auto ssnap = s2.snapshot();
+    expect(*ssnap.begin() == 1, "typed set numeric order");
+
+    basic_list<std::int64_t> l1(a, "ilist", sync_mode::async, false);
+    l1.push_back(3);
+    l1.push_back(9);
+    l1.flush();
+    basic_list<std::int64_t> l2(b, "ilist", sync_mode::sync, false);
+    expect(l2.size() == 2 && l2.at(0) == 3 && l2.at(1) == 9, "typed list round-trip");
+
+    basic_deque<double> d1(a, "dvals", sync_mode::sync, false);
+    d1.push_back(1.5);
+    d1.set_at(0, 2.25);
+    basic_deque<double> d2(b, "dvals", sync_mode::sync, false);
+    expect(d2.size() == 1 && d2.at(0) == 2.25, "typed deque double round-trip");
   }
 
   return failures();
