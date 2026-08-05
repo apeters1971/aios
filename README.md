@@ -8,6 +8,37 @@ AIOS is a small C++20 **cluster object store**: durable objects on local filesys
 
 Clients talk to the **primary** for an object (HTTP or TCP++); the primary replicates or erasure-codes across the acting set. There are no pools or placement groups—layout and storage class are chosen **per object version** at write time.
 
+### Access methods
+
+```text
+  POSIX (FUSE)          POSIX (kernel aiosfs)       VBD (kernel aiosvd)
+  aios-fuse             mount -t aios               /dev/aiosvdN
+       │                        │                         │
+       │                        │                    (optional NFS
+       │                   ┌────┴────┐                of aiosfs)
+       ▼                   ▼         ▼                    │
+  libaios_posix ◄── aios-kbridge   aios_http.ko           │
+       │              (upcall)          │                 │
+       └───────────────┬────────────────┘                 │
+                       ▼                                  ▼
+                 ┌───────────┐                      nfsd clients
+                 │   aiosd   │◄── HTTP object API
+                 │  cluster  │◄── STL C++ (libaios_client)
+                 └─────┬─────┘◄── S3 gateway (+ optional GPUDirect)
+                       ▲      ◄── XRootD (libXrdAios OSS plugin)
+                       │
+              peers / local …/aios stores
+```
+
+| Access | How | Notes |
+|--------|-----|--------|
+| **POSIX (FUSE)** | `aios-fuse` → `libaios_posix` | Userspace mount (Linux/macOS when libfuse3 is present) |
+| **POSIX (kernel)** | `aiosfs.ko` (`backend=http` or `upcall` + `aios-kbridge`) | AlmaLinux 9 VFS; can be re-exported via **nfsd** (below) |
+| **VBD (kernel)** | `aiosvd.ko` + `aios-vd` → `/dev/aiosvdN` | Object-striped block volumes |
+| **STL API (C++)** | `libaios_client` | Persistent `string` / containers / `mutex` over HTTP |
+| **S3 gateway** | `aiosd` `s3_listen` | SigV4; FS-backed; optional **GPUDirect** / cuObject |
+| **XRootD gateway** | stock XrdOfs + `libXrdAios` | OSS plugin; `entity.name` → local passwd → posix caller |
+
 | Binary / lib | Role |
 |--------------|------|
 | `aiosd` | Cluster daemon (gossip, storage targets, object RPC, HTTP + optional S3 API, repair) |
@@ -17,15 +48,17 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
 | `aios-fuse` | FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
+| `libXrdAios.so` | XRootD OSS plugin over `libaios_posix` (built when XRootD is found) |
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
 ---
 
 ## Contents
 
+- [Access methods](#access-methods)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Build](#build)
@@ -40,6 +73,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - [STL-like C++ client](#stl-like-c-client)
 - [POSIX filesystem + FUSE3](#posix-filesystem--fuse3)
 - [Kernel prototype (AlmaLinux 9)](#kernel-prototype-almalinux-9)
+- [Export aiosfs via NFS (nfsd)](#export-aiosfs-via-nfs-nfsd)
 - [Authentication](#authentication)
 - [Logging](#logging)
 - [Documentation](#documentation)
@@ -606,6 +640,59 @@ Secure Boot still requires signed modules (or SB disabled). Limits and ABI notes
 
 ---
 
+## Export aiosfs via NFS (nfsd)
+
+Mount AIOS with the kernel filesystem first, then re-export that path with the **Linux NFS kernel server** (`nfsd`). Clients see a normal NFS share; the server node still talks to the cluster through `aiosfs`.
+
+```text
+NFS client ──nfs──► host:/export/aios  (== aiosfs mount) ──► aiosd cluster
+```
+
+**1. Mount aiosfs** (example: in-kernel HTTP backend):
+
+```bash
+sudo modprobe aios_http
+sudo modprobe aiosfs
+sudo mkdir -p /export/aios
+sudo mount -t aios none /export/aios \
+  -o backend=http,endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
+```
+
+**2. Install and enable nfsd** (AlmaLinux / RHEL):
+
+```bash
+sudo dnf install -y nfs-utils
+sudo systemctl enable --now nfs-server
+```
+
+**3. Export the mount** — `/etc/exports`:
+
+```text
+/export/aios  *(rw,sync,no_subtree_check,fsid=21001)
+```
+
+Use a stable unique `fsid=` for this share (custom filesystem types are happier with an explicit id). Tighten the client netgroup/IP instead of `*` in production. Add `no_root_squash` only if remote root must look like local root on the AIOS volume.
+
+```bash
+sudo exportfs -ra
+sudo exportfs -v
+```
+
+**4. Client mount**
+
+```bash
+sudo mount -t nfs -o vers=4.2 nfs-server:/export/aios /mnt/aios-nfs
+# or NFSv3: -o vers=3
+```
+
+Notes:
+
+- Export the **aiosfs** path (or a bind-mount of it), not a FUSE mount — `nfsd` and FUSE are a weaker combination.
+- Advisory locks inside `aiosfs` stay **node-local** on the NFS server; NFS has its own locking for clients.
+- Keep the aiosfs mount up before `nfs-server` starts (e.g. systemd mount unit + `RequiresMountsFor=` / ordering), or exportfs will fail until the path is mounted.
+
+---
+
 ## Authentication
 
 Every daemon and HTTP client in a cluster must share `cluster_key`.
@@ -641,8 +728,10 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`proto/layout.md`](proto/layout.md) | Placement (CH + classes), layout, and transitions |
 | [`proto/stl_client.md`](proto/stl_client.md) | STL-like C++ client (SYNC/ASYNC) |
 | [`proto/posix_fuse.md`](proto/posix_fuse.md) | POSIX C ABI, striping, FUSE3 mount |
+| [`proto/xrd_oss.md`](proto/xrd_oss.md) | XRootD OSS plugin (`libXrdAios`) |
 | [`kernel/README.md`](kernel/README.md) | AlmaLinux 9 modules: `aios_http` / `aiosfs` / `aiosvd`, DKMS |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
+| [`config/xrootd.aios.example.cf`](config/xrootd.aios.example.cf) | Example XRootD config for `libXrdAios` |
 
 Run the unit suite after changes:
 
