@@ -172,6 +172,51 @@ bool validate_archive_rule(ArchiveRule& rule, std::string& err) {
   return true;
 }
 
+bool validate_backup_rule(BackupRule& rule, std::string& err) {
+  rule.kind = lower_copy(rule.kind);
+  rule.tape_sink = lower_copy(rule.tape_sink);
+  rule.from = lower_copy(rule.from);
+  rule.staging_class = lower_copy(rule.staging_class);
+  if (rule.kind != "posix" && rule.kind != "vbd") {
+    err = "backup_rules kind must be posix or vbd";
+    return false;
+  }
+  if (rule.kind == "posix" && rule.volume.empty()) {
+    err = "backup_rules posix requires volume";
+    return false;
+  }
+  if (rule.kind == "vbd" && (rule.pool.empty() || rule.name.empty())) {
+    err = "backup_rules vbd requires pool and name";
+    return false;
+  }
+  if (!rule.staging_class.empty() && !valid_storage_class_name(rule.staging_class)) {
+    err = "backup_rules staging_class must match [a-z0-9_-]+";
+    return false;
+  }
+  if (!rule.from.empty() && !valid_storage_class_name(rule.from)) {
+    err = "backup_rules from must match [a-z0-9_-]+";
+    return false;
+  }
+  ArchiveRule tape;
+  tape.tape_sink = rule.tape_sink;
+  tape.tape_root = rule.tape_root;
+  tape.tape_uri_prefix = rule.tape_uri_prefix;
+  tape.tape_bin = rule.tape_bin;
+  tape.tape_s3_endpoint = rule.tape_s3_endpoint;
+  tape.tape_put_cmd = rule.tape_put_cmd;
+  tape.tape_get_cmd = rule.tape_get_cmd;
+  tape.from = rule.from.empty() ? "nvme" : rule.from;
+  tape.staging_class = rule.staging_class.empty() ? "archive" : rule.staging_class;
+  tape.min_bag_bytes = 1;
+  if (!validate_archive_rule(tape, err)) {
+    const std::string pref = "archive_rules";
+    if (err.rfind(pref, 0) == 0) err.replace(0, pref.size(), "backup_rules");
+    return false;
+  }
+  rule.tape_sink = tape.tape_sink;
+  return true;
+}
+
 }  // namespace
 
 bool split_host_port(const std::string& addr, std::string& host, std::string& port) {
@@ -252,6 +297,9 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["archive_interval_ms"])
       cfg.archive_interval_ms = root["archive_interval_ms"].as<int>();
     if (root["archive_batch_oids"]) cfg.archive_batch_oids = root["archive_batch_oids"].as<int>();
+    if (root["backup_interval_ms"])
+      cfg.backup_interval_ms = root["backup_interval_ms"].as<int>();
+    if (root["backup_batch_oids"]) cfg.backup_batch_oids = root["backup_batch_oids"].as<int>();
     if (root["http_listen"]) cfg.http_listen = root["http_listen"].as<std::string>();
     if (root["s3_listen"]) cfg.s3_listen = root["s3_listen"].as<std::string>();
     if (root["s3_volume"]) cfg.s3_volume = root["s3_volume"].as<std::string>();
@@ -364,6 +412,44 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
         if (node["tape_put_cmd"]) rule.tape_put_cmd = node["tape_put_cmd"].as<std::string>();
         if (node["tape_get_cmd"]) rule.tape_get_cmd = node["tape_get_cmd"].as<std::string>();
         cfg.archive_rules.push_back(std::move(rule));
+      }
+    }
+    if (root["backup_rules"]) {
+      if (!root["backup_rules"].IsSequence()) {
+        err = "backup_rules must be a sequence";
+        return false;
+      }
+      cfg.backup_rules.clear();
+      for (const auto& node : root["backup_rules"]) {
+        if (!node.IsMap()) {
+          err = "backup_rules entries must be mappings";
+          return false;
+        }
+        if (!node["kind"]) {
+          err = "backup_rules entries require kind";
+          return false;
+        }
+        BackupRule rule;
+        rule.kind = node["kind"].as<std::string>();
+        if (node["volume"]) rule.volume = node["volume"].as<std::string>();
+        if (node["pool"]) rule.pool = node["pool"].as<std::string>();
+        if (node["name"]) rule.name = node["name"].as<std::string>();
+        if (node["retain_snaps"]) rule.retain_snaps = node["retain_snaps"].as<int>();
+        if (node["from"]) rule.from = node["from"].as<std::string>();
+        if (node["staging_class"]) rule.staging_class = node["staging_class"].as<std::string>();
+        if (node["max_bag_bytes"])
+          rule.max_bag_bytes = node["max_bag_bytes"].as<std::uint64_t>();
+        if (node["max_members"]) rule.max_members = node["max_members"].as<int>();
+        if (node["tape_sink"]) rule.tape_sink = node["tape_sink"].as<std::string>();
+        if (node["tape_root"]) rule.tape_root = node["tape_root"].as<std::string>();
+        if (node["tape_uri_prefix"])
+          rule.tape_uri_prefix = node["tape_uri_prefix"].as<std::string>();
+        if (node["tape_bin"]) rule.tape_bin = node["tape_bin"].as<std::string>();
+        if (node["tape_s3_endpoint"])
+          rule.tape_s3_endpoint = node["tape_s3_endpoint"].as<std::string>();
+        if (node["tape_put_cmd"]) rule.tape_put_cmd = node["tape_put_cmd"].as<std::string>();
+        if (node["tape_get_cmd"]) rule.tape_get_cmd = node["tape_get_cmd"].as<std::string>();
+        cfg.backup_rules.push_back(std::move(rule));
       }
     }
   } catch (const std::exception& e) {
@@ -570,6 +656,9 @@ bool normalize_config(Config& cfg, std::string& err) {
   }
   for (auto& rule : cfg.archive_rules) {
     if (!validate_archive_rule(rule, err)) return false;
+  }
+  for (auto& rule : cfg.backup_rules) {
+    if (!validate_backup_rule(rule, err)) return false;
   }
   if (!cfg.s3_listen.empty()) {
     if (cfg.http_listen.empty()) {

@@ -8,6 +8,7 @@
 #include "object/pubsub.hpp"
 #include "object/archive_pack.hpp"
 #include "object/archive_tape.hpp"
+#include "object/backup.hpp"
 #include "object/repair.hpp"
 #include "object/transition.hpp"
 #include "util/auth.hpp"
@@ -995,6 +996,94 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             continue;
           }
           write_json(*sock, 200, "OK", {{"ok", true}, {"oid", oid}}, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "GET" && (path == "/admin/backup" || path == "/admin/api/backup")) {
+        nlohmann::json rules = nlohmann::json::array();
+        for (const auto& r : cfg_.backup_rules) {
+          rules.push_back({{"kind", r.kind},
+                           {"volume", r.volume},
+                           {"pool", r.pool},
+                           {"name", r.name},
+                           {"retain_snaps", r.retain_snaps},
+                           {"from", r.from},
+                           {"staging_class", r.staging_class},
+                           {"tape_sink", r.tape_sink},
+                           {"tape_uri_prefix", r.tape_uri_prefix}});
+        }
+        write_json(*sock, 200, "OK",
+                   {{"backup_rules", rules},
+                    {"backup_interval_ms", cfg_.backup_interval_ms},
+                    {"backup_batch_oids", cfg_.backup_batch_oids}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "POST" &&
+          (path == "/admin/backup/run" || path == "/admin/api/backup/run")) {
+        const auto stats = run_backup(
+            cfg_, objects_.advertise(), objects_.map(), objects_.stores(), objects_,
+            static_cast<std::size_t>(std::max(1, cfg_.backup_batch_oids)));
+        write_json(*sock, 200, "OK",
+                   {{"rules_run", stats.rules_run},
+                    {"snaps_created", stats.snaps_created},
+                    {"oids_copied", stats.oids_copied},
+                    {"bags_sealed", stats.bags_sealed},
+                    {"drained", stats.drained},
+                    {"pruned", stats.pruned},
+                    {"failed", stats.failed}},
+                   keep_alive);
+        continue;
+      }
+      if (method == "POST" &&
+          (path == "/admin/backup/snapshot" || path == "/admin/api/backup/snapshot")) {
+        try {
+          const std::string raw =
+              body.empty() ? "{}"
+                           : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+          auto j = nlohmann::json::parse(raw);
+          const std::string kind = j.value("kind", "");
+          std::string err;
+          if (kind == "posix") {
+            const std::string volume = j.value("volume", "");
+            std::string snap_id;
+            std::size_t copied = 0;
+            if (!backup_snapshot_posix(objects_, volume, snap_id, err, &copied)) {
+              write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+              continue;
+            }
+            write_json(*sock, 200, "OK",
+                       {{"ok", true},
+                        {"kind", "posix"},
+                        {"volume", volume},
+                        {"snap_id", snap_id},
+                        {"prefix", "posix/" + volume + "/.snap/" + snap_id + "/"},
+                        {"oids_copied", copied}},
+                       keep_alive);
+          } else if (kind == "vbd") {
+            const std::string pool = j.value("pool", "");
+            const std::string name = j.value("name", "");
+            const std::string dest = j.value("dest", name + "-snap");
+            std::size_t copied = 0;
+            if (!backup_snapshot_vbd(objects_, pool, name, dest, err, &copied)) {
+              write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+              continue;
+            }
+            write_json(*sock, 200, "OK",
+                       {{"ok", true},
+                        {"kind", "vbd"},
+                        {"pool", pool},
+                        {"name", name},
+                        {"dest", dest},
+                        {"prefix", "vd/" + pool + "/" + dest + "/"},
+                        {"oids_copied", copied}},
+                       keep_alive);
+          } else {
+            write_json(*sock, 400, "Bad Request", {{"error", "kind must be posix or vbd"}},
+                       keep_alive);
+          }
         } catch (...) {
           write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
         }

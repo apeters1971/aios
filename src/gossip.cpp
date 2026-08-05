@@ -5,6 +5,7 @@
 #include "node_id.hpp"
 #include "object/archive_pack.hpp"
 #include "object/archive_tape.hpp"
+#include "object/backup.hpp"
 #include "object/repair.hpp"
 #include "object/transition.hpp"
 #include "util/log.hpp"
@@ -30,7 +31,8 @@ GossipEngine::GossipEngine(boost::asio::io_context& ioc, Config cfg,
       status_timer_(ioc),
       repair_timer_(ioc),
       transition_timer_(ioc),
-      archive_timer_(ioc) {
+      archive_timer_(ioc),
+      backup_timer_(ioc) {
   object_service_ = std::make_unique<ObjectService>(cfg_, cluster_map_, local_stores_);
 }
 
@@ -163,6 +165,10 @@ void GossipEngine::start() {
     archive_timer_.expires_after(std::chrono::milliseconds(cfg_.archive_interval_ms));
     archive_timer_.async_wait([this](auto ec) { on_archive_timer(ec); });
   }
+  if (cfg_.backup_interval_ms > 0 && !cfg_.backup_rules.empty()) {
+    backup_timer_.expires_after(std::chrono::milliseconds(cfg_.backup_interval_ms));
+    backup_timer_.async_wait([this](auto ec) { on_backup_timer(ec); });
+  }
 
   AIOS_LOG_INFO("node ", cfg_.node_id, " advertise=", adv,
                 " peers=", cfg_.peers.size(), " auth=hmac-sha256",
@@ -293,6 +299,22 @@ void GossipEngine::on_archive_timer(const boost::system::error_code& ec) {
   }
   archive_timer_.expires_after(std::chrono::milliseconds(cfg_.archive_interval_ms));
   archive_timer_.async_wait([this](auto e) { on_archive_timer(e); });
+}
+
+void GossipEngine::on_backup_timer(const boost::system::error_code& ec) {
+  if (ec) return;
+  rebuild_cluster_map();
+  const auto batch = static_cast<std::size_t>(std::max(1, cfg_.backup_batch_oids));
+  const auto stats =
+      run_backup(cfg_, advertise_addr(), cluster_map_, local_stores_, *object_service_, batch);
+  if (stats.snaps_created > 0 || stats.bags_sealed > 0 || stats.drained > 0) {
+    AIOS_LOG_INFO("backup rules=", stats.rules_run, " snaps=", stats.snaps_created,
+                  " oids=", stats.oids_copied, " bags=", stats.bags_sealed,
+                  " drained=", stats.drained, " pruned=", stats.pruned,
+                  " failed=", stats.failed);
+  }
+  backup_timer_.expires_after(std::chrono::milliseconds(cfg_.backup_interval_ms));
+  backup_timer_.async_wait([this](auto e) { on_backup_timer(e); });
 }
 
 void GossipEngine::write_status() {

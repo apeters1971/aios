@@ -23,6 +23,12 @@ struct ArchiveStats {
 ArchiveStats run_archive(const Config& cfg, const std::string& advertise, const ClusterMap& map,
                          LocalStores& stores, std::size_t max_oids_per_store);
 
+// Pack using an explicit rule list (one-shot backup / prefix archive).
+ArchiveStats run_archive_with_rules(const Config& cfg, const std::string& advertise,
+                                    const ClusterMap& map, LocalStores& stores,
+                                    std::size_t max_oids_per_store,
+                                    const std::vector<ArchiveRule>& rules);
+
 // Rehydrate a frozen tip from its bag (when bag is online / bagged).
 bool recall_archived_oid(const Config& cfg, const std::string& advertise, const ClusterMap& map,
                          LocalStores& stores, const std::string& oid, std::string& err);

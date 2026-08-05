@@ -45,6 +45,7 @@ struct SuperMeta {
   std::string uuid;
   uint64_t cas{0};
   bool exists{false};
+  bool frozen{false};  // volume snapshot/backup quiesce
 };
 
 std::string super_oid(const std::string& vol);

@@ -28,6 +28,26 @@ struct TransitionRule {
   std::optional<std::string> ec_codec;
 };
 
+// Snapshot a POSIX volume or VBD, then pack+drain the immutable tree (see proto/backup.md).
+struct BackupRule {
+  std::string kind;                 // "posix" | "vbd"
+  std::string volume;               // posix volume name
+  std::string pool;                 // vbd pool
+  std::string name;                 // vbd volume name
+  int retain_snaps{3};              // local posix .snap trees to keep (-1 = keep all)
+  std::string from;                 // storage_class of snap tips (default: default_storage_class)
+  std::string staging_class{"archive"};
+  std::uint64_t max_bag_bytes{0};   // 0 = unlimited
+  int max_members{0};
+  std::string tape_sink;
+  std::string tape_root;
+  std::string tape_uri_prefix;
+  std::string tape_bin;
+  std::string tape_s3_endpoint;
+  std::string tape_put_cmd;
+  std::string tape_get_cmd;
+};
+
 // Pack many small tips into large bag objects, then stub members (cold/tape path).
 struct ArchiveRule {
   std::string prefix;
@@ -87,6 +107,8 @@ struct Config {
   std::vector<TransitionRule> transition_rules;
   // Prefix → archive (pack-to-bag) policies.
   std::vector<ArchiveRule> archive_rules;
+  // Snapshot + archive copy-out policies (POSIX / VBD).
+  std::vector<BackupRule> backup_rules;
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};
@@ -94,6 +116,8 @@ struct Config {
   int transition_batch_oids{64};
   int archive_interval_ms{30000};
   int archive_batch_oids{64};
+  int backup_interval_ms{3600000};
+  int backup_batch_oids{256};
   // HTTP object API listen address; empty disables HTTP front-end.
   std::string http_listen{"0.0.0.0:7480"};
   // S3-compatible API listen address; empty disables. Uses libaios_posix on s3_volume.

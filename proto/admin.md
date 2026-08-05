@@ -45,6 +45,9 @@ Logout: `POST /admin/logout`.
 | `POST /admin/api/archive/run` | cookie **or** HMAC | One archive pack tick |
 | `POST /admin/api/archive/drain` | cookie **or** HMAC | Drain staged bags to tape_root / tape_put_cmd |
 | `POST /admin/api/archive/recall` | cookie **or** HMAC | `{oid}` restore bag if needed, rehydrate tip |
+| `GET /admin/api/backup` | cookie **or** HMAC | Backup (snap+pack) rules |
+| `POST /admin/api/backup/run` | cookie **or** HMAC | One backup tick |
+| `POST /admin/api/backup/snapshot` | cookie **or** HMAC | `{kind,volume}` or `{kind,pool,name}` |
 | `POST /admin/api/repair/run` | cookie **or** HMAC | One repair tick |
 | `POST /admin/api/settings` | cookie **or** HMAC | `{admin_metrics_public: bool}` (in-memory) |
 | `GET /admin/api/s3/credentials` | cookie **or** HMAC | List S3 IAM keys (secrets redacted); requires `s3_listen` |
@@ -77,6 +80,9 @@ All of these require the normal AIOS HMAC Authorization header, except `GET /met
 | `POST /admin/archive/run` | Pack tick; returns `{matched,packed,bags_sealed,failed}` |
 | `POST /admin/archive/drain` | Tape drain tick; returns `{bags_scanned,drained,skipped,failed}` |
 | `POST /admin/archive/recall` | Restore bag from tape if needed; rehydrate `{oid}` |
+| `GET /admin/backup` | Configured `backup_rules` + intervals |
+| `POST /admin/backup/run` | Snap → pack → drain → prune |
+| `POST /admin/backup/snapshot` | Create posix/vbd snapshot only |
 | `GET /metrics` | Prometheus counters (`aios_*_total`) |
 
 ## OPS counters

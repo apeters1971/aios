@@ -14,6 +14,8 @@
 #include <cstring>
 #include <errno.h>
 #include <memory>
+#include <random>
+#include <sstream>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
@@ -190,6 +192,7 @@ SuperMeta super_from_json(const std::string& body, uint64_t cas_hint) {
   m.stripe_unit = j.value("stripe_unit", kDefaultStripeUnit);
   m.stripe_width = j.value("stripe_width", kDefaultStripeWidth);
   m.uuid = j.value("uuid", "");
+  m.frozen = j.value("frozen", false);
   m.cas = cas_hint;
   return m;
 }
@@ -199,7 +202,8 @@ std::string super_to_json(const SuperMeta& m) {
                         {"next_ino", m.next_ino},
                         {"stripe_unit", m.stripe_unit},
                         {"stripe_width", m.stripe_width},
-                        {"uuid", m.uuid}}
+                        {"uuid", m.uuid},
+                        {"frozen", m.frozen}}
       .dump();
 }
 
@@ -901,6 +905,13 @@ constexpr int kWantR = 4;
 constexpr int kWantW = 2;
 constexpr int kWantX = 1;
 
+int ensure_not_frozen(aios_posix_fs* fs) {
+  if (!fs || !fs->st) return -EINVAL;
+  aios::posix::ensure_super(*fs->st);
+  if (fs->st->super.frozen) return -EBUSY;
+  return 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -1056,6 +1067,7 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
                      aios_posix_stat* st_out) {
   if (!fs || !name || !*name || std::strchr(name, '/')) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto pmeta = aios::posix::load_inode(*fs->st, parent);
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
@@ -1092,6 +1104,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
                       aios_posix_stat* st_out) {
   if (!fs || !name || !*name || std::strchr(name, '/')) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto pmeta = aios::posix::load_inode(*fs->st, parent);
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
@@ -1126,6 +1139,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
 int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
   if (!fs || !name) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto pmeta = aios::posix::load_inode(*fs->st, parent);
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
@@ -1152,6 +1166,7 @@ int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
 int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                     uint64_t new_parent, const char* new_name) {
   if (!fs || !old_name || !new_name || !*old_name || !*new_name) return -EINVAL;
+  if (int fr = ensure_not_frozen(fs)) return fr;
   if (std::strchr(new_name, '/')) return -EINVAL;
   try {
     const auto cred = effective_caller(fs);
@@ -1192,6 +1207,7 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
 int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
   if (!fs || !name) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto pmeta = aios::posix::load_inode(*fs->st, parent);
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
@@ -1227,6 +1243,7 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
 int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                       uint64_t new_parent, const char* new_name) {
   if (!fs || !old_name || !new_name) return -EINVAL;
+  if (int fr = ensure_not_frozen(fs)) return fr;
   try {
     const auto cred = effective_caller(fs);
     auto op_meta = aios::posix::load_inode(*fs->st, old_parent);
@@ -1305,6 +1322,7 @@ int aios_posix_write(aios_posix_fs* fs, uint64_t ino, uint64_t offset, const voi
                      size_t len, size_t* out_len) {
   if (!fs || !buf) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
     if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantW)) return ac;
@@ -1317,6 +1335,7 @@ int aios_posix_write(aios_posix_fs* fs, uint64_t ino, uint64_t offset, const voi
 int aios_posix_truncate(aios_posix_fs* fs, uint64_t ino, uint64_t size) {
   if (!fs) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
     if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantW)) return ac;
@@ -1330,6 +1349,7 @@ int aios_posix_setattr(aios_posix_fs* fs, uint64_t ino, const aios_posix_stat* s
                        uint32_t to_set) {
   if (!fs || !st) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
     const auto cred = effective_caller(fs);
@@ -1396,6 +1416,7 @@ int aios_posix_setxattr(aios_posix_fs* fs, uint64_t ino, const char* name, const
   if (size > aios::posix::kMaxXattrValue) return -E2BIG;
   if (size > 0 && !value) return -EINVAL;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
     const auto cred = effective_caller(fs);
@@ -1470,6 +1491,80 @@ int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name) {
     if (!m.xattrs.erase(name)) return -aios::posix::kXattrMissing;
     m.ctime_ns = aios::posix::now_ns();
     aios::posix::store_inode(*fs->st, m);
+    return 0;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+}
+
+int aios_posix_snapshot(aios_posix_fs* fs, char* snap_id_out, size_t snap_id_len) {
+  if (!fs || !fs->st || !snap_id_out || snap_id_len < 17) return -EINVAL;
+  try {
+    aios::posix::ensure_super(*fs->st);
+    auto& st = *fs->st;
+    // Freeze
+    {
+      aios::posix::SuperMeta m = st.super;
+      m.frozen = true;
+      m.cas = st.session.put_bytes(aios::posix::super_oid(st.volume), aios::posix::super_to_json(m),
+                                   {}, m.cas);
+      m.exists = true;
+      st.super = m;
+    }
+    const auto sid = [&]() {
+      static thread_local std::mt19937_64 rng{
+          static_cast<std::uint64_t>(
+              std::chrono::steady_clock::now().time_since_epoch().count())};
+      std::ostringstream oss;
+      oss << std::hex << rng() << rng();
+      return oss.str();
+    }();
+    const std::string live_prefix = "posix/" + st.volume + "/";
+    const std::string snap_prefix = live_prefix + ".snap/" + sid + "/";
+    const std::string snap_marker = live_prefix + ".snap/";
+    std::size_t copied = 0;
+    std::string cursor;
+    try {
+      for (;;) {
+        auto page = st.session.list_prefix(live_prefix, 256, cursor);
+        for (const auto& e : page.objects) {
+          if (e.oid.rfind(snap_marker, 0) == 0) continue;
+          if (e.oid.size() < live_prefix.size()) continue;
+          const std::string dst = snap_prefix + e.oid.substr(live_prefix.size());
+          auto snap = st.session.get_object(e.oid);
+          if (!snap.exists) continue;
+          st.session.put_bytes(dst, snap.body, snap.attrs, std::nullopt);
+          ++copied;
+        }
+        if (page.next_cursor.empty()) break;
+        cursor = page.next_cursor;
+      }
+      nlohmann::json man{{"aios_backup_manifest", 1},
+                         {"kind", "posix"},
+                         {"volume", st.volume},
+                         {"snap_id", sid},
+                         {"oids", copied}};
+      st.session.put_bytes(snap_prefix + "manifest", man.dump(), {}, std::nullopt);
+    } catch (...) {
+      aios::posix::SuperMeta m = st.super;
+      m.frozen = false;
+      try {
+        m.cas = st.session.put_bytes(aios::posix::super_oid(st.volume),
+                                     aios::posix::super_to_json(m), {}, m.cas);
+        st.super = m;
+      } catch (...) {
+      }
+      throw;
+    }
+    {
+      aios::posix::SuperMeta m = st.super;
+      m.frozen = false;
+      m.cas = st.session.put_bytes(aios::posix::super_oid(st.volume), aios::posix::super_to_json(m),
+                                   {}, m.cas);
+      m.exists = true;
+      st.super = m;
+    }
+    std::snprintf(snap_id_out, snap_id_len, "%s", sid.c_str());
     return 0;
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);

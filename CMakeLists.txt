@@ -157,6 +157,7 @@ add_library(aios_core STATIC
   src/object/archive_bag.cpp
   src/object/archive_pack.cpp
   src/object/archive_tape.cpp
+  src/object/backup.cpp
   src/http/http_auth.cpp
   src/http/http_server.cpp
   src/http/s3_auth.cpp
@@ -464,6 +465,7 @@ add_executable(aios_tests
   tests/test_posix_fs.cpp
   tests/test_xrd_cred.cpp
   tests/test_archive.cpp
+  tests/test_backup.cpp
   tests/test_main.cpp
 )
 target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred)

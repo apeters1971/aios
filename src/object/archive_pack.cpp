@@ -14,9 +14,10 @@
 namespace aios {
 namespace {
 
-const ArchiveRule* find_archive_rule(const Config& cfg, const std::string& oid) {
+const ArchiveRule* find_archive_rule_in(const std::vector<ArchiveRule>& rules,
+                                        const std::string& oid) {
   const ArchiveRule* best = nullptr;
-  for (const auto& rule : cfg.archive_rules) {
+  for (const auto& rule : rules) {
     if (oid.size() < rule.prefix.size()) continue;
     if (oid.compare(0, rule.prefix.size(), rule.prefix) != 0) continue;
     if (!best || rule.prefix.size() > best->prefix.size()) best = &rule;
@@ -278,14 +279,15 @@ bool recall_archived_oid(const Config& cfg, const std::string& advertise, const 
   return true;
 }
 
-ArchiveStats run_archive(const Config& cfg, const std::string& advertise, const ClusterMap& map,
-                         LocalStores& stores, std::size_t max_oids_per_store) {
+ArchiveStats run_archive_with_rules(const Config& cfg, const std::string& advertise,
+                                    const ClusterMap& map, LocalStores& stores,
+                                    std::size_t max_oids_per_store,
+                                    const std::vector<ArchiveRule>& rules) {
   ArchiveStats stats;
-  if (cfg.archive_rules.empty() || map.targets.empty()) return stats;
+  if (rules.empty() || map.targets.empty()) return stats;
 
-  // Group open bags by rule index.
-  std::vector<std::vector<ArchiveMember>> open(cfg.archive_rules.size());
-  std::vector<std::uint64_t> open_bytes(cfg.archive_rules.size(), 0);
+  std::vector<std::vector<ArchiveMember>> open(rules.size());
+  std::vector<std::uint64_t> open_bytes(rules.size(), 0);
 
   for (const auto& path : stores.paths()) {
     auto* store = stores.get(path);
@@ -296,7 +298,7 @@ ArchiveStats run_archive(const Config& cfg, const std::string& advertise, const 
     for (const auto& oid : oids) {
       ++stats.oids_scanned;
       if (is_archive_bag_oid(oid)) continue;
-      const ArchiveRule* rule = find_archive_rule(cfg, oid);
+      const ArchiveRule* rule = find_archive_rule_in(rules, oid);
       if (!rule) continue;
       ++stats.matched;
 
@@ -319,12 +321,11 @@ ArchiveStats run_archive(const Config& cfg, const std::string& advertise, const 
       }
       if (!loaded.empty()) attrs = loaded;
 
-      // Find rule index.
       std::size_t ri = 0;
-      for (; ri < cfg.archive_rules.size(); ++ri) {
-        if (&cfg.archive_rules[ri] == rule) break;
+      for (; ri < rules.size(); ++ri) {
+        if (&rules[ri] == rule) break;
       }
-      if (ri >= cfg.archive_rules.size()) continue;
+      if (ri >= rules.size()) continue;
 
       ArchiveMember m;
       m.oid = oid;
@@ -347,16 +348,20 @@ ArchiveStats run_archive(const Config& cfg, const std::string& advertise, const 
     }
   }
 
-  // Force-seal leftovers that already meet min size (leave undersized for next tick
-  // unless max_open_ms is 0 meaning seal immediately for tests).
-  for (std::size_t ri = 0; ri < cfg.archive_rules.size(); ++ri) {
-    const auto& rule = cfg.archive_rules[ri];
+  for (std::size_t ri = 0; ri < rules.size(); ++ri) {
+    const auto& rule = rules[ri];
     if (open[ri].empty()) continue;
     if (open_bytes[ri] >= rule.min_bag_bytes || rule.max_open_ms == 0) {
       seal_bag(cfg, advertise, map, stores, rule, open[ri], stats);
     }
   }
   return stats;
+}
+
+ArchiveStats run_archive(const Config& cfg, const std::string& advertise, const ClusterMap& map,
+                         LocalStores& stores, std::size_t max_oids_per_store) {
+  return run_archive_with_rules(cfg, advertise, map, stores, max_oids_per_store,
+                                cfg.archive_rules);
 }
 
 }  // namespace aios

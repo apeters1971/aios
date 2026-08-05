@@ -103,3 +103,7 @@ Stored `aios.tape_uri` is the full remote URI (`s3://…` / `root://…`) or a p
 ## Bag format
 
 Binary `AIAB` v1: header → concatenated payloads → trailing index (`oid`, offset, length, sha256 hex, attrs JSON).
+
+## Related
+
+For POSIX/VBD backups, snapshot first then pack the snap prefix — see [`backup.md`](backup.md).

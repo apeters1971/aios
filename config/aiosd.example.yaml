@@ -73,6 +73,24 @@ placement:
 # archive_interval_ms: 30000
 # archive_batch_oids: 64
 
+# Snapshot POSIX/VBD then pack+drain (see proto/backup.md).
+# backup_rules:
+#   - kind: posix
+#     volume: default
+#     retain_snaps: 3
+#     from: nvme
+#     staging_class: archive
+#     tape_sink: s3
+#     tape_uri_prefix: s3://backups/aios/
+#   - kind: vbd
+#     pool: rbd
+#     name: disk0
+#     staging_class: archive
+#     tape_sink: external
+#     tape_root: /var/lib/aios/tape
+# backup_interval_ms: 3600000
+# backup_batch_oids: 256
+
 # repair_interval_ms: 30000
 # repair_batch_oids: 256
 http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API

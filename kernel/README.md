@@ -79,7 +79,7 @@ Mount options: `endpoint`, `cluster_key`, `backend=upcall|http`, `volume`, `app_
 | `vd/{pool}/{name}/header` | JSON: `size`, `obj_order`, optional `parent_pool`/`parent_name`, `key_id` |
 | `vd/{pool}/{name}/data.{objno}` | Fixed-size data stripe (sparse; missing ⇒ zeros, or parent COW) |
 
-Object size = `1 << obj_order` (default 4 MiB). Lightweight clones store a child header with a parent ref; first write to a shared object materializes a child copy (COW).
+Object size = `1 << obj_order` (default 4 MiB). Lightweight clones store a child header with a parent ref; first write to a shared object materializes a child copy (COW). Cluster backup can clone+seal a volume into an independent tip set and pack it with archive bags — see [`proto/backup.md`](../proto/backup.md).
 
 **I/O path**
 

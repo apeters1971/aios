@@ -60,6 +60,10 @@ Uses the cluster **multi-object transaction** API (`POST /txn` … commit):
 
 Same-directory rename remains a single changelog `Rename` op. Commit still has the general `/txn` v1 torn-window if publish fails mid-commit (see [`http.md`](http.md)).
 
+## Volume snapshot
+
+`aios_posix_snapshot(fs, id_out, id_len)` freezes the volume (`super.frozen`), copies live oids to `posix/{vol}/.snap/{id}/` (excluding other snaps), then unfreezes. Mutating ops return `-EBUSY` while frozen. Used by cluster backup ([`backup.md`](backup.md)).
+
 ## Consistency notes (intentional POSIX relaxations)
 
 - **Cross-directory `link`** is still best-effort (not multi-object atomic).

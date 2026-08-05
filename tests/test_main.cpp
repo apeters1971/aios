@@ -38,6 +38,7 @@ int test_cuobject_s3();
 int test_s3_range();
 int test_xrd_cred();
 int test_archive();
+int test_backup();
 
 int main() {
   int failures = 0;
@@ -56,6 +57,7 @@ int main() {
   failures += test_posix_fs();
   failures += test_xrd_cred();
   failures += test_archive();
+  failures += test_backup();
   failures += test_object_rpc();
   failures += test_object_rpc_advanced();
   failures += test_object_service_advanced();

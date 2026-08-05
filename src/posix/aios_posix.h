@@ -141,6 +141,11 @@ int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name);
  * LOCK_SH is implemented as exclusive (cluster locks are exclusive-only). */
 int aios_posix_flock(aios_posix_fs* fs, uint64_t ino, int op);
 
+/* Crash-consistent volume snapshot under posix/{vol}/.snap/{id}/.
+ * Writes snap id (hex) into snap_id_out (NUL-terminated). Returns 0 or -errno.
+ * Mutating ops return -EBUSY while the snapshot freeze is held. */
+int aios_posix_snapshot(aios_posix_fs* fs, char* snap_id_out, size_t snap_id_len);
+
 #ifdef __cplusplus
 }
 #endif
