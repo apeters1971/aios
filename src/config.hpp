@@ -90,6 +90,10 @@ struct Config {
   bool admin{false};
   // When true (and admin), GET /metrics skips HMAC so Prometheus can scrape.
   bool admin_metrics_public{false};
+  // Whole-object PUT compression: "none" | "zstd" (range/append rejected on compressed tips).
+  std::string compression{"none"};
+  int compression_level{3};                 // zstd level 1..22
+  std::uint64_t compression_min_bytes{256}; // skip smaller objects
 };
 
 // Build dialable http host:port from TCP advertise + http_listen.

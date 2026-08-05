@@ -53,6 +53,10 @@ nlohmann::json OpsCounters::to_json() const {
       {"put_bytes", put_bytes.load()},
       {"get_bytes", get_bytes.load()},
       {"append_bytes", append_bytes.load()},
+      {"compress_puts", compress_puts.load()},
+      {"compress_skipped", compress_skipped.load()},
+      {"compress_logical_bytes", compress_logical_bytes.load()},
+      {"compress_stored_bytes", compress_stored_bytes.load()},
       {"lock_acquire", lock_acquire.load()},
       {"watch", watch.load()},
       {"pubsub_publish", pubsub_publish.load()},
@@ -77,6 +81,10 @@ void OpsCounters::load_json(const nlohmann::json& j) {
   put_bytes.store(j_u64(j, "put_bytes"));
   get_bytes.store(j_u64(j, "get_bytes"));
   append_bytes.store(j_u64(j, "append_bytes"));
+  compress_puts.store(j_u64(j, "compress_puts"));
+  compress_skipped.store(j_u64(j, "compress_skipped"));
+  compress_logical_bytes.store(j_u64(j, "compress_logical_bytes"));
+  compress_stored_bytes.store(j_u64(j, "compress_stored_bytes"));
   lock_acquire.store(j_u64(j, "lock_acquire"));
   watch.store(j_u64(j, "watch"));
   pubsub_publish.store(j_u64(j, "pubsub_publish"));
@@ -99,6 +107,10 @@ void OpsCounters::add_from(const OpsCounters& o) {
   put_bytes.fetch_add(o.put_bytes.load());
   get_bytes.fetch_add(o.get_bytes.load());
   append_bytes.fetch_add(o.append_bytes.load());
+  compress_puts.fetch_add(o.compress_puts.load());
+  compress_skipped.fetch_add(o.compress_skipped.load());
+  compress_logical_bytes.fetch_add(o.compress_logical_bytes.load());
+  compress_stored_bytes.fetch_add(o.compress_stored_bytes.load());
   lock_acquire.fetch_add(o.lock_acquire.load());
   watch.fetch_add(o.watch.load());
   pubsub_publish.fetch_add(o.pubsub_publish.load());
@@ -165,6 +177,22 @@ void OpsRegistry::note_get(std::uint64_t bytes) {
   }
 }
 
+void OpsRegistry::note_compress(std::uint64_t logical_bytes, std::uint64_t stored_bytes) {
+  total_.compress_puts.fetch_add(1, std::memory_order_relaxed);
+  total_.compress_logical_bytes.fetch_add(logical_bytes, std::memory_order_relaxed);
+  total_.compress_stored_bytes.fetch_add(stored_bytes, std::memory_order_relaxed);
+  if (auto* b = label_bucket()) {
+    b->compress_puts.fetch_add(1, std::memory_order_relaxed);
+    b->compress_logical_bytes.fetch_add(logical_bytes, std::memory_order_relaxed);
+    b->compress_stored_bytes.fetch_add(stored_bytes, std::memory_order_relaxed);
+  }
+}
+
+void OpsRegistry::note_compress_skipped() {
+  total_.compress_skipped.fetch_add(1, std::memory_order_relaxed);
+  if (auto* b = label_bucket()) b->compress_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
 void OpsRegistry::note_reclass_get_to_head(std::uint64_t get_bytes) {
   total_.get.fetch_sub(1, std::memory_order_relaxed);
   total_.get_bytes.fetch_sub(get_bytes, std::memory_order_relaxed);
@@ -227,7 +255,18 @@ nlohmann::json OpsRegistry::by_label_json() const {
 }
 
 nlohmann::json OpsRegistry::to_admin_json() const {
-  return nlohmann::json{{"ops", total_.to_json()}, {"ops_by_label", by_label_json()}};
+  const auto logical = total_.compress_logical_bytes.load();
+  const auto stored = total_.compress_stored_bytes.load();
+  double ratio = 0;
+  if (stored > 0) ratio = static_cast<double>(logical) / static_cast<double>(stored);
+  return nlohmann::json{{"ops", total_.to_json()},
+                        {"ops_by_label", by_label_json()},
+                        {"compression",
+                         {{"puts", total_.compress_puts.load()},
+                          {"skipped", total_.compress_skipped.load()},
+                          {"logical_bytes", logical},
+                          {"stored_bytes", stored},
+                          {"ratio", ratio}}}};
 }
 
 std::string OpsRegistry::to_prometheus(const std::string& node_id) const {
@@ -281,6 +320,30 @@ std::string OpsRegistry::to_prometheus(const std::string& node_id) const {
   prom_counter_family(os, "aios_ops_append_bytes_total", "Bytes appended", node_id,
                       total_.append_bytes.load(),
                       labeled([](const OpsCounters& c) { return c.append_bytes.load(); }));
+  prom_counter_family(os, "aios_compress_puts_total", "Objects stored with compression", node_id,
+                      total_.compress_puts.load(),
+                      labeled([](const OpsCounters& c) { return c.compress_puts.load(); }));
+  prom_counter_family(os, "aios_compress_skipped_total",
+                      "Puts that skipped compression (too small or no gain)", node_id,
+                      total_.compress_skipped.load(),
+                      labeled([](const OpsCounters& c) { return c.compress_skipped.load(); }));
+  prom_counter_family(os, "aios_compress_logical_bytes_total",
+                      "Logical bytes of compressed puts", node_id,
+                      total_.compress_logical_bytes.load(),
+                      labeled([](const OpsCounters& c) { return c.compress_logical_bytes.load(); }));
+  prom_counter_family(os, "aios_compress_stored_bytes_total",
+                      "Stored bytes after compression", node_id,
+                      total_.compress_stored_bytes.load(),
+                      labeled([](const OpsCounters& c) { return c.compress_stored_bytes.load(); }));
+  {
+    const auto logical = total_.compress_logical_bytes.load();
+    const auto stored = total_.compress_stored_bytes.load();
+    const double ratio =
+        stored > 0 ? static_cast<double>(logical) / static_cast<double>(stored) : 0.0;
+    os << "# HELP aios_compress_ratio Overall compression ratio (logical/stored bytes)\n";
+    os << "# TYPE aios_compress_ratio gauge\n";
+    os << "aios_compress_ratio{node_id=\"" << node_id << "\"} " << ratio << '\n';
+  }
   prom_counter_family(os, "aios_ops_lock_acquire_total", "Successful lock acquires", node_id,
                       total_.lock_acquire.load(),
                       labeled([](const OpsCounters& c) { return c.lock_acquire.load(); }));

@@ -28,6 +28,12 @@ struct OpsCounters {
   std::atomic<std::uint64_t> get_bytes{0};
   std::atomic<std::uint64_t> append_bytes{0};
 
+  // Whole-object compression accounting (logical vs stored payload bytes).
+  std::atomic<std::uint64_t> compress_puts{0};
+  std::atomic<std::uint64_t> compress_skipped{0};
+  std::atomic<std::uint64_t> compress_logical_bytes{0};
+  std::atomic<std::uint64_t> compress_stored_bytes{0};
+
   std::atomic<std::uint64_t> lock_acquire{0};
   std::atomic<std::uint64_t> watch{0};
   std::atomic<std::uint64_t> pubsub_publish{0};
@@ -60,6 +66,8 @@ class OpsRegistry {
   void note_put_range(std::uint64_t bytes);
   void note_append(std::uint64_t bytes);
   void note_get(std::uint64_t bytes);
+  void note_compress(std::uint64_t logical_bytes, std::uint64_t stored_bytes);
+  void note_compress_skipped();
   // Undo a get count and record a head instead (HTTP HEAD path).
   void note_reclass_get_to_head(std::uint64_t get_bytes);
   void note_del();

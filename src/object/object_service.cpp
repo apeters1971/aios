@@ -6,6 +6,7 @@
 #include "net/object_client.hpp"
 #include "object/object_layout.hpp"
 #include "util/base64.hpp"
+#include "util/compression.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
 
@@ -20,6 +21,94 @@
 #include <unordered_set>
 
 namespace aios {
+namespace {
+
+struct PutPayload {
+  const std::uint8_t* data{nullptr};
+  std::size_t len{0};
+  std::vector<std::uint8_t> owned;
+  bool compressed{false};
+  std::uint64_t logical_size{0};
+  std::uint32_t logical_crc{0};
+};
+
+// Optionally compress a full PUT body. `expected_crc32c` is the logical CRC.
+bool prepare_put_payload(const Config& cfg, OpsRegistry& ops, const std::uint8_t* data,
+                         std::size_t len, std::optional<std::uint32_t> expected_crc32c,
+                         PutPayload& out, std::string& err) {
+  out.logical_size = len;
+  out.logical_crc = crc32c(data, len);
+  if (expected_crc32c && *expected_crc32c != out.logical_crc) {
+    err = "crc32c mismatch";
+    return false;
+  }
+  out.data = data;
+  out.len = len;
+  out.compressed = false;
+  if (cfg.compression != kCompAlgoZstd || !zstd_available()) return true;
+  if (len < cfg.compression_min_bytes) {
+    ops.note_compress_skipped();
+    return true;
+  }
+  std::string cerr;
+  if (!zstd_compress(data, len, cfg.compression_level, out.owned, cerr)) {
+    ops.note_compress_skipped();
+    return true;
+  }
+  if (out.owned.size() >= len) {
+    out.owned.clear();
+    ops.note_compress_skipped();
+    return true;
+  }
+  out.compressed = true;
+  out.data = out.owned.data();
+  out.len = out.owned.size();
+  return true;
+}
+
+bool decompress_api_result(ApiResult& r, std::string& err) {
+  if (!attrs_are_compressed(r.attrs)) return true;
+  auto logical = compression_full_size(r.attrs);
+  if (!logical) {
+    err = "compressed object missing aios.compression.full_size";
+    return false;
+  }
+  if (!r.data) {
+    if (r.body_path.empty()) {
+      err = "compressed object has no body";
+      return false;
+    }
+    std::ifstream in(r.body_path, std::ios::binary);
+    if (!in) {
+      err = "cannot open compressed body";
+      return false;
+    }
+    in.seekg(0, std::ios::end);
+    const auto sz = static_cast<std::size_t>(in.tellg());
+    in.seekg(0);
+    std::vector<std::uint8_t> stored(sz);
+    if (sz) in.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(sz));
+    r.data = std::move(stored);
+    r.body_path.clear();
+  }
+  std::vector<std::uint8_t> plain;
+  if (!zstd_decompress(r.data->data(), r.data->size(), *logical, plain, err)) return false;
+  r.data = std::move(plain);
+  if (r.info) {
+    r.info->size = *logical;
+    auto it = r.attrs.find(kCompAttrFullCrc);
+    if (it != r.attrs.end()) {
+      try {
+        r.info->crc32c = static_cast<std::uint32_t>(std::stoul(it->second));
+        r.info->crc32c_known = true;
+      } catch (...) {
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace
 
 ObjectService::ObjectService(Config cfg, ClusterMap& map, LocalStores& stores)
     : cfg_(std::move(cfg)), map_(map), stores_(stores) {}
@@ -1111,26 +1200,47 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
+  PutPayload payload;
+  if (!prepare_put_payload(cfg_, ops_, data, len, expected_crc32c, payload, err)) {
+    if (err == "crc32c mismatch") return fail("crc_mismatch", err);
+    return fail("store_error", err);
+  }
+  auto put_attrs = attrs;
+  if (payload.compressed) {
+    set_compression_attrs(put_attrs, kCompAlgoZstd, payload.logical_size, payload.logical_crc);
+  }
+
   if (layout.is_ec()) {
-    auto r = commit_ec_put(store, placement, oid, data, len, attrs, replace_attrs,
-                           expected_crc32c, layout);
+    auto r = commit_ec_put(store, placement, oid, payload.data, payload.len, put_attrs,
+                           replace_attrs, std::nullopt, layout);
     if (r.ok) {
-      ops_.note_put(len);
+      ops_.note_put(payload.logical_size);
+      if (payload.compressed) ops_.note_compress(payload.logical_size, payload.len);
+      if (r.info) {
+        r.info->size = payload.logical_size;
+        r.info->crc32c = payload.logical_crc;
+        r.info->crc32c_known = true;
+      }
     }
     return r;
   }
 
-  auto put_attrs = attrs;
   apply_layout_attrs(put_attrs, layout);
   PreparedVersion pv;
-  if (!store->prepare_put(oid, data, len, put_attrs, replace_attrs, expected_crc32c, pv,
-                          err)) {
+  if (!store->prepare_put(oid, payload.data, payload.len, put_attrs, replace_attrs, std::nullopt,
+                          pv, err)) {
     if (err == "crc32c mismatch") return fail("crc_mismatch", err);
     return fail("store_error", err);
   }
-  auto r = commit_prepared(store, placement, pv, data, len, put_attrs);
+  auto r = commit_prepared(store, placement, pv, payload.data, payload.len, put_attrs);
   if (r.ok) {
-    ops_.note_put(len);
+    ops_.note_put(payload.logical_size);
+    if (payload.compressed) ops_.note_compress(payload.logical_size, payload.len);
+    if (r.info) {
+      r.info->size = payload.logical_size;
+      r.info->crc32c = payload.logical_crc;
+      r.info->crc32c_known = true;
+    }
   }
   return r;
 }
@@ -1161,10 +1271,15 @@ ApiResult ObjectService::api_put_file(
   if (pr == PrecondResult::NotFound) return fail("not_found", err);
   if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
 
-  if (layout.is_ec()) {
-    constexpr std::uint64_t kEcMemLimit = 16ull * 1024ull * 1024ull;
-    if (size > kEcMemLimit) {
-      return fail("bad_request", "ec v1 supports objects up to 16 MiB");
+  // Compression (and EC) need the body in memory. Cap keeps RAM bounded.
+  constexpr std::uint64_t kMemCompressLimit = 64ull * 1024ull * 1024ull;
+  const bool want_compress = cfg_.compression == kCompAlgoZstd && zstd_available();
+  if (layout.is_ec() || (want_compress && size <= kMemCompressLimit)) {
+    if (layout.is_ec()) {
+      constexpr std::uint64_t kEcMemLimit = 16ull * 1024ull * 1024ull;
+      if (size > kEcMemLimit) {
+        return fail("bad_request", "ec v1 supports objects up to 16 MiB");
+      }
     }
     std::ifstream in(staging_abs_path, std::ios::binary);
     if (!in) return fail("store_error", "cannot open staging file");
@@ -1175,13 +1290,50 @@ ApiResult ObjectService::api_put_file(
         return fail("store_error", "short read of staging file");
       }
     }
-    auto r = commit_ec_put(store, placement, oid, buf.data(), buf.size(), attrs, replace_attrs,
-                           expected_crc32c.value_or(crc32c_val), layout);
+    PutPayload payload;
+    if (!prepare_put_payload(cfg_, ops_, buf.data(), buf.size(),
+                             expected_crc32c.value_or(crc32c_val), payload, err)) {
+      if (err == "crc32c mismatch") return fail("crc_mismatch", err);
+      return fail("store_error", err);
+    }
+    auto put_attrs = attrs;
+    if (payload.compressed) {
+      set_compression_attrs(put_attrs, kCompAlgoZstd, payload.logical_size, payload.logical_crc);
+    }
+    if (layout.is_ec()) {
+      auto r = commit_ec_put(store, placement, oid, payload.data, payload.len, put_attrs,
+                             replace_attrs, std::nullopt, layout);
+      if (r.ok) {
+        ops_.note_put(payload.logical_size);
+        if (payload.compressed) ops_.note_compress(payload.logical_size, payload.len);
+        if (r.info) {
+          r.info->size = payload.logical_size;
+          r.info->crc32c = payload.logical_crc;
+          r.info->crc32c_known = true;
+        }
+      }
+      return r;
+    }
+    apply_layout_attrs(put_attrs, layout);
+    PreparedVersion pv;
+    if (!store->prepare_put(oid, payload.data, payload.len, put_attrs, replace_attrs,
+                            std::nullopt, pv, err)) {
+      if (err == "crc32c mismatch") return fail("crc_mismatch", err);
+      return fail("store_error", err);
+    }
+    auto r = commit_prepared(store, placement, pv, payload.data, payload.len, put_attrs);
     if (r.ok) {
-      ops_.note_put(size);
+      ops_.note_put(payload.logical_size);
+      if (payload.compressed) ops_.note_compress(payload.logical_size, payload.len);
+      if (r.info) {
+        r.info->size = payload.logical_size;
+        r.info->crc32c = payload.logical_crc;
+        r.info->crc32c_known = true;
+      }
     }
     return r;
   }
+  if (want_compress && size > kMemCompressLimit) ops_.note_compress_skipped();
 
   auto put_attrs = attrs;
   apply_layout_attrs(put_attrs, layout);
@@ -1261,6 +1413,9 @@ ApiResult ObjectService::api_put_range(
     if (attrs_are_ec(tip_attrs)) {
       return fail("bad_request", "ranged put not supported for erasure-coded objects");
     }
+    if (attrs_are_compressed(tip_attrs)) {
+      return fail("bad_request", "ranged put not supported for compressed objects");
+    }
   }
 
   auto put_attrs = attrs;
@@ -1315,6 +1470,9 @@ ApiResult ObjectService::api_append(
     auto tip_attrs = store->list_attrs(oid, err);
     if (attrs_are_ec(tip_attrs)) {
       return fail("bad_request", "append not supported for erasure-coded objects");
+    }
+    if (attrs_are_compressed(tip_attrs)) {
+      return fail("bad_request", "append not supported for compressed objects");
     }
   }
 
@@ -1506,6 +1664,8 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     rec.info->seq = info->seq;
     rec.info->mtime_ms = info->mtime_ms;
     rec.info->ctime_ms = info->ctime_ms;
+    rec.attrs = attrs;
+    if (!decompress_api_result(rec, err)) return fail("store_error", err);
     if (!offset.has_value()) {
       note_get(rec);
       return rec;
@@ -1529,7 +1689,8 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   r.attrs = attrs;
   r.placement = placement;
 
-  if (!offset.has_value()) {
+  const bool compressed = attrs_are_compressed(attrs);
+  if (!offset.has_value() && !compressed) {
     constexpr std::uint64_t kStreamThreshold = 256u * 1024u;
     if (!info->inline_body && info->size >= kStreamThreshold) {
       if (auto path = store->fs_body_path(oid, seq, err)) {
@@ -1538,6 +1699,10 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
         return r;
       }
     }
+  }
+
+  // Compressed tips: always load full stored body, decompress, then slice.
+  if (compressed || !offset.has_value()) {
     r.data = store->get(oid, seq, err);
     if (!r.data) {
       if (info->is_delete) {
@@ -1547,9 +1712,22 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
       }
       return fail("not_found", err);
     }
+    if (!decompress_api_result(r, err)) return fail("store_error", err);
+    if (!offset.has_value()) {
+      note_get(r);
+      return r;
+    }
+    if (*offset >= r.data->size()) return fail("range_unsatisfiable", "range unsatisfiable");
+    std::uint64_t end = end_inclusive.value_or(r.data->size() - 1);
+    if (end >= r.data->size()) end = r.data->size() - 1;
+    if (end < *offset) return fail("range_unsatisfiable", "range unsatisfiable");
+    std::vector<std::uint8_t> slice(r.data->begin() + static_cast<std::ptrdiff_t>(*offset),
+                                    r.data->begin() + static_cast<std::ptrdiff_t>(end + 1));
+    r.data = std::move(slice);
     note_get(r);
     return r;
   }
+
   if (*offset >= info->size) return fail("range_unsatisfiable", "range unsatisfiable");
   std::uint64_t end = end_inclusive.value_or(info->size - 1);
   if (end >= info->size) end = info->size - 1;

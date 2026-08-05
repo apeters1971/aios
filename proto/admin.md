@@ -64,7 +64,7 @@ All of these require the normal AIOS HMAC Authorization header, except `GET /met
 | Path | Response |
 |------|----------|
 | `GET /admin/status` | Node identity, map epoch, membership, local `ops` |
-| `GET /admin/ops` | `{node_id, ops, ops_by_label}` |
+| `GET /admin/ops` | `{node_id, ops, ops_by_label, compression, io_frontends}` |
 | `GET /admin/config` | Effective config (`cluster_key` → `"***"`). Most changes need restart; `admin_metrics_public` can be toggled via `/admin/api/settings`. |
 | `GET /admin/cluster` | Local status + `admin_peers` (`node_id`, `http_addr`) for cluster scrape |
 | `GET /admin/transitions` | Configured storage-class `transition_rules` + intervals |
@@ -77,9 +77,24 @@ Process-local monotonic counters (see `src/metrics/ops_counters.hpp`), including
 
 - HTTP requests, put / put_range / append / get / head / del / list
 - put/get/append bytes
+- compress_puts / compress_skipped / compress_logical_bytes / compress_stored_bytes
 - lock_acquire, watch, pubsub_publish
 - gossip_rounds, repair_scanned / repaired / failed
 - errors (failed API results; excludes `not_primary` redirects)
+
+### Compression
+
+When whole-object compression is enabled (`compression: zstd` in config), `/admin/ops` also includes a top-level `compression` object:
+
+| Field | Meaning |
+|-------|---------|
+| `puts` | Objects stored compressed |
+| `skipped` | Puts that skipped compression (too small or no gain) |
+| `logical_bytes` | Uncompressed payload bytes of compressed puts |
+| `stored_bytes` | On-disk payload bytes after compression |
+| `ratio` | `logical_bytes / stored_bytes` (overall; `0` if nothing stored compressed) |
+
+Prometheus exposes the same counters plus gauge `aios_compress_ratio`.
 
 **Cluster-wide totals:** scrape `/admin/ops` (or use the console `cluster` command) across alive peers listed by `/admin/cluster`. Gossip does not carry counters.
 

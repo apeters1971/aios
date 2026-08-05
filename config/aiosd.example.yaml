@@ -62,6 +62,11 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # max_versions: 16            # retain newest N versions per oid
 # clone_required: true        # FS COW via FICLONE/clonefile; false allows full-copy fallback
 # max_object_bytes: 68719476736  # HTTP streaming PUT cap (default 64 GiB)
+# Whole-object PUT compression (zstd requires libzstd at build time).
+# Range/append rejected on compressed tips; VBD stays uncompressed.
+# compression: none            # none | zstd
+# compression_level: 3         # zstd 1..22
+# compression_min_bytes: 256   # skip smaller objects
 # status_file: "/tmp/aios-status.json"
 
 # Admin console + Prometheus (only on nodes that should expose ops/config):

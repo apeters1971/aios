@@ -210,6 +210,10 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["admin"]) cfg.admin = root["admin"].as<bool>();
     if (root["admin_metrics_public"])
       cfg.admin_metrics_public = root["admin_metrics_public"].as<bool>();
+    if (root["compression"]) cfg.compression = root["compression"].as<std::string>();
+    if (root["compression_level"]) cfg.compression_level = root["compression_level"].as<int>();
+    if (root["compression_min_bytes"])
+      cfg.compression_min_bytes = root["compression_min_bytes"].as<std::uint64_t>();
     if (root["peers"]) {
       cfg.peers.clear();
       for (const auto& p : root["peers"]) {
@@ -394,6 +398,18 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       cfg.admin_metrics_public = true;
       continue;
     }
+    if (arg == "--compression") {
+      const char* v = need("--compression");
+      if (!v) return false;
+      cfg.compression = v;
+      continue;
+    }
+    if (arg == "--compression-level") {
+      const char* v = need("--compression-level");
+      if (!v) return false;
+      cfg.compression_level = std::stoi(v);
+      continue;
+    }
     err = "unknown argument: " + arg;
     return false;
   }
@@ -463,6 +479,22 @@ bool normalize_config(Config& cfg, std::string& err) {
     }
     if (cfg.s3_access_key.empty()) {
       err = "s3_access_key must be non-empty when s3_listen is set";
+      return false;
+    }
+  }
+  cfg.compression = lower_copy(cfg.compression);
+  if (cfg.compression.empty()) cfg.compression = "none";
+  if (cfg.compression != "none" && cfg.compression != "zstd") {
+    err = "compression must be 'none' or 'zstd'";
+    return false;
+  }
+  if (cfg.compression == "zstd") {
+#if !defined(AIOS_HAVE_ZSTD) || !AIOS_HAVE_ZSTD
+    err = "compression=zstd requires libzstd at build time";
+    return false;
+#endif
+    if (cfg.compression_level < 1 || cfg.compression_level > 22) {
+      err = "compression_level must be 1..22";
       return false;
     }
   }

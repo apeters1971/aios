@@ -378,12 +378,32 @@ void print_ops_table(const nlohmann::json& ops, const std::string& label) {
   static const char* keys[] = {
       "http_requests", "put",           "put_range",      "append",         "get",
       "head",          "del",           "list",           "put_bytes",      "get_bytes",
-      "append_bytes",  "lock_acquire",  "watch",          "pubsub_publish", "gossip_rounds",
-      "repair_scanned","repair_repaired","repair_failed", "errors"};
+      "append_bytes",  "compress_puts", "compress_skipped","compress_logical_bytes",
+      "compress_stored_bytes", "lock_acquire",  "watch",          "pubsub_publish",
+      "gossip_rounds", "repair_scanned","repair_repaired","repair_failed", "errors"};
   for (const char* k : keys) {
     if (!ops.contains(k)) continue;
-    std::cout << "  " << std::left << std::setw(18) << k << " " << ops[k] << "\n";
+    std::cout << "  " << std::left << std::setw(22) << k << " " << ops[k] << "\n";
   }
+}
+
+void print_compression(const nlohmann::json& j) {
+  if (!j.contains("compression") || !j["compression"].is_object()) return;
+  const auto& c = j["compression"];
+  std::cout << "compression:\n";
+  std::cout << "  " << std::left << std::setw(22) << "puts" << " " << c.value("puts", 0) << "\n";
+  std::cout << "  " << std::left << std::setw(22) << "skipped" << " " << c.value("skipped", 0)
+            << "\n";
+  std::cout << "  " << std::left << std::setw(22) << "logical_bytes" << " "
+            << c.value("logical_bytes", 0) << "\n";
+  std::cout << "  " << std::left << std::setw(22) << "stored_bytes" << " "
+            << c.value("stored_bytes", 0) << "\n";
+  const double ratio = c.value("ratio", 0.0);
+  std::cout << "  " << std::left << std::setw(22) << "ratio" << " ";
+  if (c.value("stored_bytes", 0ull) > 0)
+    std::cout << std::fixed << std::setprecision(2) << ratio << "x\n";
+  else
+    std::cout << "—\n";
 }
 
 int cmd_admin_status(std::string host, std::string port, const std::string& key) {
@@ -427,6 +447,7 @@ int cmd_admin_ops(std::string host, std::string port, const std::string& key) {
     auto j = nlohmann::json::parse(r.body);
     print_ops_table(j.value("ops", nlohmann::json::object()),
                     "ops (" + j.value("node_id", std::string("?")) + "):");
+    print_compression(j);
     if (j.contains("ops_by_label") && j["ops_by_label"].is_object()) {
       for (auto it = j["ops_by_label"].begin(); it != j["ops_by_label"].end(); ++it) {
         print_ops_table(it.value(), "ops_by_label[" + it.key() + "]:");

@@ -72,6 +72,31 @@ if(AIOS_WITH_ISAL)
   endif()
 endif()
 
+# Optional ZSTD for whole-object PUT compression.
+option(AIOS_WITH_ZSTD "Enable ZSTD object compression when libzstd is found" ON)
+set(AIOS_HAVE_ZSTD OFF)
+if(AIOS_WITH_ZSTD)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(ZSTD QUIET IMPORTED_TARGET libzstd)
+  endif()
+  if(TARGET PkgConfig::ZSTD)
+    set(AIOS_HAVE_ZSTD ON)
+    message(STATUS "ZSTD: enabled (pkg-config)")
+  else()
+    find_path(ZSTD_INCLUDE_DIR NAMES zstd.h
+      PATHS /opt/homebrew/include /usr/local/include /usr/include)
+    find_library(ZSTD_LIBRARY NAMES zstd
+      PATHS /opt/homebrew/lib /usr/local/lib /usr/lib)
+    if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+      set(AIOS_HAVE_ZSTD ON)
+      message(STATUS "ZSTD: enabled (${ZSTD_LIBRARY})")
+    else()
+      message(STATUS "ZSTD: not found (compression=zstd disabled)")
+    endif()
+  endif()
+endif()
+
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(aios_core STATIC
@@ -88,6 +113,7 @@ add_library(aios_core STATIC
   src/util/auth.cpp
   src/util/base64.cpp
   src/util/crc32c.cpp
+  src/util/compression.cpp
   src/store/object_store.cpp
   src/store/fs_clone.cpp
   src/store/local_stores.cpp
@@ -135,6 +161,15 @@ if(AIOS_HAVE_ISAL)
   else()
     target_include_directories(aios_core PUBLIC ${ISAL_INCLUDE_DIR})
     target_link_libraries(aios_core PUBLIC ${ISAL_LIBRARY})
+  endif()
+endif()
+if(AIOS_HAVE_ZSTD)
+  target_compile_definitions(aios_core PUBLIC AIOS_HAVE_ZSTD=1)
+  if(TARGET PkgConfig::ZSTD)
+    target_link_libraries(aios_core PUBLIC PkgConfig::ZSTD)
+  else()
+    target_include_directories(aios_core PUBLIC ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(aios_core PUBLIC ${ZSTD_LIBRARY})
   endif()
 endif()
 
@@ -273,6 +308,7 @@ add_executable(aios_tests
   tests/test_quota.cpp
   tests/test_qos.cpp
   tests/test_frontend_io.cpp
+  tests/test_compression.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
   tests/test_http_ec.cpp

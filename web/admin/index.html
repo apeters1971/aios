@@ -49,6 +49,9 @@
       <section id="tab-overview" class="panel">
         <h2>Overview</h2>
         <div id="overview-cards" class="cards"></div>
+        <h3>Compression</h3>
+        <p class="note muted">Whole-object ZSTD puts: overall ratio is logical÷stored bytes (higher means more savings).</p>
+        <div id="compression-stats" class="table-wrap"></div>
         <h3>IO by frontend</h3>
         <p class="note muted">Logical IO for S3 and FS (posix); VBD from aiosvd device stats when the module is loaded. Object OPS under the same labels are chunk-level.</p>
         <div id="io-frontends" class="table-wrap"></div>

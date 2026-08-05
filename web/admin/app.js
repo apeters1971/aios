@@ -85,6 +85,31 @@
       .join("");
     document.getElementById("ops-table").innerHTML =
       `<table><thead><tr><th>Counter</th><th>Value</th></tr></thead><tbody>${rows}</tbody></table>`;
+    const comp = (opsPayload && opsPayload.compression) || {};
+    const ratio = typeof comp.ratio === "number" ? comp.ratio : 0;
+    const ratioTxt =
+      comp.stored_bytes > 0 ? `${ratio.toFixed(2)}×` : "—";
+    document.getElementById("compression-stats").innerHTML =
+      `<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+        <tr><td>Overall ratio (logical÷stored)</td><td>${ratioTxt}</td></tr>
+        <tr><td>Compressed puts</td><td>${fmt(comp.puts)}</td></tr>
+        <tr><td>Skipped</td><td>${fmt(comp.skipped)}</td></tr>
+        <tr><td>Logical bytes</td><td>${fmt(comp.logical_bytes)}</td></tr>
+        <tr><td>Stored bytes</td><td>${fmt(comp.stored_bytes)}</td></tr>
+      </tbody></table>`;
+    const cardsEl = document.getElementById("overview-cards");
+    if (cardsEl && comp.stored_bytes > 0) {
+      const extra = `<div class="card"><span class="label">Compression ratio</span><div class="value">${ratioTxt}</div></div>`;
+      if (!cardsEl.innerHTML.includes("Compression ratio")) {
+        cardsEl.insertAdjacentHTML("beforeend", extra);
+      } else {
+        cardsEl.querySelectorAll(".card").forEach((c) => {
+          if (c.querySelector(".label")?.textContent === "Compression ratio") {
+            c.querySelector(".value").textContent = ratioTxt;
+          }
+        });
+      }
+    }
     const fe = (opsPayload && opsPayload.io_frontends && opsPayload.io_frontends.logical) || {};
     const order = ["s3", "fs", "vbd"];
     const keys = order.concat(Object.keys(fe).filter((k) => !order.includes(k)));

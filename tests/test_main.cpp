@@ -33,6 +33,7 @@ int test_s3_iam();
 int test_quota();
 int test_qos();
 int test_frontend_io();
+int test_compression();
 
 int main() {
   int failures = 0;
@@ -58,6 +59,7 @@ int main() {
   failures += test_quota();
   failures += test_qos();
   failures += test_frontend_io();
+  failures += test_compression();
   failures += test_http_api();
   failures += test_http_wire();
   failures += test_http_ec();
