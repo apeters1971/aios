@@ -36,6 +36,7 @@ int test_frontend_io();
 int test_compression();
 int test_cuobject_s3();
 int test_s3_range();
+int test_xrd_cred();
 
 int main() {
   int failures = 0;
@@ -52,6 +53,7 @@ int main() {
   failures += test_cluster_map();
   failures += test_placement();
   failures += test_posix_fs();
+  failures += test_xrd_cred();
   failures += test_object_rpc();
   failures += test_object_rpc_advanced();
   failures += test_object_service_advanced();

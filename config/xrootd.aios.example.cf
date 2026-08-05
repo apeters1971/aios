@@ -1,0 +1,21 @@
+# Example XRootD config using the AIOS OSS plugin (libXrdAios.so).
+# Requires a running aiosd HTTP endpoint and a sec protocol that sets
+# XrdSecEntity.name to a local passwd account.
+
+xrd.port 1094
+all.export /
+all.adminpath /tmp/xrd-aios-admin
+all.pidpath /tmp/xrd-aios-pid
+
+# Stock OFS + AIOS storage
+ofs.osslib libXrdAios.so
+
+# AIOS mount (also accepted as ofs.osslib … endpoint=… cluster_key=…)
+aios.endpoint 127.0.0.1:7480
+aios.cluster_key changeme
+aios.volume default
+
+# Example: unix protocol maps the client login name into entity.name
+# (must exist in the server's local passwd database).
+sec.protocol unix
+sec.protbind * only unix

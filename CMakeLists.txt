@@ -314,6 +314,93 @@ if(AIOS_HAVE_FUSE)
   install(TARGETS aios-fuse RUNTIME DESTINATION bin)
 endif()
 
+# Optional XRootD OSS plugin (libXrdAios) over libaios_posix.
+option(AIOS_WITH_XROOTD "Build XrdAios OSS plugin when XRootD is available" ON)
+set(AIOS_HAVE_XROOTD OFF)
+if(AIOS_WITH_XROOTD)
+  if(DEFINED ENV{XRootD_ROOT} AND NOT XRootD_ROOT)
+    set(XRootD_ROOT "$ENV{XRootD_ROOT}")
+  endif()
+  if(DEFINED ENV{XROOTD_ROOT} AND NOT XRootD_ROOT)
+    set(XRootD_ROOT "$ENV{XROOTD_ROOT}")
+  endif()
+  find_path(XROOTD_INCLUDE_DIR NAMES XrdOss/XrdOss.hh
+    HINTS
+      ${XRootD_ROOT}/include/xrootd
+      ${XRootD_ROOT}/include
+      ${XRootD_ROOT}/src
+      ${CMAKE_SOURCE_DIR}/../xrootd/src
+      /usr/include/xrootd
+      /usr/local/include/xrootd
+      /opt/homebrew/include/xrootd
+  )
+  find_path(XROOTD_VERSION_INCLUDE_DIR NAMES XrdVersion.hh
+    HINTS
+      ${XRootD_ROOT}/include/xrootd
+      ${XRootD_ROOT}/include
+      ${XRootD_ROOT}/build/src
+      ${CMAKE_SOURCE_DIR}/../xrootd/build/src
+      ${XROOTD_INCLUDE_DIR}
+      /usr/include/xrootd
+      /usr/local/include/xrootd
+  )
+  find_library(XROOTD_UTILS_LIBRARY NAMES XrdUtils
+    HINTS
+      ${XRootD_ROOT}/lib64
+      ${XRootD_ROOT}/lib
+      ${XRootD_ROOT}/build/lib
+      ${CMAKE_SOURCE_DIR}/../xrootd/build/lib
+      /usr/lib64
+      /usr/lib
+      /usr/local/lib
+      /opt/homebrew/lib
+  )
+  find_library(XROOTD_SERVER_LIBRARY NAMES XrdServer
+    HINTS
+      ${XRootD_ROOT}/lib64
+      ${XRootD_ROOT}/lib
+      ${XRootD_ROOT}/build/lib
+      ${CMAKE_SOURCE_DIR}/../xrootd/build/lib
+      /usr/lib64
+      /usr/lib
+      /usr/local/lib
+      /opt/homebrew/lib
+  )
+  if(XROOTD_INCLUDE_DIR AND XROOTD_VERSION_INCLUDE_DIR AND XROOTD_UTILS_LIBRARY
+     AND XROOTD_SERVER_LIBRARY)
+    set(AIOS_HAVE_XROOTD ON)
+    message(STATUS "XRootD: enabled (${XROOTD_UTILS_LIBRARY})")
+  else()
+    message(STATUS "XRootD: not found (libXrdAios disabled; set XRootD_ROOT)")
+  endif()
+endif()
+
+# Always build PWD name→uid/gid helper (used by plugin + unit tests).
+add_library(aios_xrd_cred STATIC src/xrd/aios_xrd_cred.cpp)
+target_include_directories(aios_xrd_cred PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if(AIOS_HAVE_XROOTD)
+  add_library(XrdAios MODULE
+    src/xrd/XrdAiosOss.cpp
+    src/xrd/XrdAiosDF.cpp
+    src/xrd/XrdAiosUtil.cpp
+  )
+  target_include_directories(XrdAios PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${XROOTD_INCLUDE_DIR}
+    ${XROOTD_VERSION_INCLUDE_DIR}
+  )
+  target_link_libraries(XrdAios PRIVATE
+    aios_posix aios_xrd_cred ${XROOTD_UTILS_LIBRARY} ${XROOTD_SERVER_LIBRARY})
+  set_target_properties(XrdAios PROPERTIES
+    PREFIX "lib"
+    SUFFIX ".so"
+    OUTPUT_NAME "XrdAios"
+  )
+  install(TARGETS XrdAios LIBRARY DESTINATION lib)
+  install(FILES config/xrootd.aios.example.cf DESTINATION share/aios)
+endif()
+
 # Userspace bridge for the AlmaLinux 9 aiosfs kernel prototype (kernel/aiosfs).
 option(AIOS_WITH_KBRIDGE "Build aios-kbridge userspace daemon for aiosfs.ko" ON)
 if(AIOS_WITH_KBRIDGE)
@@ -371,9 +458,10 @@ add_executable(aios_tests
   tests/test_append.cpp
   tests/test_admin.cpp
   tests/test_posix_fs.cpp
+  tests/test_xrd_cred.cpp
   tests/test_main.cpp
 )
-target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3)
+target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred)
 add_test(NAME aios_tests COMMAND aios_tests)
 
 install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION bin)

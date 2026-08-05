@@ -68,7 +68,7 @@ Same-directory rename remains a single changelog `Rename` op. Commit still has t
 
 ## Caller credentials and mode checks
 
-Gateways (FUSE, S3, future XRootD OFS) set a **thread-scoped caller** before ops:
+Gateways (FUSE, S3, XRootD OSS) set a **thread-scoped caller** before ops:
 
 ```c
 typedef struct aios_posix_cred { uint32_t uid; uint32_t gid; } aios_posix_cred;
@@ -86,7 +86,7 @@ int aios_posix_access(aios_posix_fs* fs, uint64_t ino, int amode);  /* R_OK/W_OK
 - Reads/writes/truncates require R/W vs mode; directory mutations need W+X on the parent; sticky bit (`S_ISVTX`) restricts unlink/rename of others’ entries; `chmod` is owner/root, `chown` is root-only.
 - Cluster object HMAC auth is unchanged (mount = trusted client). Callers are an application-layer principal for POSIX mode bits.
 
-**FUSE** sets the caller from `fuse_get_context()->uid/gid` on each op. **S3** sets IAM `uid`/`gid`, or `0:0` for the root access key. The S3 volume root is mode `1777` (sticky) so IAM principals can create buckets they own; multipart staging is `0777`.
+**FUSE** sets the caller from `fuse_get_context()->uid/gid` on each op. **S3** sets IAM `uid`/`gid`, or `0:0` for the root access key. The S3 volume root is mode `1777` (sticky) so IAM principals can create buckets they own; multipart staging is `0777`. **XRootD** (`libXrdAios` OSS under stock XrdOfs) maps `XrdSecEntity::name` through the local passwd DB (`getpwnam_r`) to uid/gid — see [`xrd_oss.md`](xrd_oss.md).
 
 ## C ABI
 
