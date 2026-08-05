@@ -20,7 +20,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
 ---
 
@@ -395,6 +395,8 @@ export AWS_SECRET_ACCESS_KEY='…secret from create…'
 aws --endpoint-url http://127.0.0.1:7481 s3 ls s3://photos/
 ```
 
+Optional GPUDirect / cuObject RDMA payload offload (`cuobject_listen`, `x-amz-rdma-token`): [`proto/cuobject.md`](proto/cuobject.md). Example client: `aios-cuobj-s3`.
+
 Details: [`proto/s3.md`](proto/s3.md).
 
 ---
@@ -631,6 +633,7 @@ AIOS_LOG=debug|info|warn|error   # default: info
 |-----|-------|
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
 | [`proto/s3.md`](proto/s3.md) | S3-compatible API (FS-backed, SigV4) |
+| [`proto/cuobject.md`](proto/cuobject.md) | GPUDirect / cuObject S3 RDMA offload |
 | [`proto/admin.md`](proto/admin.md) | Admin web UI, OPS counters, Prometheus `/metrics` |
 | [`proto/quota.md`](proto/quota.md) | Soft uid/gid + project (subtree) quotas |
 | [`proto/qos.md`](proto/qos.md) | Soft IOPS / bandwidth QoS (FUSE + S3) |

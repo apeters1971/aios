@@ -1,5 +1,7 @@
 #include "http/s3_server.hpp"
 
+#include "cuobject/cuobject_endpoint.hpp"
+#include "cuobject/cuobject_s3_xfer.hpp"
 #include "http/s3_auth.hpp"
 #include "posix/aios_posix.h"
 #include "util/auth.hpp"
@@ -147,7 +149,15 @@ void write_http(tcp::socket& sock, int status, const std::string& reason,
                 const std::string& body) {
   std::ostringstream oss;
   oss << "HTTP/1.1 " << status << ' ' << reason << "\r\n";
-  oss << "Content-Length: " << body.size() << "\r\n";
+  bool has_cl = false;
+  for (const auto& [k, v] : headers) {
+    if (lower(k) == "content-length") {
+      has_cl = true;
+      break;
+    }
+  }
+  // Allow callers (RDMA GET) to advertise logical size while sending an empty TCP body.
+  if (!has_cl) oss << "Content-Length: " << body.size() << "\r\n";
   oss << "Connection: close\r\n";
   for (const auto& [k, v] : headers) oss << k << ": " << v << "\r\n";
   oss << "\r\n";
@@ -404,11 +414,12 @@ std::string s3_loopback_http_endpoint(const std::string& http_listen) {
 }
 
 S3Server::S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_http_endpoint,
-                   std::shared_ptr<S3IamStore> iam)
+                   std::shared_ptr<S3IamStore> iam, std::shared_ptr<CuObjectEndpoint> cuobject)
     : ioc_(ioc),
       cfg_(std::move(cfg)),
       posix_endpoint_(std::move(posix_http_endpoint)),
       iam_(std::move(iam)),
+      cuobject_(cuobject ? std::move(cuobject) : make_cuobject_endpoint(cfg_)),
       acceptor_(ioc) {}
 
 S3Server::~S3Server() {
@@ -446,7 +457,11 @@ void S3Server::start() {
   acceptor_.bind(eps.begin()->endpoint());
   acceptor_.listen();
   AIOS_LOG_INFO("S3 API listening on ", cfg_.s3_listen, " volume=", cfg_.s3_volume,
-                " (posix via ", posix_endpoint_, ")");
+                " (posix via ", posix_endpoint_, ")",
+                cuobject_ && cuobject_->available()
+                    ? (cfg_.cuobject_listen.empty() ? " cuobject=on"
+                                                   : (" cuobject=" + cfg_.cuobject_listen))
+                    : " cuobject=off");
   do_accept();
 }
 
@@ -501,25 +516,34 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     path = url_decode(path);
     auto qmap = parse_query(query);
 
-    // Read body
+    // Read body. RDMA PUT uses Content-Length as object size with an empty TCP body.
+    const std::string rdma_token = header_get(headers, kAmzRdmaToken);
     std::size_t content_len = 0;
     if (auto cl = header_get(headers, "content-length"); !cl.empty()) {
       content_len = static_cast<std::size_t>(std::stoull(cl));
     }
+    const bool rdma_put =
+        method == "PUT" && !rdma_token.empty() && qmap.find("uploadId") == qmap.end();
+    std::size_t rdma_object_size = 0;
     std::string body;
-    body.resize(content_len);
-    std::size_t already = buf.size();
-    std::size_t got = 0;
-    if (already && content_len) {
-      got = std::min(already, content_len);
-      is.read(body.data(), static_cast<std::streamsize>(got));
+    if (rdma_put) {
+      rdma_object_size = content_len;
+      // Do not wait for TCP payload bytes.
+    } else {
+      body.resize(content_len);
+      std::size_t already = buf.size();
+      std::size_t got = 0;
+      if (already && content_len) {
+        got = std::min(already, content_len);
+        is.read(body.data(), static_cast<std::streamsize>(got));
+      }
+      while (got < content_len) {
+        auto n = sock->read_some(boost::asio::buffer(body.data() + got, content_len - got), ec);
+        if (ec) break;
+        got += n;
+      }
+      body.resize(got);
     }
-    while (got < content_len) {
-      auto n = sock->read_some(boost::asio::buffer(body.data() + got, content_len - got), ec);
-      if (ec) break;
-      got += n;
-    }
-    body.resize(got);
 
     std::string payload_hash = header_get(headers, "x-amz-content-sha256");
     if (payload_hash.empty()) {
@@ -1031,9 +1055,36 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 500, "InternalError", "create failed", path);
         return;
       }
+
+      std::string put_data;
+      std::string rdma_reply;
+      if (rdma_put) {
+        put_data.resize(rdma_object_size);
+        std::string rdma_err;
+        if (!s3_try_rdma_put(cuobject_.get(), bucket + "/" + key, rdma_token, put_data.data(),
+                             put_data.size(), rdma_reply, rdma_err)) {
+          int code = 500;
+          const char* ename = "InternalError";
+          if (!cuobject_ || !cuobject_->available()) {
+            code = 501;
+            ename = "NotImplemented";
+          } else if (rdma_object_size == 0 || rdma_object_size > kCuObjectMaxTransferBytes) {
+            code = 400;
+            ename = "InvalidArgument";
+          }
+          write_s3_error(*sock, code, ename,
+                         "RDMA PUT failed: " + rdma_err + "; retry without " +
+                             std::string(kAmzRdmaToken),
+                         path);
+          return;
+        }
+      } else {
+        put_data = std::move(body);
+      }
+
       aios_posix_truncate(fs_, ino, 0);
       size_t wrote = 0;
-      err = aios_posix_write(fs_, ino, 0, body.data(), body.size(), &wrote);
+      err = aios_posix_write(fs_, ino, 0, put_data.data(), put_data.size(), &wrote);
       if (err) {
         if (!write_posix_err(*sock, err, path))
           write_s3_error(*sock, 500, "InternalError", "write failed", path);
@@ -1048,8 +1099,10 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
           aios_posix_setxattr(fs_, ino, xn.c_str(), hv.data(), hv.size(), 0);
         }
       }
-      auto etag = md5_hex(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
-      write_http(*sock, 200, "OK", {{"ETag", "\"" + etag + "\""}}, {});
+      auto etag = md5_hex(reinterpret_cast<const std::uint8_t*>(put_data.data()), put_data.size());
+      std::unordered_map<std::string, std::string> rh{{"ETag", "\"" + etag + "\""}};
+      if (!rdma_reply.empty()) rh[kAmzRdmaReply] = rdma_reply;
+      write_http(*sock, 200, "OK", rh, {});
       return;
     }
 
@@ -1123,6 +1176,21 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         out.resize(got);
       }
+
+      // Whole-object RDMA GET (no Range): push host buffer to client GPU/system memory.
+      if (s3_want_rdma_get(rdma_token, ranged, method == "GET")) {
+        std::string rdma_reply;
+        std::string rdma_err;
+        if (s3_try_rdma_get(cuobject_.get(), bucket + "/" + key, rdma_token, out.data(), out.size(),
+                            rdma_reply, rdma_err)) {
+          rh["Content-Length"] = std::to_string(out.size());
+          rh[kAmzRdmaReply] = rdma_reply;
+          write_http(*sock, 200, "OK", rh, {});
+          return;
+        }
+        AIOS_LOG_WARN("S3 RDMA GET failed (", rdma_err, "); falling back to TCP body");
+      }
+
       if (ranged) {
         rh["Content-Range"] = "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" +
                               std::to_string(st.size);

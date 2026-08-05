@@ -78,6 +78,8 @@ struct Config {
   std::string s3_volume{"s3"};
   // AWS SigV4 access key id; secret is always cluster_key.
   std::string s3_access_key{"aios"};
+  // cuObjServer RDMA listen (IP:port). Empty disables S3 GPUDirect offload.
+  std::string cuobject_listen;
   // Body durability for ranged FS puts: none | data | full (informational; store fsyncs).
   std::string http_body_sync{"data"};
   // Retain newest N object versions per oid (default 16).

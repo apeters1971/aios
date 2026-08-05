@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "cuobject/cuobject_endpoint.hpp"
 #include "http/s3_iam.hpp"
 
 #include <boost/asio.hpp>
@@ -17,13 +18,18 @@ class S3Server {
  public:
   // posix_http_endpoint: HOST:PORT for aios_posix_mount (usually 127.0.0.1:<http port>).
   S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_http_endpoint,
-           std::shared_ptr<S3IamStore> iam = nullptr);
+           std::shared_ptr<S3IamStore> iam = nullptr,
+           std::shared_ptr<CuObjectEndpoint> cuobject = nullptr);
   ~S3Server();
 
   S3Server(const S3Server&) = delete;
   S3Server& operator=(const S3Server&) = delete;
 
   void start();
+
+  // Tests: replace RDMA endpoint after construction (before or after start).
+  void set_cuobject_endpoint(std::shared_ptr<CuObjectEndpoint> ep) { cuobject_ = std::move(ep); }
+  CuObjectEndpoint* cuobject_endpoint() const { return cuobject_.get(); }
 
  private:
   void do_accept();
@@ -33,6 +39,7 @@ class S3Server {
   Config cfg_;
   std::string posix_endpoint_;
   std::shared_ptr<S3IamStore> iam_;
+  std::shared_ptr<CuObjectEndpoint> cuobject_;
   aios_posix_fs* fs_{nullptr};
   boost::asio::ip::tcp::acceptor acceptor_;
 };

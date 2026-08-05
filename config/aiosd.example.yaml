@@ -56,6 +56,7 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # s3_listen: "0.0.0.0:7481"
 # s3_volume: s3                 # POSIX volume; buckets = top-level directories
 # s3_access_key: aios           # global SigV4 access key; secret = cluster_key
+# cuobject_listen: "0.0.0.0:18515"  # cuObjServer RDMA (needs AIOS_HAVE_CUOBJECT); see proto/cuobject.md
 # Per-bucket IAM keys (opaque id → uid/gid + buckets): admin UI / aios admin s3-cred
 # (stored as object s3iam/<s3_volume>)
 # http_body_sync: data

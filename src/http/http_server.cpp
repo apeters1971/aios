@@ -539,6 +539,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"s3_listen", c.s3_listen},
       {"s3_volume", c.s3_volume},
       {"s3_access_key", c.s3_access_key},
+      {"cuobject_listen", c.cuobject_listen},
       {"compression", c.compression},
       {"compression_level", c.compression_level},
       {"compression_min_bytes", c.compression_min_bytes},

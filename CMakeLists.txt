@@ -72,6 +72,31 @@ if(AIOS_WITH_ISAL)
   endif()
 endif()
 
+# Optional NVIDIA cuObjServer for S3 GPUDirect / RDMA offload.
+option(AIOS_WITH_CUOBJECT "Enable cuObjServer when the SDK is found" ON)
+set(AIOS_HAVE_CUOBJECT OFF)
+if(AIOS_WITH_CUOBJECT)
+  if(DEFINED ENV{CUOBJECT_ROOT} AND NOT CUOBJECT_ROOT)
+    set(CUOBJECT_ROOT "$ENV{CUOBJECT_ROOT}")
+  endif()
+  find_path(CUOBJECT_INCLUDE_DIR
+    NAMES cuObjServer.h cuobject/cuObjServer.h
+    PATHS ${CUOBJECT_ROOT} ${CUOBJECT_ROOT}/include
+          /usr/local/include /usr/include
+    PATH_SUFFIXES include)
+  find_library(CUOBJECT_LIBRARY
+    NAMES cuobjserver cuObjServer
+    PATHS ${CUOBJECT_ROOT} ${CUOBJECT_ROOT}/lib ${CUOBJECT_ROOT}/lib64
+          /usr/local/lib /usr/lib
+    PATH_SUFFIXES lib lib64)
+  if(CUOBJECT_INCLUDE_DIR AND CUOBJECT_LIBRARY)
+    set(AIOS_HAVE_CUOBJECT ON)
+    message(STATUS "cuObjServer: enabled (${CUOBJECT_LIBRARY})")
+  else()
+    message(STATUS "cuObjServer: not found (S3 RDMA offload stub/null only)")
+  endif()
+endif()
+
 # Optional ZSTD for whole-object PUT compression.
 option(AIOS_WITH_ZSTD "Enable ZSTD object compression when libzstd is found" ON)
 set(AIOS_HAVE_ZSTD OFF)
@@ -207,6 +232,22 @@ target_include_directories(aios_posix PUBLIC
 )
 target_link_libraries(aios_posix PUBLIC aios_client)
 
+# cuObject / GPUDirect bridge (null+stub always; NVIDIA when AIOS_HAVE_CUOBJECT).
+add_library(aios_cuobject STATIC
+  src/cuobject/cuobject_null.cpp
+  src/cuobject/cuobject_stub.cpp
+  src/cuobject/cuobject_nvidia.cpp
+)
+target_include_directories(aios_cuobject PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(aios_cuobject PUBLIC aios_core)
+if(AIOS_HAVE_CUOBJECT)
+  target_compile_definitions(aios_cuobject PUBLIC AIOS_HAVE_CUOBJECT=1)
+  target_include_directories(aios_cuobject PUBLIC ${CUOBJECT_INCLUDE_DIR})
+  target_link_libraries(aios_cuobject PUBLIC ${CUOBJECT_LIBRARY})
+endif()
+
 # S3-compatible front-end (FS-backed). Separate from aios_core to avoid link cycle with aios_posix.
 add_library(aios_s3 STATIC
   src/http/s3_server.cpp
@@ -214,7 +255,7 @@ add_library(aios_s3 STATIC
 target_include_directories(aios_s3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(aios_s3 PUBLIC aios_core aios_posix)
+target_link_libraries(aios_s3 PUBLIC aios_core aios_posix aios_cuobject)
 
 # Optional FUSE3 mount helper.
 option(AIOS_WITH_FUSE "Build aios-fuse when libfuse3 is available" ON)
@@ -252,6 +293,10 @@ target_link_libraries(aios-store-bench PRIVATE aios_core)
 
 add_executable(aios tools/aios.cpp)
 target_link_libraries(aios PRIVATE aios_core)
+
+add_executable(aios-cuobj-s3 tools/aios_cuobj_s3.cpp)
+target_link_libraries(aios-cuobj-s3 PRIVATE aios_core aios_cuobject)
+install(TARGETS aios-cuobj-s3 RUNTIME DESTINATION bin)
 
 if(AIOS_HAVE_FUSE)
   add_executable(aios-fuse
@@ -309,6 +354,7 @@ add_executable(aios_tests
   tests/test_qos.cpp
   tests/test_frontend_io.cpp
   tests/test_compression.cpp
+  tests/test_cuobject_s3.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
   tests/test_http_ec.cpp

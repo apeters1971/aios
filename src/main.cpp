@@ -78,7 +78,8 @@ int main(int argc, char** argv) {
       if (endpoint.empty()) {
         throw std::runtime_error("cannot derive loopback HTTP endpoint for S3 posix mount");
       }
-      s3 = std::make_unique<S3Server>(ioc, cfg, endpoint, engine.s3_iam());
+      s3 = std::make_unique<S3Server>(ioc, cfg, endpoint, engine.s3_iam(),
+                                      make_cuobject_endpoint(cfg));
       s3->start();
     }
 

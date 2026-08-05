@@ -201,6 +201,7 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["s3_listen"]) cfg.s3_listen = root["s3_listen"].as<std::string>();
     if (root["s3_volume"]) cfg.s3_volume = root["s3_volume"].as<std::string>();
     if (root["s3_access_key"]) cfg.s3_access_key = root["s3_access_key"].as<std::string>();
+    if (root["cuobject_listen"]) cfg.cuobject_listen = root["cuobject_listen"].as<std::string>();
     if (root["http_body_sync"])
       cfg.http_body_sync = root["http_body_sync"].as<std::string>();
     if (root["max_versions"]) cfg.max_versions = root["max_versions"].as<int>();
@@ -388,6 +389,12 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       const char* v = need("--s3-access-key");
       if (!v) return false;
       cfg.s3_access_key = v;
+      continue;
+    }
+    if (arg == "--cuobject-listen") {
+      const char* v = need("--cuobject-listen");
+      if (!v) return false;
+      cfg.cuobject_listen = v;
       continue;
     }
     if (arg == "--admin") {

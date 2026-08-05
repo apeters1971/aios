@@ -34,6 +34,7 @@ int test_quota();
 int test_qos();
 int test_frontend_io();
 int test_compression();
+int test_cuobject_s3();
 
 int main() {
   int failures = 0;
@@ -60,6 +61,7 @@ int main() {
   failures += test_qos();
   failures += test_frontend_io();
   failures += test_compression();
+  failures += test_cuobject_s3();
   failures += test_http_api();
   failures += test_http_wire();
   failures += test_http_ec();
