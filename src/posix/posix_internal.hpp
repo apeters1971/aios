@@ -5,11 +5,14 @@
 #include "posix/qos_controller.hpp"
 #include "posix/quota_ledger.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aios {
@@ -27,12 +30,18 @@ struct InodeMeta {
   uint32_t uid{0};
   uint32_t gid{0};
   uint32_t project_id{0};  // 0 = volume domain; inherited from parent on create
+  uint64_t parent_ino{0};  // primary parent directory; 0 for root
   uint64_t size{0};
   uint64_t atime_ns{0};
   uint64_t mtime_ns{0};
   uint64_t ctime_ns{0};
   uint64_t stripe_unit{kDefaultStripeUnit};
   uint32_t stripe_width{kDefaultStripeWidth};
+  // Lazy recursive accounting (directories); recomputed on flush.
+  uint64_t rbytes{0};
+  uint64_t rfiles{0};
+  uint64_t rdirs{0};
+  uint64_t rtime_ns{0};
   uint64_t cas{0};
   bool exists{false};
   std::unordered_map<std::string, std::string> xattrs;  // name → raw bytes
@@ -125,11 +134,23 @@ struct FsState {
   std::mutex mu;
   std::unordered_map<uint64_t, InodeMeta> inode_cache;
   std::unordered_map<uint64_t, std::string> flock_tokens;  // ino → lock token
+  std::unordered_set<uint64_t> rstat_dirty;
+  int rstat_interval_ms{60000};
+  std::atomic<bool> rstat_stop{false};
+  std::thread rstat_thread;
   std::unique_ptr<QuotaLedger> quota;
   std::unique_ptr<QosController> qos;
 
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}
+
+  ~FsState() {
+    rstat_stop.store(true);
+    if (rstat_thread.joinable()) rstat_thread.join();
+  }
+
+  FsState(const FsState&) = delete;
+  FsState& operator=(const FsState&) = delete;
 };
 
 // Cross-directory rename via /txn (compact rewrite of both dir tips under locks).
@@ -148,6 +169,20 @@ int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len,
 int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size_t len,
                size_t* out_len);
 int truncate_file(FsState& st, uint64_t ino, uint64_t size);
+
+void mark_rstat_dirty(FsState& st, uint64_t dir_ino);
+void flush_rstats(FsState& st);
+void start_rstat_thread(FsState& st);
+void stop_rstat_thread(FsState& st);
+
+inline constexpr const char* kRstatXattrRbytes = "aios.rbytes";
+inline constexpr const char* kRstatXattrRfiles = "aios.rfiles";
+inline constexpr const char* kRstatXattrRdirs = "aios.rdirs";
+inline constexpr const char* kRstatXattrRtime = "aios.rtime";
+
+bool is_rstat_xattr(const char* name);
+// Returns length written/needed, or -errno. For directories only.
+int get_rstat_xattr(const InodeMeta& m, const char* name, void* value, size_t size);
 
 }  // namespace posix
 }  // namespace aios

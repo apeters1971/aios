@@ -93,6 +93,7 @@ int main(int argc, char** argv) {
   cfg.stripe_width = opt.stripe_width;
   cfg.uid = static_cast<uint32_t>(::geteuid());
   cfg.gid = static_cast<uint32_t>(::getegid());
+  cfg.rstat_interval_ms = 60000;
 
   int err = 0;
   aios_posix_fs* fs = aios_posix_mount(&cfg, &err);

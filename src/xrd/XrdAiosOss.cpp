@@ -50,6 +50,7 @@ int XrdAiosOss::Init(XrdSysLogger* lp, const char* cfn, XrdOucEnv* /*envP*/) {
   pcfg.stripe_width = cfg_.stripe_width;
   pcfg.uid = 0;
   pcfg.gid = 0;
+  pcfg.rstat_interval_ms = 60000;
 
   int err = 0;
   fs_ = aios_posix_mount(&pcfg, &err);

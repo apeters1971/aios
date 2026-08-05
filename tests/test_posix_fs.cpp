@@ -6,6 +6,7 @@
 #include <boost/asio.hpp>
 
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <sys/file.h>
@@ -213,6 +214,52 @@ int test_posix_fs() {
   aios_posix_clear_caller(fs);
   cred = aios_posix_get_caller(fs);
   expect(cred.uid == 1000 && cred.gid == 1000, "clear → mount defaults");
+
+  // parent_ino + lazy recursive directory stats (aios.r*)
+  expect(aios_posix_mkdir(fs, 1, "roll", 0755, &st) == 0, "mkdir roll");
+  const uint64_t roll = st.ino;
+  expect(st.parent_ino == 1, "roll parent_ino root");
+  expect(aios_posix_mkdir(fs, roll, "nested", 0755, &st) == 0, "mkdir nested");
+  const uint64_t nested = st.ino;
+  expect(st.parent_ino == roll, "nested parent_ino");
+  expect(aios_posix_create(fs, nested, "blob", 0644, &st) == 0, "create blob");
+  const uint64_t blob = st.ino;
+  expect(st.parent_ino == nested, "blob parent_ino");
+  const char* roll_payload = "rollup-bytes";
+  expect(aios_posix_write(fs, blob, 0, roll_payload, std::strlen(roll_payload), &wrote) == 0,
+         "write blob");
+  aios_posix_flush_rstats(fs);
+  auto read_u64_xattr = [&](uint64_t ino, const char* name) -> uint64_t {
+    char xb[32]{};
+    int n = aios_posix_getxattr(fs, ino, name, xb, sizeof(xb));
+    if (n <= 0) return UINT64_MAX;
+    return std::stoull(std::string(xb, static_cast<size_t>(n)));
+  };
+  expect(read_u64_xattr(nested, "aios.rbytes") == std::strlen(roll_payload), "nested rbytes");
+  expect(read_u64_xattr(nested, "aios.rfiles") == 1, "nested rfiles");
+  expect(read_u64_xattr(nested, "aios.rdirs") == 0, "nested rdirs");
+  expect(read_u64_xattr(roll, "aios.rbytes") == std::strlen(roll_payload), "roll rbytes");
+  expect(read_u64_xattr(roll, "aios.rfiles") == 1, "roll rfiles");
+  expect(read_u64_xattr(roll, "aios.rdirs") == 1, "roll rdirs");
+  expect(read_u64_xattr(nested, "aios.rtime") != UINT64_MAX, "nested rtime");
+  char xlist[128]{};
+  int xlsz = aios_posix_listxattr(fs, nested, xlist, sizeof(xlist));
+  expect(xlsz > 0 && std::strstr(xlist, "aios.rbytes") != nullptr, "listxattr rbytes");
+  expect(aios_posix_setxattr(fs, nested, "aios.rbytes", "0", 1, 0) == -EPERM, "rbytes EPERM");
+  expect(aios_posix_mkdir(fs, 1, "roll2", 0755, &st) == 0, "mkdir roll2");
+  const uint64_t roll2 = st.ino;
+  expect(aios_posix_rename(fs, nested, "blob", roll2, "blob") == 0, "cross rename blob");
+  expect(aios_posix_getattr(fs, blob, &st) == 0 && st.parent_ino == roll2, "parent after rename");
+  aios_posix_flush_rstats(fs);
+  expect(read_u64_xattr(nested, "aios.rbytes") == 0, "nested empty after move");
+  expect(read_u64_xattr(roll2, "aios.rbytes") == std::strlen(roll_payload), "roll2 rbytes");
+  expect(aios_posix_unlink(fs, roll2, "blob") == 0, "unlink blob");
+  aios_posix_flush_rstats(fs);
+  expect(read_u64_xattr(roll2, "aios.rbytes") == 0, "roll2 empty after unlink");
+  expect(read_u64_xattr(roll2, "aios.rfiles") == 0, "roll2 rfiles 0");
+  expect(aios_posix_rmdir(fs, roll, "nested") == 0, "rmdir nested");
+  expect(aios_posix_rmdir(fs, 1, "roll") == 0, "rmdir roll");
+  expect(aios_posix_rmdir(fs, 1, "roll2") == 0, "rmdir roll2");
 
   aios_posix_unmount(fs);
   return failures();

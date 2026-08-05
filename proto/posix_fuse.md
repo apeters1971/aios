@@ -45,6 +45,14 @@ Snapshot = JSON `{"entries":{name:ino,...}}`; auto-compact ~1 MiB.
 
 Stored in inode JSON as `xattrs: { name: base64(value) }` (opaque bytes). ABI: `aios_posix_setxattr` / `getxattr` / `listxattr` / `removexattr` with `AIOS_POSIX_XATTR_CREATE` / `REPLACE`. Limits: name ≤ 255, value ≤ 64 KiB, ≤ 128 attrs per inode.
 
+## Parent pointers and recursive directory stats
+
+Every inode persists `parent_ino` (primary parent directory; `0` for root). Create/mkdir set it; cross-directory rename updates it; hard `link` leaves the primary parent unchanged.
+
+Directories also store lazy rollups `rbytes` / `rfiles` / `rdirs` / `rtime_ns` in inode JSON. Mutators mark the affected directory dirty; a mount-local timer (`aios_posix_config.rstat_interval_ms`, default **60000**, `0` disables) recomputes dirty dirs from `DirTable` children and cascades via `parent_ino`. Final flush on unmount (and via `aios_posix_flush_rstats`).
+
+Exposed as **virtual** xattrs on directories (not writable): `aios.rbytes`, `aios.rfiles`, `aios.rdirs`, `aios.rtime` (decimal; `rtime` is Unix seconds). `listxattr` includes these four for directories; `setxattr` / `removexattr` return `-EPERM`.
+
 ## flock
 
 `aios_posix_flock(ino, op)` maps `LOCK_SH` / `LOCK_EX` / `LOCK_UN` (+ optional `LOCK_NB`) onto exclusive AIOS object locks on the inode OID. Shared and exclusive are both exclusive at the cluster layer. Tokens are tracked per mount and released on `LOCK_UN` / unmount / inode delete. Non-blocking contention returns `-EWOULDBLOCK`.

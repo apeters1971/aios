@@ -66,6 +66,7 @@ int handle_mount(const aios_kabi_mount_in* in, aios_kabi_mount_out* out) {
   cfg.stripe_width = in->stripe_width;
   cfg.uid = in->uid;
   cfg.gid = in->gid;
+  cfg.rstat_interval_ms = 60000;
 
   int err = 0;
   aios_posix_fs* fs = aios_posix_mount(&cfg, &err);

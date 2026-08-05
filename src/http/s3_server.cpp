@@ -436,6 +436,7 @@ void S3Server::start() {
   pcfg.cluster_key = cfg_.cluster_key.c_str();
   pcfg.volume = cfg_.s3_volume.c_str();
   pcfg.app_label = "s3";
+  pcfg.rstat_interval_ms = 60000;
   int err = 0;
   fs_ = aios_posix_mount(&pcfg, &err);
   if (!fs_) {

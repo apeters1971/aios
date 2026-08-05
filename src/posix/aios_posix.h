@@ -23,6 +23,7 @@ typedef struct aios_posix_config {
   uint32_t stripe_width;    /* 0 => 4 (max in-flight chunk ops) */
   uint32_t uid;             /* default owner / caller when unset on thread */
   uint32_t gid;
+  int rstat_interval_ms;    /* recursive dir stats flush; 0 disables; typical 60000 */
 } aios_posix_config;
 
 /* Per-request caller identity (thread-local for this mount). */
@@ -43,6 +44,7 @@ typedef struct aios_posix_stat {
   uint64_t ctime_ns;
   uint64_t stripe_unit;
   uint32_t stripe_width;
+  uint64_t parent_ino; /* primary parent directory; 0 for root */
 } aios_posix_stat;
 
 typedef struct aios_posix_dirent {
@@ -55,6 +57,10 @@ typedef struct aios_posix_dirent {
 
 aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out);
 void aios_posix_unmount(aios_posix_fs* fs);
+
+/* Recompute dirty recursive directory stats (aios.r*). Also runs on the
+ * rstat timer and on unmount when rstat_interval_ms > 0. */
+void aios_posix_flush_rstats(aios_posix_fs* fs);
 
 /* Thread-scoped caller for subsequent ops on this mount (gateways/FUSE/OFS).
  * When unset, mount config uid/gid are used. uid 0 bypasses mode checks. */

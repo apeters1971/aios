@@ -231,6 +231,7 @@ target_link_libraries(aios_client PUBLIC aios_core)
 
 add_library(aios_posix STATIC
   src/posix/posix_fs.cpp
+  src/posix/posix_rstat.cpp
   src/posix/quota_ledger.cpp
   src/posix/qos_controller.cpp
 )

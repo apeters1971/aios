@@ -108,6 +108,7 @@ void fill_stat(const InodeMeta& m, aios_posix_stat* st) {
   st->ctime_ns = m.ctime_ns;
   st->stripe_unit = m.stripe_unit;
   st->stripe_width = m.stripe_width;
+  st->parent_ino = m.parent_ino;
 }
 
 int check_access(const aios_posix_cred& cred, const InodeMeta& m, int want) {
@@ -143,12 +144,17 @@ InodeMeta inode_from_json(const std::string& body, uint64_t cas_hint) {
   m.uid = j.value("uid", static_cast<uint32_t>(0));
   m.gid = j.value("gid", static_cast<uint32_t>(0));
   m.project_id = j.value("project_id", static_cast<uint32_t>(0));
+  m.parent_ino = j.value("parent_ino", static_cast<uint64_t>(0));
   m.size = j.value("size", static_cast<uint64_t>(0));
   m.atime_ns = j.value("atime_ns", static_cast<uint64_t>(0));
   m.mtime_ns = j.value("mtime_ns", static_cast<uint64_t>(0));
   m.ctime_ns = j.value("ctime_ns", static_cast<uint64_t>(0));
   m.stripe_unit = j.value("stripe_unit", kDefaultStripeUnit);
   m.stripe_width = j.value("stripe_width", kDefaultStripeWidth);
+  m.rbytes = j.value("rbytes", static_cast<uint64_t>(0));
+  m.rfiles = j.value("rfiles", static_cast<uint64_t>(0));
+  m.rdirs = j.value("rdirs", static_cast<uint64_t>(0));
+  m.rtime_ns = j.value("rtime_ns", static_cast<uint64_t>(0));
   m.cas = cas_hint;
   if (j.contains("xattrs") && j["xattrs"].is_object()) {
     for (auto it = j["xattrs"].begin(); it != j["xattrs"].end(); ++it) {
@@ -170,12 +176,17 @@ std::string inode_to_json(const InodeMeta& m) {
                    {"uid", m.uid},
                    {"gid", m.gid},
                    {"project_id", m.project_id},
+                   {"parent_ino", m.parent_ino},
                    {"size", m.size},
                    {"atime_ns", m.atime_ns},
                    {"mtime_ns", m.mtime_ns},
                    {"ctime_ns", m.ctime_ns},
                    {"stripe_unit", m.stripe_unit},
-                   {"stripe_width", m.stripe_width}};
+                   {"stripe_width", m.stripe_width},
+                   {"rbytes", m.rbytes},
+                   {"rfiles", m.rfiles},
+                   {"rdirs", m.rdirs},
+                   {"rtime_ns", m.rtime_ns}};
   if (!m.xattrs.empty()) {
     nlohmann::json xa = nlohmann::json::object();
     for (const auto& [k, v] : m.xattrs) {
@@ -533,19 +544,23 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
         } catch (...) {
         }
       }
-      // Reproject moved inode when crossing quota domains.
-      if (moved.project_id != new_p.project_id) {
-        const auto old_proj = moved.project_id;
-        moved.project_id = new_p.project_id;
+      // Primary parent follows the destination directory; reproject if needed.
+      const auto old_proj = moved.project_id;
+      const bool reproject = moved.project_id != new_p.project_id;
+      if (moved.parent_ino != new_parent || reproject) {
+        moved.parent_ino = new_parent;
+        if (reproject) moved.project_id = new_p.project_id;
         moved.ctime_ns = ts;
         try {
           store_inode(st, moved);
-          if (st.quota) {
+          if (reproject && st.quota) {
             st.quota->note_reproject(old_proj, moved.project_id, moved.uid, moved.gid, moved.size);
           }
         } catch (...) {
         }
       }
+      mark_rstat_dirty(st, old_parent);
+      mark_rstat_dirty(st, new_parent);
       return 0;
     } catch (const client_error& e) {
       if (!txn_id.empty()) {
@@ -649,6 +664,7 @@ void ensure_root(FsState& st) {
   root.nlink = 2;
   root.uid = st.default_uid;
   root.gid = st.default_gid;
+  root.parent_ino = 0;
   root.size = 0;
   root.atime_ns = root.mtime_ns = root.ctime_ns = ts;
   root.stripe_unit = st.stripe_unit;
@@ -817,6 +833,7 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
     st.quota->note_delta(meta.project_id, meta.uid, meta.gid,
                          static_cast<std::int64_t>(new_size) - static_cast<std::int64_t>(old_size));
   }
+  if (meta.parent_ino != 0) mark_rstat_dirty(st, meta.parent_ino);
   if (out_len) *out_len = len;
   return 0;
 }
@@ -867,6 +884,7 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
     st.quota->note_delta(meta.project_id, meta.uid, meta.gid,
                          static_cast<std::int64_t>(size) - static_cast<std::int64_t>(old_size));
   }
+  if (meta.parent_ino != 0) mark_rstat_dirty(st, meta.parent_ino);
   return 0;
 }
 
@@ -973,8 +991,10 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
                                                                  : fs->st->session.app_label();
     fs->st->quota = std::make_unique<aios::posix::QuotaLedger>(fs->st->session, fs->st->volume);
     fs->st->qos = std::make_unique<aios::posix::QosController>(fs->st->session, fs->st->volume);
+    fs->st->rstat_interval_ms = cfg->rstat_interval_ms;
     aios::posix::ensure_super(*fs->st);
     aios::posix::ensure_root(*fs->st);
+    aios::posix::start_rstat_thread(*fs->st);
     return fs;
   } catch (const aios::client_error& e) {
     if (err_out) *err_out = -aios::posix::map_error(e);
@@ -989,10 +1009,19 @@ void aios_posix_unmount(aios_posix_fs* fs) {
   if (!fs) return;
   g_tls_callers.erase(fs);
   if (fs->st) {
+    aios::posix::stop_rstat_thread(*fs->st);
     if (fs->st->quota) fs->st->quota->flush();
     aios::posix::release_all_flocks(*fs->st);
   }
   delete fs;
+}
+
+void aios_posix_flush_rstats(aios_posix_fs* fs) {
+  if (!fs || !fs->st) return;
+  try {
+    aios::posix::flush_rstats(*fs->st);
+  } catch (...) {
+  }
 }
 
 int aios_posix_lookup(aios_posix_fs* fs, uint64_t parent, const char* name,
@@ -1087,6 +1116,7 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     m.uid = cred.uid;
     m.gid = cred.gid;
     m.project_id = pmeta.project_id;
+    m.parent_ino = parent;
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
@@ -1095,6 +1125,7 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     pmeta.mtime_ns = pmeta.ctime_ns = ts;
     pmeta.nlink += 1;
     aios::posix::store_inode(*fs->st, pmeta);
+    aios::posix::mark_rstat_dirty(*fs->st, parent);
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
   } catch (const aios::client_error& e) {
@@ -1124,6 +1155,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     m.uid = cred.uid;
     m.gid = cred.gid;
     m.project_id = pmeta.project_id;
+    m.parent_ino = parent;
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
@@ -1131,6 +1163,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     dir.link(name, ino);
     pmeta.mtime_ns = pmeta.ctime_ns = ts;
     aios::posix::store_inode(*fs->st, pmeta);
+    aios::posix::mark_rstat_dirty(*fs->st, parent);
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
   } catch (const aios::client_error& e) {
@@ -1159,6 +1192,7 @@ int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
     }
     dir.unlink(name);
     if (m.exists) aios::posix::drop_nlink(*fs->st, ino);
+    aios::posix::mark_rstat_dirty(*fs->st, parent);
     return 0;
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
@@ -1194,12 +1228,14 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
     if (int ac = aios::posix::check_access(cred, np, kWantW | kWantX)) return ac;
 
     // Bump nlink before creating the new dentry (safer on crash).
+    // Primary parent_ino is unchanged; only the destination dir is dirty for rstat.
     m.nlink += 1;
     m.ctime_ns = aios::posix::now_ns();
     aios::posix::store_inode(*fs->st, m);
     new_dir.link(new_name, ino);
     np.mtime_ns = np.ctime_ns = m.ctime_ns;
     aios::posix::store_inode(*fs->st, np);
+    aios::posix::mark_rstat_dirty(*fs->st, new_parent);
     return 0;
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
@@ -1234,8 +1270,11 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
       pmeta.mtime_ns = pmeta.ctime_ns = aios::posix::now_ns();
       aios::posix::store_inode(*fs->st, pmeta);
     }
-    std::lock_guard lock(fs->st->mu);
-    fs->st->inode_cache.erase(ino);
+    {
+      std::lock_guard lock(fs->st->mu);
+      fs->st->inode_cache.erase(ino);
+    }
+    aios::posix::mark_rstat_dirty(*fs->st, parent);
     return 0;
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
@@ -1279,6 +1318,7 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
         if (tm.exists) aios::posix::drop_nlink(*fs->st, victim);
       }
       dir.rename_same(old_name, new_name);
+      aios::posix::mark_rstat_dirty(*fs->st, old_parent);
       return 0;
     }
     // Cross-dir: sticky checks on source and optional victim.
@@ -1415,6 +1455,7 @@ int aios_posix_statfs(aios_posix_fs* fs, aios_posix_statvfs* st_out) {
 int aios_posix_setxattr(aios_posix_fs* fs, uint64_t ino, const char* name, const void* value,
                         size_t size, int flags) {
   if (!fs || !aios::posix::valid_xattr_name(name)) return -EINVAL;
+  if (aios::posix::is_rstat_xattr(name)) return -EPERM;
   if (size > aios::posix::kMaxXattrValue) return -E2BIG;
   if (size > 0 && !value) return -EINVAL;
   try {
@@ -1445,6 +1486,9 @@ int aios_posix_getxattr(aios_posix_fs* fs, uint64_t ino, const char* name, void*
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
     if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
+    if (aios::posix::is_rstat_xattr(name)) {
+      return aios::posix::get_rstat_xattr(m, name, value, size);
+    }
     auto it = m.xattrs.find(name);
     if (it == m.xattrs.end()) return -aios::posix::kXattrMissing;
     if (size == 0) return static_cast<int>(it->second.size());
@@ -1464,8 +1508,13 @@ int aios_posix_listxattr(aios_posix_fs* fs, uint64_t ino, char* list, size_t siz
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
     if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
+    static const char* kVirt[] = {aios::posix::kRstatXattrRbytes, aios::posix::kRstatXattrRfiles,
+                                  aios::posix::kRstatXattrRdirs, aios::posix::kRstatXattrRtime};
     size_t need = 0;
     for (const auto& [k, _] : m.xattrs) need += k.size() + 1;
+    if (S_ISDIR(m.mode)) {
+      for (const char* v : kVirt) need += std::strlen(v) + 1;
+    }
     if (size == 0) return static_cast<int>(need);
     if (size < need) return -ERANGE;
     if (!list && need > 0) return -EINVAL;
@@ -1475,6 +1524,14 @@ int aios_posix_listxattr(aios_posix_fs* fs, uint64_t ino, char* list, size_t siz
       off += k.size();
       list[off++] = '\0';
     }
+    if (S_ISDIR(m.mode)) {
+      for (const char* v : kVirt) {
+        const size_t n = std::strlen(v);
+        std::memcpy(list + off, v, n);
+        off += n;
+        list[off++] = '\0';
+      }
+    }
     return static_cast<int>(need);
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
@@ -1483,6 +1540,7 @@ int aios_posix_listxattr(aios_posix_fs* fs, uint64_t ino, char* list, size_t siz
 
 int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name) {
   if (!fs || !aios::posix::valid_xattr_name(name)) return -EINVAL;
+  if (aios::posix::is_rstat_xattr(name)) return -EPERM;
   try {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists) return -ENOENT;
