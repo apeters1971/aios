@@ -63,10 +63,14 @@ class basic_set : public detail::StlBase {
   }
 
   void compact() {
-    ensure_fresh_read();
     if (mode() == sync_mode::async && dirty()) flush();
-    const auto body = wire::make_set_doc(to_wire(local_), mode()).dump();
-    impl_->log.compact(body, mode(), impl_->applied_op);
+    impl_->log.compact(mode(), [this] {
+      impl_->applied_op = 0;
+      local_.clear();
+      pull();
+      local_valid_ = true;
+      return std::make_pair(wire::make_set_doc(to_wire(local_), mode()).dump(), impl_->applied_op);
+    });
     auto m = impl_->log.load_meta();
     impl_->applied_op = m.snapshot_op;
   }

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace aios {
@@ -79,7 +80,12 @@ class Log {
   // Returns highest op_id written (0 if records empty).
   std::uint64_t append_ops(std::vector<Record> records, sync_mode mode);
 
-  void compact(const std::string& snapshot_json, sync_mode mode, std::uint64_t applied_op);
+  // Acquire the log lock, invoke `rebuild` (which must refresh local state via pull
+  // and return snapshot_json + applied_op), then write the snapshot and truncate
+  // the log. Building the snapshot under the lock closes the race where a peer
+  // append lands after a stale snapshot was taken but before truncate.
+  void compact(sync_mode mode,
+               const std::function<std::pair<std::string, std::uint64_t>()>& rebuild);
 
   std::string load_snapshot_body();
 

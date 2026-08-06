@@ -411,7 +411,8 @@ void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std:
       compact_if_needed();
       return;
     } catch (const client_error& e) {
-      if (e.code() != "conflict") throw;
+      if (e.code() == "conflict" || e.code() == "lock_held") continue;
+      throw;
     }
   }
   throw client_error("conflict", "dir changelog append failed");
@@ -419,6 +420,74 @@ void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std:
 
 void DirTable::link(const std::string& name, uint64_t child) {
   append_ops({{kOpLink, {name, std::to_string(child)}}});
+}
+
+bool DirTable::link_if_absent(const std::string& name, uint64_t child) {
+  // Serialize create/link against peers and against directory compaction so two
+  // racers cannot both observe a missing name and both return success.
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    HeldLocks locks;
+    locks.session = &session_;
+    try {
+      locks.acquire_sorted({meta_oid_, log_oid_, snap_oid_});
+    } catch (const client_error& e) {
+      if (e.code() == "lock_held") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      throw;
+    }
+    load();
+    if (entries_.count(name)) return false;
+
+    const uint64_t start = next_op_;
+    changelog::Record r;
+    r.op_id = start;
+    r.op = static_cast<changelog::Op>(kOpLink);
+    r.args = {name, std::to_string(child)};
+    const std::string batch = changelog::encode_record(r);
+    try {
+      next_op_ = start + 1;
+      auto ar = session_.append(log_oid_, batch, locks.token_for(log_oid_));
+      log_bytes_ = ar.size;
+      meta_cas_ = session_.put_bytes(
+          meta_oid_,
+          nlohmann::json{{"aios_posix_dir", 1},
+                         {"next_op", next_op_},
+                         {"log_bytes", log_bytes_},
+                         {"snapshot_op", snapshot_op_},
+                         {"snapshot_oid", snap_oid_}}
+              .dump(),
+          {}, meta_cas_, locks.token_for(meta_oid_), put_layout_);
+      apply_record(0, kOpLink, r.args);
+      // Compaction under the same locks we already hold.
+      if (log_bytes_ >= changelog::kAutoCompactBytes) {
+        std::string txn_id;
+        try {
+          txn_id = session_.txn_begin();
+          txn_put_dir(session_, txn_id, *this, locks);
+          session_.txn_commit(txn_id);
+          txn_id.clear();
+          snapshot_op_ = next_op_ > 0 ? next_op_ - 1 : 0;
+          log_bytes_ = 0;
+          meta_cas_ += 1;
+        } catch (const client_error&) {
+          if (!txn_id.empty()) {
+            try {
+              session_.txn_abort(txn_id);
+            } catch (...) {
+            }
+          }
+          // Link already committed; compaction is best-effort.
+        }
+      }
+      return true;
+    } catch (const client_error& e) {
+      if (e.code() == "conflict" || e.code() == "lock_held") continue;
+      throw;
+    }
+  }
+  throw client_error("conflict", "dir link_if_absent exhausted retries");
 }
 
 void DirTable::unlink(const std::string& name) { append_ops({{kOpUnlink, {name}}}); }
@@ -1430,8 +1499,7 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
           parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
       aios::posix::store_inode(*fs->st, m, child_path);
     }
-    dir.link(name, ino);
-    if (!aios::posix::verify_dir_link(*fs->st, parent, name, ino)) {
+    if (!dir.link_if_absent(name, ino)) {
       aios::posix::delete_orphan_inode(*fs->st, ino);
       return -EEXIST;
     }
@@ -1484,8 +1552,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
           parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
       aios::posix::store_inode(*fs->st, m, child_path);
     }
-    dir.link(name, ino);
-    if (!aios::posix::verify_dir_link(*fs->st, parent, name, ino)) {
+    if (!dir.link_if_absent(name, ino)) {
       aios::posix::delete_orphan_inode(*fs->st, ino);
       return -EEXIST;
     }
@@ -1577,7 +1644,14 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
       next.nlink += 1;
       next.ctime_ns = ts;
     });
-    new_dir.link(new_name, ino);
+    if (!new_dir.link_if_absent(new_name, ino)) {
+      // Roll back the nlink bump; the name lost the race.
+      aios::posix::store_inode(*fs->st, m, std::nullopt, [ts](aios::posix::InodeMeta& next) {
+        if (next.nlink > 0) next.nlink -= 1;
+        next.ctime_ns = ts;
+      });
+      return -EEXIST;
+    }
     np.mtime_ns = np.ctime_ns = ts;
     aios::posix::store_inode(*fs->st, np, std::nullopt, [ts](aios::posix::InodeMeta& next) {
       next.mtime_ns = next.ctime_ns = ts;

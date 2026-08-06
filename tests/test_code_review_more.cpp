@@ -274,9 +274,6 @@ TEST(CodeReviewC1, CompactPreservesFlushedKeys) {
   HttpFixture http("aios-crm-c1", 20400);
   Session s(http.session_cfg());
 
-  // Compact takes the log lock before truncate; a snapshot of already-applied
-  // keys must survive. (Concurrent append-during-compact remains a harder race;
-  // map::compact still builds the snapshot before acquiring the lock.)
   map m(s, "c1keys", sync_mode::sync, false);
   for (int i = 0; i < 20; ++i) m.set("k" + std::to_string(i), "v");
   m.compact();
@@ -288,6 +285,50 @@ TEST(CodeReviewC1, CompactPreservesFlushedKeys) {
     EXPECT_TRUE(check.contains("k" + std::to_string(i))) << "missing k" << i;
   }
   EXPECT_EQ(check.at("after"), "1");
+}
+
+TEST(CodeReviewC1b, CompactUnderLockKeepsConcurrentAppends) {
+  using namespace aios;
+  HttpFixture http("aios-crm-c1b", 20410);
+  Session writer_s(http.session_cfg());
+  Session compact_s(http.session_cfg());
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> wrote{0};
+  std::thread writer([&] {
+    map m(writer_s, "c1race", sync_mode::sync, false);
+    for (int i = 0; i < 40 && !stop.load(); ++i) {
+      for (int attempt = 0; attempt < 64; ++attempt) {
+        try {
+          m.set("k" + std::to_string(i), "v");
+          wrote.store(i + 1);
+          break;
+        } catch (const client_error&) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+      }
+    }
+  });
+  std::thread compactor([&] {
+    map m(compact_s, "c1race", sync_mode::sync, false);
+    for (int i = 0; i < 10; ++i) {
+      try {
+        m.compact();
+      } catch (...) {
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    }
+    stop.store(true);
+  });
+  writer.join();
+  compactor.join();
+
+  map check(writer_s, "c1race", sync_mode::sync, false);
+  const int n = wrote.load();
+  ASSERT_GT(n, 0);
+  for (int i = 0; i < n; ++i) {
+    EXPECT_TRUE(check.contains("k" + std::to_string(i))) << "missing k" << i;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +605,8 @@ TEST(CodeReviewP10, ConcurrentCreateSameNameOneWins) {
   t0.join();
   t1.join();
 
-  EXPECT_EQ(ok.load() + exist.load(), 2);
+  EXPECT_EQ(ok.load(), 1);
+  EXPECT_EQ(exist.load(), 1);
   EXPECT_EQ(other.load(), 0);
 
   aios_posix_stat st{};
@@ -572,7 +614,12 @@ TEST(CodeReviewP10, ConcurrentCreateSameNameOneWins) {
   const uint64_t winner = st.ino;
   EXPECT_TRUE(winner == inos[0] || winner == inos[1]);
 
-  // Directory must settle on a single dentry (no duplicate names).
+  // Loser inode must have been orphan-deleted.
+  const uint64_t loser = (winner == inos[0]) ? inos[1] : inos[0];
+  if (loser != 0) {
+    EXPECT_EQ(aios_posix_getattr(m.fs, loser, &st), -ENOENT);
+  }
+
   uint64_t off = 0;
   int named = 0;
   for (;;) {

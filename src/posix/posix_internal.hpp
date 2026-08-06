@@ -94,6 +94,9 @@ class DirTable {
   const std::unordered_map<std::string, uint64_t>& entries() const { return entries_; }
 
   void link(const std::string& name, uint64_t child);
+  // Lock the directory tip, reload, and link only if `name` is absent.
+  // Returns false when the name is already present (caller should orphan `child`).
+  bool link_if_absent(const std::string& name, uint64_t child);
   void unlink(const std::string& name);
   void rename_same(const std::string& old_name, const std::string& new_name);
   void compact_if_needed();

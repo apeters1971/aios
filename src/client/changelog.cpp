@@ -3,7 +3,9 @@
 #include "client/wire.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <nlohmann/json.hpp>
+#include <thread>
 
 namespace aios {
 namespace changelog {
@@ -336,7 +338,18 @@ std::uint64_t Log::append_op(Op op, std::vector<std::string> args, sync_mode mod
       throw;
     }
 
-    auto ar = session_->append(log_oid_, framed);
+    AppendResult ar;
+    for (int ltry = 0;; ++ltry) {
+      try {
+        ar = session_->append(log_oid_, framed);
+        break;
+      } catch (const client_error& e) {
+        // Compact holds the log lock. Retry the same reserved op_id — do not
+        // re-CAS meta or we leave a hole that stalls pull's contiguous apply.
+        if (e.code() != "lock_held" || ltry >= 64) throw;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    }
     for (int mtry = 0; mtry < 8; ++mtry) {
       Meta cur = load_meta();
       cur.log_bytes = ar.size;
@@ -376,7 +389,16 @@ std::uint64_t Log::append_ops(std::vector<Record> records, sync_mode mode) {
       if (e.code() == "conflict") continue;
       throw;
     }
-    auto ar = session_->append(log_oid_, batch);
+    AppendResult ar;
+    for (int ltry = 0;; ++ltry) {
+      try {
+        ar = session_->append(log_oid_, batch);
+        break;
+      } catch (const client_error& e) {
+        if (e.code() != "lock_held" || ltry >= 64) throw;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    }
     for (int mtry = 0; mtry < 8; ++mtry) {
       Meta cur = load_meta();
       cur.log_bytes = ar.size;
@@ -394,21 +416,29 @@ std::uint64_t Log::append_ops(std::vector<Record> records, sync_mode mode) {
   throw client_error("conflict", "changelog append_ops exhausted retries");
 }
 
-void Log::compact(const std::string& snapshot_json, sync_mode mode, std::uint64_t applied_op) {
+void Log::compact(sync_mode mode,
+                  const std::function<std::pair<std::string, std::uint64_t>()>& rebuild) {
   LogLockGuard log_lock(*session_, log_oid_);
   const std::optional<std::string> lock_token = log_lock.token;
 
   Meta m = open(mode);
   ensure_meta(m, mode);
 
+  // Peer appends are blocked by the log lock; rebuild sees a stable tip.
+  const auto [snapshot_json, applied_op] = rebuild();
+
   auto snap_head = session_->head_object(snap_oid_);
   session_->put_object(snap_oid_, snapshot_json, type_, snap_head.cas, lock_token, 1);
 
+  // next_op must stay contiguous with snapshot_op. Bumping past an unused
+  // "fence" id (without writing a Compact record) left a hole that made pull
+  // stop applying later ops after a rebuild-under-lock.
   const std::uint64_t fence_id = m.next_op;
   const std::uint64_t snap_op = applied_op > 0 ? applied_op : (fence_id > 0 ? fence_id - 1 : 0);
+  const std::uint64_t new_next = std::max(fence_id, snap_op + 1);
 
   Meta reserved = m;
-  reserved.next_op = fence_id + 1;
+  reserved.next_op = new_next;
   reserved.snapshot_op = snap_op;
   reserved.log_bytes = 0;
   cas_put_meta(reserved, mode, lock_token);
@@ -419,7 +449,7 @@ void Log::compact(const std::string& snapshot_json, sync_mode mode, std::uint64_
   Meta cur = load_meta();
   cur.log_bytes = 0;
   cur.snapshot_op = snap_op;
-  if (cur.next_op < fence_id + 1) cur.next_op = fence_id + 1;
+  if (cur.next_op < new_next) cur.next_op = new_next;
   cas_put_meta(cur, mode, lock_token);
 }
 
