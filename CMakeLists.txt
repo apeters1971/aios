@@ -21,6 +21,13 @@ find_package(Boost 1.70 REQUIRED CONFIG)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
+# Alma/RHEL FindSQLite3 may set variables without creating the imported target.
+if(NOT TARGET SQLite3::SQLite3)
+  add_library(SQLite3::SQLite3 UNKNOWN IMPORTED)
+  set_target_properties(SQLite3::SQLite3 PROPERTIES
+    IMPORTED_LOCATION "${SQLite3_LIBRARIES}"
+    INTERFACE_INCLUDE_DIRECTORIES "${SQLite3_INCLUDE_DIRS}")
+endif()
 
 include(FetchContent)
 
