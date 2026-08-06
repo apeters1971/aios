@@ -446,12 +446,14 @@ bool is_admin_static_path(const std::string& path) {
          path == "/admin/aios-icon.png";
 }
 
-std::string admin_static_content_type(const std::string& path) {
-  if (path.size() >= 5 && path.substr(path.size() - 5) == ".html") return "text/html; charset=utf-8";
-  if (path.size() >= 3 && path.substr(path.size() - 3) == ".js")
+std::string admin_static_content_type(const std::string& filename) {
+  if (filename.size() >= 5 && filename.substr(filename.size() - 5) == ".html")
+    return "text/html; charset=utf-8";
+  if (filename.size() >= 3 && filename.substr(filename.size() - 3) == ".js")
     return "application/javascript; charset=utf-8";
-  if (path.size() >= 4 && path.substr(path.size() - 4) == ".css") return "text/css; charset=utf-8";
-  if (path.size() >= 4 && path.substr(path.size() - 4) == ".png") return "image/png";
+  if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".css")
+    return "text/css; charset=utf-8";
+  if (filename.size() >= 4 && filename.substr(filename.size() - 4) == ".png") return "image/png";
   return "application/octet-stream";
 }
 
@@ -486,7 +488,7 @@ bool serve_admin_static(tcp::socket& sock, const std::string& path, bool keep_al
     return true;
   }
   std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  write_response(sock, 200, "OK", {{"Content-Type", admin_static_content_type(path)}},
+  write_response(sock, 200, "OK", {{"Content-Type", admin_static_content_type(rel)}},
                  reinterpret_cast<const std::uint8_t*>(data.data()), data.size(), keep_alive);
   return true;
 }
