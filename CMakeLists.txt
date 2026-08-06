@@ -493,6 +493,7 @@ add_executable(aios_tests
   tests/test_backup.cpp
   tests/test_bugfix_regressions.cpp
   tests/test_aiosd_regressions.cpp
+  tests/test_code_review_regressions.cpp
 )
 target_include_directories(aios_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)
