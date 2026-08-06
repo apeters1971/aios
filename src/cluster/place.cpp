@@ -28,9 +28,19 @@ struct VNode {
   std::size_t target_index{0};
 };
 
-int vnode_count_for(const StorageTarget& t, const PlacementConfig& pc) {
+// Ring share for one target. max_weight is the largest weight in the pool: when
+// weight * vnodes_per_target would exceed max_vnodes, shares are scaled down
+// proportionally rather than clamped. Clamping flattens every target above
+// max_vnodes / vnodes_per_target (8 weight units, i.e. ~8 TiB, at the defaults) to
+// an identical share, which silently discards capacity weighting on real hardware.
+int vnode_count_for(const StorageTarget& t, const PlacementConfig& pc, int max_weight) {
   const int w = t.weight > 0 ? t.weight : 1;
+  const int mw = max_weight > 0 ? max_weight : 1;
   long long v = static_cast<long long>(w) * pc.vnodes_per_target;
+  const long long top = static_cast<long long>(mw) * pc.vnodes_per_target;
+  if (top > pc.max_vnodes && top > 0) {
+    v = (v * pc.max_vnodes + top / 2) / top;
+  }
   if (v < pc.min_vnodes) v = pc.min_vnodes;
   if (v > pc.max_vnodes) v = pc.max_vnodes;
   return static_cast<int>(v);
@@ -40,8 +50,10 @@ std::vector<VNode> build_ring(const std::vector<StorageTarget>& targets,
                               const PlacementConfig& pc) {
   std::vector<VNode> ring;
   ring.reserve(targets.size() * static_cast<std::size_t>(std::max(1, pc.vnodes_per_target)));
+  int max_weight = 1;
+  for (const auto& t : targets) max_weight = std::max(max_weight, t.weight > 0 ? t.weight : 1);
   for (std::size_t ti = 0; ti < targets.size(); ++ti) {
-    const int vn = vnode_count_for(targets[ti], pc);
+    const int vn = vnode_count_for(targets[ti], pc, max_weight);
     const std::string base = target_key(targets[ti]);
     for (int i = 0; i < vn; ++i) {
       VNode v;
@@ -111,8 +123,12 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
   walk(DomainPref::NewRack);
   // Pass 2: distinct nodes (may share a rack).
   walk(DomainPref::NewNode);
-  // Pass 3: any remaining unused mounts.
+  // Pass 3: any remaining unused mounts. This can put two copies on one node when
+  // the class has fewer nodes than n, so report the domains covered rather than
+  // letting the caller assume acting_set.size() independent failure domains.
   walk(DomainPref::Any);
+  p.distinct_nodes = used_nodes.size();
+  p.distinct_racks = used_racks.size();
   return p;
 }
 

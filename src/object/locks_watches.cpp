@@ -152,6 +152,7 @@ bool WatchHub::wait_oid(const std::string& oid, std::uint64_t after_seq, int tim
   waiter->after_seq = after_seq;
 
   std::unique_lock lock(mu_);
+  if (stopped_) return false;
   waiters_.push_back(waiter);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
@@ -167,6 +168,14 @@ bool WatchHub::wait_oid(const std::string& oid, std::uint64_t after_seq, int tim
   return true;
 }
 
+void WatchHub::shutdown() {
+  std::lock_guard lock(mu_);
+  stopped_ = true;
+  for (auto& w : waiters_) w->done = true;
+  waiters_.clear();
+  cv_.notify_all();
+}
+
 bool WatchHub::wait_prefix(const std::string& prefix, int timeout_ms,
                            std::vector<WatchEvent>& out) {
   auto waiter = std::make_shared<Waiter>();
@@ -174,6 +183,7 @@ bool WatchHub::wait_prefix(const std::string& prefix, int timeout_ms,
   waiter->prefix = prefix;
 
   std::unique_lock lock(mu_);
+  if (stopped_) return false;
   waiters_.push_back(waiter);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));

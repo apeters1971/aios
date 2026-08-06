@@ -63,6 +63,10 @@ class WatchHub {
   // Block until an event for an oid under prefix, or timeout.
   bool wait_prefix(const std::string& prefix, int timeout_ms, std::vector<WatchEvent>& out);
 
+  // Wake every waiter and refuse new waits. Long polls block for up to two minutes,
+  // which is far too long to hold up shutdown.
+  void shutdown();
+
  private:
   struct Waiter {
     enum class Kind { Oid, Prefix } kind{Kind::Oid};
@@ -76,6 +80,7 @@ class WatchHub {
   std::mutex mu_;
   std::condition_variable cv_;
   std::list<std::shared_ptr<Waiter>> waiters_;
+  bool stopped_{false};
 };
 
 }  // namespace aios

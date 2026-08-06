@@ -119,9 +119,22 @@ void ObjectService::set_advertise(std::string advertise) {
   advertise_ = std::move(advertise);
 }
 
-void ObjectService::update_cluster_map(ClusterMap m) {
+std::uint64_t ObjectService::update_cluster_map(ClusterMap m) {
   std::lock_guard lock(mu_);
+  const auto prev = map_.epoch;
   map_ = std::move(m);
+  return prev;
+}
+
+ClusterMap ObjectService::map_snapshot() const {
+  std::lock_guard lock(mu_);
+  return map_;
+}
+
+void ObjectService::shutdown_waiters() {
+  // No mu_ here: waiters release it before blocking, and the hubs have their own.
+  watches_.shutdown();
+  pubsub_.shutdown();
 }
 
 Frame ObjectService::reply_ok(std::uint64_t epoch) const {
@@ -140,8 +153,8 @@ Frame ObjectService::reply_err(std::uint64_t epoch, const std::string& code,
 }
 
 ApiResult ObjectService::fail(const std::string& code, const std::string& error) const {
-  // not_primary is a redirect signal, not an operator error.
-  if (code != "not_primary") ops_.note_error();
+  // not_primary and not_local are redirect signals, not operator errors.
+  if (code != "not_primary" && code != "not_local") ops_.note_error();
   ApiResult r;
   r.ok = false;
   r.code = code;
@@ -1122,17 +1135,41 @@ ApiResult ObjectService::reconstruct_ec_object(
     return fail("no_targets", "acting set smaller than k+m");
   }
 
-  std::vector<std::optional<std::vector<std::uint8_t>>> shards(
-      static_cast<std::size_t>(codec->shard_count()));
+  const auto shard_count = static_cast<std::size_t>(codec->shard_count());
+  // Shard identity is the stored aios.ec.i attr; the acting-set position it happens
+  // to occupy changes whenever place() reorders the set for a topology change.
+  auto shard_index_for = [&](const StorageTarget& t, std::size_t fallback) -> std::size_t {
+    std::unordered_map<std::string, std::string> a;
+    if (t.node_id == cfg_.node_id) {
+      auto* s = stores_.get(t.aios_path);
+      if (!s) return fallback;
+      std::string e;
+      a = s->list_attrs(oid, e);
+    } else {
+      auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                   cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+      if (!st.ok || !st.body.contains("attrs") || !st.body["attrs"].is_object()) return fallback;
+      for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
+        if (it.value().is_string()) a[it.key()] = it.value().get<std::string>();
+      }
+    }
+    const auto sm = parse_ec_attrs(a);
+    if (!sm || sm->shard_i < 0) return fallback;
+    return static_cast<std::size_t>(sm->shard_i);
+  };
+
+  std::vector<std::optional<std::vector<std::uint8_t>>> shards(shard_count);
   int got = 0;
-  for (int i = 0; i < codec->shard_count(); ++i) {
-    const auto& t = placement.acting_set[static_cast<std::size_t>(i)];
+  for (std::size_t ti = 0; ti < placement.acting_set.size(); ++ti) {
+    const auto& t = placement.acting_set[ti];
+    const auto i = shard_index_for(t, ti);
+    if (i >= shard_count || shards[i]) continue;
     if (t.node_id == cfg_.node_id) {
       auto* s = stores_.get(t.aios_path);
       if (!s) continue;
       auto data = s->get(oid, seq, err);
       if (!data) continue;
-      shards[static_cast<std::size_t>(i)] = std::move(*data);
+      shards[i] = std::move(*data);
       ++got;
     } else {
       ObjectRpcResult r;
@@ -1145,17 +1182,17 @@ ApiResult ObjectService::reconstruct_ec_object(
                                     cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid, 0,
                                     static_cast<std::size_t>(st.size), seq);
         if (r.ok && !r.raw.empty()) {
-          shards[static_cast<std::size_t>(i)] = std::move(r.raw);
+          shards[i] = std::move(r.raw);
           ++got;
         } else if (r.ok && r.data) {
-          shards[static_cast<std::size_t>(i)] = std::move(*r.data);
+          shards[i] = std::move(*r.data);
           ++got;
         }
       } else {
         r = object_get_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
                               cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
         if (!r.ok || !r.data) continue;
-        shards[static_cast<std::size_t>(i)] = std::move(*r.data);
+        shards[i] = std::move(*r.data);
         ++got;
       }
     }
@@ -1600,7 +1637,13 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
           if (store) break;
         }
       }
-      if (!store) return fail("not_local", "no local replica for oid");
+      if (!store) {
+        // The object is fine, this node just is not holding it. Carry the acting
+        // set so the client is redirected instead of being told the server broke.
+        auto r = fail("not_local", "no local replica for oid");
+        r.placement = placement;
+        return r;
+      }
     }
   }
 
@@ -1992,7 +2035,11 @@ ApiResult ObjectService::api_list_versions(const std::string& oid) {
       if (store) break;
     }
   }
-  if (!store) return fail("not_local", "no local store");
+  if (!store) {
+    auto r = fail("not_local", "no local store");
+    r.placement = placement;
+    return r;
+  }
   ApiResult r;
   r.ok = true;
   r.epoch = map_.epoch;

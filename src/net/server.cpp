@@ -123,6 +123,12 @@ void TcpServer::close() {
     s->shutdown(tcp::socket::shutdown_both, ignored);
     s->close(ignored);
   }
+  // Sockets are closed, so blocking session reads have returned; joining here means
+  // no session can still be dispatching into handlers_ after close() returns.
+  if (!workers_drained_.exchange(true)) {
+    workers_.stop();
+    workers_.join();
+  }
 }
 
 TcpServer::~TcpServer() { close(); }
@@ -136,7 +142,7 @@ void TcpServer::do_accept() {
         std::lock_guard lock(sessions_mu_);
         sessions_.insert(sock);
       }
-      boost::asio::post(ioc_, [this, sock] {
+      boost::asio::post(workers_, [this, sock] {
         handle_session(sock);
         std::lock_guard lock(sessions_mu_);
         sessions_.erase(sock);

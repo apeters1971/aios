@@ -19,9 +19,13 @@ void FsTable::set_local(const std::string& node_id, const std::vector<AiosTarget
   const std::string default_rack = node_rack.empty() ? node_id : node_rack;
   const auto ts = now_ms();
   for (const auto& t : targets) {
-    if (!t.usable) continue;
     const LifecycleState eff = worse_lifecycle(node_state, t.state);
-    if (eff == LifecycleState::Off) continue;  // not advertised
+    // An off or unusable target is advertised as a tombstone rather than dropped.
+    // Merge is upsert-only, so simply omitting the entry would leave every peer
+    // holding the last "up" copy forever and placing on a target we no longer serve.
+    // ClusterMap::build skips both !usable and Off, so these never enter the map.
+    const bool tombstone = !t.usable || eff == LifecycleState::Off;
+    if (tombstone && t.aios_path.empty()) continue;  // nothing peers could be holding
     FsEntry e;
     e.node_id = node_id;
     e.mount = t.mount;
@@ -37,7 +41,7 @@ void FsTable::set_local(const std::string& node_id, const std::vector<AiosTarget
     e.bavail = t.bavail;
     e.files = t.files;
     e.ffree = t.ffree;
-    e.usable = true;
+    e.usable = !tombstone;
     e.updated_ms = ts;
     entries_[key_of(e)] = std::move(e);
   }

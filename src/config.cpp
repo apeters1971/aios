@@ -607,6 +607,22 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       }
       return argv[++i];
     };
+    // parse_cli runs before main's try block, so a bare std::stoi on a bad value
+    // would terminate the process instead of reporting a usage error.
+    auto need_int = [&](const char* name, int& out) -> bool {
+      const char* v = need(name);
+      if (!v) return false;
+      try {
+        std::size_t used = 0;
+        const int parsed = std::stoi(std::string(v), &used);
+        if (used != std::string(v).size()) throw std::invalid_argument("trailing");
+        out = parsed;
+      } catch (...) {
+        err = std::string("invalid integer for ") + name + ": " + v;
+        return false;
+      }
+      return true;
+    };
     if (arg == "--help" || arg == "-h") {
       help = true;
       continue;
@@ -654,15 +670,11 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       continue;
     }
     if (arg == "--replica-count") {
-      const char* v = need("--replica-count");
-      if (!v) return false;
-      cfg.replica_count = std::stoi(v);
+      if (!need_int("--replica-count", cfg.replica_count)) return false;
       continue;
     }
     if (arg == "--write-quorum") {
-      const char* v = need("--write-quorum");
-      if (!v) return false;
-      cfg.write_quorum = std::stoi(v);
+      if (!need_int("--write-quorum", cfg.write_quorum)) return false;
       continue;
     }
     if (arg == "--durability") {
@@ -672,15 +684,11 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       continue;
     }
     if (arg == "--ec-k") {
-      const char* v = need("--ec-k");
-      if (!v) return false;
-      cfg.ec_k = std::stoi(v);
+      if (!need_int("--ec-k", cfg.ec_k)) return false;
       continue;
     }
     if (arg == "--ec-m") {
-      const char* v = need("--ec-m");
-      if (!v) return false;
-      cfg.ec_m = std::stoi(v);
+      if (!need_int("--ec-m", cfg.ec_m)) return false;
       continue;
     }
     if (arg == "--ec-codec") {
@@ -734,9 +742,7 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       continue;
     }
     if (arg == "--compression-level") {
-      const char* v = need("--compression-level");
-      if (!v) return false;
-      cfg.compression_level = std::stoi(v);
+      if (!need_int("--compression-level", cfg.compression_level)) return false;
       continue;
     }
     err = "unknown argument: " + arg;
@@ -770,6 +776,30 @@ bool normalize_config(Config& cfg, std::string& err) {
     err = "weight_autotune_min_delta must be >= 1";
     return false;
   }
+  // The gossip and scan timers re-arm with these directly. A non-positive interval
+  // makes the handler re-queue itself on an already-expired deadline, which spins
+  // the io_context thread at 100% and starves accepts. Unlike the repair/transition
+  // timers, neither is guarded by a > 0 check at start.
+  if (cfg.gossip_interval_ms < 1) {
+    err = "gossip_interval_ms must be >= 1";
+    return false;
+  }
+  if (cfg.scan_interval_ms < 1) {
+    err = "scan_interval_ms must be >= 1";
+    return false;
+  }
+  if (cfg.suspect_after_ms >= cfg.dead_after_ms) {
+    err = "suspect_after_ms must be less than dead_after_ms";
+    return false;
+  }
+  if (cfg.replica_count < 1) {
+    err = "replica_count must be >= 1";
+    return false;
+  }
+  if (cfg.write_quorum < 0) {
+    err = "write_quorum must be >= 0";
+    return false;
+  }
   if (cfg.durability.empty() || cfg.durability == "replica") {
     cfg.durability = "replica";
   } else if (cfg.durability != "ec") {
@@ -785,6 +815,13 @@ bool normalize_config(Config& cfg, std::string& err) {
     cfg.ec_codec = codec;
     cfg.replica_count = cfg.ec_k + cfg.ec_m;
     if (cfg.write_quorum == 0) cfg.write_quorum = cfg.replica_count;
+  }
+  // quorum_need() clamps to the acting-set size, so an over-large write_quorum would
+  // silently acknowledge writes at fewer copies than the operator asked for.
+  if (cfg.write_quorum > cfg.replica_count) {
+    err = "write_quorum must not exceed replica_count (" +
+          std::to_string(cfg.replica_count) + ")";
+    return false;
   }
 
   cfg.default_storage_class = lower_copy(cfg.default_storage_class);

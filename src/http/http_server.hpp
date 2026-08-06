@@ -12,6 +12,7 @@
 
 #include <boost/asio.hpp>
 
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -22,6 +23,12 @@ namespace aios {
 
 class HttpServer {
  public:
+  // Decrements the detached long-poll count on every exit path of such a thread.
+  struct DetachedGuard {
+    HttpServer* server{nullptr};
+    ~DetachedGuard();
+  };
+
   // cfg is shared with GossipEngine so live admin toggles (node_state, etc.) apply.
   HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService& objects,
              MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam = nullptr,
@@ -46,6 +53,12 @@ class HttpServer {
  private:
   void do_accept();
   void handle_session(std::shared_ptr<boost::asio::ip::tcp::socket> sock);
+  // Long-poll replies (watch, pubsub subscribe) are written from a detached thread
+  // so the worker is freed. Those threads hold references to this server and to
+  // ObjectService, so close_sessions() has to wait for them. Call detached_begin()
+  // on the worker before spawning, and hold a DetachedGuard inside the thread.
+  void detached_begin();
+  void detached_end();
   nlohmann::json admin_status_json() const;
   nlohmann::json admin_config_json() const;
   nlohmann::json admin_lifecycle_json() const;
@@ -66,6 +79,9 @@ class HttpServer {
   boost::asio::thread_pool workers_{4};
   std::mutex sessions_mu_;
   std::unordered_set<std::shared_ptr<boost::asio::ip::tcp::socket>> sessions_;
+  std::mutex detached_mu_;
+  std::condition_variable detached_cv_;
+  int detached_{0};
 };
 
 }  // namespace aios

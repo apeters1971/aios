@@ -63,17 +63,25 @@ void MembershipTable::mark_alive(const std::string& node_id, const std::string& 
 
 void MembershipTable::merge(const std::vector<Member>& remote, std::int64_t now) {
   std::lock_guard lock(mu_);
-  (void)now;
-  for (const auto& r : remote) {
-    if (r.node_id.empty() || r.node_id.rfind("seed:", 0) == 0) continue;
-    if (r.node_id == local_id_) continue;
+  for (const auto& incoming : remote) {
+    if (incoming.node_id.empty() || incoming.node_id.rfind("seed:", 0) == 0) continue;
+    if (incoming.node_id == local_id_) continue;
+    Member r = incoming;
+    // last_seen_ms comes from the observer's system clock. A peer running ahead
+    // would stamp a time age() can never reach, pinning a dead node Online across
+    // the cluster, so no observation may be newer than our own clock.
+    if (now > 0 && r.last_seen_ms > now) r.last_seen_ms = now;
     auto it = members_.find(r.node_id);
     if (it == members_.end()) {
       members_[r.node_id] = r;
       if (members_[r.node_id].rack.empty()) members_[r.node_id].rack = r.node_id;
       continue;
     }
-    if (r.last_seen_ms >= it->second.last_seen_ms) {
+    // Strictly newer wins. last_seen_ms freezes once a node stops answering, so every
+    // peer ends up holding the same value while each ages it at a different moment;
+    // accepting a tie would let a peer that has not aged yet overwrite the Offline we
+    // just derived and flap the node back into the ring.
+    if (r.last_seen_ms > it->second.last_seen_ms) {
       auto keep_addr = it->second.addr;
       auto keep_http = it->second.http_addr;
       auto keep_rack = it->second.rack;
@@ -81,6 +89,11 @@ void MembershipTable::merge(const std::vector<Member>& remote, std::int64_t now)
       if (it->second.addr.empty()) it->second.addr = keep_addr;
       if (it->second.http_addr.empty()) it->second.http_addr = keep_http;
       if (it->second.rack.empty()) it->second.rack = keep_rack.empty() ? r.node_id : keep_rack;
+    } else if (r.last_seen_ms == it->second.last_seen_ms) {
+      // Same observation: fill gaps, but never replace locally derived liveness.
+      if (it->second.addr.empty()) it->second.addr = r.addr;
+      if (it->second.http_addr.empty()) it->second.http_addr = r.http_addr;
+      if (it->second.rack.empty()) it->second.rack = r.rack.empty() ? r.node_id : r.rack;
     }
   }
 }
@@ -120,6 +133,7 @@ std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
   std::lock_guard lock(mu_);
   std::vector<Member> online;
   std::vector<Member> suspect;
+  std::vector<Member> offline;
   std::vector<Member> seeds;
   for (const auto& [id, m] : members_) {
     if (id == local_id_) continue;
@@ -130,6 +144,7 @@ std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
     }
     if (m.state == MemberState::Online) online.push_back(m);
     else if (m.state == MemberState::Suspect) suspect.push_back(m);
+    else if (m.state == MemberState::Offline) offline.push_back(m);
   }
 
   thread_local std::mt19937 rng{std::random_device{}()};
@@ -138,11 +153,18 @@ std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
   };
   shuffle(online);
   shuffle(suspect);
+  shuffle(offline);
   shuffle(seeds);
 
   std::vector<Member> out;
   if (!suspect.empty() && k > 0) {
     out.push_back(suspect.front());
+  }
+  // One offline probe per round, ahead of the online peers so a busy cluster still
+  // spends a slot on it. Nothing else ever dials an offline member, so without this
+  // a node that comes back is only rediscovered if it has seeds of its own to dial.
+  if (!offline.empty() && out.size() < k) {
+    out.push_back(offline.front());
   }
   for (const auto& m : online) {
     if (out.size() >= k) break;

@@ -301,23 +301,36 @@ bool repair_ec_object(const Config& cfg, const std::string& advertise, const Clu
   if (!codec || codec->m() != meta->m) return false;
   if (static_cast<int>(p.acting_set.size()) < codec->shard_count()) return false;
 
-  std::vector<std::optional<std::vector<std::uint8_t>>> shards(
-      static_cast<std::size_t>(codec->shard_count()));
+  const auto shard_count = static_cast<std::size_t>(codec->shard_count());
+  std::vector<std::optional<std::vector<std::uint8_t>>> shards(shard_count);
   int got = 0;
-  for (int i = 0; i < codec->shard_count(); ++i) {
-    if (!has[static_cast<std::size_t>(i)]) continue;
+  // A shard's identity is the aios.ec.i attr it was stamped with, not its slot in
+  // the acting set: place() reorders the set whenever the topology changes, so
+  // decoding by position would feed the codec mismatched shards.
+  for (std::size_t ti = 0; ti < p.acting_set.size(); ++ti) {
+    if (!has[ti]) continue;
+    const auto shard_attrs = load_attrs_from_target(cfg, advertise, map, stores, p.acting_set[ti],
+                                                    oid);
+    const auto shard_meta = parse_ec_attrs(shard_attrs);
+    const auto idx = (shard_meta && shard_meta->shard_i >= 0)
+                         ? static_cast<std::size_t>(shard_meta->shard_i)
+                         : ti;
+    if (idx >= shard_count || shards[idx]) continue;
     std::vector<std::uint8_t> body;
-    if (!fetch_shard_body(cfg, advertise, map, stores, p.acting_set[static_cast<std::size_t>(i)],
-                          oid, body)) {
-      continue;
-    }
-    shards[static_cast<std::size_t>(i)] = std::move(body);
+    if (!fetch_shard_body(cfg, advertise, map, stores, p.acting_set[ti], oid, body)) continue;
+    shards[idx] = std::move(body);
     ++got;
   }
   if (got < meta->k) return false;
 
   std::vector<std::uint8_t> full;
   if (!codec->decode(shards, static_cast<std::size_t>(meta->full_size), full, err)) {
+    return false;
+  }
+  // Repair overwrites healthy shards with the re-encoded result, so a bad decode
+  // here is unrecoverable. Verify before writing anything.
+  if (meta->full_crc_known && crc32c(full.data(), full.size()) != meta->full_crc) {
+    AIOS_LOG_WARN("ec repair aborted oid=", oid, ": decoded object crc mismatch");
     return false;
   }
   std::vector<std::vector<std::uint8_t>> encoded;

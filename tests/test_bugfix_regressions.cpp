@@ -95,61 +95,7 @@ int raw_request(const std::string& port, const std::string& raw, int timeout_ms 
   return status.load();
 }
 
-// Three local targets, EC k=2/m=1, so an acting set of 3 shards.
-struct EcFixture {
-  fs::path root;
-  std::string p1, p2, p3;
-  aios::MembershipTable membership;
-  aios::FsTable fs_table;
-  aios::Config cfg;
-  aios::ClusterMap map;
-  aios::LocalStores stores;
-  std::unique_ptr<aios::ObjectService> svc;
-
-  EcFixture() {
-    using namespace aios;
-    root = aios::test::temp_root("aios-ecquorum");
-    for (const char* d : {"t1", "t2", "t3"}) fs::create_directories(root / d / "aios");
-    p1 = (root / "t1" / "aios").string();
-    p2 = (root / "t2" / "aios").string();
-    p3 = (root / "t3" / "aios").string();
-
-    membership.set_local("node-a", "127.0.0.1:7400");
-    std::vector<AiosTarget> local;
-    for (const auto& path : {p1, p2, p3}) local.push_back(aios::test::make_target(path));
-    fs_table.set_local("node-a", local);
-
-    cfg.node_id = "node-a";
-    cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
-    cfg.durability = "ec";
-    cfg.ec_k = 2;
-    cfg.ec_m = 1;
-    std::string err;
-    EXPECT_TRUE(normalize_config(cfg, err)) << err;
-    // Replication-style quorum that is lower than k: the pre-fix gate accepted this.
-    cfg.write_quorum = 1;
-    cfg.max_versions = 16;
-    cfg.clone_required = false;
-
-    map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
-    stores.sync_paths({p1, p2, p3}, opts());
-    svc = std::make_unique<ObjectService>(cfg, map, stores);
-    svc->set_advertise("127.0.0.1:7400");
-  }
-
-  static aios::ObjectStoreOptions opts() {
-    aios::ObjectStoreOptions o;
-    o.shard_count = 4;
-    o.clone_required = false;
-    o.max_versions = 16;
-    return o;
-  }
-
-  ~EcFixture() {
-    std::error_code ec;
-    fs::remove_all(root, ec);
-  }
-};
+using aios::test::EcFixture;
 
 }  // namespace
 

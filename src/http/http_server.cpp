@@ -222,6 +222,8 @@ int status_for(const ApiResult& r) {
   if (r.code == "crc_mismatch") return 400;
   if (r.code == "range_unsatisfiable") return 416;
   if (r.code == "not_primary") return 307;
+  // Reached the wrong node for a read: redirect like a write, not a server error.
+  if (r.code == "not_local") return 307;
   if (r.code == "restoring") return 503;
   if (r.code == "frozen") return 409;
   if (r.code == "no_targets") return 503;
@@ -277,7 +279,7 @@ void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
     }
   }
   nlohmann::json body = {{"error", r.error},
-                         {"code", "not_primary"},
+                         {"code", r.code},
                          {"epoch", r.epoch},
                          {"acting_set", acting}};
   const auto body_s = body.dump();
@@ -335,8 +337,14 @@ bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
 
 void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& path_q,
                      bool keep_alive) {
-  if (r.code == "not_primary") {
-    write_not_primary(sock, path_q, r, keep_alive);
+  if (r.code == "not_primary" || r.code == "not_local") {
+    if (!r.placement.acting_set.empty()) {
+      write_not_primary(sock, path_q, r, keep_alive);
+      return;
+    }
+    // Nothing to redirect to; unavailable beats a 307 with no Location.
+    write_json(sock, 503, "Service Unavailable",
+               {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
     return;
   }
   if (r.code == "restoring") {
@@ -745,6 +753,20 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService&
   AIOS_LOG_INFO("http listening on ", ep.address().to_string(), ":", ep.port());
 }
 
+void HttpServer::detached_begin() {
+  std::lock_guard lock(detached_mu_);
+  ++detached_;
+}
+
+void HttpServer::detached_end() {
+  std::lock_guard lock(detached_mu_);
+  if (--detached_ == 0) detached_cv_.notify_all();
+}
+
+HttpServer::DetachedGuard::~DetachedGuard() {
+  if (server) server->detached_end();
+}
+
 void HttpServer::close_sessions() {
   boost::system::error_code ec;
   acceptor_.close(ec);
@@ -758,6 +780,15 @@ void HttpServer::close_sessions() {
     s->cancel(ignored);
     s->shutdown(tcp::socket::shutdown_both, ignored);
     s->close(ignored);
+  }
+  // Detached long polls are no longer in sessions_, so closing sockets does not
+  // reach them: release their waiters explicitly, then wait. They hold a raw
+  // ObjectService pointer that is destroyed shortly after this returns.
+  objects_.shutdown_waiters();
+  std::unique_lock lock(detached_mu_);
+  if (!detached_cv_.wait_for(lock, std::chrono::seconds(10),
+                             [this] { return detached_ == 0; })) {
+    AIOS_LOG_WARN("shutdown: ", detached_, " long-poll handler(s) still running");
   }
 }
 
@@ -821,6 +852,17 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       headers[name] = value;
     }
 
+    // Chunked bodies are not decoded here. Accepting one would store the object as
+    // empty (no Content-Length) and then parse the chunk framing as the next
+    // request, so refuse it explicitly instead of silently losing the upload.
+    if (!header_get(headers, "transfer-encoding").empty()) {
+      write_json(*sock, 501, "Not Implemented",
+                 {{"error", "Transfer-Encoding not supported; use Content-Length"},
+                  {"code", "unsupported_transfer_encoding"}},
+                 false);
+      return;
+    }
+
     std::size_t content_length = 0;
     {
       auto cl = header_get(headers, "content-length");
@@ -875,7 +917,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (ec) return;
     }
 
-    const auto conn = header_get(headers, "connection");
+    // Header names are lowercased above, values are not; Connection is a token and
+    // clients do send "Keep-Alive" and "Close".
+    auto conn = header_get(headers, "connection");
+    for (char& c : conn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (version == "HTTP/1.0") keep_alive = (conn == "keep-alive");
     else keep_alive = (conn != "close");
 
@@ -1963,7 +2008,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       const std::string target_copy = target;
       const std::string label_copy = app_label;
       ObjectService* svc = &objects_;
-      std::thread([sock_ptr, svc, prefix, timeout_ms, target_copy, label_copy]() {
+      detached_begin();
+      std::thread([this, sock_ptr, svc, prefix, timeout_ms, target_copy, label_copy]() {
+        DetachedGuard guard{this};
         AppLabelScope scope(label_copy);
         auto r = svc->api_watch_prefix(prefix, timeout_ms);
         if (!r.ok) {
@@ -2055,7 +2102,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
 
       if (sub == "publish" && method == "POST") {
-        if (!upload_path.empty() || body.size() > TopicHub::kMaxMessageBytes ||
+        if (body.size() > TopicHub::kMaxMessageBytes ||
             content_length > TopicHub::kMaxMessageBytes) {
           if (!upload_path.empty()) {
             std::error_code rec;
@@ -2066,6 +2113,23 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                      {{"error", "message exceeds 1 MiB"}, {"code", "payload_too_large"}},
                      keep_alive);
           continue;
+        }
+        if (!upload_path.empty()) {
+          // Bodies past the 256 KiB spill threshold are on disk, but the publish
+          // limit is 1 MiB: read it back instead of rejecting a legal message.
+          std::ifstream in(upload_path, std::ios::binary);
+          std::string raw((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+          const bool read_ok = static_cast<bool>(in) || in.eof();
+          in.close();
+          std::error_code rec;
+          fs::remove(upload_path, rec);
+          upload_path.clear();
+          if (!read_ok) {
+            write_json(*sock, 500, "Error", {{"error", "cannot read upload temp"}}, keep_alive);
+            continue;
+          }
+          body.assign(raw.begin(), raw.end());
         }
         std::optional<DeliveryMode> mode = parse_delivery();
         if (qmap.count("delivery") && !mode) {
@@ -2116,8 +2180,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         const std::string target_copy = target;
         const std::string label_copy = app_label;
         ObjectService* svc = &objects_;
-        std::thread([sock_ptr, svc, topic, after_id, after_set, timeout_ms, target_copy,
+        detached_begin();
+        std::thread([this, sock_ptr, svc, topic, after_id, after_set, timeout_ms, target_copy,
                      label_copy]() {
+          DetachedGuard guard{this};
           AppLabelScope scope(label_copy);
           auto r = svc->api_pubsub_subscribe(topic, after_id, after_set, timeout_ms);
           if (!r.ok) {
@@ -2512,7 +2578,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         const std::string target_copy = target;
         const std::string label_copy = app_label;
         ObjectService* svc = &objects_;
-        std::thread([sock_ptr, svc, oid, after_seq, timeout_ms, target_copy, label_copy]() {
+        detached_begin();
+        std::thread([this, sock_ptr, svc, oid, after_seq, timeout_ms, target_copy, label_copy]() {
+          DetachedGuard guard{this};
           AppLabelScope scope(label_copy);
           auto r = svc->api_watch_oid(oid, after_seq, timeout_ms);
           if (!r.ok) {

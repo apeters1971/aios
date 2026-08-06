@@ -16,14 +16,31 @@
 
 namespace {
 std::atomic<bool> g_stop{false};
-boost::asio::io_context* g_ioc = nullptr;
-std::unique_ptr<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> g_work;
+
+using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
 
 void on_signal(int) {
   // Only request stop; main tears down S3 (posix unmount/rstat flush needs HTTP)
   // before stopping the io_context.
   g_stop.store(true);
 }
+
+// Releases the work guard, stops the io_context and joins its thread. Declared
+// after the objects whose handlers run on that thread, so unwinding stops the
+// thread before they are destroyed. Without this, an exception thrown after the
+// thread starts reaches ~thread while it is still joinable, which calls
+// std::terminate instead of running main's error path.
+struct IoStopper {
+  boost::asio::io_context& ioc;
+  std::thread& thread;
+  WorkGuard& work;
+
+  ~IoStopper() {
+    work.reset();
+    ioc.stop();
+    if (thread.joinable()) thread.join();
+  }
+};
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -60,14 +77,11 @@ int main(int argc, char** argv) {
 
   try {
     boost::asio::io_context ioc;
-    g_ioc = &ioc;
-    g_work = std::make_unique<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>(
-        boost::asio::make_work_guard(ioc));
+    WorkGuard work = boost::asio::make_work_guard(ioc);
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    std::thread ioc_thread;
     {
       MembershipTable membership;
       FsTable fs_table;
@@ -77,7 +91,8 @@ int main(int argc, char** argv) {
       engine.start();
 
       // Run the io_context before S3 starts: posix mount needs loopback HTTP.
-      ioc_thread = std::thread([&] { ioc.run(); });
+      std::thread ioc_thread([&] { ioc.run(); });
+      const IoStopper io_stopper{ioc, ioc_thread, work};
 
       std::unique_ptr<S3Server> s3;
       if (!cfg.s3_listen.empty()) {
@@ -99,20 +114,14 @@ int main(int argc, char** argv) {
       s3.reset();
       // Close acceptors + HTTP keep-alive sockets before stopping ioc/joining workers.
       engine.stop();
-      g_work.reset();
-      ioc.stop();
-      if (ioc_thread.joinable()) ioc_thread.join();
+      // ~IoStopper stops the io_context and joins its thread, before ~GossipEngine.
     }
     AIOS_LOG_INFO("aiosd stopped");
   } catch (const std::exception& e) {
     AIOS_LOG_ERROR("fatal: ", e.what());
-    g_work.reset();
-    if (g_ioc) g_ioc->stop();
     return 1;
   } catch (...) {
     AIOS_LOG_ERROR("fatal: unknown exception");
-    g_work.reset();
-    if (g_ioc) g_ioc->stop();
     return 1;
   }
   return 0;

@@ -102,6 +102,63 @@ struct DualStoreFixture {
   }
 };
 
+// Three local targets, EC k=2/m=1, so an acting set of exactly k+m shards.
+struct EcFixture {
+  std::filesystem::path root;
+  std::string p1, p2, p3;
+  MembershipTable membership;
+  FsTable fs_table;
+  Config cfg;
+  ClusterMap map;
+  LocalStores stores;
+  std::unique_ptr<ObjectService> svc;
+
+  explicit EcFixture(const char* prefix = "aios-ecquorum") {
+    root = temp_root(prefix);
+    for (const char* d : {"t1", "t2", "t3"}) {
+      std::filesystem::create_directories(root / d / "aios");
+    }
+    p1 = (root / "t1" / "aios").string();
+    p2 = (root / "t2" / "aios").string();
+    p3 = (root / "t3" / "aios").string();
+
+    membership.set_local("node-a", "127.0.0.1:7400");
+    std::vector<AiosTarget> local;
+    for (const auto& path : {p1, p2, p3}) local.push_back(make_target(path));
+    fs_table.set_local("node-a", local);
+
+    cfg.node_id = "node-a";
+    cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+    cfg.durability = "ec";
+    cfg.ec_k = 2;
+    cfg.ec_m = 1;
+    std::string err;
+    EXPECT_TRUE(normalize_config(cfg, err)) << err;
+    // Replication-style quorum that is lower than k: the pre-fix gate accepted this.
+    cfg.write_quorum = 1;
+    cfg.max_versions = 16;
+    cfg.clone_required = false;
+
+    map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
+    stores.sync_paths({p1, p2, p3}, opts());
+    svc = std::make_unique<ObjectService>(cfg, map, stores);
+    svc->set_advertise("127.0.0.1:7400");
+  }
+
+  static ObjectStoreOptions opts() {
+    ObjectStoreOptions o;
+    o.shard_count = 4;
+    o.clone_required = false;
+    o.max_versions = 16;
+    return o;
+  }
+
+  ~EcFixture() {
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+  }
+};
+
 inline ObjectStoreOptions default_opts() {
   ObjectStoreOptions o;
   o.shard_count = 4;

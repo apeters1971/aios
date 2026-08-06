@@ -18,9 +18,33 @@
 #include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aios {
+namespace {
+
+// place() falls back to reusing a node when a class has fewer nodes than copies to
+// place, so replicas (or EC shards, where replica_count is k+m) end up sharing
+// hardware. That is silent in the placement itself, so surface it per epoch.
+void warn_thin_failure_domains(const ClusterMap& map) {
+  std::unordered_map<std::string, std::unordered_set<std::string>> nodes_by_class;
+  std::unordered_map<std::string, std::size_t> mounts_by_class;
+  for (const auto& t : map.targets) {
+    if (t.state != LifecycleState::Up) continue;
+    nodes_by_class[t.storage_class].insert(t.node_id);
+    ++mounts_by_class[t.storage_class];
+  }
+  for (const auto& [sc, nodes] : nodes_by_class) {
+    const auto need = static_cast<std::size_t>(std::max(1, map.replica_count));
+    if (nodes.size() >= need || mounts_by_class[sc] < need) continue;
+    AIOS_LOG_WARN("storage class ", sc, ": only ", nodes.size(), " node(s) for ", need,
+                  " copies; copies will share a node and one node loss removes several");
+  }
+}
+
+}  // namespace
 
 GossipEngine::GossipEngine(boost::asio::io_context& ioc, Config cfg,
                            MembershipTable& membership, FsTable& fs_table)
@@ -50,24 +74,33 @@ std::string GossipEngine::advertise_addr() const {
 }
 
 void GossipEngine::rebuild_cluster_map() {
-  const auto prev = cluster_map_.epoch;
   PlacementConfig pc;
   pc.vnodes_per_target = cfg_.vnodes_per_target;
   pc.min_vnodes = cfg_.min_vnodes;
   pc.max_vnodes = cfg_.max_vnodes;
   auto built = ClusterMap::build(membership_, fs_table_, cfg_.replica_count, pc);
+  const auto epoch = built.epoch;
+  const auto targets = built.targets.size();
+  const auto replicas = built.replica_count;
+  std::uint64_t prev = 0;
   if (object_service_) {
     // Publishing through ObjectService serializes the swap against in-flight
-    // requests on the HTTP worker threads, which read the map by reference.
-    object_service_->update_cluster_map(std::move(built));
+    // requests on the HTTP and RPC worker threads, which read the map by reference.
+    prev = object_service_->update_cluster_map(std::move(built));
   } else {
+    prev = cluster_map_.epoch;
     cluster_map_ = std::move(built);
   }
-  if (cluster_map_.epoch != prev) {
-    AIOS_LOG_INFO("cluster map epoch=", cluster_map_.epoch,
-                  " targets=", cluster_map_.targets.size(),
-                  " replica_count=", cluster_map_.replica_count);
+  if (epoch != prev) {
+    AIOS_LOG_INFO("cluster map epoch=", epoch, " targets=", targets,
+                  " replica_count=", replicas);
+    warn_thin_failure_domains(map_snapshot());
   }
+}
+
+ClusterMap GossipEngine::map_snapshot() const {
+  if (object_service_) return object_service_->map_snapshot();
+  return cluster_map_;
 }
 
 void GossipEngine::sync_local_stores() {
@@ -135,11 +168,17 @@ void GossipEngine::start() {
                                                 s3_iam_, quota_, qos_, backup_policies_,
                                                 posix_layout_, vbd_registry_);
     http_server_->set_on_lifecycle_changed([this] {
-      // Reset hysteresis so a policy change (incl. autotune on/off) applies on this scan.
-      autotune_weights_.clear();
-      run_scan();
-      rebuild_cluster_map();
-      sync_local_stores();
+      // Runs on an HTTP worker thread, but cluster_map_, autotune_weights_ and
+      // local_stores_ are owned by the io_context thread (the timers read the map by
+      // reference for whole repair/transition passes). Hand the rebuild over rather
+      // than mutating them from under those readers.
+      boost::asio::post(ioc_, [this] {
+        // Reset hysteresis so a policy change (incl. autotune on/off) applies on this scan.
+        autotune_weights_.clear();
+        run_scan();
+        rebuild_cluster_map();
+        sync_local_stores();
+      });
     });
     http_server_->start();
     if (cfg_.admin) {
@@ -241,7 +280,7 @@ Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
   reply.body = {
       {"membership", membership_.to_json()},
       {"fs_table", fs_table_.to_json()},
-      {"cluster_map", cluster_map_.to_json()},
+      {"cluster_map", map_snapshot().to_json()},
   };
   return reply;
 }
@@ -330,8 +369,9 @@ void GossipEngine::on_scan_timer(const boost::system::error_code& ec) {
 void GossipEngine::on_repair_timer(const boost::system::error_code& ec) {
   if (ec) return;
   rebuild_cluster_map();
+  const auto map = map_snapshot();
   const auto stats =
-      run_repair(cfg_, advertise_addr(), cluster_map_, local_stores_,
+      run_repair(cfg_, advertise_addr(), map, local_stores_,
                  static_cast<std::size_t>(std::max(1, cfg_.repair_batch_oids)));
   if (object_service_) {
     object_service_->ops().note_repair(stats.oids_scanned, stats.repaired, stats.failed);
@@ -348,8 +388,9 @@ void GossipEngine::on_repair_timer(const boost::system::error_code& ec) {
 void GossipEngine::on_transition_timer(const boost::system::error_code& ec) {
   if (ec) return;
   rebuild_cluster_map();
+  const auto map = map_snapshot();
   const auto stats = run_transitions(
-      cfg_, advertise_addr(), cluster_map_, local_stores_,
+      cfg_, advertise_addr(), map, local_stores_,
       static_cast<std::size_t>(std::max(1, cfg_.transition_batch_oids)));
   if (stats.matched > 0 || stats.migrated > 0 || stats.drained > 0) {
     AIOS_LOG_INFO("transition scanned=", stats.oids_scanned, " matched=", stats.matched,
@@ -363,14 +404,15 @@ void GossipEngine::on_transition_timer(const boost::system::error_code& ec) {
 void GossipEngine::on_archive_timer(const boost::system::error_code& ec) {
   if (ec) return;
   rebuild_cluster_map();
+  const auto map = map_snapshot();
   const auto batch = static_cast<std::size_t>(std::max(1, cfg_.archive_batch_oids));
-  const auto stats = run_archive(cfg_, advertise_addr(), cluster_map_, local_stores_, batch);
+  const auto stats = run_archive(cfg_, advertise_addr(), map, local_stores_, batch);
   if (stats.matched > 0 || stats.bags_sealed > 0 || stats.packed > 0) {
     AIOS_LOG_INFO("archive scanned=", stats.oids_scanned, " matched=", stats.matched,
                   " packed=", stats.packed, " bags=", stats.bags_sealed,
                   " failed=", stats.failed);
   }
-  const auto drain = run_archive_drain(cfg_, advertise_addr(), cluster_map_, local_stores_, batch);
+  const auto drain = run_archive_drain(cfg_, advertise_addr(), map, local_stores_, batch);
   if (drain.drained > 0 || drain.failed > 0) {
     AIOS_LOG_INFO("archive drain scanned=", drain.bags_scanned, " drained=", drain.drained,
                   " skipped=", drain.skipped, " failed=", drain.failed);
@@ -382,9 +424,10 @@ void GossipEngine::on_archive_timer(const boost::system::error_code& ec) {
 void GossipEngine::on_backup_timer(const boost::system::error_code& ec) {
   if (ec) return;
   rebuild_cluster_map();
+  const auto map = map_snapshot();
   const auto batch = static_cast<std::size_t>(std::max(1, cfg_.backup_batch_oids));
   const auto stats =
-      run_backup(cfg_, advertise_addr(), cluster_map_, local_stores_, *object_service_, batch,
+      run_backup(cfg_, advertise_addr(), map, local_stores_, *object_service_, batch,
                  backup_policies_.get(), false);
   if (stats.snaps_created > 0 || stats.bags_sealed > 0 || stats.drained > 0) {
     AIOS_LOG_INFO("backup rules=", stats.rules_run, " snaps=", stats.snaps_created,
@@ -401,6 +444,7 @@ void GossipEngine::on_backup_timer(const boost::system::error_code& ec) {
 }
 
 void GossipEngine::write_status() {
+  const auto map = map_snapshot();
   nlohmann::json j = {
       {"node_id", cfg_.node_id},
       {"listen", cfg_.listen},
@@ -413,7 +457,7 @@ void GossipEngine::write_status() {
       {"write_quorum", cfg_.write_quorum > 0 ? cfg_.write_quorum : cfg_.replica_count},
       {"membership", membership_.to_json()},
       {"fs_table", fs_table_.to_json()},
-      {"cluster_map", cluster_map_.to_json()},
+      {"cluster_map", map.to_json()},
   };
   if (object_service_) {
     auto admin = object_service_->ops().to_admin_json();
@@ -427,8 +471,7 @@ void GossipEngine::write_status() {
   }
   AIOS_LOG_INFO("status members=", members.size(), " alive=", alive,
                 " fs_entries=", fs_table_.snapshot().size(),
-                " map_targets=", cluster_map_.targets.size(),
-                " epoch=", cluster_map_.epoch);
+                " map_targets=", map.targets.size(), " epoch=", map.epoch);
 
   if (cfg_.status_file.empty()) return;
   const std::string tmp = cfg_.status_file + ".tmp";

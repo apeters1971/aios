@@ -166,9 +166,20 @@ class ObjectService {
   ApiResult api_txn_commit(const std::string& txn_id);
   ApiResult api_txn_abort(const std::string& txn_id);
 
-  // Publish a rebuilt cluster map. Takes the same lock that serializes request
-  // handling, so worker threads never observe a half-written map.
-  void update_cluster_map(ClusterMap m);
+  // Publish a rebuilt cluster map, returning the epoch it replaced. Takes the same
+  // lock that serializes request handling, so worker threads never observe a
+  // half-written map.
+  std::uint64_t update_cluster_map(ClusterMap m);
+
+  // Copy of the current map. Callers that hold the map across long work (repair,
+  // transition, archive passes) must use this rather than map(): a concurrent
+  // update_cluster_map reassigns the targets vector out from under a reference.
+  ClusterMap map_snapshot() const;
+
+  // Release every long-poll waiter (watch, pubsub subscribe) and refuse new ones.
+  // Their handlers hold a raw pointer to this service, so they must be drained
+  // before it is destroyed.
+  void shutdown_waiters();
 
   ClusterMap& map() { return map_; }
   const ClusterMap& map() const { return map_; }

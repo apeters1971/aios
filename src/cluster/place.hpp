@@ -12,6 +12,11 @@ struct Placement {
   std::uint64_t epoch{0};
   std::string storage_class;
   std::vector<StorageTarget> acting_set;
+  // Failure domains actually covered by acting_set. A value below acting_set.size()
+  // means the class ran out of domains and copies (or EC shards) share hardware, so
+  // losing one node takes out more than one of them.
+  std::size_t distinct_nodes{0};
+  std::size_t distinct_racks{0};
 };
 
 // Consistent-hash placement with virtual nodes on the class-scoped ring.

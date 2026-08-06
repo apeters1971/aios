@@ -94,6 +94,10 @@ class TopicHub {
   bool subscribe(const std::string& topic, std::uint64_t after_id, int timeout_ms,
                  std::vector<PubMessage>& out);
 
+  // Wake every subscriber and refuse new waits, so shutdown does not block on a
+  // long poll.
+  void shutdown();
+
   std::uint64_t tip_id(const std::string& topic) const;  // 0 if none / unknown
 
  private:
@@ -120,6 +124,7 @@ class TopicHub {
   std::condition_variable cv_;
   std::unordered_map<std::string, Topic> topics_;
   std::list<std::shared_ptr<Waiter>> waiters_;
+  bool stopped_{false};
 };
 
 inline std::string pubsub_meta_oid(const std::string& topic) { return "pubsub/" + topic; }

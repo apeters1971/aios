@@ -226,6 +226,7 @@ bool TopicHub::subscribe(const std::string& topic, std::uint64_t after_id, int t
   waiter->after_id = after_id;
 
   std::unique_lock lock(mu_);
+  if (stopped_) return false;
   waiters_.push_back(waiter);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, timeout_ms));
@@ -238,6 +239,14 @@ bool TopicHub::subscribe(const std::string& topic, std::uint64_t after_id, int t
   }
   out = std::move(waiter->messages);
   return !out.empty();
+}
+
+void TopicHub::shutdown() {
+  std::lock_guard lock(mu_);
+  stopped_ = true;
+  for (auto& w : waiters_) w->done = true;
+  waiters_.clear();
+  cv_.notify_all();
 }
 
 std::uint64_t TopicHub::tip_id(const std::string& topic) const {

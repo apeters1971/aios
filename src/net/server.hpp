@@ -4,6 +4,7 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -48,8 +49,9 @@ class TcpServer {
   ~TcpServer();
 
   void start();
-  // Closes the acceptor and every live session so blocking session reads return.
-  // Must be called before the object is destroyed while the io_context still runs.
+  // Closes the acceptor and every live session so blocking session reads return,
+  // then drains the session pool. No handler runs once this returns, so it must be
+  // called before anything RpcHandlers refers to is destroyed.
   void close();
 
  private:
@@ -59,6 +61,10 @@ class TcpServer {
   boost::asio::io_context& ioc_;
   tcp::acceptor acceptor_;
   RpcHandlers handlers_;
+  // Sessions read and write synchronously and stay open for keep-alive, so they
+  // must not run on ioc_: one idle peer would stall accepts, gossip and every timer.
+  boost::asio::thread_pool workers_{8};
+  std::atomic<bool> workers_drained_{false};
   std::mutex sessions_mu_;
   std::unordered_set<std::shared_ptr<tcp::socket>> sessions_;
 };

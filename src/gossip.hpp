@@ -53,6 +53,9 @@ class GossipEngine {
   void run_scan();
   void apply_target_weights(std::vector<AiosTarget>& targets);
   void rebuild_cluster_map();
+  // Copy of the published map. Every read outside the publishing call must go
+  // through this: RPC and HTTP worker threads publish concurrently with the timers.
+  ClusterMap map_snapshot() const;
   void sync_local_stores();
   void write_status();
   Frame handle_inbound_gossip(const std::string& peer_node_id,
