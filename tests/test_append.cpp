@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "client/session.hpp"
 #include "http/http_server.hpp"
@@ -15,9 +16,6 @@
 namespace {
 
 using aios::test::DualStoreFixture;
-using aios::test::expect;
-using aios::test::failures;
-
 struct HttpFixture {
   DualStoreFixture fx;
   int port_num;
@@ -48,12 +46,11 @@ struct HttpFixture {
   }
 };
 
+
 }  // namespace
 
-int test_append() {
-  using namespace aios;
-  failures() = 0;
-
+TEST(Append, ConcurrentAppendsBothPayloadsPresentSizesAddUpDistinctOffset) {
+using namespace aios;
   // Concurrent appends: both payloads present, sizes add up, distinct offsets.
   {
     DualStoreFixture fx("aios-append-conc");
@@ -82,35 +79,39 @@ int test_append() {
     });
     t1.join();
     t2.join();
-    expect(ok.load() == 2, "concurrent append both ok");
-    expect(ra.offset != rb.offset, "distinct offsets");
-    expect((ra.offset == 0 && rb.offset == a.size()) || (rb.offset == 0 && ra.offset == b.size()),
-           "offsets are sequential");
+    EXPECT_TRUE(ok.load() == 2) << "concurrent append both ok";
+    EXPECT_TRUE(ra.offset != rb.offset) << "distinct offsets";
+    EXPECT_TRUE((ra.offset == 0 && rb.offset == a.size()) || (rb.offset == 0 && ra.offset == b.size())) << "offsets are sequential";
     auto got = fx.svc->api_get(oid, std::nullopt, std::nullopt, {});
-    expect(got.ok && got.data && got.data->size() == a.size() + b.size(), "concat size");
+    EXPECT_TRUE(got.ok && got.data && got.data->size() == a.size() + b.size()) << "concat size";
     if (got.data) {
       const std::string body(got.data->begin(), got.data->end());
-      expect(body.find(a) != std::string::npos && body.find(b) != std::string::npos,
-             "both payloads present");
+      EXPECT_TRUE(body.find(a) != std::string::npos && body.find(b) != std::string::npos) << "both payloads present";
     }
   }
+}
 
+TEST(Append, LockHeldWithoutToken409LockHeld) {
+using namespace aios;
   // Lock held without token → 409 / lock_held
   {
     DualStoreFixture fx("aios-append-lock");
     const std::string oid = "log/locked";
     auto lk = fx.svc->api_lock_acquire(oid, 30000);
-    expect(lk.ok, "lock acquire");
+    EXPECT_TRUE(lk.ok) << "lock acquire";
     auto denied = fx.svc->api_append(oid, reinterpret_cast<const std::uint8_t*>("x"), 1, {}, false,
                                      {}, {}, std::nullopt);
-    expect(!denied.ok && denied.code == "lock_held", "append without token denied");
+    EXPECT_TRUE(!denied.ok && denied.code == "lock_held") << "append without token denied";
     const std::string token = (*lk.json_body)["token"].get<std::string>();
     auto ok =
         fx.svc->api_append(oid, reinterpret_cast<const std::uint8_t*>("x"), 1, {}, false, {}, {},
                            token);
-    expect(ok.ok, "append with token");
+    EXPECT_TRUE(ok.ok) << "append with token";
   }
+}
 
+TEST(Append, WrongPrimaryNotPrimaryHTTPMapsTo307) {
+using namespace aios;
   // Wrong primary → not_primary (HTTP maps to 307)
   {
     DualStoreFixture fx("aios-append-np");
@@ -119,9 +120,12 @@ int test_append() {
     fx.svc->set_advertise("127.0.0.1:7400");
     auto r = fx.svc->api_append("log/np", reinterpret_cast<const std::uint8_t*>("z"), 1, {}, false,
                                 {}, {}, std::nullopt);
-    expect(!r.ok && r.code == "not_primary", "append not_primary");
+    EXPECT_TRUE(!r.ok && r.code == "not_primary") << "append not_primary";
   }
+}
 
+TEST(Append, ECTipAppendRejected) {
+using namespace aios;
   // EC tip → append rejected
   {
     namespace fs = std::filesystem;
@@ -176,25 +180,28 @@ int test_append() {
     const std::string body = "abcdefgh";
     auto put = svc.api_put("ecobj", reinterpret_cast<const std::uint8_t*>(body.data()),
                            body.size(), {}, true, {}, std::nullopt, layout);
-    expect(put.ok, "ec put for append reject test");
+    EXPECT_TRUE(put.ok) << "ec put for append reject test";
     auto ap = svc.api_append("ecobj", reinterpret_cast<const std::uint8_t*>("z"), 1, {}, false,
                              {}, {}, std::nullopt);
-    expect(!ap.ok && ap.code == "bad_request", "append rejected on EC tip");
+    EXPECT_TRUE(!ap.ok && ap.code == "bad_request") << "append rejected on EC tip";
     std::error_code ec;
     fs::remove_all(root, ec);
   }
+}
 
+TEST(Append, SessionHTTPAppend307FollowPathSameNode) {
+using namespace aios;
   // Session HTTP append + 307 follow path (same node)
   {
     HttpFixture hf("aios-append-http");
     Session s(hf.cfg());
     auto r1 = s.append("http-log", "hello");
-    expect(r1.offset == 0 && r1.size == 5, "session append create");
+    EXPECT_TRUE(r1.offset == 0 && r1.size == 5) << "session append create";
     auto r2 = s.append("http-log", "!");
-    expect(r2.offset == 5 && r2.size == 6, "session append extend");
+    EXPECT_TRUE(r2.offset == 5 && r2.size == 6) << "session append extend";
     auto snap = s.get_object("http-log");
-    expect(snap.exists && snap.body == "hello!", "session get after append");
+    EXPECT_TRUE(snap.exists && snap.body == "hello!") << "session get after append";
   }
-
-  return failures();
 }
+
+

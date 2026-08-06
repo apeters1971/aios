@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "http/http_auth.hpp"
 #include "http/http_server.hpp"
@@ -19,9 +20,6 @@ namespace {
 
 using tcp = boost::asio::ip::tcp;
 using aios::test::DualStoreFixture;
-using aios::test::expect;
-using aios::test::failures;
-
 struct HttpResponse {
   int status{0};
   std::unordered_map<std::string, std::string> headers;
@@ -126,37 +124,39 @@ HttpResponse http_request(const std::string& host, const std::string& port,
   return resp;
 }
 
+
 }  // namespace
 
-int test_locks_watches() {
-  using namespace aios;
-  failures() = 0;
-
+TEST(LocksWatches, ServiceEnforcedLock) {
+using namespace aios;
   // Service: enforced lock
   {
     DualStoreFixture fx("aios-locks");
     const auto* body = reinterpret_cast<const std::uint8_t*>("payload");
     auto acq = fx.svc->api_lock_acquire("lock/a", 5000);
-    expect(acq.ok && acq.json_body && acq.json_body->contains("token"), "lock acquire");
+    EXPECT_TRUE(acq.ok && acq.json_body && acq.json_body->contains("token")) << "lock acquire";
     const std::string token = (*acq.json_body)["token"].get<std::string>();
 
     auto denied = fx.svc->api_put("lock/a", body, 7, {}, true, {});
-    expect(!denied.ok && denied.code == "lock_held", "put without token denied");
+    EXPECT_TRUE(!denied.ok && denied.code == "lock_held") << "put without token denied";
 
     auto ok =
         fx.svc->api_put("lock/a", body, 7, {}, true, {}, std::nullopt, {}, token);
-    expect(ok.ok, "put with token ok");
+    EXPECT_TRUE(ok.ok) << "put with token ok";
 
     auto bad_renew = fx.svc->api_lock_renew("lock/a", "wrong", 5000);
-    expect(!bad_renew.ok, "renew wrong token");
-    expect(fx.svc->api_lock_renew("lock/a", token, 5000).ok, "renew ok");
+    EXPECT_TRUE(!bad_renew.ok) << "renew wrong token";
+    EXPECT_TRUE(fx.svc->api_lock_renew("lock/a", token, 5000).ok) << "renew ok";
 
-    expect(fx.svc->api_lock_stat("lock/a").ok, "stat held");
-    expect(fx.svc->api_lock_release("lock/a", token).ok, "release");
-    expect(!fx.svc->api_lock_stat("lock/a").ok, "stat free");
-    expect(fx.svc->api_put("lock/a", body, 7, {}, true, {}).ok, "put after unlock");
+    EXPECT_TRUE(fx.svc->api_lock_stat("lock/a").ok) << "stat held";
+    EXPECT_TRUE(fx.svc->api_lock_release("lock/a", token).ok) << "release";
+    EXPECT_TRUE(!fx.svc->api_lock_stat("lock/a").ok) << "stat free";
+    EXPECT_TRUE(fx.svc->api_put("lock/a", body, 7, {}, true, {}).ok) << "put after unlock";
   }
+}
 
+TEST(LocksWatches, ServiceWatchWakesOnPut) {
+using namespace aios;
   // Service: watch wakes on put
   {
     DualStoreFixture fx("aios-watch");
@@ -172,11 +172,14 @@ int test_locks_watches() {
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const auto* body = reinterpret_cast<const std::uint8_t*>("hi");
-    expect(fx.svc->api_put(oid, body, 2, {}, true, {}).ok, "put for watch");
+    EXPECT_TRUE(fx.svc->api_put(oid, body, 2, {}, true, {}).ok) << "put for watch";
     waiter.join();
-    expect(got.load() && ev.oid == oid && ev.op == "put", "watch woke on put");
+    EXPECT_TRUE(got.load() && ev.oid == oid && ev.op == "put") << "watch woke on put";
   }
+}
 
+TEST(LocksWatches, HTTPLockWatchTimeout) {
+using namespace aios;
   // HTTP: lock + watch timeout
   {
     DualStoreFixture fx("aios-locks-http");
@@ -193,29 +196,29 @@ int test_locks_watches() {
 
     auto acq = http_request(host, port, "POST", "/o/http-lock/lock",
                             {{"x-aios-lock-ttl-ms", "10000"}}, "", key);
-    expect(acq.status == 201, "HTTP lock acquire 201");
+    EXPECT_TRUE(acq.status == 201) << "HTTP lock acquire 201";
     std::string token;
     try {
       token = nlohmann::json::parse(acq.body).value("token", "");
     } catch (...) {
     }
-    expect(!token.empty(), "HTTP lock token");
+    EXPECT_TRUE(!token.empty()) << "HTTP lock token";
 
     auto denied =
         http_request(host, port, "PUT", "/o/http-lock", {}, "nope", key);
-    expect(denied.status == 409, "HTTP put without token 409");
+    EXPECT_TRUE(denied.status == 409) << "HTTP put without token 409";
 
     auto put_ok = http_request(host, port, "PUT", "/o/http-lock",
                                {{"x-aios-lock-token", token}}, "yes", key);
-    expect(put_ok.status == 204, "HTTP put with token 204");
+    EXPECT_TRUE(put_ok.status == 204) << "HTTP put with token 204";
 
     auto watch = http_request(host, port, "GET", "/o/http-lock/watch?timeout_ms=200", {},
                               "", key);
-    expect(watch.status == 204, "HTTP watch timeout 204");
+    EXPECT_TRUE(watch.status == 204) << "HTTP watch timeout 204";
 
     ioc.stop();
     th.join();
   }
-
-  return failures();
 }
+
+

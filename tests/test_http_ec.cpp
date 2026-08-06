@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "cluster/place.hpp"
 #include "ec/codec_factory.hpp"
@@ -21,8 +22,6 @@
 namespace {
 
 using tcp = boost::asio::ip::tcp;
-using aios::test::expect;
-using aios::test::failures;
 using aios::test::temp_root;
 
 struct HttpResponse {
@@ -172,7 +171,7 @@ struct EcHttpFixture {
     cfg.ec_m = 1;
     cfg.ec_codec = ec_codec;
     std::string err;
-    expect(normalize_config(cfg, err), "normalize http ec");
+    EXPECT_TRUE(normalize_config(cfg, err)) << "normalize http ec";
     cfg.clone_required = false;
     cfg.max_versions = 16;
     const int port_num = 18500 + static_cast<int>(::getpid() % 500) * 2 + port_offset;
@@ -195,12 +194,11 @@ struct EcHttpFixture {
   }
 };
 
+
 }  // namespace
 
-int test_http_ec() {
+TEST(HttpEc, Basic) {
   using namespace aios;
-  failures() = 0;
-
   EcHttpFixture fx("xor");
   boost::asio::io_context ioc;
   HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
@@ -215,39 +213,36 @@ int test_http_ec() {
   // PUT via HTTP → EC stripe
   {
     auto r = http_request(host, port, "PUT", "/o/http-ec-1", {}, body, key);
-    expect(r.status == 204, "HTTP EC PUT 204");
-    expect(r.headers.count("x-aios-version"), "PUT version header");
-    expect(r.headers.count("x-aios-crc32c"), "PUT full crc header");
+    EXPECT_TRUE(r.status == 204) << "HTTP EC PUT 204";
+    EXPECT_TRUE(r.headers.count("x-aios-version")) << "PUT version header";
+    EXPECT_TRUE(r.headers.count("x-aios-crc32c")) << "PUT full crc header";
   }
 
   // GET returns full reconstructed body + size/attr headers
   {
     auto r = http_request(host, port, "GET", "/o/http-ec-1", {}, "", key);
-    expect(r.status == 200, "HTTP EC GET 200");
-    expect(r.body == body, "HTTP EC GET body");
-    expect(r.headers.count("x-aios-size") && r.headers["x-aios-size"] == std::to_string(body.size()),
-           "HTTP EC x-aios-size full");
-    expect(r.headers.count("x-aios-attr-aios.ec.k"), "HTTP EC attr k");
-    expect(r.headers.count("x-aios-attr-aios.ec.codec") &&
-               r.headers["x-aios-attr-aios.ec.codec"] == "xor",
-           "HTTP EC attr codec");
+    EXPECT_TRUE(r.status == 200) << "HTTP EC GET 200";
+    EXPECT_TRUE(r.body == body) << "HTTP EC GET body";
+    EXPECT_TRUE(r.headers.count("x-aios-size") && r.headers["x-aios-size"] == std::to_string(body.size())) << "HTTP EC x-aios-size full";
+    EXPECT_TRUE(r.headers.count("x-aios-attr-aios.ec.k")) << "HTTP EC attr k";
+    EXPECT_TRUE(r.headers.count("x-aios-attr-aios.ec.codec") &&
+               r.headers["x-aios-attr-aios.ec.codec"] == "xor") << "HTTP EC attr codec";
   }
 
   // HEAD
   {
     auto r = http_request(host, port, "HEAD", "/o/http-ec-1", {}, "", key);
-    expect(r.status == 200, "HTTP EC HEAD 200");
-    expect(r.headers.count("content-length") &&
-               r.headers["content-length"] == std::to_string(body.size()),
-           "HTTP EC HEAD Content-Length");
+    EXPECT_TRUE(r.status == 200) << "HTTP EC HEAD 200";
+    EXPECT_TRUE(r.headers.count("content-length") &&
+               r.headers["content-length"] == std::to_string(body.size())) << "HTTP EC HEAD Content-Length";
   }
 
   // Partial GET reconstructs then slices
   {
     std::unordered_map<std::string, std::string> h = {{"range", "bytes=5-7"}};
     auto r = http_request(host, port, "GET", "/o/http-ec-1", h, "", key);
-    expect(r.status == 206, "HTTP EC Range 206");
-    expect(r.body == body.substr(5, 3), "HTTP EC range body");
+    EXPECT_TRUE(r.status == 206) << "HTTP EC Range 206";
+    EXPECT_TRUE(r.body == body.substr(5, 3)) << "HTTP EC range body";
   }
 
   // Ranged PUT rejected
@@ -257,7 +252,7 @@ int test_http_ec() {
         {"content-length", "1"},
     };
     auto r = http_request(host, port, "PUT", "/o/http-ec-1", h, "Z", key);
-    expect(r.status == 400, "HTTP EC ranged PUT 400");
+    EXPECT_TRUE(r.status == 400) << "HTTP EC ranged PUT 400";
   }
 
   // Degraded: purge one shard tip, HTTP GET still works
@@ -266,39 +261,38 @@ int test_http_ec() {
     auto* victim = fx.stores.get(pl.acting_set[2].aios_path);
     std::string err;
     auto st = victim->stat("http-ec-1", err);
-    expect(st.has_value(), "victim tip");
-    expect(victim->purge_version("http-ec-1", st->seq, true, err), "purge shard");
+    EXPECT_TRUE(st.has_value()) << "victim tip";
+    EXPECT_TRUE(victim->purge_version("http-ec-1", st->seq, true, err)) << "purge shard";
     auto r = http_request(host, port, "GET", "/o/http-ec-1", {}, "", key);
-    expect(r.status == 200 && r.body == body, "HTTP EC degraded GET");
+    EXPECT_TRUE(r.status == 200 && r.body == body) << "HTTP EC degraded GET";
   }
 
   // HTTP txn prepare/commit of two objects on EC cluster
   {
     auto begin = http_request(host, port, "POST", "/txn", {}, "", key);
-    expect(begin.status == 201, "HTTP EC txn begin");
+    EXPECT_TRUE(begin.status == 201) << "HTTP EC txn begin";
     std::string txn_id;
     try {
       txn_id = nlohmann::json::parse(begin.body).value("txn_id", "");
     } catch (...) {
-      expect(false, "txn begin json");
+      EXPECT_TRUE(false) << "txn begin json";
     }
-    expect(!txn_id.empty(), "txn id");
+    EXPECT_TRUE(!txn_id.empty()) << "txn id";
 
     auto p1 = http_request(host, port, "PUT", "/txn/" + txn_id + "/o/txn-a", {}, "alpha", key);
     auto p2 = http_request(host, port, "PUT", "/txn/" + txn_id + "/o/txn-b", {}, "bravo", key);
-    expect(p1.status == 200 && p2.status == 200, "HTTP EC txn prepare");
+    EXPECT_TRUE(p1.status == 200 && p2.status == 200) << "HTTP EC txn prepare";
 
     // Invisible before commit
-    expect(http_request(host, port, "GET", "/o/txn-a", {}, "", key).status != 200,
-           "txn-a hidden");
+    EXPECT_TRUE(http_request(host, port, "GET", "/o/txn-a", {}, "", key).status != 200) << "txn-a hidden";
 
     auto commit = http_request(host, port, "POST", "/txn/" + txn_id + "/commit", {}, "", key);
-    expect(commit.status == 200, "HTTP EC txn commit");
+    EXPECT_TRUE(commit.status == 200) << "HTTP EC txn commit";
 
     auto ga = http_request(host, port, "GET", "/o/txn-a", {}, "", key);
     auto gb = http_request(host, port, "GET", "/o/txn-b", {}, "", key);
-    expect(ga.status == 200 && ga.body == "alpha", "txn-a after commit");
-    expect(gb.status == 200 && gb.body == "bravo", "txn-b after commit");
+    EXPECT_TRUE(ga.status == 200 && ga.body == "alpha") << "txn-a after commit";
+    EXPECT_TRUE(gb.status == 200 && gb.body == "bravo") << "txn-b after commit";
   }
 
   // ISA-L over HTTP when available
@@ -316,19 +310,16 @@ int test_http_ec() {
 
     auto r =
         http_request(host, fx_isal.port, "PUT", "/o/http-ec-isal", {}, "isal-http", key);
-    expect(r.status == 204, "HTTP ISA-L PUT");
+    EXPECT_TRUE(r.status == 204) << "HTTP ISA-L PUT";
     auto g = http_request(host, fx_isal.port, "GET", "/o/http-ec-isal", {}, "", key);
-    expect(g.status == 200 && g.body == "isal-http", "HTTP ISA-L GET");
-    expect(g.headers.count("x-aios-attr-aios.ec.codec") &&
-               g.headers["x-aios-attr-aios.ec.codec"] == "isal",
-           "HTTP ISA-L codec attr");
+    EXPECT_TRUE(g.status == 200 && g.body == "isal-http") << "HTTP ISA-L GET";
+    EXPECT_TRUE(g.headers.count("x-aios-attr-aios.ec.codec") &&
+               g.headers["x-aios-attr-aios.ec.codec"] == "isal") << "HTTP ISA-L codec attr";
 
     ioc2.stop();
     th2.join();
-    return failures();
+  } else {
+    ioc.stop();
+    th.join();
   }
-
-  ioc.stop();
-  th.join();
-  return failures();
 }

@@ -957,10 +957,11 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 | [`config/xrootd.aios.example.cf`](config/xrootd.aios.example.cf) | Example XRootD config for `libXrdAios` |
 
-Run the unit suite after changes:
+Run the GoogleTest suite after changes:
 
 ```bash
 ./build/aios_tests
-# or
+./build/aios_tests --gtest_filter='S3Iam.*:HttpEc.*'
+# or (each TEST is registered with CTest; RUN_SERIAL avoids port clashes)
 ctest --test-dir build --output-on-failure
 ```

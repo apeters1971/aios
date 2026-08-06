@@ -1,23 +1,13 @@
 #include "http/http_auth.hpp"
+#include <gtest/gtest.h>
 #include "util/log.hpp"
 
 #include <iostream>
 #include <string>
 #include <unordered_map>
 
-namespace {
 
-int failures = 0;
-void expect(bool cond, const char* msg) {
-  if (!cond) {
-    std::cerr << "FAIL: " << msg << "\n";
-    ++failures;
-  }
-}
-
-}  // namespace
-
-int test_http_auth() {
+TEST(HttpAuth, Basic) {
   using namespace aios;
   const std::string key = "550e8400-e29b-41d4-a716-446655440000";
   const std::string date = std::to_string(now_ms());
@@ -34,13 +24,13 @@ int test_http_auth() {
       ", Signature=" + sig;
 
   auto ok = http_auth_verify("PUT", "/o/foo", headers, "UNSIGNED-PAYLOAD", key, 60000);
-  expect(ok.ok, "verify ok");
+  EXPECT_TRUE(ok.ok) << "verify ok";
 
   headers["authorization"] =
       "AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=" + signed_headers +
       ", Signature=" + std::string(64, '0');
   auto bad = http_auth_verify("PUT", "/o/foo", headers, "UNSIGNED-PAYLOAD", key, 60000);
-  expect(!bad.ok, "bad sig rejected");
+  EXPECT_TRUE(!bad.ok) << "bad sig rejected";
 
   // Wrong method → fail
   headers["authorization"] =
@@ -48,7 +38,7 @@ int test_http_auth() {
       ", Signature=" + sig;
   auto wrong_method =
       http_auth_verify("GET", "/o/foo", headers, "UNSIGNED-PAYLOAD", key, 60000);
-  expect(!wrong_method.ok, "wrong method rejected");
+  EXPECT_TRUE(!wrong_method.ok) << "wrong method rejected";
 
   // Skew: stale date
   {
@@ -61,13 +51,12 @@ int test_http_auth() {
     h["authorization"] = "AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=" + signed_headers +
                          ", Signature=" + http_sign(key, c);
     auto skew = http_auth_verify("PUT", "/o/foo", h, "UNSIGNED-PAYLOAD", key, 1000);
-    expect(!skew.ok, "skew rejected");
+    EXPECT_TRUE(!skew.ok) << "skew rejected";
   }
 
   // header_get helper
-  expect(header_get({{"Foo", "1"}, {"x-aios-date", "9"}}, "x-aios-date") == "9",
-         "header_get");
-  expect(header_get({{"Foo", "1"}}, "missing").empty(), "header_get missing");
+  EXPECT_TRUE(header_get({{"Foo", "1"}, {"x-aios-date", "9"}}, "x-aios-date") == "9") << "header_get";
+  EXPECT_TRUE(header_get({{"Foo", "1"}}, "missing").empty()) << "header_get missing";
 
   // Hashed payload path (non UNSIGNED)
   {
@@ -83,10 +72,9 @@ int test_http_auth() {
     h["authorization"] =
         "AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=" + sh + ", Signature=" + http_sign(key, c);
     auto ok2 = http_auth_verify("GET", "/map", h, hash, key, 60000);
-    expect(ok2.ok, "hashed payload verify");
+    EXPECT_TRUE(ok2.ok) << "hashed payload verify";
     auto mismatch = http_auth_verify("GET", "/map", h, "UNSIGNED-PAYLOAD", key, 60000);
-    expect(!mismatch.ok, "payload hash mismatch");
+    EXPECT_TRUE(!mismatch.ok) << "payload hash mismatch";
   }
 
-  return failures;
-}
+  }

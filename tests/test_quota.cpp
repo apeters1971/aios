@@ -1,4 +1,5 @@
 #include "http/http_server.hpp"
+#include <gtest/gtest.h>
 #include "http/quota_admin.hpp"
 #include "posix/aios_posix.h"
 #include "posix/quota_ledger.hpp"
@@ -18,17 +19,6 @@ namespace {
 
 using aios::test::DualStoreFixture;
 
-int& failures() {
-  static int n = 0;
-  return n;
-}
-void expect(bool cond, const char* msg) {
-  if (!cond) {
-    std::cerr << "FAIL quota: " << msg << "\n";
-    ++failures();
-  }
-}
-
 std::int64_t project_used(const nlohmann::json& show, std::uint32_t pid) {
   for (const auto& p : show.at("projects")) {
     if (p.value("id", 0u) == pid) return p.value("used_bytes", 0ll);
@@ -36,12 +26,12 @@ std::int64_t project_used(const nlohmann::json& show, std::uint32_t pid) {
   return -1;
 }
 
+
 }  // namespace
 
-int test_quota() {
-  using namespace aios;
+TEST(Quota, LimitsCodec) {
+using namespace aios;
   using namespace aios::posix;
-  failures() = 0;
 
   {
     QuotaLimits lim;
@@ -53,9 +43,14 @@ int test_quota() {
     lim.projects[2] = p;
     auto s = serialize_quota_limits(lim);
     auto back = parse_quota_limits(s, 3);
-    expect(back.volume_uids[1].bytes && *back.volume_uids[1].bytes == 99, "codec uid");
-    expect(back.projects[2].name == "x" && back.projects[2].root_ino == 7, "codec project");
+    EXPECT_TRUE(back.volume_uids[1].bytes && *back.volume_uids[1].bytes == 99) << "codec uid";
+    EXPECT_TRUE(back.projects[2].name == "x" && back.projects[2].root_ino == 7) << "codec project";
   }
+}
+
+TEST(Quota, VolumeUidAndProjectEnforcement) {
+using namespace aios;
+  using namespace aios::posix;
 
   {
     DualStoreFixture fx("aios-quota-unit");
@@ -78,105 +73,96 @@ int test_quota() {
     pcfg.gid = 100;
     int err = 0;
     auto* fs = aios_posix_mount(&pcfg, &err);
-    expect(fs != nullptr, "mount");
+    EXPECT_TRUE(fs != nullptr) << "mount";
     if (!fs) {
       work.reset();
       ioc.stop();
       th.join();
-      return failures();
-    }
+      }
 
     std::string qerr;
     size_t wrote = 0;
 
     // Volume uid soft limit
-    expect(quota_admin->set_volume_uid_limit(1001, 100, qerr), "set uid limit 100 bytes");
+    EXPECT_TRUE(quota_admin->set_volume_uid_limit(1001, 100, qerr)) << "set uid limit 100 bytes";
     aios_posix_stat st{};
-    expect(aios_posix_mkdir(fs, 1, "photos", 0755, &st) == 0, "mkdir photos");
+    EXPECT_TRUE(aios_posix_mkdir(fs, 1, "photos", 0755, &st) == 0) << "mkdir photos";
     const auto photos_ino = st.ino;
-    expect(aios_posix_mkdir(fs, 1, "other", 0755, &st) == 0, "mkdir other");
+    EXPECT_TRUE(aios_posix_mkdir(fs, 1, "other", 0755, &st) == 0) << "mkdir other";
     const auto other_ino = st.ino;
-    expect(aios_posix_create(fs, other_ino, "volf", 0644, &st) == 0, "create volf");
+    EXPECT_TRUE(aios_posix_create(fs, other_ino, "volf", 0644, &st) == 0) << "create volf";
     const auto volf = st.ino;
     const std::string big(80, 'x');
-    expect(aios_posix_write(fs, volf, 0, big.data(), big.size(), &wrote) == 0, "write under limit");
+    EXPECT_TRUE(aios_posix_write(fs, volf, 0, big.data(), big.size(), &wrote) == 0) << "write under limit";
     const std::string more(50, 'y');
-    expect(aios_posix_write(fs, volf, big.size(), more.data(), more.size(), &wrote) == -EDQUOT,
-           "over limit EDQUOT");
-    expect(quota_admin->set_volume_uid_limit(1001, 100000, qerr), "raise limit");
+    EXPECT_TRUE(aios_posix_write(fs, volf, big.size(), more.data(), more.size(), &wrote) == -EDQUOT) << "over limit EDQUOT";
+    EXPECT_TRUE(quota_admin->set_volume_uid_limit(1001, 100000, qerr)) << "raise limit";
     aios_posix_unmount(fs);
     fs = aios_posix_mount(&pcfg, &err);
-    expect(fs != nullptr, "remount after raise");
-    expect(aios_posix_write(fs, volf, big.size(), more.data(), more.size(), &wrote) == 0,
-           "write after raise");
+    EXPECT_TRUE(fs != nullptr) << "remount after raise";
+    EXPECT_TRUE(aios_posix_write(fs, volf, big.size(), more.data(), more.size(), &wrote) == 0) << "write after raise";
 
     // Project on photos; outside writes do not charge project total
     std::uint32_t pid = 0;
-    expect(quota_admin->create_project("photos", photos_ino, 50, pid, qerr), "create project");
-    expect(pid > 0, "project id");
+    EXPECT_TRUE(quota_admin->create_project("photos", photos_ino, 50, pid, qerr)) << "create project";
+    EXPECT_TRUE(pid > 0) << "project id";
     aios_posix_unmount(fs);
     fs = aios_posix_mount(&pcfg, &err);
-    expect(fs != nullptr, "remount after project");
+    EXPECT_TRUE(fs != nullptr) << "remount after project";
 
     aios_posix_stat outside{};
-    expect(aios_posix_create(fs, other_ino, "out", 0644, &outside) == 0, "create outside");
+    EXPECT_TRUE(aios_posix_create(fs, other_ino, "out", 0644, &outside) == 0) << "create outside";
     const std::string out_chunk(40, 'o');
-    expect(aios_posix_write(fs, outside.ino, 0, out_chunk.data(), out_chunk.size(), &wrote) == 0,
-           "write outside project");
+    EXPECT_TRUE(aios_posix_write(fs, outside.ino, 0, out_chunk.data(), out_chunk.size(), &wrote) == 0) << "write outside project";
 
     aios_posix_stat pfile{};
-    expect(aios_posix_create(fs, photos_ino, "pfile", 0644, &pfile) == 0, "create pfile");
+    EXPECT_TRUE(aios_posix_create(fs, photos_ino, "pfile", 0644, &pfile) == 0) << "create pfile";
     const std::string chunk(40, 'z');
-    expect(aios_posix_write(fs, pfile.ino, 0, chunk.data(), chunk.size(), &wrote) == 0,
-           "project write ok");
-    expect(aios_posix_write(fs, pfile.ino, chunk.size(), chunk.data(), chunk.size(), &wrote) ==
-               -EDQUOT,
-           "project total EDQUOT");
+    EXPECT_TRUE(aios_posix_write(fs, pfile.ino, 0, chunk.data(), chunk.size(), &wrote) == 0) << "project write ok";
+    EXPECT_TRUE(aios_posix_write(fs, pfile.ino, chunk.size(), chunk.data(), chunk.size(), &wrote) ==
+               -EDQUOT) << "project total EDQUOT";
 
     // Optional project-uid limit on a fresh project with headroom on total
-    expect(quota_admin->delete_project(pid, qerr), "delete project before uid-cap test");
-    expect(aios_posix_unlink(fs, photos_ino, "pfile") == 0, "unlink pfile");
-    expect(quota_admin->create_project("photos", photos_ino, 1000, pid, qerr), "recreate project");
-    expect(quota_admin->set_project_uid_limit(pid, 1001, 20, qerr), "project uid limit 20");
+    EXPECT_TRUE(quota_admin->delete_project(pid, qerr)) << "delete project before uid-cap test";
+    EXPECT_TRUE(aios_posix_unlink(fs, photos_ino, "pfile") == 0) << "unlink pfile";
+    EXPECT_TRUE(quota_admin->create_project("photos", photos_ino, 1000, pid, qerr)) << "recreate project";
+    EXPECT_TRUE(quota_admin->set_project_uid_limit(pid, 1001, 20, qerr)) << "project uid limit 20";
     aios_posix_unmount(fs);
     fs = aios_posix_mount(&pcfg, &err);
     aios_posix_stat puidf{};
-    expect(aios_posix_create(fs, photos_ino, "puid", 0644, &puidf) == 0, "create puid");
-    expect(aios_posix_write(fs, puidf.ino, 0, std::string(30, 'u').data(), 30, &wrote) == -EDQUOT,
-           "project uid EDQUOT");
-    expect(quota_admin->set_project_uid_limit(pid, 1001, std::nullopt, qerr), "clear project uid");
+    EXPECT_TRUE(aios_posix_create(fs, photos_ino, "puid", 0644, &puidf) == 0) << "create puid";
+    EXPECT_TRUE(aios_posix_write(fs, puidf.ino, 0, std::string(30, 'u').data(), 30, &wrote) == -EDQUOT) << "project uid EDQUOT";
+    EXPECT_TRUE(quota_admin->set_project_uid_limit(pid, 1001, std::nullopt, qerr)) << "clear project uid";
     aios_posix_unmount(fs);
     fs = aios_posix_mount(&pcfg, &err);
-    expect(aios_posix_write(fs, puidf.ino, 0, chunk.data(), chunk.size(), &wrote) == 0,
-           "write after clear uid limit");
+    EXPECT_TRUE(aios_posix_write(fs, puidf.ino, 0, chunk.data(), chunk.size(), &wrote) == 0) << "write after clear uid limit";
 
     // Rename out of project → usage moves (verify via reconcile)
-    expect(aios_posix_rename(fs, photos_ino, "puid", other_ino, "moved") == 0, "rename out");
+    EXPECT_TRUE(aios_posix_rename(fs, photos_ino, "puid", other_ino, "moved") == 0) << "rename out";
     aios_posix_unmount(fs);
-    expect(quota_admin->reconcile(qerr), "reconcile after rename");
+    EXPECT_TRUE(quota_admin->reconcile(qerr)) << "reconcile after rename";
     auto show = quota_admin->show();
-    expect(show.contains("volume_uids"), "show has uids");
-    expect(project_used(show, pid) == 0, "project usage zero after rename out");
+    EXPECT_TRUE(show.contains("volume_uids")) << "show has uids";
+    EXPECT_TRUE(project_used(show, pid) == 0) << "project usage zero after rename out";
 
     // Write under project again; reconcile matches size
     fs = aios_posix_mount(&pcfg, &err);
     aios_posix_stat p2{};
-    expect(aios_posix_create(fs, photos_ino, "p2", 0644, &p2) == 0, "create p2");
-    expect(aios_posix_write(fs, p2.ino, 0, chunk.data(), chunk.size(), &wrote) == 0, "p2 write");
+    EXPECT_TRUE(aios_posix_create(fs, photos_ino, "p2", 0644, &p2) == 0) << "create p2";
+    EXPECT_TRUE(aios_posix_write(fs, p2.ino, 0, chunk.data(), chunk.size(), &wrote) == 0) << "p2 write";
     aios_posix_unmount(fs);
-    expect(quota_admin->reconcile(qerr), "reconcile p2");
+    EXPECT_TRUE(quota_admin->reconcile(qerr)) << "reconcile p2";
     show = quota_admin->show();
-    expect(project_used(show, pid) == 40, "reconcile project usage matches");
+    EXPECT_TRUE(project_used(show, pid) == 40) << "reconcile project usage matches";
 
-    expect(quota_admin->delete_project(pid, qerr), "delete project");
+    EXPECT_TRUE(quota_admin->delete_project(pid, qerr)) << "delete project";
     show = quota_admin->show();
-    expect(show["projects"].empty(), "projects empty after delete");
+    EXPECT_TRUE(show["projects"].empty()) << "projects empty after delete";
 
     work.reset();
     ioc.stop();
     th.join();
   }
-
-  if (failures() == 0) std::cout << "test_quota OK\n";
-  return failures();
 }
+
+

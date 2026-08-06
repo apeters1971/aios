@@ -1,4 +1,5 @@
 #include "http/http_auth.hpp"
+#include <gtest/gtest.h>
 #include "http/http_server.hpp"
 #include "http/s3_auth.hpp"
 #include "http/s3_iam.hpp"
@@ -26,17 +27,6 @@ namespace {
 
 using tcp = boost::asio::ip::tcp;
 using aios::test::DualStoreFixture;
-
-int& failures() {
-  static int n = 0;
-  return n;
-}
-void expect(bool cond, const char* msg) {
-  if (!cond) {
-    std::cerr << "FAIL s3_iam: " << msg << "\n";
-    ++failures();
-  }
-}
 
 std::string amz_now() {
   const auto t = std::time(nullptr);
@@ -175,12 +165,11 @@ HttpResp http_req(const std::string& host, const std::string& port, const std::s
   return resp;
 }
 
+
 }  // namespace
 
-int test_s3_iam() {
-  using namespace aios;
-  failures() = 0;
-
+TEST(S3Iam, UnitStoreCreateListFindRemoveViaObjectService) {
+using namespace aios;
   // Unit: store create / list / find / remove via ObjectService
   {
     DualStoreFixture fx("aios-s3iam-store");
@@ -194,37 +183,40 @@ int test_s3_iam() {
     in.gid = 100;
     in.buckets = {"photos"};
     auto created = store.create(in, err);
-    expect(created.has_value(), "create ok");
-    expect(created && !created->secret.empty(), "secret generated");
+    EXPECT_TRUE(created.has_value()) << "create ok";
+    EXPECT_TRUE(created && !created->secret.empty()) << "secret generated";
     auto found = store.find("photos-rw");
-    expect(found.has_value(), "find ok");
-    expect(found && found->uid == 1001 && found->gid == 100, "uid/gid");
-    expect(found && store.allows_bucket(*found, "photos"), "allow photos");
-    expect(found && !store.allows_bucket(*found, "other"), "deny other");
+    EXPECT_TRUE(found.has_value()) << "find ok";
+    EXPECT_TRUE(found && found->uid == 1001 && found->gid == 100) << "uid/gid";
+    EXPECT_TRUE(found && store.allows_bucket(*found, "photos")) << "allow photos";
+    EXPECT_TRUE(found && !store.allows_bucket(*found, "other")) << "deny other";
     auto listed = store.list_redacted();
-    expect(listed["credentials"].size() == 1, "list size");
-    expect(listed["credentials"][0].value("secret", "") == "***", "secret redacted");
+    EXPECT_TRUE(listed["credentials"].size() == 1) << "list size";
+    EXPECT_TRUE(listed["credentials"][0].value("secret", "") == "***") << "secret redacted";
 
     S3Credential dup = in;
     dup.secret.clear();
-    expect(!store.create(dup, err), "duplicate id rejected");
+    EXPECT_TRUE(!store.create(dup, err)) << "duplicate id rejected";
     S3Credential clash;
     clash.access_key_id = "aios";
     clash.uid = 1;
     clash.gid = 1;
     clash.buckets = {"photos"};
-    expect(!store.create(clash, err), "global s3_access_key conflict rejected");
+    EXPECT_TRUE(!store.create(clash, err)) << "global s3_access_key conflict rejected";
     S3Credential nobuckets;
     nobuckets.access_key_id = "nobuckets";
     nobuckets.uid = 1;
     nobuckets.gid = 1;
-    expect(!store.create(nobuckets, err), "empty buckets rejected");
+    EXPECT_TRUE(!store.create(nobuckets, err)) << "empty buckets rejected";
 
-    expect(store.remove("photos-rw", err), "remove ok");
-    expect(!store.find("photos-rw"), "gone after remove");
-    expect(!store.remove("photos-rw", err), "remove missing fails");
+    EXPECT_TRUE(store.remove("photos-rw", err)) << "remove ok";
+    EXPECT_TRUE(!store.find("photos-rw")) << "gone after remove";
+    EXPECT_TRUE(!store.remove("photos-rw", err)) << "remove missing fails";
   }
+}
 
+TEST(S3Iam, IntegrationAdminCreateS3SigV4PutWithOwnershipDenyOtherBucket) {
+using namespace aios;
   // Integration: admin create → S3 SigV4 put with ownership → deny other bucket
   {
     DualStoreFixture fx("aios-s3iam-e2e");
@@ -256,14 +248,14 @@ int test_s3_iam() {
     auto created = http_req(
         "127.0.0.1", http_port, "POST", "/admin/api/s3/credentials", h,
         R"({"access_key_id":"photos-rw","uid":1001,"gid":100,"buckets":["photos"]})");
-    expect(created.status == 201 || created.status == 200, "admin create cred");
+    EXPECT_TRUE(created.status == 201 || created.status == 200) << "admin create cred";
     std::string secret;
     try {
       auto j = nlohmann::json::parse(created.body);
       secret = j.value("secret", "");
     } catch (...) {
     }
-    expect(!secret.empty(), "admin returned secret");
+    EXPECT_TRUE(!secret.empty()) << "admin returned secret";
 
     // Root key can create any bucket
     {
@@ -272,7 +264,7 @@ int test_s3_iam() {
       const auto payload = sha256_hex("");
       sign_s3("PUT", "/other", s3_hostport, amz, payload, "aios", key, "us-east-1", sh);
       auto r = http_req("127.0.0.1", s3_port, "PUT", "/other", sh, "");
-      expect(r.status == 200, "root CreateBucket other");
+      EXPECT_TRUE(r.status == 200) << "root CreateBucket other";
     }
 
     // Wrong IAM secret rejected
@@ -282,7 +274,7 @@ int test_s3_iam() {
       const auto payload = sha256_hex("");
       sign_s3("GET", "/", s3_hostport, amz, payload, "photos-rw", "wrong-secret", "us-east-1", sh);
       auto r = http_req("127.0.0.1", s3_port, "GET", "/", sh, "");
-      expect(r.status == 403, "wrong iam secret rejected");
+      EXPECT_TRUE(r.status == 403) << "wrong iam secret rejected";
     }
 
     // IAM key denied on other
@@ -293,7 +285,7 @@ int test_s3_iam() {
       sign_s3("PUT", "/other/x", s3_hostport, amz, payload, "photos-rw", secret, "us-east-1",
               sh);
       auto r = http_req("127.0.0.1", s3_port, "PUT", "/other/x", sh, "");
-      expect(r.status == 403, "iam denied other bucket");
+      EXPECT_TRUE(r.status == 403) << "iam denied other bucket";
     }
 
     // IAM CreateBucket + PutObject on photos
@@ -303,7 +295,7 @@ int test_s3_iam() {
       auto payload = sha256_hex("");
       sign_s3("PUT", "/photos", s3_hostport, amz, payload, "photos-rw", secret, "us-east-1", sh);
       auto mb = http_req("127.0.0.1", s3_port, "PUT", "/photos", sh, "");
-      expect(mb.status == 200, "iam CreateBucket photos");
+      EXPECT_TRUE(mb.status == 200) << "iam CreateBucket photos";
 
       const std::string body = "hello-iam";
       sh.clear();
@@ -312,7 +304,7 @@ int test_s3_iam() {
       sign_s3("PUT", "/photos/a.txt", s3_hostport, amz, payload, "photos-rw", secret, "us-east-1",
               sh);
       auto put = http_req("127.0.0.1", s3_port, "PUT", "/photos/a.txt", sh, body);
-      expect(put.status == 200, "iam PutObject");
+      EXPECT_TRUE(put.status == 200) << "iam PutObject";
     }
 
     // ListBuckets: IAM sees only allowlisted; root sees both
@@ -322,18 +314,18 @@ int test_s3_iam() {
       auto payload = sha256_hex("");
       sign_s3("GET", "/", s3_hostport, amz, payload, "photos-rw", secret, "us-east-1", sh);
       auto iam_ls = http_req("127.0.0.1", s3_port, "GET", "/", sh, "");
-      expect(iam_ls.status == 200, "iam ListBuckets");
-      expect(iam_ls.body.find("<Name>photos</Name>") != std::string::npos, "iam lists photos");
-      expect(iam_ls.body.find("<Name>other</Name>") == std::string::npos, "iam hides other");
+      EXPECT_TRUE(iam_ls.status == 200) << "iam ListBuckets";
+      EXPECT_TRUE(iam_ls.body.find("<Name>photos</Name>") != std::string::npos) << "iam lists photos";
+      EXPECT_TRUE(iam_ls.body.find("<Name>other</Name>") == std::string::npos) << "iam hides other";
 
       sh.clear();
       amz = amz_now();
       payload = sha256_hex("");
       sign_s3("GET", "/", s3_hostport, amz, payload, "aios", key, "us-east-1", sh);
       auto root_ls = http_req("127.0.0.1", s3_port, "GET", "/", sh, "");
-      expect(root_ls.status == 200, "root ListBuckets");
-      expect(root_ls.body.find("<Name>photos</Name>") != std::string::npos, "root lists photos");
-      expect(root_ls.body.find("<Name>other</Name>") != std::string::npos, "root lists other");
+      EXPECT_TRUE(root_ls.status == 200) << "root ListBuckets";
+      EXPECT_TRUE(root_ls.body.find("<Name>photos</Name>") != std::string::npos) << "root lists photos";
+      EXPECT_TRUE(root_ls.body.find("<Name>other</Name>") != std::string::npos) << "root lists other";
     }
 
     // Verify POSIX uid/gid via aios_posix
@@ -345,13 +337,13 @@ int test_s3_iam() {
       pcfg.volume = "s3";
       int err = 0;
       auto* fs = aios_posix_mount(&pcfg, &err);
-      expect(fs != nullptr, "posix mount");
+      EXPECT_TRUE(fs != nullptr) << "posix mount";
       if (fs) {
         aios_posix_stat bst{}, fst{};
-        expect(aios_posix_lookup(fs, 1, "photos", &bst) == 0, "lookup photos");
-        expect(bst.uid == 1001 && bst.gid == 100, "bucket ownership");
-        expect(aios_posix_lookup(fs, bst.ino, "a.txt", &fst) == 0, "lookup a.txt");
-        expect(fst.uid == 1001 && fst.gid == 100, "file ownership");
+        EXPECT_TRUE(aios_posix_lookup(fs, 1, "photos", &bst) == 0) << "lookup photos";
+        EXPECT_TRUE(bst.uid == 1001 && bst.gid == 100) << "bucket ownership";
+        EXPECT_TRUE(aios_posix_lookup(fs, bst.ino, "a.txt", &fst) == 0) << "lookup a.txt";
+        EXPECT_TRUE(fst.uid == 1001 && fst.gid == 100) << "file ownership";
         aios_posix_unmount(fs);
       }
     }
@@ -361,20 +353,20 @@ int test_s3_iam() {
       std::unordered_map<std::string, std::string> h2;
       add_hmac(h2, "GET", "/admin/api/s3/credentials", key);
       auto lst = http_req("127.0.0.1", http_port, "GET", "/admin/api/s3/credentials", h2, "");
-      expect(lst.status == 200, "list credentials");
+      EXPECT_TRUE(lst.status == 200) << "list credentials";
       try {
         auto j = nlohmann::json::parse(lst.body);
-        expect(j["credentials"].size() == 1, "one cred listed");
-        expect(j["credentials"][0].value("secret", "") == "***", "listed secret redacted");
+        EXPECT_TRUE(j["credentials"].size() == 1) << "one cred listed";
+        EXPECT_TRUE(j["credentials"][0].value("secret", "") == "***") << "listed secret redacted";
       } catch (...) {
-        expect(false, "list json");
+        EXPECT_TRUE(false) << "list json";
       }
 
       std::unordered_map<std::string, std::string> h3;
       add_hmac(h3, "DELETE", "/admin/api/s3/credentials/photos-rw", key);
       auto del = http_req("127.0.0.1", http_port, "DELETE", "/admin/api/s3/credentials/photos-rw",
                           h3, "");
-      expect(del.status == 200, "admin delete cred");
+      EXPECT_TRUE(del.status == 200) << "admin delete cred";
 
       // Deleted key can no longer authenticate
       std::unordered_map<std::string, std::string> sh;
@@ -382,7 +374,7 @@ int test_s3_iam() {
       const auto payload = sha256_hex("");
       sign_s3("GET", "/", s3_hostport, amz, payload, "photos-rw", secret, "us-east-1", sh);
       auto r = http_req("127.0.0.1", s3_port, "GET", "/", sh, "");
-      expect(r.status == 403, "deleted iam key rejected");
+      EXPECT_TRUE(r.status == 403) << "deleted iam key rejected";
     }
 
     s3->stop();  // close accept + unmount while HTTP still serves rstat flush
@@ -391,16 +383,18 @@ int test_s3_iam() {
     ioc.stop();
     th.join();
   }
+}
 
+TEST(S3Iam, ParseAccessKeyHelper) {
+using namespace aios;
   // parse access key helper
   {
     std::unordered_map<std::string, std::string> headers;
     headers["authorization"] =
         "AWS4-HMAC-SHA256 Credential=photos-rw/20260101/us-east-1/s3/aws4_request, "
         "SignedHeaders=host, Signature=abc";
-    expect(aios::s3_sigv4_access_key(headers) == "photos-rw", "parse akid");
+    EXPECT_TRUE(aios::s3_sigv4_access_key(headers) == "photos-rw") << "parse akid";
   }
-
-  if (failures() == 0) std::cout << "test_s3_iam OK\n";
-  return failures();
 }
+
+

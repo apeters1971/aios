@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "http/http_auth.hpp"
 #include "http/http_server.hpp"
@@ -22,9 +23,6 @@ namespace {
 
 using tcp = boost::asio::ip::tcp;
 using aios::test::DualStoreFixture;
-using aios::test::expect;
-using aios::test::failures;
-
 struct HttpResponse {
   int status{0};
   std::unordered_map<std::string, std::string> headers;
@@ -129,16 +127,15 @@ HttpResponse http_request(const std::string& host, const std::string& port,
   return resp;
 }
 
+
 }  // namespace
 
-int test_pubsub() {
-  using namespace aios;
-  failures() = 0;
-
+TEST(PubSub, EphemeralWaitingSubscriberWakesNoBacklogForLateAfterId) {
+using namespace aios;
   // Ephemeral: waiting subscriber wakes; no backlog for late after_id
   {
     DualStoreFixture fx("aios-pubsub-eph");
-    expect(fx.svc->api_pubsub_create("eph", DeliveryMode::Ephemeral).ok, "eph create");
+    EXPECT_TRUE(fx.svc->api_pubsub_create("eph", DeliveryMode::Ephemeral).ok) << "eph create";
 
     std::atomic<bool> got{false};
     std::vector<PubMessage> msgs;
@@ -152,63 +149,70 @@ int test_pubsub() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const auto* body = reinterpret_cast<const std::uint8_t*>("hello");
     auto pub = fx.svc->api_pubsub_publish("eph", body, 5, "text/plain");
-    expect(pub.ok && pub.json_body && (*pub.json_body)["id"] == 1, "eph publish");
+    EXPECT_TRUE(pub.ok && pub.json_body && (*pub.json_body)["id"] == 1) << "eph publish";
     waiter.join();
-    expect(got.load() && msgs.size() == 1 && msgs[0].id == 1, "eph waiter woke");
-    expect(std::string(msgs[0].data.begin(), msgs[0].data.end()) == "hello", "eph payload");
+    EXPECT_TRUE(got.load() && msgs.size() == 1 && msgs[0].id == 1) << "eph waiter woke";
+    EXPECT_TRUE(std::string(msgs[0].data.begin(), msgs[0].data.end()) == "hello") << "eph payload";
 
     // Late subscribe with after_id=0 must not see the missed ephemeral message.
     auto late = fx.svc->api_pubsub_subscribe("eph", 0, true, 200);
-    expect(late.ok && late.code == "timeout", "eph no backlog");
+    EXPECT_TRUE(late.ok && late.code == "timeout") << "eph no backlog";
   }
+}
 
+TEST(PubSub, BufferedCatchUpRingDrop) {
+using namespace aios;
   // Buffered: catch-up + ring drop
   {
     DualStoreFixture fx("aios-pubsub-buf");
-    expect(fx.svc->api_pubsub_create("buf", DeliveryMode::Buffered, 2).ok, "buf create");
+    EXPECT_TRUE(fx.svc->api_pubsub_create("buf", DeliveryMode::Buffered, 2).ok) << "buf create";
     const auto* a = reinterpret_cast<const std::uint8_t*>("a");
     const auto* b = reinterpret_cast<const std::uint8_t*>("b");
     const auto* c = reinterpret_cast<const std::uint8_t*>("c");
-    expect(fx.svc->api_pubsub_publish("buf", a, 1, "").ok, "buf pub a");
-    expect(fx.svc->api_pubsub_publish("buf", b, 1, "").ok, "buf pub b");
-    expect(fx.svc->api_pubsub_publish("buf", c, 1, "").ok, "buf pub c");
+    EXPECT_TRUE(fx.svc->api_pubsub_publish("buf", a, 1, "").ok) << "buf pub a";
+    EXPECT_TRUE(fx.svc->api_pubsub_publish("buf", b, 1, "").ok) << "buf pub b";
+    EXPECT_TRUE(fx.svc->api_pubsub_publish("buf", c, 1, "").ok) << "buf pub c";
 
     auto catchup = fx.svc->api_pubsub_subscribe("buf", 0, true, 200);
-    expect(catchup.ok && catchup.code != "timeout", "buf catchup ok");
-    expect(catchup.pub_messages.size() == 2, "buf ring capacity 2");
-    expect(catchup.pub_messages[0].id == 2 && catchup.pub_messages[1].id == 3,
-           "buf oldest dropped");
+    EXPECT_TRUE(catchup.ok && catchup.code != "timeout") << "buf catchup ok";
+    EXPECT_TRUE(catchup.pub_messages.size() == 2) << "buf ring capacity 2";
+    EXPECT_TRUE(catchup.pub_messages[0].id == 2 && catchup.pub_messages[1].id == 3) << "buf oldest dropped";
 
     auto mismatch = fx.svc->api_pubsub_publish("buf", a, 1, "", DeliveryMode::Ephemeral);
-    expect(!mismatch.ok && mismatch.code == "mode_mismatch", "buf mode sticky");
+    EXPECT_TRUE(!mismatch.ok && mismatch.code == "mode_mismatch") << "buf mode sticky";
   }
+}
 
+TEST(PubSub, DurableObjectPersistCatchUpModeSticky) {
+using namespace aios;
   // Durable: object persist + catch-up + mode sticky
   {
     DualStoreFixture fx("aios-pubsub-dur");
-    expect(fx.svc->api_pubsub_create("dur", DeliveryMode::Durable).ok, "dur create");
+    EXPECT_TRUE(fx.svc->api_pubsub_create("dur", DeliveryMode::Durable).ok) << "dur create";
     const auto* body = reinterpret_cast<const std::uint8_t*>("persist-me");
     auto pub = fx.svc->api_pubsub_publish("dur", body, 10, "application/octet-stream");
-    expect(pub.ok && pub.json_body, "dur publish");
+    EXPECT_TRUE(pub.ok && pub.json_body) << "dur publish";
     const auto id = (*pub.json_body)["id"].get<std::uint64_t>();
-    expect(id == 1, "dur id 1");
+    EXPECT_TRUE(id == 1) << "dur id 1";
 
     auto get = fx.svc->api_get(pubsub_msg_oid("dur", id), std::nullopt, std::nullopt, {});
-    expect(get.ok && get.data && get.data->size() == 10, "dur msg object");
-    expect(std::string(get.data->begin(), get.data->end()) == "persist-me", "dur msg body");
+    EXPECT_TRUE(get.ok && get.data && get.data->size() == 10) << "dur msg object";
+    EXPECT_TRUE(std::string(get.data->begin(), get.data->end()) == "persist-me") << "dur msg body";
 
     auto head = fx.svc->api_head(pubsub_meta_oid("dur"), {});
-    expect(head.ok, "dur meta tip");
+    EXPECT_TRUE(head.ok) << "dur meta tip";
 
     auto sub = fx.svc->api_pubsub_subscribe("dur", 0, true, 200);
-    expect(sub.ok && sub.pub_messages.size() == 1 && sub.pub_messages[0].id == 1,
-           "dur catchup");
+    EXPECT_TRUE(sub.ok && sub.pub_messages.size() == 1 && sub.pub_messages[0].id == 1) << "dur catchup";
 
     auto mismatch =
         fx.svc->api_pubsub_publish("dur", body, 10, "", DeliveryMode::Buffered);
-    expect(!mismatch.ok && mismatch.code == "mode_mismatch", "dur mode sticky");
+    EXPECT_TRUE(!mismatch.ok && mismatch.code == "mode_mismatch") << "dur mode sticky";
   }
+}
 
+TEST(PubSub, HTTPCreateBufferedTimeout204ThenPublishSubscribe200) {
+using namespace aios;
   // HTTP: create buffered, timeout 204, then publish+subscribe 200
   {
     DualStoreFixture fx("aios-pubsub-http");
@@ -225,39 +229,38 @@ int test_pubsub() {
 
     auto create = http_request(host, port, "PUT", "/pubsub/http-t?delivery=buffered&capacity=16",
                                {}, "", key);
-    expect(create.status == 201, "HTTP pubsub create 201");
+    EXPECT_TRUE(create.status == 201) << "HTTP pubsub create 201";
 
     auto timeout =
         http_request(host, port, "GET", "/pubsub/http-t/subscribe?timeout_ms=200", {}, "", key);
-    expect(timeout.status == 204, "HTTP pubsub subscribe timeout 204");
+    EXPECT_TRUE(timeout.status == 204) << "HTTP pubsub subscribe timeout 204";
 
     auto pub =
         http_request(host, port, "POST", "/pubsub/http-t/publish",
                      {{"content-type", "text/plain"}}, "wire", key);
-    expect(pub.status == 201, "HTTP pubsub publish 201");
+    EXPECT_TRUE(pub.status == 201) << "HTTP pubsub publish 201";
 
     auto sub = http_request(host, port, "GET", "/pubsub/http-t/subscribe?after_id=0&timeout_ms=1000",
                             {}, "", key);
-    expect(sub.status == 200, "HTTP pubsub subscribe 200");
+    EXPECT_TRUE(sub.status == 200) << "HTTP pubsub subscribe 200";
     try {
       auto j = nlohmann::json::parse(sub.body);
-      expect(j.contains("messages") && j["messages"].is_array() && !j["messages"].empty(),
-             "HTTP messages array");
+      EXPECT_TRUE(j.contains("messages") && j["messages"].is_array() && !j["messages"].empty()) << "HTTP messages array";
       const auto& m0 = j["messages"][0];
       std::vector<std::uint8_t> decoded;
       std::string derr;
-      expect(base64_decode(m0.value("data_b64", ""), decoded, derr), "HTTP data_b64");
-      expect(std::string(decoded.begin(), decoded.end()) == "wire", "HTTP payload");
+      EXPECT_TRUE(base64_decode(m0.value("data_b64", ""), decoded, derr)) << "HTTP data_b64";
+      EXPECT_TRUE(std::string(decoded.begin(), decoded.end()) == "wire") << "HTTP payload";
     } catch (...) {
-      expect(false, "HTTP subscribe json");
+      EXPECT_TRUE(false) << "HTTP subscribe json";
     }
 
     auto stat = http_request(host, port, "GET", "/pubsub/http-t", {}, "", key);
-    expect(stat.status == 200, "HTTP pubsub stat 200");
+    EXPECT_TRUE(stat.status == 200) << "HTTP pubsub stat 200";
 
     ioc.stop();
     th.join();
   }
-
-  return failures();
 }
+
+

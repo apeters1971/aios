@@ -56,6 +56,16 @@ FetchContent_Declare(
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nlohmann_json)
 
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG v1.15.2
+  GIT_SHALLOW TRUE
+)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+include(GoogleTest)
+
 # Optional Intel ISA-L for Reed–Solomon EC (m>1). XOR (m=1) always available.
 option(AIOS_WITH_ISAL "Enable Intel ISA-L Reed-Solomon erasure coding when found" ON)
 set(AIOS_HAVE_ISAL OFF)
@@ -481,10 +491,13 @@ add_executable(aios_tests
   tests/test_xrd_cred.cpp
   tests/test_archive.cpp
   tests/test_backup.cpp
-  tests/test_main.cpp
 )
-target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred)
-add_test(NAME aios_tests COMMAND aios_tests)
+target_include_directories(aios_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)
+gtest_discover_tests(aios_tests
+  DISCOVERY_MODE PRE_TEST
+  PROPERTIES RUN_SERIAL TRUE
+)
 
 install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION bin)
 install(TARGETS aios_client aios_posix ARCHIVE DESTINATION lib)

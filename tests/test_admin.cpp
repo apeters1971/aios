@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "http/http_auth.hpp"
 #include "http/http_server.hpp"
@@ -18,9 +19,6 @@ namespace {
 
 using tcp = boost::asio::ip::tcp;
 using aios::test::DualStoreFixture;
-using aios::test::expect;
-using aios::test::failures;
-
 struct HttpResponse {
   int status{0};
   std::unordered_map<std::string, std::string> headers;
@@ -123,12 +121,11 @@ HttpResponse http_request(const std::string& host, const std::string& port,
   return resp;
 }
 
+
 }  // namespace
 
-int test_admin() {
-  using namespace aios;
-  failures() = 0;
-
+TEST(Admin, AdminDisabled404) {
+using namespace aios;
   // Admin disabled → 404
   {
     DualStoreFixture fx("aios-admin-off");
@@ -141,12 +138,15 @@ int test_admin() {
 
     auto r = http_request("127.0.0.1", "19380", "GET", "/admin/status", {}, "",
                           fx.cfg.cluster_key);
-    expect(r.status == 404, "admin disabled → 404");
+    EXPECT_TRUE(r.status == 404) << "admin disabled → 404";
 
     ioc.stop();
     th.join();
   }
+}
 
+TEST(Admin, AdminEnabledStatusOpsConfigMetricsOpsIncrementOnPUT) {
+using namespace aios;
   // Admin enabled: status, ops, config, metrics; ops increment on PUT
   {
     DualStoreFixture fx("aios-admin-on");
@@ -161,104 +161,102 @@ int test_admin() {
 
     const std::string key = fx.cfg.cluster_key;
     auto put = http_request("127.0.0.1", "19381", "PUT", "/o/admin-obj", {}, "hello", key);
-    expect(put.status == 204, "put for ops");
+    EXPECT_TRUE(put.status == 204) << "put for ops";
 
     auto st = http_request("127.0.0.1", "19381", "GET", "/admin/status", {}, "", key);
-    expect(st.status == 200, "admin status 200");
+    EXPECT_TRUE(st.status == 200) << "admin status 200";
     try {
       auto j = nlohmann::json::parse(st.body);
-      expect(j.value("admin", false), "status.admin");
-      expect(j.contains("ops") && j["ops"].value("put", 0ull) >= 1, "ops.put >= 1");
+      EXPECT_TRUE(j.value("admin", false)) << "status.admin";
+      EXPECT_TRUE(j.contains("ops") && j["ops"].value("put", 0ull) >= 1) << "ops.put >= 1";
     } catch (...) {
-      expect(false, "status json");
+      EXPECT_TRUE(false) << "status json";
     }
 
     auto cfg = http_request("127.0.0.1", "19381", "GET", "/admin/config", {}, "", key);
-    expect(cfg.status == 200, "admin config 200");
+    EXPECT_TRUE(cfg.status == 200) << "admin config 200";
     try {
       auto j = nlohmann::json::parse(cfg.body);
-      expect(j.value("cluster_key", "") == "***", "cluster_key redacted");
+      EXPECT_TRUE(j.value("cluster_key", "") == "***") << "cluster_key redacted";
     } catch (...) {
-      expect(false, "config json");
+      EXPECT_TRUE(false) << "config json";
     }
 
     auto met = http_request("127.0.0.1", "19381", "GET", "/metrics", {}, "", key,
                             /*auth=*/false);
-    expect(met.status == 200, "public metrics 200");
-    expect(met.body.find("aios_ops_put_total") != std::string::npos, "prom put metric");
-    expect(met.body.find("aios_http_requests_total") != std::string::npos, "prom http metric");
+    EXPECT_TRUE(met.status == 200) << "public metrics 200";
+    EXPECT_TRUE(met.body.find("aios_ops_put_total") != std::string::npos) << "prom put metric";
+    EXPECT_TRUE(met.body.find("aios_http_requests_total") != std::string::npos) << "prom http metric";
 
     auto cl = http_request("127.0.0.1", "19381", "GET", "/admin/cluster", {}, "", key);
-    expect(cl.status == 200, "admin cluster 200");
+    EXPECT_TRUE(cl.status == 200) << "admin cluster 200";
 
     // App label → ops_by_label + prometheus app_label series
     {
       auto bad = http_request("127.0.0.1", "19381", "PUT", "/o/labeled",
                               {{"x-aios-app-label", "bad label!"}}, "x", key);
-      expect(bad.status == 400, "invalid app label rejected");
+      EXPECT_TRUE(bad.status == 400) << "invalid app label rejected";
 
       auto lp = http_request("127.0.0.1", "19381", "PUT", "/o/labeled",
                              {{"x-aios-app-label", "etl/job-1"}}, "payload", key);
-      expect(lp.status == 204, "labeled put");
+      EXPECT_TRUE(lp.status == 204) << "labeled put";
 
       auto ops = http_request("127.0.0.1", "19381", "GET", "/admin/ops", {}, "", key);
-      expect(ops.status == 200, "ops after label");
+      EXPECT_TRUE(ops.status == 200) << "ops after label";
       try {
         auto j = nlohmann::json::parse(ops.body);
-        expect(j.contains("ops_by_label") && j["ops_by_label"].contains("etl/job-1"),
-               "ops_by_label has etl/job-1");
-        expect(j["ops_by_label"]["etl/job-1"].value("put", 0ull) >= 1, "label put count");
+        EXPECT_TRUE(j.contains("ops_by_label") && j["ops_by_label"].contains("etl/job-1")) << "ops_by_label has etl/job-1";
+        EXPECT_TRUE(j["ops_by_label"]["etl/job-1"].value("put", 0ull) >= 1) << "label put count";
       } catch (...) {
-        expect(false, "ops_by_label json");
+        EXPECT_TRUE(false) << "ops_by_label json";
       }
 
       auto met2 = http_request("127.0.0.1", "19381", "GET", "/metrics", {}, "", key, false);
-      expect(met2.body.find("app_label=\"etl/job-1\"") != std::string::npos,
-             "prom app_label series");
+      EXPECT_TRUE(met2.body.find("app_label=\"etl/job-1\"") != std::string::npos) << "prom app_label series";
     }
 
     // Web UI static + cluster-key session login
     {
       auto idx = http_request("127.0.0.1", "19381", "GET", "/admin/", {}, "", key,
                               /*auth=*/false);
-      expect(idx.status == 200, "admin index.html without HMAC");
-      expect(idx.body.find("AIOS") != std::string::npos, "admin html has brand");
+      EXPECT_TRUE(idx.status == 200) << "admin index.html without HMAC";
+      EXPECT_TRUE(idx.body.find("AIOS") != std::string::npos) << "admin html has brand";
 
       auto bad_login =
           http_request("127.0.0.1", "19381", "POST", "/admin/login",
                        {{"content-type", "application/json"}},
                        R"({"cluster_key":"wrong"})", key, /*auth=*/false);
-      expect(bad_login.status == 401, "bad cluster key rejected");
+      EXPECT_TRUE(bad_login.status == 401) << "bad cluster key rejected";
 
       auto login = http_request("127.0.0.1", "19381", "POST", "/admin/login",
                                 {{"content-type", "application/json"}},
                                 std::string("{\"cluster_key\":\"") + key + "\"}", key,
                                 /*auth=*/false);
-      expect(login.status == 200, "login ok");
+      EXPECT_TRUE(login.status == 200) << "login ok";
       auto set_cookie = login.headers.count("set-cookie") ? login.headers["set-cookie"] : "";
-      expect(set_cookie.find("aios_admin=") != std::string::npos, "session cookie set");
+      EXPECT_TRUE(set_cookie.find("aios_admin=") != std::string::npos) << "session cookie set";
       std::string cookie = set_cookie;
       auto semi = cookie.find(';');
       if (semi != std::string::npos) cookie = cookie.substr(0, semi);
 
       auto api = http_request("127.0.0.1", "19381", "GET", "/admin/api/status",
                               {{"cookie", cookie}}, "", key, /*auth=*/false);
-      expect(api.status == 200, "cookie session status");
+      EXPECT_TRUE(api.status == 200) << "cookie session status";
       try {
         auto j = nlohmann::json::parse(api.body);
-        expect(j.value("admin", false), "api status.admin");
+        EXPECT_TRUE(j.value("admin", false)) << "api status.admin";
       } catch (...) {
-        expect(false, "api status json");
+        EXPECT_TRUE(false) << "api status json";
       }
 
       auto settings = http_request(
           "127.0.0.1", "19381", "POST", "/admin/api/settings",
           {{"cookie", cookie}, {"content-type", "application/json"}},
           R"({"admin_metrics_public":false})", key, /*auth=*/false);
-      expect(settings.status == 200, "settings toggle");
+      EXPECT_TRUE(settings.status == 200) << "settings toggle";
       auto met_priv = http_request("127.0.0.1", "19381", "GET", "/metrics", {}, "", key,
                                    /*auth=*/false);
-      expect(met_priv.status == 401, "metrics private after toggle");
+      EXPECT_TRUE(met_priv.status == 401) << "metrics private after toggle";
       // restore public for cleanliness
       http_request("127.0.0.1", "19381", "POST", "/admin/api/settings",
                    {{"cookie", cookie}, {"content-type", "application/json"}},
@@ -268,6 +266,6 @@ int test_admin() {
     ioc.stop();
     th.join();
   }
-
-  return failures();
 }
+
+

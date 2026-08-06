@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "util/crc32c.hpp"
 
@@ -17,9 +18,6 @@
 namespace fs = std::filesystem;
 
 namespace {
-
-using aios::test::expect;
-using aios::test::failures;
 
 std::int64_t now_ms() {
   using namespace std::chrono;
@@ -155,16 +153,15 @@ bool insert_legacy_fs(const fs::path& db_path, const std::string& oid,
   return true;
 }
 
+
 }  // namespace
 
-int test_store_advanced() {
-  using namespace aios;
+TEST(StoreAdvanced, S1PurgeVersion) {
+using namespace aios;
   using aios::test::default_opts;
   using aios::test::temp_root;
 
-  failures() = 0;
   std::string err;
-
   // -------------------------------------------------------------------------
   // 1. purge_version
   // -------------------------------------------------------------------------
@@ -173,28 +170,35 @@ int test_store_advanced() {
     ObjectStore store;
     auto opts = default_opts();
     opts.max_versions = 32;
-    expect(store.open(root.string(), opts, err), "purge: open");
-    expect(store.put("purged", std::string("v1"), {}, true, err), "purge: put1");
-    expect(store.put("purged", std::string("v2"), {}, true, err), "purge: put2");
-    expect(store.put("purged", std::string("v3"), {}, true, err), "purge: put3");
+    EXPECT_TRUE(store.open(root.string(), opts, err)) << "purge: open";
+    EXPECT_TRUE(store.put("purged", std::string("v1"), {}, true, err)) << "purge: put1";
+    EXPECT_TRUE(store.put("purged", std::string("v2"), {}, true, err)) << "purge: put2";
+    EXPECT_TRUE(store.put("purged", std::string("v3"), {}, true, err)) << "purge: put3";
     auto tip = store.stat("purged", err);
-    expect(tip && tip->seq == 3, "purge: tip seq3");
+    EXPECT_TRUE(tip && tip->seq == 3) << "purge: tip seq3";
 
-    expect(store.purge_version("purged", 2, false, err), "purge: middle seq");
-    expect(store.get("purged", 2, err) == std::nullopt, "purge: seq2 gone");
-    expect(body_str(store.get("purged", 1, err)) == "v1", "purge: seq1 intact");
-    expect(body_str(store.get("purged", err)) == "v3", "purge: tip body intact");
+    EXPECT_TRUE(store.purge_version("purged", 2, false, err)) << "purge: middle seq";
+    EXPECT_TRUE(store.get("purged", 2, err) == std::nullopt) << "purge: seq2 gone";
+    EXPECT_TRUE(body_str(store.get("purged", 1, err)) == "v1") << "purge: seq1 intact";
+    EXPECT_TRUE(body_str(store.get("purged", err)) == "v3") << "purge: tip body intact";
 
-    expect(!store.purge_version("purged", 3, false, err), "purge: tip reject allow_tip=false");
-    expect(err == "cannot purge tip", "purge: tip reject message");
+    EXPECT_TRUE(!store.purge_version("purged", 3, false, err)) << "purge: tip reject allow_tip=false";
+    EXPECT_TRUE(err == "cannot purge tip") << "purge: tip reject message";
     tip = store.stat("purged", err);
-    expect(tip && tip->seq == 3, "purge: tip still 3 after reject");
+    EXPECT_TRUE(tip && tip->seq == 3) << "purge: tip still 3 after reject";
 
-    expect(store.purge_version("purged", 3, true, err), "purge: tip with allow_tip");
-    expect(store.get("purged", err) == std::nullopt, "purge: get fails after tip cleared");
-    expect(store.stat("purged", err) == std::nullopt, "purge: tip stat gone");
+    EXPECT_TRUE(store.purge_version("purged", 3, true, err)) << "purge: tip with allow_tip";
+    EXPECT_TRUE(store.get("purged", err) == std::nullopt) << "purge: get fails after tip cleared";
+    EXPECT_TRUE(store.stat("purged", err) == std::nullopt) << "purge: tip stat gone";
   }
+}
 
+TEST(StoreAdvanced, S2TrimVersions) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 2. trim_versions
   // -------------------------------------------------------------------------
@@ -203,23 +207,29 @@ int test_store_advanced() {
     ObjectStore store;
     auto opts = default_opts();
     opts.max_versions = 64;
-    expect(store.open(root.string(), opts, err), "trim: open");
+    EXPECT_TRUE(store.open(root.string(), opts, err)) << "trim: open";
     for (int i = 1; i <= 5; ++i) {
-      expect(store.put("trimme", std::string("b") + std::to_string(i), {}, true, err),
-             "trim: put " + std::to_string(i));
+      EXPECT_TRUE(store.put("trimme", std::string("b") + std::to_string(i), {}, true, err)) << "trim: put " + std::to_string(i);
     }
     auto vers = store.list_versions("trimme", err);
-    expect(vers.size() == 5, "trim: 5 versions before");
-    expect(store.trim_versions("trimme", 2, err), "trim: trim_versions keep 2");
+    EXPECT_TRUE(vers.size() == 5) << "trim: 5 versions before";
+    EXPECT_TRUE(store.trim_versions("trimme", 2, err)) << "trim: trim_versions keep 2";
     vers = store.list_versions("trimme", err);
-    expect(vers.size() == 2, "trim: list_versions size==2");
+    EXPECT_TRUE(vers.size() == 2) << "trim: list_versions size==2";
     auto tip = store.stat("trimme", err);
-    expect(tip && tip->seq == 5, "trim: tip retained");
-    expect(body_str(store.get("trimme", err)) == "b5", "trim: tip body");
-    expect(store.get("trimme", 1, err) == std::nullopt, "trim: old seq purged");
-    expect(store.get("trimme", 3, err) == std::nullopt, "trim: mid seq purged");
+    EXPECT_TRUE(tip && tip->seq == 5) << "trim: tip retained";
+    EXPECT_TRUE(body_str(store.get("trimme", err)) == "b5") << "trim: tip body";
+    EXPECT_TRUE(store.get("trimme", 1, err) == std::nullopt) << "trim: old seq purged";
+    EXPECT_TRUE(store.get("trimme", 3, err) == std::nullopt) << "trim: mid seq purged";
   }
+}
 
+TEST(StoreAdvanced, S3InstallVersion) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 3. install_version
   // -------------------------------------------------------------------------
@@ -227,22 +237,21 @@ int test_store_advanced() {
     const auto root_a = temp_root("aios-adv-inst-a");
     ObjectStore store_a;
     auto opts = default_opts();
-    expect(store_a.open(root_a.string(), opts, err), "install: open A");
-    expect(store_a.put("base", std::string("aaa"), {}, true, err), "install: base put");
+    EXPECT_TRUE(store_a.open(root_a.string(), opts, err)) << "install: open A";
+    EXPECT_TRUE(store_a.put("base", std::string("aaa"), {}, true, err)) << "install: base put";
     auto tip_before = store_a.stat("base", err);
-    expect(tip_before && tip_before->seq == 1, "install: tip before prepare");
+    EXPECT_TRUE(tip_before && tip_before->seq == 1) << "install: tip before prepare";
 
     PreparedVersion prep;
-    expect(store_a.prepare_put("base", reinterpret_cast<const std::uint8_t*>("bbb"), 3, {},
-                               true, std::nullopt, prep, err),
-           "install: prepare_put on A");
+    EXPECT_TRUE(store_a.prepare_put("base", reinterpret_cast<const std::uint8_t*>("bbb"), 3, {},
+                               true, std::nullopt, prep, err)) << "install: prepare_put on A";
     auto tip_after = store_a.stat("base", err);
-    expect(tip_after && tip_after->seq == 1, "install: tip unchanged after prepare");
-    expect(body_str(store_a.get("base", err)) == "aaa", "install: tip body unchanged");
+    EXPECT_TRUE(tip_after && tip_after->seq == 1) << "install: tip unchanged after prepare";
+    EXPECT_TRUE(body_str(store_a.get("base", err)) == "aaa") << "install: tip body unchanged";
 
     const auto root_b = temp_root("aios-adv-inst-b");
     ObjectStore store_b;
-    expect(store_b.open(root_b.string(), opts, err), "install: open B");
+    EXPECT_TRUE(store_b.open(root_b.string(), opts, err)) << "install: open B";
 
     const std::string payload = "hello";
     const auto payload_crc =
@@ -256,24 +265,28 @@ int test_store_advanced() {
     crafted.inline_body = true;
     crafted.is_delete = false;
 
-    expect(store_b.install_version(crafted,
+    EXPECT_TRUE(store_b.install_version(crafted,
                                    reinterpret_cast<const std::uint8_t*>(payload.data()),
-                                   payload.size(), {{"src", "crafted"}}, err),
-           "install: first install");
-    expect(store_b.install_version(crafted,
+                                   payload.size(), {{"src", "crafted"}}, err)) << "install: first install";
+    EXPECT_TRUE(store_b.install_version(crafted,
                                    reinterpret_cast<const std::uint8_t*>(payload.data()),
-                                   payload.size(), {{"src", "crafted"}}, err),
-           "install: retry idempotent");
+                                   payload.size(), {{"src", "crafted"}}, err)) << "install: retry idempotent";
 
     PreparedVersion conflict = crafted;
     conflict.size = payload.size() + 1;
-    expect(!store_b.install_version(conflict,
+    EXPECT_TRUE(!store_b.install_version(conflict,
                                     reinterpret_cast<const std::uint8_t*>(payload.data()),
-                                    payload.size(), {}, err),
-           "install: conflicting size fails");
-    expect(err == "version already exists", "install: conflict message");
+                                    payload.size(), {}, err)) << "install: conflicting size fails";
+    EXPECT_TRUE(err == "version already exists") << "install: conflict message";
   }
+}
 
+TEST(StoreAdvanced, S4PrepareAbortPublishForPutRangeDeleteRedirect) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 4. prepare/abort/publish for put_range, delete, redirect
   // -------------------------------------------------------------------------
@@ -282,218 +295,222 @@ int test_store_advanced() {
     ObjectStore store;
     auto opts = default_opts();
     opts.clone_required = false;
-    expect(store.open(root.string(), opts, err), "txn: open");
-    expect(store.put("range-o", std::string("abcdefghij"), {}, true, err), "txn: seed range");
+    EXPECT_TRUE(store.open(root.string(), opts, err)) << "txn: open";
+    EXPECT_TRUE(store.put("range-o", std::string("abcdefghij"), {}, true, err)) << "txn: seed range";
 
     // put_range
     {
       auto tip = store.stat("range-o", err);
-      expect(tip && tip->seq == 1, "txn: range tip1");
+      EXPECT_TRUE(tip && tip->seq == 1) << "txn: range tip1";
       PreparedVersion pv;
       const char* patch = "ZZ";
-      expect(store.prepare_put_range("range-o", 2,
+      EXPECT_TRUE(store.prepare_put_range("range-o", 2,
                                      reinterpret_cast<const std::uint8_t*>(patch), 2, {}, false,
-                                     pv, err),
-             "txn: prepare_put_range");
+                                     pv, err)) << "txn: prepare_put_range";
       tip = store.stat("range-o", err);
-      expect(tip && tip->seq == 1, "txn: tip unchanged after prepare_put_range");
-      expect(store.abort_version("range-o", pv.seq, err), "txn: abort put_range");
-      expect(store.get("range-o", pv.seq, err) == std::nullopt, "txn: aborted range seq gone");
+      EXPECT_TRUE(tip && tip->seq == 1) << "txn: tip unchanged after prepare_put_range";
+      EXPECT_TRUE(store.abort_version("range-o", pv.seq, err)) << "txn: abort put_range";
+      EXPECT_TRUE(store.get("range-o", pv.seq, err) == std::nullopt) << "txn: aborted range seq gone";
       tip = store.stat("range-o", err);
-      expect(tip && tip->seq == 1, "txn: tip still 1 after abort range");
+      EXPECT_TRUE(tip && tip->seq == 1) << "txn: tip still 1 after abort range";
 
-      expect(store.prepare_put_range("range-o", 2,
+      EXPECT_TRUE(store.prepare_put_range("range-o", 2,
                                      reinterpret_cast<const std::uint8_t*>(patch), 2, {}, false,
-                                     pv, err),
-             "txn: prepare_put_range again");
-      expect(store.publish_tip("range-o", pv.seq, err), "txn: publish put_range");
+                                     pv, err)) << "txn: prepare_put_range again";
+      EXPECT_TRUE(store.publish_tip("range-o", pv.seq, err)) << "txn: publish put_range";
       tip = store.stat("range-o", err);
-      expect(tip && tip->seq == pv.seq, "txn: tip advanced after publish range");
+      EXPECT_TRUE(tip && tip->seq == pv.seq) << "txn: tip advanced after publish range";
       auto body = store.get("range-o", err);
-      expect(body && body->size() >= 4 && (*body)[2] == 'Z' && (*body)[3] == 'Z',
-             "txn: range patch applied");
+      EXPECT_TRUE(body && body->size() >= 4 && (*body)[2] == 'Z' && (*body)[3] == 'Z') << "txn: range patch applied";
     }
 
     // delete
     {
-      expect(store.put("del-o", std::string("alive"), {}, true, err), "txn: seed delete");
+      EXPECT_TRUE(store.put("del-o", std::string("alive"), {}, true, err)) << "txn: seed delete";
       auto tip = store.stat("del-o", err);
       const auto tip_seq = tip ? tip->seq : 0;
-      expect(tip_seq > 0, "txn: del tip exists");
+      EXPECT_TRUE(tip_seq > 0) << "txn: del tip exists";
       PreparedVersion pv;
-      expect(store.prepare_delete("del-o", pv, err), "txn: prepare_delete");
+      EXPECT_TRUE(store.prepare_delete("del-o", pv, err)) << "txn: prepare_delete";
       tip = store.stat("del-o", err);
-      expect(tip && tip->seq == tip_seq, "txn: tip unchanged after prepare_delete");
-      expect(store.abort_version("del-o", pv.seq, err), "txn: abort delete");
-      expect(store.get("del-o", pv.seq, err) == std::nullopt, "txn: aborted delete seq gone");
+      EXPECT_TRUE(tip && tip->seq == tip_seq) << "txn: tip unchanged after prepare_delete";
+      EXPECT_TRUE(store.abort_version("del-o", pv.seq, err)) << "txn: abort delete";
+      EXPECT_TRUE(store.get("del-o", pv.seq, err) == std::nullopt) << "txn: aborted delete seq gone";
       tip = store.stat("del-o", err);
-      expect(tip && tip->seq == tip_seq, "txn: tip after abort delete");
+      EXPECT_TRUE(tip && tip->seq == tip_seq) << "txn: tip after abort delete";
 
-      expect(store.prepare_delete("del-o", pv, err), "txn: prepare_delete again");
-      expect(store.publish_tip("del-o", pv.seq, err), "txn: publish delete");
-      expect(store.stat("del-o", err) == std::nullopt, "txn: tip hidden after delete publish");
+      EXPECT_TRUE(store.prepare_delete("del-o", pv, err)) << "txn: prepare_delete again";
+      EXPECT_TRUE(store.publish_tip("del-o", pv.seq, err)) << "txn: publish delete";
+      EXPECT_TRUE(store.stat("del-o", err) == std::nullopt) << "txn: tip hidden after delete publish";
       auto st = store.stat("del-o", pv.seq, err);
-      expect(st && st->is_delete, "txn: delete marker via seq");
+      EXPECT_TRUE(st && st->is_delete) << "txn: delete marker via seq";
     }
 
     // redirect
     {
-      expect(store.put("redir-tgt", std::string("target"), {}, true, err), "txn: redirect target");
+      EXPECT_TRUE(store.put("redir-tgt", std::string("target"), {}, true, err)) << "txn: redirect target";
       PreparedVersion pv;
-      expect(store.prepare_redirect("redir-a", "redir-tgt", {}, true, pv, err),
-             "txn: prepare_redirect");
-      expect(store.stat("redir-a", err) == std::nullopt, "txn: tip unchanged (no tip) after prep");
-      expect(store.abort_version("redir-a", pv.seq, err), "txn: abort redirect");
-      expect(store.get("redir-a", pv.seq, err) == std::nullopt, "txn: aborted redirect gone");
+      EXPECT_TRUE(store.prepare_redirect("redir-a", "redir-tgt", {}, true, pv, err)) << "txn: prepare_redirect";
+      EXPECT_TRUE(store.stat("redir-a", err) == std::nullopt) << "txn: tip unchanged (no tip) after prep";
+      EXPECT_TRUE(store.abort_version("redir-a", pv.seq, err)) << "txn: abort redirect";
+      EXPECT_TRUE(store.get("redir-a", pv.seq, err) == std::nullopt) << "txn: aborted redirect gone";
 
-      expect(store.prepare_redirect("redir-a", "redir-tgt", {}, true, pv, err),
-             "txn: prepare_redirect again");
-      expect(store.publish_tip("redir-a", pv.seq, err), "txn: publish redirect");
+      EXPECT_TRUE(store.prepare_redirect("redir-a", "redir-tgt", {}, true, pv, err)) << "txn: prepare_redirect again";
+      EXPECT_TRUE(store.publish_tip("redir-a", pv.seq, err)) << "txn: publish redirect";
       auto st = store.stat("redir-a", err);
-      expect(st && st->redirect_oid == "redir-tgt", "txn: tip advanced to redirect");
-      expect(st && st->seq == pv.seq, "txn: redirect tip seq");
+      EXPECT_TRUE(st && st->redirect_oid == "redir-tgt") << "txn: tip advanced to redirect";
+      EXPECT_TRUE(st && st->seq == pv.seq) << "txn: redirect tip seq";
     }
   }
+}
 
+TEST(StoreAdvanced, S5Attrs) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 5. attrs
   // -------------------------------------------------------------------------
   {
     const auto root = temp_root("aios-adv-attrs");
     ObjectStore store;
-    expect(store.open(root.string(), default_opts(), err), "attrs: open");
-    expect(store.put("attr-o", std::string("body"), {{"a", "1"}, {"b", "2"}}, true, err),
-           "attrs: put with attrs");
+    EXPECT_TRUE(store.open(root.string(), default_opts(), err)) << "attrs: open";
+    EXPECT_TRUE(store.put("attr-o", std::string("body"), {{"a", "1"}, {"b", "2"}}, true, err)) << "attrs: put with attrs";
     auto a = store.get_attr("attr-o", "a", err);
-    expect(a && *a == "1", "attrs: get_attr a");
+    EXPECT_TRUE(a && *a == "1") << "attrs: get_attr a";
     auto listed = store.list_attrs("attr-o", err);
-    expect(listed.size() == 2 && listed["a"] == "1" && listed["b"] == "2", "attrs: list_attrs");
+    EXPECT_TRUE(listed.size() == 2 && listed["a"] == "1" && listed["b"] == "2") << "attrs: list_attrs";
 
-    expect(store.put("attr-o", std::string("body2"), {{"c", "3"}}, false, err),
-           "attrs: put merge replace_attrs=false");
+    EXPECT_TRUE(store.put("attr-o", std::string("body2"), {{"c", "3"}}, false, err)) << "attrs: put merge replace_attrs=false";
     listed = store.list_attrs("attr-o", err);
-    expect(listed.count("a") && listed.count("b") && listed["c"] == "3",
-           "attrs: merged attrs retained");
+    EXPECT_TRUE(listed.count("a") && listed.count("b") && listed["c"] == "3") << "attrs: merged attrs retained";
     auto tip = store.stat("attr-o", err);
-    expect(tip && tip->seq == 2, "attrs: seq after merge put");
+    EXPECT_TRUE(tip && tip->seq == 2) << "attrs: seq after merge put";
 
-    expect(store.set_attr("attr-o", "d", "4", err), "attrs: set_attr");
+    EXPECT_TRUE(store.set_attr("attr-o", "d", "4", err)) << "attrs: set_attr";
     tip = store.stat("attr-o", err);
-    expect(tip && tip->seq == 3, "attrs: set_attr creates new version");
+    EXPECT_TRUE(tip && tip->seq == 3) << "attrs: set_attr creates new version";
     auto d = store.get_attr("attr-o", "d", err);
-    expect(d && *d == "4", "attrs: get_attr d");
+    EXPECT_TRUE(d && *d == "4") << "attrs: get_attr d";
     listed = store.list_attrs("attr-o", err);
-    expect(listed.count("a") && listed.count("d"), "attrs: list after set_attr");
+    EXPECT_TRUE(listed.count("a") && listed.count("d")) << "attrs: list after set_attr";
   }
+}
 
+TEST(StoreAdvanced, S6Preconditions) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 6. preconditions
   // -------------------------------------------------------------------------
   {
     const auto root = temp_root("aios-adv-pred");
     ObjectStore store;
-    expect(store.open(root.string(), default_opts(), err), "pred: open");
-    expect(store.put("pred-o", std::string("x"), {{"color", "red"}, {"n", "1"}}, true, err),
-           "pred: put");
+    EXPECT_TRUE(store.open(root.string(), default_opts(), err)) << "pred: open";
+    EXPECT_TRUE(store.put("pred-o", std::string("x"), {{"color", "red"}, {"n", "1"}}, true, err)) << "pred: put";
 
     using K = AttrPrecondition::Kind;
-    expect(store.check_preconditions("pred-o", {{K::MustExist, {}, {}}}, err) ==
-               PrecondResult::Ok,
-           "pred: MustExist ok");
-    expect(store.check_preconditions("missing", {{K::MustExist, {}, {}}}, err) ==
-               PrecondResult::NotFound,
-           "pred: MustExist missing");
-    expect(store.check_preconditions("missing", {{K::MustNotExist, {}, {}}}, err) ==
-               PrecondResult::Ok,
-           "pred: MustNotExist ok");
-    expect(store.check_preconditions("pred-o", {{K::MustNotExist, {}, {}}}, err) ==
-               PrecondResult::Conflict,
-           "pred: MustNotExist conflict");
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::MustExist, {}, {}}}, err) ==
+               PrecondResult::Ok) << "pred: MustExist ok";
+    EXPECT_TRUE(store.check_preconditions("missing", {{K::MustExist, {}, {}}}, err) ==
+               PrecondResult::NotFound) << "pred: MustExist missing";
+    EXPECT_TRUE(store.check_preconditions("missing", {{K::MustNotExist, {}, {}}}, err) ==
+               PrecondResult::Ok) << "pred: MustNotExist ok";
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::MustNotExist, {}, {}}}, err) ==
+               PrecondResult::Conflict) << "pred: MustNotExist conflict";
 
-    expect(store.check_preconditions("pred-o", {{K::Eq, "color", "red"}}, err) ==
-               PrecondResult::Ok,
-           "pred: Eq ok");
-    expect(store.check_preconditions("pred-o", {{K::Eq, "color", "blue"}}, err) ==
-               PrecondResult::Conflict,
-           "pred: Eq conflict");
-    expect(store.check_preconditions("pred-o", {{K::Ne, "color", "blue"}}, err) ==
-               PrecondResult::Ok,
-           "pred: Ne ok");
-    expect(store.check_preconditions("pred-o", {{K::Ne, "color", "red"}}, err) ==
-               PrecondResult::Conflict,
-           "pred: Ne conflict");
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Eq, "color", "red"}}, err) ==
+               PrecondResult::Ok) << "pred: Eq ok";
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Eq, "color", "blue"}}, err) ==
+               PrecondResult::Conflict) << "pred: Eq conflict";
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Ne, "color", "blue"}}, err) ==
+               PrecondResult::Ok) << "pred: Ne ok";
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Ne, "color", "red"}}, err) ==
+               PrecondResult::Conflict) << "pred: Ne conflict";
 
-    expect(store.check_preconditions("pred-o", {{K::Present, "color", {}}}, err) ==
-               PrecondResult::Ok,
-           "pred: Present ok");
-    expect(store.check_preconditions("pred-o", {{K::Present, "nope", {}}}, err) ==
-               PrecondResult::Conflict,
-           "pred: Present conflict");
-    expect(store.check_preconditions("pred-o", {{K::Absent, "nope", {}}}, err) ==
-               PrecondResult::Ok,
-           "pred: Absent ok when key missing");
-    expect(store.check_preconditions("pred-o", {{K::Absent, "color", {}}}, err) ==
-               PrecondResult::Conflict,
-           "pred: Absent conflict when key present");
-    expect(store.check_preconditions("ghost", {{K::Absent, "any", {}}}, err) == PrecondResult::Ok,
-           "pred: Absent when object missing is Ok");
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Present, "color", {}}}, err) ==
+               PrecondResult::Ok) << "pred: Present ok";
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Present, "nope", {}}}, err) ==
+               PrecondResult::Conflict) << "pred: Present conflict";
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Absent, "nope", {}}}, err) ==
+               PrecondResult::Ok) << "pred: Absent ok when key missing";
+    EXPECT_TRUE(store.check_preconditions("pred-o", {{K::Absent, "color", {}}}, err) ==
+               PrecondResult::Conflict) << "pred: Absent conflict when key present";
+    EXPECT_TRUE(store.check_preconditions("ghost", {{K::Absent, "any", {}}}, err) == PrecondResult::Ok) << "pred: Absent when object missing is Ok";
   }
+}
 
+TEST(StoreAdvanced, S7List) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 7. list
   // -------------------------------------------------------------------------
   {
     const auto root = temp_root("aios-adv-list");
     ObjectStore store;
-    expect(store.open(root.string(), default_opts(), err), "list: open");
-    expect(store.put("list/a", std::string("1"), {{"env", "prod"}}, true, err), "list: put a");
-    expect(store.put("list/b", std::string("2"), {{"env", "dev"}}, true, err), "list: put b");
-    expect(store.put("list/c", std::string("3"), {{"env", "prod"}}, true, err), "list: put c");
-    expect(store.put("other/x", std::string("4"), {{"env", "prod"}}, true, err), "list: put other");
+    EXPECT_TRUE(store.open(root.string(), default_opts(), err)) << "list: open";
+    EXPECT_TRUE(store.put("list/a", std::string("1"), {{"env", "prod"}}, true, err)) << "list: put a";
+    EXPECT_TRUE(store.put("list/b", std::string("2"), {{"env", "dev"}}, true, err)) << "list: put b";
+    EXPECT_TRUE(store.put("list/c", std::string("3"), {{"env", "prod"}}, true, err)) << "list: put c";
+    EXPECT_TRUE(store.put("other/x", std::string("4"), {{"env", "prod"}}, true, err)) << "list: put other";
 
     auto lst = store.list("list/", "", "", 100, "", false, err);
-    expect(lst.objects.size() == 3, "list: prefix count");
+    EXPECT_TRUE(lst.objects.size() == 3) << "list: prefix count";
 
     lst = store.list("list/", "env", "prod", 100, "", false, err);
-    expect(lst.objects.size() == 2, "list: attr_eq filter");
+    EXPECT_TRUE(lst.objects.size() == 2) << "list: attr_eq filter";
     for (const auto& e : lst.objects) {
-      expect(e.oid == "list/a" || e.oid == "list/c", "list: filtered oid");
+      EXPECT_TRUE(e.oid == "list/a" || e.oid == "list/c") << "list: filtered oid";
     }
 
     lst = store.list("list/", "env", "prod", 100, "", true, err);
-    expect(!lst.objects.empty() && lst.objects[0].attrs.count("env"),
-           "list: include_attrs");
+    EXPECT_TRUE(!lst.objects.empty() && lst.objects[0].attrs.count("env")) << "list: include_attrs";
 
     lst = store.list("list/", "", "", 1, "", false, err);
-    expect(lst.objects.size() == 1, "list: limit=1");
-    expect(!lst.next_cursor.empty(), "list: next_cursor set");
+    EXPECT_TRUE(lst.objects.size() == 1) << "list: limit=1";
+    EXPECT_TRUE(!lst.next_cursor.empty()) << "list: next_cursor set";
     auto page2 = store.list("list/", "", "", 1, lst.next_cursor, false, err);
-    expect(page2.objects.size() == 1, "list: page2 size");
-    expect(page2.objects[0].oid != lst.objects[0].oid, "list: page2 different oid");
+    EXPECT_TRUE(page2.objects.size() == 1) << "list: page2 size";
+    EXPECT_TRUE(page2.objects[0].oid != lst.objects[0].oid) << "list: page2 different oid";
 
-    expect(store.put("list/gone", std::string("z"), {}, true, err), "list: put delete candidate");
-    expect(store.del("list/gone", err), "list: del marker");
+    EXPECT_TRUE(store.put("list/gone", std::string("z"), {}, true, err)) << "list: put delete candidate";
+    EXPECT_TRUE(store.del("list/gone", err)) << "list: del marker";
     lst = store.list("list/", "", "", 100, "", false, err);
     bool found_gone = false;
     for (const auto& e : lst.objects) {
       if (e.oid == "list/gone") found_gone = true;
     }
-    expect(!found_gone, "list: delete marker excluded");
+    EXPECT_TRUE(!found_gone) << "list: delete marker excluded";
 
-    expect(store.put("list-tgt", std::string("t"), {}, true, err), "list: redirect target");
-    expect(store.put_redirect("list/alias", "list-tgt", {}, true, nullptr, err),
-           "list: put_redirect");
+    EXPECT_TRUE(store.put("list-tgt", std::string("t"), {}, true, err)) << "list: redirect target";
+    EXPECT_TRUE(store.put_redirect("list/alias", "list-tgt", {}, true, nullptr, err)) << "list: put_redirect";
     lst = store.list("list/", "", "", 100, "", false, err);
     bool found_redir = false;
     for (const auto& e : lst.objects) {
       if (e.oid == "list/alias") {
         found_redir = true;
-        expect(e.redirect_oid == "list-tgt", "list: redirect_oid in entry");
+        EXPECT_TRUE(e.redirect_oid == "list-tgt") << "list: redirect_oid in entry";
       }
     }
-    expect(found_redir, "list: redirect appears");
+    EXPECT_TRUE(found_redir) << "list: redirect appears";
   }
+}
 
+TEST(StoreAdvanced, S8ScrubOrphansListOidsFsBodyPath) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 8. scrub_orphans + list_oids + fs_body_path
   // -------------------------------------------------------------------------
@@ -503,22 +520,22 @@ int test_store_advanced() {
     auto opts = default_opts();
     opts.force_mode = "fs";
     opts.clone_required = false;
-    expect(store.open(root.string(), opts, err), "scrub: open");
-    expect(store.put("fs-obj", std::string("filesystem-body"), {}, true, err), "scrub: put fs");
+    EXPECT_TRUE(store.open(root.string(), opts, err)) << "scrub: open";
+    EXPECT_TRUE(store.put("fs-obj", std::string("filesystem-body"), {}, true, err)) << "scrub: put fs";
 
     auto path = store.fs_body_path("fs-obj", err);
-    expect(path.has_value() && fs::is_regular_file(*path), "scrub: fs_body_path");
+    EXPECT_TRUE(path.has_value() && fs::is_regular_file(*path)) << "scrub: fs_body_path";
 
     auto oids = store.list_oids(100, err);
-    expect(!oids.empty(), "scrub: list_oids nonempty");
+    EXPECT_TRUE(!oids.empty()) << "scrub: list_oids nonempty";
     bool has_fs = false;
     for (const auto& o : oids) {
       if (o == "fs-obj") has_fs = true;
     }
-    expect(has_fs, "scrub: list_oids contains fs-obj");
+    EXPECT_TRUE(has_fs) << "scrub: list_oids contains fs-obj";
 
     auto tip = store.stat("fs-obj", err);
-    expect(tip.has_value(), "scrub: tip");
+    EXPECT_TRUE(tip.has_value()) << "scrub: tip";
     char shard_buf[8];
     std::snprintf(shard_buf, sizeof(shard_buf), "%x", tip->shard);
     const auto orphan =
@@ -528,13 +545,20 @@ int test_store_advanced() {
       std::ofstream out(orphan, std::ios::binary);
       out << "orphan-data";
     }
-    expect(fs::is_regular_file(orphan), "scrub: orphan created");
+    EXPECT_TRUE(fs::is_regular_file(orphan)) << "scrub: orphan created";
     const auto removed = store.scrub_orphans(err);
-    expect(removed >= 1, "scrub: removed >= 1");
-    expect(!fs::exists(orphan), "scrub: orphan gone");
-    expect(fs::is_regular_file(*path), "scrub: real body kept");
+    EXPECT_TRUE(removed >= 1) << "scrub: removed >= 1";
+    EXPECT_TRUE(!fs::exists(orphan)) << "scrub: orphan gone";
+    EXPECT_TRUE(fs::is_regular_file(*path)) << "scrub: real body kept";
   }
+}
 
+TEST(StoreAdvanced, S9LegacyMigrate) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 9. legacy migrate
   // -------------------------------------------------------------------------
@@ -547,17 +571,16 @@ int test_store_advanced() {
     }
 
     const std::uint32_t shard = shard_of_oid("legacy-1", 4);
-    expect(shard < 4, "legacy: shard in range");
+    EXPECT_TRUE(shard < 4) << "legacy: shard in range";
     char shard_dir_name[8];
     std::snprintf(shard_dir_name, sizeof(shard_dir_name), "%x", shard);
     const auto shard_dir = root / "shards" / shard_dir_name;
     fs::create_directories(shard_dir / "objects" / "aa" / "bb");
     const auto db_path = shard_dir / "meta.sqlite";
-    expect(seed_legacy_db(db_path, err), "legacy: seed schema");
+    EXPECT_TRUE(seed_legacy_db(db_path, err)) << "legacy: seed schema";
 
     const std::string inline_body = "oldbody";
-    expect(insert_legacy_inline(db_path, "legacy-1", inline_body, "k", "v", err),
-           "legacy: insert inline");
+    EXPECT_TRUE(insert_legacy_inline(db_path, "legacy-1", inline_body, "k", "v", err)) << "legacy: insert inline";
 
     // FS object: prefer same shard when possible; otherwise create its own shard DB.
     const std::string fs_oid = "legacy-fs";
@@ -568,7 +591,7 @@ int test_store_advanced() {
     fs::create_directories(fs_shard_dir / "objects" / "aa" / "bb");
     const auto fs_db = fs_shard_dir / "meta.sqlite";
     if (fs_shard != shard) {
-      expect(seed_legacy_db(fs_db, err), "legacy: seed fs shard schema");
+      EXPECT_TRUE(seed_legacy_db(fs_db, err)) << "legacy: seed fs shard schema";
     }
     const std::string fs_rel = "objects/aa/bb/deadbeef";
     const std::string fs_body = "fslegacy";
@@ -578,95 +601,120 @@ int test_store_advanced() {
       std::ofstream out(fs_shard_dir / fs_rel, std::ios::binary);
       out << fs_body;
     }
-    expect(insert_legacy_fs(fs_shard == shard ? db_path : fs_db, fs_oid, fs_rel, fs_body.size(),
-                            fs_crc, err),
-           "legacy: insert fs object");
+    EXPECT_TRUE(insert_legacy_fs(fs_shard == shard ? db_path : fs_db, fs_oid, fs_rel, fs_body.size(),
+                            fs_crc, err)) << "legacy: insert fs object";
 
     ObjectStore store;
     auto opts = default_opts();
     opts.shard_count = 4;
-    expect(store.open(root.string(), opts, err), "legacy: open migrates");
+    EXPECT_TRUE(store.open(root.string(), opts, err)) << "legacy: open migrates";
     if (!err.empty() && !store.is_open()) {
       std::cerr << "legacy open err: " << err << "\n";
     }
 
     auto body = store.get("legacy-1", err);
-    expect(body && body_str(body) == "oldbody", "legacy: get body");
+    EXPECT_TRUE(body && body_str(body) == "oldbody") << "legacy: get body";
     auto st = store.stat("legacy-1", err);
-    expect(st && st->seq == 1, "legacy: seq==1");
-    expect(st && st->size == inline_body.size(), "legacy: size");
+    EXPECT_TRUE(st && st->seq == 1) << "legacy: seq==1";
+    EXPECT_TRUE(st && st->size == inline_body.size()) << "legacy: size";
     auto attr = store.get_attr("legacy-1", "k", err);
-    expect(attr && *attr == "v", "legacy: attr k=v");
+    EXPECT_TRUE(attr && *attr == "v") << "legacy: attr k=v";
     auto attrs = store.list_attrs("legacy-1", err);
-    expect(attrs.count("k") && attrs["k"] == "v", "legacy: list_attrs");
+    EXPECT_TRUE(attrs.count("k") && attrs["k"] == "v") << "legacy: list_attrs";
 
     auto fs_got = store.get(fs_oid, err);
-    expect(fs_got && body_str(fs_got) == fs_body, "legacy: fs object get");
+    EXPECT_TRUE(fs_got && body_str(fs_got) == fs_body) << "legacy: fs object get";
     auto fs_st = store.stat(fs_oid, err);
-    expect(fs_st && fs_st->seq == 1 && !fs_st->inline_body, "legacy: fs seq==1");
+    EXPECT_TRUE(fs_st && fs_st->seq == 1 && !fs_st->inline_body) << "legacy: fs seq==1";
   }
+}
 
+TEST(StoreAdvanced, S10EmptyPutZeroLength) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 10. empty put / zero-length
   // -------------------------------------------------------------------------
   {
     const auto root = temp_root("aios-adv-empty");
     ObjectStore store;
-    expect(store.open(root.string(), default_opts(), err), "empty: open");
-    expect(store.put("empty-o", std::string(""), {}, true, err), "empty: put");
+    EXPECT_TRUE(store.open(root.string(), default_opts(), err)) << "empty: open";
+    EXPECT_TRUE(store.put("empty-o", std::string(""), {}, true, err)) << "empty: put";
     auto st = store.stat("empty-o", err);
-    expect(st && st->size == 0, "empty: size 0");
+    EXPECT_TRUE(st && st->size == 0) << "empty: size 0";
     auto body = store.get("empty-o", err);
-    expect(body.has_value() && body->empty(), "empty: get empty object");
+    EXPECT_TRUE(body.has_value() && body->empty()) << "empty: get empty object";
   }
+}
 
+TEST(StoreAdvanced, S11RedirectInstallViaPrepareRedirectAbortPublish) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 11. redirect install via prepare_redirect + abort + publish
   // -------------------------------------------------------------------------
   {
     const auto root = temp_root("aios-adv-redir");
     ObjectStore store;
-    expect(store.open(root.string(), default_opts(), err), "redir: open");
-    expect(store.put("r-target", std::string("payload"), {}, true, err), "redir: target");
+    EXPECT_TRUE(store.open(root.string(), default_opts(), err)) << "redir: open";
+    EXPECT_TRUE(store.put("r-target", std::string("payload"), {}, true, err)) << "redir: target";
 
     PreparedVersion pv;
-    expect(store.prepare_redirect("r-alias", "r-target", {{"kind", "alias"}}, true, pv, err),
-           "redir: prepare");
-    expect(store.stat("r-alias", err) == std::nullopt, "redir: tip unchanged after prepare");
-    expect(store.abort_version("r-alias", pv.seq, err), "redir: abort");
-    expect(store.stat("r-alias", pv.seq, err) == std::nullopt, "redir: aborted seq gone");
+    EXPECT_TRUE(store.prepare_redirect("r-alias", "r-target", {{"kind", "alias"}}, true, pv, err)) << "redir: prepare";
+    EXPECT_TRUE(store.stat("r-alias", err) == std::nullopt) << "redir: tip unchanged after prepare";
+    EXPECT_TRUE(store.abort_version("r-alias", pv.seq, err)) << "redir: abort";
+    EXPECT_TRUE(store.stat("r-alias", pv.seq, err) == std::nullopt) << "redir: aborted seq gone";
 
-    expect(store.prepare_redirect("r-alias", "r-target", {{"kind", "alias"}}, true, pv, err),
-           "redir: prepare again");
-    expect(store.publish_tip("r-alias", pv.seq, err), "redir: publish");
+    EXPECT_TRUE(store.prepare_redirect("r-alias", "r-target", {{"kind", "alias"}}, true, pv, err)) << "redir: prepare again";
+    EXPECT_TRUE(store.publish_tip("r-alias", pv.seq, err)) << "redir: publish";
     auto st = store.stat("r-alias", err);
-    expect(st && st->redirect_oid == "r-target", "redir: published redirect_oid");
-    expect(st && st->seq == pv.seq, "redir: published seq");
-    expect(store.get("r-alias", err) == std::nullopt, "redir: get fails");
-    expect(err == "object is redirect", "redir: get err");
+    EXPECT_TRUE(st && st->redirect_oid == "r-target") << "redir: published redirect_oid";
+    EXPECT_TRUE(st && st->seq == pv.seq) << "redir: published seq";
+    EXPECT_TRUE(store.get("r-alias", err) == std::nullopt) << "redir: get fails";
+    EXPECT_TRUE(err == "object is redirect") << "redir: get err";
   }
+}
 
+TEST(StoreAdvanced, S12VersionedGetOfDeleteMarker) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 12. versioned get of delete marker
   // -------------------------------------------------------------------------
   {
     const auto root = temp_root("aios-adv-delmark");
     ObjectStore store;
-    expect(store.open(root.string(), default_opts(), err), "delmark: open");
-    expect(store.put("dm", std::string("live"), {}, true, err), "delmark: put");
+    EXPECT_TRUE(store.open(root.string(), default_opts(), err)) << "delmark: open";
+    EXPECT_TRUE(store.put("dm", std::string("live"), {}, true, err)) << "delmark: put";
     auto before = store.stat("dm", err);
-    expect(before && before->seq == 1, "delmark: seq1");
-    expect(store.del("dm", err), "delmark: del");
-    expect(store.stat("dm", err) == std::nullopt, "delmark: tip hidden");
+    EXPECT_TRUE(before && before->seq == 1) << "delmark: seq1";
+    EXPECT_TRUE(store.del("dm", err)) << "delmark: del";
+    EXPECT_TRUE(store.stat("dm", err) == std::nullopt) << "delmark: tip hidden";
     auto vers = store.list_versions("dm", err);
-    expect(!vers.empty() && vers[0].is_delete, "delmark: newest is delete");
+    EXPECT_TRUE(!vers.empty() && vers[0].is_delete) << "delmark: newest is delete";
     const auto del_seq = vers[0].seq;
     auto st = store.stat("dm", del_seq, err);
-    expect(st && st->is_delete, "delmark: versioned stat is_delete");
-    expect(store.get("dm", del_seq, err) == std::nullopt, "delmark: get delete marker fails");
-    expect(err == "object is delete marker", "delmark: get err");
+    EXPECT_TRUE(st && st->is_delete) << "delmark: versioned stat is_delete";
+    EXPECT_TRUE(store.get("dm", del_seq, err) == std::nullopt) << "delmark: get delete marker fails";
+    EXPECT_TRUE(err == "object is delete marker") << "delmark: get err";
   }
+}
 
+TEST(StoreAdvanced, S13PreparePutFileStagingStreamPath) {
+using namespace aios;
+  using aios::test::default_opts;
+  using aios::test::temp_root;
+
+  std::string err;
   // -------------------------------------------------------------------------
   // 13. prepare_put_file / staging stream path
   // -------------------------------------------------------------------------
@@ -675,9 +723,9 @@ int test_store_advanced() {
     ObjectStore store;
     ObjectStoreOptions opts = default_opts();
     opts.force_mode = "fs";
-    expect(store.open(root.string(), opts, err), "stage: open");
+    EXPECT_TRUE(store.open(root.string(), opts, err)) << "stage: open";
     std::string staging;
-    expect(store.create_staging_file("big", staging, err), "stage: create");
+    EXPECT_TRUE(store.create_staging_file("big", staging, err)) << "stage: create";
     std::vector<std::uint8_t> payload(300 * 1024);
     for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<std::uint8_t>(i);
     {
@@ -687,15 +735,14 @@ int test_store_advanced() {
     }
     const auto crc = aios::crc32c(payload.data(), payload.size());
     PreparedVersion pv;
-    expect(store.prepare_put_file("big", staging, payload.size(), crc, {{"k", "v"}}, true,
-                                  crc, pv, err),
-           "stage: prepare_put_file");
-    expect(store.publish_tip("big", pv.seq, err), "stage: publish");
+    EXPECT_TRUE(store.prepare_put_file("big", staging, payload.size(), crc, {{"k", "v"}}, true,
+                                  crc, pv, err)) << "stage: prepare_put_file";
+    EXPECT_TRUE(store.publish_tip("big", pv.seq, err)) << "stage: publish";
     auto got = store.get("big", err);
-    expect(got && *got == payload, "stage: get matches");
+    EXPECT_TRUE(got && *got == payload) << "stage: get matches";
     auto path = store.fs_body_path("big", err);
-    expect(path.has_value(), "stage: fs path");
+    EXPECT_TRUE(path.has_value()) << "stage: fs path";
   }
-
-  return failures();
 }
+
+

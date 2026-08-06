@@ -1,4 +1,5 @@
 #include "http/s3_auth.hpp"
+#include <gtest/gtest.h>
 #include "util/auth.hpp"
 
 #include <ctime>
@@ -6,16 +7,6 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
-
-namespace {
-
-int failures = 0;
-void expect(bool cond, const char* msg) {
-  if (!cond) {
-    std::cerr << "FAIL s3_auth: " << msg << "\n";
-    ++failures;
-  }
-}
 
 std::string amz_now() {
   const auto t = std::time(nullptr);
@@ -69,14 +60,11 @@ void sign_request(const std::string& method, const std::string& uri, const std::
       "/s3/aws4_request, SignedHeaders=" + signed_headers + ", Signature=" + sig;
 }
 
-}  // namespace
 
-int test_s3_auth() {
+TEST(S3Auth, SigV4) {
   using namespace aios;
-  failures = 0;
-
-  expect(s3_uri_encode("a/b", false) == "a/b", "uri encode keep slash");
-  expect(s3_uri_encode("a b", true) == "a%20b", "uri encode space");
+  EXPECT_TRUE(s3_uri_encode("a/b", false) == "a/b") << "uri encode keep slash";
+  EXPECT_TRUE(s3_uri_encode("a b", true) == "a%20b") << "uri encode space";
 
   const std::string access = "aios";
   const std::string secret = "test-cluster-key";
@@ -87,16 +75,14 @@ int test_s3_auth() {
   sign_request("GET", "/", "", amz, payload, access, secret, region, headers);
 
   auto ok = s3_sigv4_verify("GET", "/", "", headers, payload, access, secret, 60000);
-  expect(ok.ok, "sigv4 verify ok");
-  expect(ok.access_key == access, "access key");
-  expect(ok.region == region, "region");
+  EXPECT_TRUE(ok.ok) << "sigv4 verify ok";
+  EXPECT_TRUE(ok.access_key == access) << "access key";
+  EXPECT_TRUE(ok.region == region) << "region";
 
   auto bad = s3_sigv4_verify("GET", "/", "", headers, payload, access, "wrong", 60000);
-  expect(!bad.ok, "wrong secret rejected");
+  EXPECT_TRUE(!bad.ok) << "wrong secret rejected";
 
   auto bad_ak = s3_sigv4_verify("GET", "/", "", headers, payload, "other", secret, 60000);
-  expect(!bad_ak.ok, "wrong access key rejected");
+  EXPECT_TRUE(!bad_ak.ok) << "wrong access key rejected";
 
-  if (failures == 0) std::cout << "test_s3_auth OK\n";
-  return failures;
-}
+  }

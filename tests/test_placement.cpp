@@ -1,4 +1,5 @@
 #include "cluster/place.hpp"
+#include <gtest/gtest.h>
 #include "object/object_layout.hpp"
 #include "object/repair.hpp"
 #include "object/transition.hpp"
@@ -7,12 +8,9 @@
 #include <string>
 #include <vector>
 
-int test_placement() {
-  using namespace aios;
+TEST(Placement, PreferDistinctRacksBeforeSameRackNodes) {
+using namespace aios;
   using namespace aios::test;
-  int& failures = aios::test::failures();
-  failures = 0;
-
   // Prefer distinct racks before same-rack nodes.
   {
     auto root = temp_root("place-rack");
@@ -59,14 +57,18 @@ int test_placement() {
     pc.min_vnodes = 8;
     pc.max_vnodes = 256;
     auto map = ClusterMap::build(membership, fs, 2, pc);
-    expect(map.targets.size() == 4, "four targets across racks");
+    EXPECT_TRUE(map.targets.size() == 4) << "four targets across racks";
     auto p = place("rack-oid-0", map, 2, "nvme");
-    expect(p.acting_set.size() == 2, "acting set size 2");
-    expect(p.acting_set[0].rack != p.acting_set[1].rack, "distinct racks preferred");
+    EXPECT_TRUE(p.acting_set.size() == 2) << "acting set size 2";
+    EXPECT_TRUE(p.acting_set[0].rack != p.acting_set[1].rack) << "distinct racks preferred";
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
   }
+}
 
+TEST(Placement, DrainTargetsStayInTheMapButAreExcludedFromPlace) {
+using namespace aios;
+  using namespace aios::test;
   // Drain targets stay in the map but are excluded from place().
   {
     auto root = temp_root("place-drain");
@@ -90,27 +92,31 @@ int test_placement() {
     pc.min_vnodes = 8;
     pc.max_vnodes = 256;
     auto map = ClusterMap::build(membership, fs, 2, pc);
-    expect(map.targets.size() == 3, "map includes drain");
+    EXPECT_TRUE(map.targets.size() == 3) << "map includes drain";
     int drain_n = 0;
     for (const auto& t : map.targets) {
       if (t.state == LifecycleState::Drain) ++drain_n;
     }
-    expect(drain_n == 1, "one drain in map");
+    EXPECT_TRUE(drain_n == 1) << "one drain in map";
     auto p = place("drain-oid", map, 2, "nvme");
-    expect(p.acting_set.size() == 2, "place uses two up targets");
+    EXPECT_TRUE(p.acting_set.size() == 2) << "place uses two up targets";
     for (const auto& t : p.acting_set) {
-      expect(t.state == LifecycleState::Up, "acting set is up-only");
-      expect(t.aios_path != d1, "drain path excluded from place");
+      EXPECT_TRUE(t.state == LifecycleState::Up) << "acting set is up-only";
+      EXPECT_TRUE(t.aios_path != d1) << "drain path excluded from place";
     }
     // Off is omitted from the map entirely.
     local[2].state = LifecycleState::Off;
     fs.set_local("node-a", local);
     map = ClusterMap::build(membership, fs, 2, pc);
-    expect(map.targets.size() == 2, "off omitted from map");
+    EXPECT_TRUE(map.targets.size() == 2) << "off omitted from map";
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
   }
+}
 
+TEST(Placement, ClassScopedRingsSameOidMapsIndependentlyPerClass) {
+using namespace aios;
+  using namespace aios::test;
   // Class-scoped rings: same oid maps independently per class.
   {
     DualStoreFixture nvme("place-nvme", 2, 2, "nvme");
@@ -134,18 +140,22 @@ int test_placement() {
     pc.min_vnodes = 8;
     pc.max_vnodes = 256;
     auto map = ClusterMap::build(membership, fs, 2, pc);
-    expect(map.targets_for_class("nvme").size() == 2, "nvme pool");
-    expect(map.targets_for_class("hdd").size() == 2, "hdd pool");
+    EXPECT_TRUE(map.targets_for_class("nvme").size() == 2) << "nvme pool";
+    EXPECT_TRUE(map.targets_for_class("hdd").size() == 2) << "hdd pool";
     auto pn = place("obj", map, 2, "nvme");
     auto ph = place("obj", map, 2, "hdd");
-    expect(pn.acting_set.size() == 2, "nvme acting set");
-    expect(ph.acting_set.size() == 2, "hdd acting set");
-    expect(pn.acting_set[0].storage_class == "nvme", "nvme primary class");
-    expect(ph.acting_set[0].storage_class == "hdd", "hdd primary class");
+    EXPECT_TRUE(pn.acting_set.size() == 2) << "nvme acting set";
+    EXPECT_TRUE(ph.acting_set.size() == 2) << "hdd acting set";
+    EXPECT_TRUE(pn.acting_set[0].storage_class == "nvme") << "nvme primary class";
+    EXPECT_TRUE(ph.acting_set[0].storage_class == "hdd") << "hdd primary class";
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
   }
+}
 
+TEST(Placement, PUTWithStorageClassTipAttrsClientDrivenClassChange) {
+using namespace aios;
+  using namespace aios::test;
   // PUT with storage class + tip attrs; client-driven class change.
   {
     DualStoreFixture fx("place-put-class", 2, 2, "nvme");
@@ -178,18 +188,22 @@ int test_placement() {
     LayoutRequest req;
     req.storage_class = "nvme";
     auto put = fx.svc->api_put("cold/item", body, 11, {}, true, {}, std::nullopt, req);
-    expect(put.ok, "put nvme");
-    expect(put.attrs.at(kStorageClassAttr) == "nvme", "tip class nvme");
+    EXPECT_TRUE(put.ok) << "put nvme";
+    EXPECT_TRUE(put.attrs.at(kStorageClassAttr) == "nvme") << "tip class nvme";
 
     LayoutRequest move;
     move.storage_class = "hdd";
     auto put2 = fx.svc->api_put("cold/item", body, 11, {}, true, {}, std::nullopt, move);
-    expect(put2.ok, "put hdd");
-    expect(put2.attrs.at(kStorageClassAttr) == "hdd", "tip class hdd");
+    EXPECT_TRUE(put2.ok) << "put hdd";
+    EXPECT_TRUE(put2.attrs.at(kStorageClassAttr) == "hdd") << "tip class hdd";
     auto got = fx.svc->api_get("cold/item", std::nullopt, std::nullopt, {});
-    expect(got.ok && got.data && got.data->size() == 11, "get after class change");
+    EXPECT_TRUE(got.ok && got.data && got.data->size() == 11) << "get after class change";
   }
+}
 
+TEST(Placement, BackgroundTransitionNvmeHdd) {
+using namespace aios;
+  using namespace aios::test;
   // Background transition nvme → hdd.
   {
     DualStoreFixture fx("place-transition", 2, 2, "nvme");
@@ -223,25 +237,29 @@ int test_placement() {
     LayoutRequest req;
     req.storage_class = "nvme";
     auto put = fx.svc->api_put("archive/o1", body, 12, {}, true, {}, std::nullopt, req);
-    expect(put.ok, "seed nvme object");
+    EXPECT_TRUE(put.ok) << "seed nvme object";
 
     auto stats = run_transitions(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64);
-    expect(stats.migrated >= 1 || stats.matched >= 1, "transition matched/migrated");
+    EXPECT_TRUE(stats.migrated >= 1 || stats.matched >= 1) << "transition matched/migrated";
 
     // Dest primary may need a second pass if first only matched.
     if (stats.migrated == 0) {
       stats = run_transitions(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64);
     }
-    expect(stats.migrated >= 1 || stats.drained >= 1, "transition progressed");
+    EXPECT_TRUE(stats.migrated >= 1 || stats.drained >= 1) << "transition progressed";
 
     auto got = fx.svc->api_get("archive/o1", std::nullopt, std::nullopt, {});
-    expect(got.ok, "get during/after transition");
+    EXPECT_TRUE(got.ok) << "get during/after transition";
     if (got.ok) {
       const auto sc = storage_class_for_attrs(got.attrs, "");
-      expect(sc == "hdd" || sc == "nvme", "class nvme or hdd");
+      EXPECT_TRUE(sc == "hdd" || sc == "nvme") << "class nvme or hdd";
     }
   }
+}
 
+TEST(Placement, DrainEvacuateLocalTipOnADrainedTargetIsPushedIntoTheNewActin) {
+using namespace aios;
+  using namespace aios::test;
   // Drain evacuate: local tip on a drained target is pushed into the new acting set.
   {
     auto root = temp_root("place-evacuate");
@@ -284,33 +302,33 @@ int test_placement() {
     svc.set_advertise("127.0.0.1:7400");
     const auto* body = reinterpret_cast<const std::uint8_t*>("evacuate-me");
     auto put = svc.api_put("evac/1", body, 11, {}, true, {}, std::nullopt, {});
-    expect(put.ok, "seed for evacuate");
+    EXPECT_TRUE(put.ok) << "seed for evacuate";
     auto before = place("evac/1", map, 2, "nvme");
-    expect(before.acting_set.size() == 2, "acting set before drain");
+    EXPECT_TRUE(before.acting_set.size() == 2) << "acting set before drain";
     const std::string drained = before.acting_set[0].aios_path;
     for (auto& t : local) {
       if (t.aios_path == drained) t.state = LifecycleState::Drain;
     }
     fs.set_local("node-a", local);
     map = ClusterMap::build(membership, fs, cfg.replica_count, plc);
-    expect(map.targets.size() == 3, "drain remains in map");
+    EXPECT_TRUE(map.targets.size() == 3) << "drain remains in map";
     auto after = place("evac/1", map, 2, "nvme");
-    expect(after.acting_set.size() == 2, "acting set after drain");
+    EXPECT_TRUE(after.acting_set.size() == 2) << "acting set after drain";
     for (const auto& t : after.acting_set) {
-      expect(t.aios_path != drained, "drained target left acting set");
+      EXPECT_TRUE(t.aios_path != drained) << "drained target left acting set";
     }
     auto stats = run_repair(cfg, "127.0.0.1:7400", map, stores, 64);
-    expect(stats.repaired >= 1, "evacuate repaired");
+    EXPECT_TRUE(stats.repaired >= 1) << "evacuate repaired";
     int present = 0;
     for (const auto& t : after.acting_set) {
       auto* s = stores.get(t.aios_path);
       std::string err;
       if (s && s->stat("evac/1", err)) ++present;
     }
-    expect(present == 2, "acting set fully populated after evacuate");
+    EXPECT_TRUE(present == 2) << "acting set fully populated after evacuate";
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
   }
-
-  return failures;
 }
+
+

@@ -9,8 +9,9 @@
 #include "store/local_stores.hpp"
 #include "store/object_store.hpp"
 
+#include <gtest/gtest.h>
+
 #include <filesystem>
-#include <iostream>
 #include <memory>
 #include <string>
 #include <unistd.h>
@@ -18,20 +19,6 @@
 #include <vector>
 
 namespace aios::test {
-
-inline int& failures() {
-  static int f = 0;
-  return f;
-}
-
-inline void expect(bool cond, const char* msg) {
-  if (!cond) {
-    std::cerr << "FAIL: " << msg << "\n";
-    ++failures();
-  }
-}
-
-inline void expect(bool cond, const std::string& msg) { expect(cond, msg.c_str()); }
 
 inline std::filesystem::path temp_root(const char* prefix) {
   auto p = std::filesystem::temp_directory_path() /
@@ -123,5 +110,11 @@ inline ObjectStoreOptions default_opts() {
   o.clone_required = false;
   return o;
 }
+
+// gtest fixture wrapping DualStoreFixture (default dual-replica nvme layout).
+class DualStoreTest : public ::testing::Test {
+ protected:
+  DualStoreFixture fx{"gtest-dual"};
+};
 
 }  // namespace aios::test

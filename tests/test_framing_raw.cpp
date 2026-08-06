@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "net/framing.hpp"
 
@@ -6,13 +7,8 @@
 #include <string>
 #include <vector>
 
-int test_framing_raw() {
+TEST(FramingRaw, RoundTrip) {
   using namespace aios;
-  using aios::test::expect;
-  using aios::test::failures;
-
-  failures() = 0;
-
   Frame in;
   in.type = MsgType::ObjectPutRange;
   in.flags = kFlagRawBody;
@@ -27,30 +23,25 @@ int test_framing_raw() {
   in.raw.assign(raw_bytes.begin(), raw_bytes.end());
 
   auto bytes = encode_frame(in);
-  expect(bytes.size() >= kHeaderSize, "encoded has header");
-  expect(std::memcmp(bytes.data(), "AIOS", 4) == 0, "magic");
-  expect(bytes[5] == static_cast<std::uint8_t>(MsgType::ObjectPutRange), "type byte");
+  EXPECT_TRUE(bytes.size() >= kHeaderSize) << "encoded has header";
+  EXPECT_TRUE(std::memcmp(bytes.data(), "AIOS", 4) == 0) << "magic";
+  EXPECT_TRUE(bytes[5] == static_cast<std::uint8_t>(MsgType::ObjectPutRange)) << "type byte";
 
   Frame out;
   std::size_t consumed = 0;
   std::string err;
-  expect(decode_frame(bytes.data(), bytes.size(), out, consumed, err), "decode ok");
-  expect(err.empty(), "no err");
-  expect(consumed == bytes.size(), "consumed all");
-  expect(out.type == MsgType::ObjectPutRange, "type roundtrip");
-  expect((out.flags & kFlagRawBody) != 0, "raw flag set");
-  expect(out.body.value("oid", "") == "raw-obj", "json oid");
-  expect(out.body.value("offset", static_cast<std::uint64_t>(0)) == 4, "json offset");
-  expect(std::string(out.raw.begin(), out.raw.end()) == raw_bytes, "raw bytes roundtrip");
+  EXPECT_TRUE(decode_frame(bytes.data(), bytes.size(), out, consumed, err)) << "decode ok";
+  EXPECT_TRUE(err.empty()) << "no err";
+  EXPECT_TRUE(consumed == bytes.size()) << "consumed all";
+  EXPECT_TRUE(out.type == MsgType::ObjectPutRange) << "type roundtrip";
+  EXPECT_TRUE((out.flags & kFlagRawBody) != 0) << "raw flag set";
+  EXPECT_TRUE(out.body.value("oid", "") == "raw-obj") << "json oid";
+  EXPECT_TRUE(out.body.value("offset", static_cast<std::uint64_t>(0)) == 4) << "json offset";
+  EXPECT_TRUE(std::string(out.raw.begin(), out.raw.end()) == raw_bytes) << "raw bytes roundtrip";
 
-  expect(std::string(msg_type_name(MsgType::ObjectPublishTip)) == "ObjectPublishTip",
-         "msg ObjectPublishTip");
-  expect(std::string(msg_type_name(MsgType::ObjectAbortVersion)) == "ObjectAbortVersion",
-         "msg ObjectAbortVersion");
-  expect(std::string(msg_type_name(MsgType::ObjectListVersions)) == "ObjectListVersions",
-         "msg ObjectListVersions");
-  expect(std::string(msg_type_name(MsgType::ObjectPurgeVersions)) == "ObjectPurgeVersions",
-         "msg ObjectPurgeVersions");
+  EXPECT_TRUE(std::string(msg_type_name(MsgType::ObjectPublishTip)) == "ObjectPublishTip") << "msg ObjectPublishTip";
+  EXPECT_TRUE(std::string(msg_type_name(MsgType::ObjectAbortVersion)) == "ObjectAbortVersion") << "msg ObjectAbortVersion";
+  EXPECT_TRUE(std::string(msg_type_name(MsgType::ObjectListVersions)) == "ObjectListVersions") << "msg ObjectListVersions";
+  EXPECT_TRUE(std::string(msg_type_name(MsgType::ObjectPurgeVersions)) == "ObjectPurgeVersions") << "msg ObjectPurgeVersions";
 
-  return failures();
-}
+  }

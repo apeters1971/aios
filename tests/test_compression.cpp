@@ -1,4 +1,5 @@
 #include "cluster/cluster_map.hpp"
+#include <gtest/gtest.h>
 #include "config.hpp"
 #include "fs/aios_scan.hpp"
 #include "fs/fs_table.hpp"
@@ -15,47 +16,33 @@
 
 namespace fs = std::filesystem;
 
-namespace {
 
-int failures = 0;
-void expect(bool cond, const char* msg) {
-  if (!cond) {
-    std::cerr << "FAIL compression: " << msg << "\n";
-    ++failures;
-  }
-}
-
-}  // namespace
-
-int test_compression() {
+TEST(Compression, Basic) {
   using namespace aios;
-  failures = 0;
-
   std::string cerr;
   std::vector<std::uint8_t> tiny{1, 2, 3};
   std::vector<std::uint8_t> out;
   if (!zstd_available()) {
-    expect(!zstd_compress(tiny.data(), tiny.size(), 3, out, cerr), "compress unavailable");
-    std::cout << "test_compression SKIP (no libzstd)\n";
-    return 0;
+    EXPECT_TRUE(!zstd_compress(tiny.data(), tiny.size(), 3, out, cerr)) << "compress unavailable";
+    GTEST_SKIP() << "test_compression SKIP (no libzstd)\n";
   }
 
   // Unit: round-trip compressible payload.
   std::vector<std::uint8_t> plain(4096, 'A');
-  expect(zstd_compress(plain.data(), plain.size(), 3, out, cerr), "zstd_compress");
-  expect(out.size() < plain.size(), "compress shrinks");
+  EXPECT_TRUE(zstd_compress(plain.data(), plain.size(), 3, out, cerr)) << "zstd_compress";
+  EXPECT_TRUE(out.size() < plain.size()) << "compress shrinks";
   std::vector<std::uint8_t> back;
-  expect(zstd_decompress(out.data(), out.size(), plain.size(), back, cerr), "zstd_decompress");
-  expect(back == plain, "round-trip");
+  EXPECT_TRUE(zstd_decompress(out.data(), out.size(), plain.size(), back, cerr)) << "zstd_decompress";
+  EXPECT_TRUE(back == plain) << "round-trip";
 
   // Ops ratio accounting.
   OpsRegistry ops;
   ops.note_compress(1000, 250);
   auto admin = ops.to_admin_json();
-  expect(admin.contains("compression"), "compression block");
-  expect(admin["compression"].value("ratio", 0.0) == 4.0, "ratio 4x");
-  expect(admin["compression"].value("logical_bytes", 0ull) == 1000, "logical");
-  expect(admin["compression"].value("stored_bytes", 0ull) == 250, "stored");
+  EXPECT_TRUE(admin.contains("compression")) << "compression block";
+  EXPECT_TRUE(admin["compression"].value("ratio", 0.0) == 4.0) << "ratio 4x";
+  EXPECT_TRUE(admin["compression"].value("logical_bytes", 0ull) == 1000) << "logical";
+  EXPECT_TRUE(admin["compression"].value("stored_bytes", 0ull) == 250) << "stored";
 
   // ObjectService: put/get with compression=zstd.
   const auto root = fs::temp_directory_path() / ("aios-comp-" + std::to_string(::getpid()));
@@ -100,31 +87,28 @@ int test_compression() {
 
   const std::string oid = "comp/blob";
   auto put = svc.api_put(oid, plain.data(), plain.size(), {}, true, {});
-  expect(put.ok, "api_put compressed");
-  expect(put.info && put.info->size == plain.size(), "put logical size");
-  expect(attrs_are_compressed(put.attrs), "compression attr");
-  expect(svc.ops().total().compress_puts.load() >= 1, "compress_puts");
+  EXPECT_TRUE(put.ok) << "api_put compressed";
+  EXPECT_TRUE(put.info && put.info->size == plain.size()) << "put logical size";
+  EXPECT_TRUE(attrs_are_compressed(put.attrs)) << "compression attr";
+  EXPECT_TRUE(svc.ops().total().compress_puts.load() >= 1) << "compress_puts";
 
   auto got = svc.api_get(oid, std::nullopt, std::nullopt, {});
-  expect(got.ok && got.data && *got.data == plain, "get decompress");
-  expect(got.info && got.info->size == plain.size(), "get logical size");
+  EXPECT_TRUE(got.ok && got.data && *got.data == plain) << "get decompress";
+  EXPECT_TRUE(got.info && got.info->size == plain.size()) << "get logical size";
 
   auto ranged = svc.api_get(oid, 10, 19, {});
-  expect(ranged.ok && ranged.data && ranged.data->size() == 10, "logical range len");
-  expect(std::string(ranged.data->begin(), ranged.data->end()) == std::string(10, 'A'),
-         "logical range bytes");
+  EXPECT_TRUE(ranged.ok && ranged.data && ranged.data->size() == 10) << "logical range len";
+  EXPECT_TRUE(std::string(ranged.data->begin(), ranged.data->end()) == std::string(10, 'A')) << "logical range bytes";
 
   auto pr = svc.api_put_range(oid, 0, reinterpret_cast<const std::uint8_t*>("x"), 1, {}, false,
                               {});
-  expect(!pr.ok && pr.code == "bad_request", "put_range rejected");
+  EXPECT_TRUE(!pr.ok && pr.code == "bad_request") << "put_range rejected";
 
   auto ap = svc.api_append(oid, reinterpret_cast<const std::uint8_t*>("y"), 1, {}, false, {});
-  expect(!ap.ok && ap.code == "bad_request", "append rejected");
+  EXPECT_TRUE(!ap.ok && ap.code == "bad_request") << "append rejected";
 
   const auto ratio = svc.ops().to_admin_json()["compression"].value("ratio", 0.0);
-  expect(ratio > 1.0, "overall ratio > 1");
+  EXPECT_TRUE(ratio > 1.0) << "overall ratio > 1";
 
   fs::remove_all(root);
-  if (failures == 0) std::cout << "test_compression OK\n";
-  return failures;
-}
+  }

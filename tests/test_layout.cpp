@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "cluster/place.hpp"
 #include "ec/ec_attrs.hpp"
@@ -21,8 +22,6 @@
 namespace {
 
 using tcp = boost::asio::ip::tcp;
-using aios::test::expect;
-using aios::test::failures;
 using aios::test::temp_root;
 
 struct MixedLayoutFixture {
@@ -189,12 +188,11 @@ HttpResponse http_request(const std::string& host, const std::string& port,
   return resp;
 }
 
+
 }  // namespace
 
-int test_layout() {
+TEST(Layout, Basic) {
   using namespace aios;
-  failures() = 0;
-
   // resolve_object_layout defaults + caps
   {
     Config cfg;
@@ -205,15 +203,13 @@ int test_layout() {
     cfg.max_ec_k = 4;
     ObjectLayout layout;
     std::string err;
-    expect(resolve_object_layout(cfg, "any", {}, layout, err) && !layout.is_ec() && layout.n == 3,
-           "default replica layout");
+    EXPECT_TRUE(resolve_object_layout(cfg, "any", {}, layout, err) && !layout.is_ec() && layout.n == 3) << "default replica layout";
     LayoutRequest ec_req;
     ec_req.layout = "ec";
-    expect(resolve_object_layout(cfg, "any", ec_req, layout, err) && layout.is_ec() &&
-               layout.n == 3 && layout.ec_codec == "xor",
-           "request ec uses defaults");
+    EXPECT_TRUE(resolve_object_layout(cfg, "any", ec_req, layout, err) && layout.is_ec() &&
+               layout.n == 3 && layout.ec_codec == "xor") << "request ec uses defaults";
     ec_req.ec_k = 8;
-    expect(!resolve_object_layout(cfg, "any", ec_req, layout, err), "ec_k cap");
+    EXPECT_TRUE(!resolve_object_layout(cfg, "any", ec_req, layout, err)) << "ec_k cap";
   }
 
   // Prefix layout rules: longest match; request overrides
@@ -229,22 +225,17 @@ int test_layout() {
         {.prefix = "cold/logs/", .layout = "replica"},
     };
     std::string err;
-    expect(normalize_config(cfg, err), "normalize layout_rules");
+    EXPECT_TRUE(normalize_config(cfg, err)) << "normalize layout_rules";
 
     ObjectLayout layout;
-    expect(resolve_object_layout(cfg, "cold/x", {}, layout, err) && layout.is_ec(),
-           "cold/ → ec rule");
-    expect(resolve_object_layout(cfg, "hot/x", {}, layout, err) && !layout.is_ec(),
-           "hot/ → replica rule");
-    expect(resolve_object_layout(cfg, "cold/logs/a", {}, layout, err) && !layout.is_ec(),
-           "longer prefix cold/logs/ beats cold/");
-    expect(resolve_object_layout(cfg, "other/x", {}, layout, err) && !layout.is_ec(),
-           "no rule → cluster default");
+    EXPECT_TRUE(resolve_object_layout(cfg, "cold/x", {}, layout, err) && layout.is_ec()) << "cold/ → ec rule";
+    EXPECT_TRUE(resolve_object_layout(cfg, "hot/x", {}, layout, err) && !layout.is_ec()) << "hot/ → replica rule";
+    EXPECT_TRUE(resolve_object_layout(cfg, "cold/logs/a", {}, layout, err) && !layout.is_ec()) << "longer prefix cold/logs/ beats cold/";
+    EXPECT_TRUE(resolve_object_layout(cfg, "other/x", {}, layout, err) && !layout.is_ec()) << "no rule → cluster default";
 
     LayoutRequest force_repl;
     force_repl.layout = "replica";
-    expect(resolve_object_layout(cfg, "cold/x", force_repl, layout, err) && !layout.is_ec(),
-           "request wins over prefix rule");
+    EXPECT_TRUE(resolve_object_layout(cfg, "cold/x", force_repl, layout, err) && !layout.is_ec()) << "request wins over prefix rule";
   }
 
   // Service: prefix rules applied on PUT without headers
@@ -255,31 +246,29 @@ int test_layout() {
         {.prefix = "hot/", .layout = "replica"},
     };
     std::string nerr;
-    expect(normalize_config(fx.cfg, nerr), "normalize fixture rules");
+    EXPECT_TRUE(normalize_config(fx.cfg, nerr)) << "normalize fixture rules";
     fx.svc = std::make_unique<ObjectService>(fx.cfg, fx.map, fx.stores);
     fx.svc->set_advertise("127.0.0.1:7400");
 
     const auto* body = reinterpret_cast<const std::uint8_t*>("prefix-rule-body");
     auto cold = fx.svc->api_put("cold/obj", body, 16, {}, true, {});
-    expect(cold.ok && attrs_are_ec(cold.attrs), "cold/ put uses EC rule");
+    EXPECT_TRUE(cold.ok && attrs_are_ec(cold.attrs)) << "cold/ put uses EC rule";
     auto hot = fx.svc->api_put("hot/obj", body, 16, {}, true, {});
-    expect(hot.ok && !attrs_are_ec(hot.attrs) && hot.attrs.at(kLayoutAttr) == "replica",
-           "hot/ put uses replica rule");
+    EXPECT_TRUE(hot.ok && !attrs_are_ec(hot.attrs) && hot.attrs.at(kLayoutAttr) == "replica") << "hot/ put uses replica rule";
     LayoutRequest force_repl;
     force_repl.layout = "replica";
     auto override_put =
         fx.svc->api_put("cold/override", body, 16, {}, true, {}, std::nullopt, force_repl);
-    expect(override_put.ok && !attrs_are_ec(override_put.attrs),
-           "header/request overrides cold/ EC rule");
+    EXPECT_TRUE(override_put.ok && !attrs_are_ec(override_put.attrs)) << "header/request overrides cold/ EC rule";
   }
 
   // place(oid, map, n, "nvme") hard-fails when n > targets
   {
     MixedLayoutFixture fx;
     auto ok = place("o", fx.map, 3, "nvme");
-    expect(ok.acting_set.size() == 3, "place n=3");
-    expect(place("o", fx.map, 4, "nvme").acting_set.empty(), "place n>targets empty");
-    expect(place("o", fx.map, "nvme").acting_set.size() == 3, "place compat");
+    EXPECT_TRUE(ok.acting_set.size() == 3) << "place n=3";
+    EXPECT_TRUE(place("o", fx.map, 4, "nvme").acting_set.empty()) << "place n>targets empty";
+    EXPECT_TRUE(place("o", fx.map, "nvme").acting_set.size() == 3) << "place compat";
   }
 
   // Same cluster: replica object + EC object
@@ -289,48 +278,41 @@ int test_layout() {
     const auto* ec_body = reinterpret_cast<const std::uint8_t*>("ec-body-payload");
 
     auto rput = fx.svc->api_put("layout/repl", repl_body, 14, {}, true, {});
-    expect(rput.ok, "replica put");
-    expect(rput.attrs.count(kLayoutAttr) && rput.attrs.at(kLayoutAttr) == "replica",
-           "replica layout attr");
-    expect(!attrs_are_ec(rput.attrs), "replica has no ec attrs");
+    EXPECT_TRUE(rput.ok) << "replica put";
+    EXPECT_TRUE(rput.attrs.count(kLayoutAttr) && rput.attrs.at(kLayoutAttr) == "replica") << "replica layout attr";
+    EXPECT_TRUE(!attrs_are_ec(rput.attrs)) << "replica has no ec attrs";
 
     LayoutRequest ec_req;
     ec_req.layout = "ec";
     auto eput = fx.svc->api_put("layout/ec", ec_body, 15, {}, true, {}, std::nullopt, ec_req);
-    expect(eput.ok, "ec put on replica-default cluster");
-    expect(eput.attrs.count(kLayoutAttr) && eput.attrs.at(kLayoutAttr) == "ec", "ec layout attr");
-    expect(attrs_are_ec(eput.attrs), "ec attrs present");
+    EXPECT_TRUE(eput.ok) << "ec put on replica-default cluster";
+    EXPECT_TRUE(eput.attrs.count(kLayoutAttr) && eput.attrs.at(kLayoutAttr) == "ec") << "ec layout attr";
+    EXPECT_TRUE(attrs_are_ec(eput.attrs)) << "ec attrs present";
 
     auto rg = fx.svc->api_get("layout/repl", std::nullopt, std::nullopt, {});
-    expect(rg.ok && rg.data &&
-               std::string(rg.data->begin(), rg.data->end()) == "replica-body!!",
-           "replica get");
+    EXPECT_TRUE(rg.ok && rg.data &&
+               std::string(rg.data->begin(), rg.data->end()) == "replica-body!!") << "replica get";
     auto eg = fx.svc->api_get("layout/ec", std::nullopt, std::nullopt, {});
-    expect(eg.ok && eg.data &&
-               std::string(eg.data->begin(), eg.data->end()) == "ec-body-payload",
-           "ec get");
+    EXPECT_TRUE(eg.ok && eg.data &&
+               std::string(eg.data->begin(), eg.data->end()) == "ec-body-payload") << "ec get";
 
     // Ranged put on EC tip rejected; on replica tip ok.
-    expect(!fx.svc->api_put_range("layout/ec", 0, ec_body, 1, {}, false, {}).ok,
-           "range put on ec tip rejected");
-    expect(fx.svc->api_put_range("layout/repl", 0, reinterpret_cast<const std::uint8_t*>("R"),
+    EXPECT_TRUE(!fx.svc->api_put_range("layout/ec", 0, ec_body, 1, {}, false, {}).ok) << "range put on ec tip rejected";
+    EXPECT_TRUE(fx.svc->api_put_range("layout/repl", 0, reinterpret_cast<const std::uint8_t*>("R"),
                                  1, {}, false, {})
-               .ok,
-           "range put on replica tip ok");
+               .ok) << "range put on replica tip ok";
 
     // Repair EC object after dropping a shard (attrs-first, not cfg.durability).
     auto pl = place("layout/ec", fx.map, 3, "nvme");
     std::string err;
     auto* victim = fx.stores.get(pl.acting_set[2].aios_path);
     auto st = victim->stat("layout/ec", err);
-    expect(st.has_value() && victim->purge_version("layout/ec", st->seq, true, err),
-           "purge ec shard");
+    EXPECT_TRUE(st.has_value() && victim->purge_version("layout/ec", st->seq, true, err)) << "purge ec shard";
     auto stats = run_repair(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 256);
-    expect(stats.repaired >= 1, "ec repaired on replica-default cluster");
+    EXPECT_TRUE(stats.repaired >= 1) << "ec repaired on replica-default cluster";
     auto eg2 = fx.svc->api_get("layout/ec", std::nullopt, std::nullopt, {});
-    expect(eg2.ok && eg2.data &&
-               std::string(eg2.data->begin(), eg2.data->end()) == "ec-body-payload",
-           "ec get after repair");
+    EXPECT_TRUE(eg2.ok && eg2.data &&
+               std::string(eg2.data->begin(), eg2.data->end()) == "ec-body-payload") << "ec get after repair";
   }
 
   // TCP++ ObjectPut with layout fields
@@ -338,7 +320,7 @@ int test_layout() {
     MixedLayoutFixture fx;
     const std::string oid = "layout/tcp-ec";
     auto pl = place(oid, fx.map, 3, "nvme");
-    expect(!pl.acting_set.empty(), "tcp place");
+    EXPECT_TRUE(!pl.acting_set.empty()) << "tcp place";
     const auto& primary = pl.acting_set[0];
 
     Frame put;
@@ -356,15 +338,13 @@ int test_layout() {
         {"ec_codec", "xor"},
     };
     auto reply = fx.svc->handle(put);
-    expect(reply.body.value("ok", false), "TCP EC ObjectPut ok");
+    EXPECT_TRUE(reply.body.value("ok", false)) << "TCP EC ObjectPut ok";
 
     auto g = fx.svc->api_get(oid, std::nullopt, std::nullopt, {});
-    expect(g.ok && g.data &&
-               std::string(g.data->begin(), g.data->end()) == "tcp-ec-body!",
-           "TCP EC ObjectPut readable via api_get");
-    expect(attrs_are_ec(g.attrs) && g.attrs.count(kLayoutAttr) &&
-               g.attrs.at(kLayoutAttr) == "ec",
-           "TCP EC layout attrs");
+    EXPECT_TRUE(g.ok && g.data &&
+               std::string(g.data->begin(), g.data->end()) == "tcp-ec-body!") << "TCP EC ObjectPut readable via api_get";
+    EXPECT_TRUE(attrs_are_ec(g.attrs) && g.attrs.count(kLayoutAttr) &&
+               g.attrs.at(kLayoutAttr) == "ec") << "TCP EC layout attrs";
   }
 
   // HTTP headers round-trip on replica-default cluster
@@ -384,7 +364,7 @@ int test_layout() {
 
     {
       auto r = http_request(host, port, "PUT", "/o/http-repl", {}, "plain", key);
-      expect(r.status == 204, "HTTP replica PUT");
+      EXPECT_TRUE(r.status == 204) << "HTTP replica PUT";
     }
     {
       std::unordered_map<std::string, std::string> h = {
@@ -394,27 +374,24 @@ int test_layout() {
           {"x-aios-ec-codec", "xor"},
       };
       auto r = http_request(host, port, "PUT", "/o/http-ec", h, "striped!", key);
-      expect(r.status == 204, "HTTP EC layout PUT");
+      EXPECT_TRUE(r.status == 204) << "HTTP EC layout PUT";
     }
     {
       auto g = http_request(host, port, "GET", "/o/http-repl", {}, "", key);
-      expect(g.status == 200 && g.body == "plain", "HTTP replica GET");
-      expect(g.headers.count("x-aios-attr-aios.layout") &&
-                 g.headers["x-aios-attr-aios.layout"] == "replica",
-             "HTTP replica layout attr");
+      EXPECT_TRUE(g.status == 200 && g.body == "plain") << "HTTP replica GET";
+      EXPECT_TRUE(g.headers.count("x-aios-attr-aios.layout") &&
+                 g.headers["x-aios-attr-aios.layout"] == "replica") << "HTTP replica layout attr";
     }
     {
       auto g = http_request(host, port, "GET", "/o/http-ec", {}, "", key);
-      expect(g.status == 200 && g.body == "striped!", "HTTP EC GET");
-      expect(g.headers.count("x-aios-attr-aios.layout") &&
-                 g.headers["x-aios-attr-aios.layout"] == "ec",
-             "HTTP EC layout attr");
-      expect(g.headers.count("x-aios-attr-aios.ec.k"), "HTTP EC k attr");
+      EXPECT_TRUE(g.status == 200 && g.body == "striped!") << "HTTP EC GET";
+      EXPECT_TRUE(g.headers.count("x-aios-attr-aios.layout") &&
+                 g.headers["x-aios-attr-aios.layout"] == "ec") << "HTTP EC layout attr";
+      EXPECT_TRUE(g.headers.count("x-aios-attr-aios.ec.k")) << "HTTP EC k attr";
     }
 
     ioc.stop();
     th.join();
   }
 
-  return failures();
-}
+  }

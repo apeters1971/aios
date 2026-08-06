@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "http/http_auth.hpp"
 #include "http/http_server.hpp"
@@ -160,16 +161,12 @@ HttpResponse http_request(const std::string& host, const std::string& port,
   return resp;
 }
 
+
 }  // namespace
 
-int test_http_wire() {
+TEST(HttpWire, Basic) {
   using namespace aios;
   using aios::test::DualStoreFixture;
-  using aios::test::expect;
-  using aios::test::failures;
-
-  failures() = 0;
-
   DualStoreFixture fx("aios-http-wire");
   const int port_num = 18000 + static_cast<int>(::getpid() % 1000);
   const std::string port = std::to_string(port_num);
@@ -186,84 +183,83 @@ int test_http_wire() {
   // PUT /o/wire1 → 204
   {
     auto r = http_request(host, port, "PUT", "/o/wire1", {}, "hello-wire", key);
-    expect(r.status == 204, "PUT wire1 204");
+    EXPECT_TRUE(r.status == 204) << "PUT wire1 204";
   }
 
   // GET /o/wire1 → 200 body
   {
     auto r = http_request(host, port, "GET", "/o/wire1", {}, "", key);
-    expect(r.status == 200, "GET wire1 200");
-    expect(r.body == "hello-wire", "GET wire1 body");
+    EXPECT_TRUE(r.status == 200) << "GET wire1 200";
+    EXPECT_TRUE(r.body == "hello-wire") << "GET wire1 body";
   }
 
   // HEAD /o/wire1 → 200
   {
     auto r = http_request(host, port, "HEAD", "/o/wire1", {}, "", key);
-    expect(r.status == 200, "HEAD wire1 200");
+    EXPECT_TRUE(r.status == 200) << "HEAD wire1 200";
   }
 
   // PUT redirect with x-aios-redirect, empty body → 204
   {
     std::unordered_map<std::string, std::string> h = {{"x-aios-redirect", "wire1"}};
     auto r = http_request(host, port, "PUT", "/o/wire-alias", h, "", key);
-    expect(r.status == 204, "PUT redirect 204");
+    EXPECT_TRUE(r.status == 204) << "PUT redirect 204";
   }
 
   // GET redirect → 307 + Location
   {
     auto r = http_request(host, port, "GET", "/o/wire-alias", {}, "", key);
-    expect(r.status == 307, "GET redirect 307");
-    expect(r.headers.count("location") && r.headers["location"].find("wire1") != std::string::npos,
-           "Location header");
+    EXPECT_TRUE(r.status == 307) << "GET redirect 307";
+    EXPECT_TRUE(r.headers.count("location") && r.headers["location"].find("wire1") != std::string::npos) << "Location header";
   }
 
   // GET /o/wire1/versions → 200 JSON with versions
   {
     auto r = http_request(host, port, "GET", "/o/wire1/versions", {}, "", key);
-    expect(r.status == 200, "versions 200");
+    EXPECT_TRUE(r.status == 200) << "versions 200";
     try {
       auto j = nlohmann::json::parse(r.body);
-      expect(j.contains("versions") && j["versions"].is_array(), "versions array");
-      expect(!j["versions"].empty(), "versions non-empty");
+      EXPECT_TRUE(j.contains("versions") && j["versions"].is_array()) << "versions array";
+      EXPECT_TRUE(!j["versions"].empty()) << "versions non-empty";
     } catch (...) {
-      expect(false, "versions json parse");
+      EXPECT_TRUE(false) << "versions json parse";
     }
   }
 
   // Second put so we have multiple versions for later purge/delete-by-version.
   {
     auto r = http_request(host, port, "PUT", "/o/wire1", {}, "hello-wire-v2", key);
-    expect(r.status == 204, "PUT wire1 v2");
+    EXPECT_TRUE(r.status == 204) << "PUT wire1 v2";
   }
   {
     auto r = http_request(host, port, "PUT", "/o/wire1", {}, "hello-wire-v3", key);
-    expect(r.status == 204, "PUT wire1 v3");
+    EXPECT_TRUE(r.status == 204) << "PUT wire1 v3";
   }
 
   // POST /o/wire1/purge?keep=1 → 204
   {
     auto r = http_request(host, port, "POST", "/o/wire1/purge?keep=1", {}, "", key);
-    expect(r.status == 204, "purge keep=1 204");
+    EXPECT_TRUE(r.status == 204) << "purge keep=1 204";
   }
 
   // Re-seed versions for versioned DELETE (purge above may have trimmed).
   {
     auto r = http_request(host, port, "PUT", "/o/wire1", {}, "after-purge-a", key);
-    expect(r.status == 204, "put after purge a");
+    EXPECT_TRUE(r.status == 204) << "put after purge a";
     r = http_request(host, port, "PUT", "/o/wire1", {}, "after-purge-b", key);
-    expect(r.status == 204, "put after purge b");
+    EXPECT_TRUE(r.status == 204) << "put after purge b";
   }
 
   std::uint64_t old_seq = 0;
   {
     auto r = http_request(host, port, "GET", "/o/wire1/versions", {}, "", key);
-    expect(r.status == 200, "versions for delete");
+    EXPECT_TRUE(r.status == 200) << "versions for delete";
     try {
       auto j = nlohmann::json::parse(r.body);
-      expect(j["versions"].size() >= 2, "need 2 versions for delete-by-version");
+      EXPECT_TRUE(j["versions"].size() >= 2) << "need 2 versions for delete-by-version";
       old_seq = j["versions"][1]["seq"].get<std::uint64_t>();
     } catch (...) {
-      expect(false, "parse versions for delete");
+      EXPECT_TRUE(false) << "parse versions for delete";
     }
   }
 
@@ -271,31 +267,31 @@ int test_http_wire() {
   {
     const auto target = "/o/wire1?version=" + std::to_string(old_seq);
     auto r = http_request(host, port, "DELETE", target, {}, "", key);
-    expect(r.status == 204, "DELETE non-tip version 204");
+    EXPECT_TRUE(r.status == 204) << "DELETE non-tip version 204";
   }
 
   // DELETE /o/wire1 → 204 (delete marker)
   {
     auto r = http_request(host, port, "DELETE", "/o/wire1", {}, "", key);
-    expect(r.status == 204, "DELETE tip 204");
+    EXPECT_TRUE(r.status == 204) << "DELETE tip 204";
   }
 
   // Recreate for remaining tests
   {
     auto r = http_request(host, port, "PUT", "/o/wire1", {}, "ABCDEFGH", key);
-    expect(r.status == 204, "recreate wire1");
+    EXPECT_TRUE(r.status == 204) << "recreate wire1";
   }
 
   // GET /map → 200
   {
     auto r = http_request(host, port, "GET", "/map", {}, "", key);
-    expect(r.status == 200, "GET /map 200");
+    EXPECT_TRUE(r.status == 200) << "GET /map 200";
   }
 
   // GET /o?prefix= → 200
   {
     auto r = http_request(host, port, "GET", "/o?prefix=", {}, "", key);
-    expect(r.status == 200, "GET /o prefix 200");
+    EXPECT_TRUE(r.status == 200) << "GET /o prefix 200";
   }
 
   // bad auth → 401
@@ -309,7 +305,7 @@ int test_http_wire() {
              std::string(64, '0')},
     };
     auto r = http_request(host, port, "GET", "/o/wire1", h, "", key, /*sign=*/false);
-    expect(r.status == 401, "bad auth 401");
+    EXPECT_TRUE(r.status == 401) << "bad auth 401";
   }
 
   // PUT with Content-Range
@@ -319,21 +315,21 @@ int test_http_wire() {
         {"content-length", "2"},
     };
     auto r = http_request(host, port, "PUT", "/o/wire1", h, "xy", key);
-    expect(r.status == 204, "PUT Content-Range 204");
+    EXPECT_TRUE(r.status == 204) << "PUT Content-Range 204";
   }
 
   // GET with Range → 206
   {
     std::unordered_map<std::string, std::string> h = {{"range", "bytes=2-3"}};
     auto r = http_request(host, port, "GET", "/o/wire1", h, "", key);
-    expect(r.status == 206, "GET Range 206");
-    expect(r.body == "xy", "range body");
+    EXPECT_TRUE(r.status == 206) << "GET Range 206";
+    EXPECT_TRUE(r.body == "xy") << "range body";
   }
 
   // GET ?version=1 (or whatever first version exists — use listed seq)
   {
     auto vr = http_request(host, port, "GET", "/o/wire1/versions", {}, "", key);
-    expect(vr.status == 200, "list for version get");
+    EXPECT_TRUE(vr.status == 200) << "list for version get";
     std::uint64_t v1 = 0;
     try {
       auto j = nlohmann::json::parse(vr.body);
@@ -342,12 +338,12 @@ int test_http_wire() {
         v1 = j["versions"].back()["seq"].get<std::uint64_t>();
       }
     } catch (...) {
-      expect(false, "parse for version get");
+      EXPECT_TRUE(false) << "parse for version get";
     }
     if (v1 > 0) {
       auto r =
           http_request(host, port, "GET", "/o/wire1?version=" + std::to_string(v1), {}, "", key);
-      expect(r.status == 200, "GET ?version= 200");
+      EXPECT_TRUE(r.status == 200) << "GET ?version= 200";
     }
   }
 
@@ -355,10 +351,9 @@ int test_http_wire() {
   {
     std::unordered_map<std::string, std::string> h = {{"if-none-match", "*"}};
     auto r = http_request(host, port, "PUT", "/o/wire1", h, "nope", key);
-    expect(r.status == 412, "If-None-Match * 412");
+    EXPECT_TRUE(r.status == 412) << "If-None-Match * 412";
   }
 
   ioc.stop();
   th.join();
-  return failures();
-}
+  }

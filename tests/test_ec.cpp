@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
@@ -57,7 +58,7 @@ struct TripleStoreFixture {
     cfg.ec_m = 1;
     cfg.ec_codec = ec_codec;
     std::string err;
-    aios::test::expect(normalize_config(cfg, err), "normalize ec config");
+    EXPECT_TRUE(normalize_config(cfg, err)) << "normalize ec config";
     cfg.max_versions = 16;
     cfg.clone_required = false;
 
@@ -79,20 +80,17 @@ struct TripleStoreFixture {
 
 void expect_roundtrip(const aios::ErasureCodec& codec, std::span<const std::uint8_t> payload,
                       const char* label) {
-  using aios::test::expect;
   std::string err;
   std::vector<std::vector<std::uint8_t>> shards;
-  expect(codec.encode(payload, shards, err), std::string(label) + " encode");
-  expect(static_cast<int>(shards.size()) == codec.shard_count(),
-         std::string(label) + " shard count");
+  EXPECT_TRUE(codec.encode(payload, shards, err)) << std::string(label) + " encode";
+  EXPECT_TRUE(static_cast<int>(shards.size()) == codec.shard_count()) << std::string(label) + " shard count";
 
   std::vector<std::optional<std::vector<std::uint8_t>>> all(shards.size());
   for (std::size_t i = 0; i < shards.size(); ++i) all[i] = shards[i];
   std::vector<std::uint8_t> out;
-  expect(codec.decode(all, payload.size(), out, err), std::string(label) + " decode full");
-  expect(out.size() == payload.size() &&
-             std::equal(out.begin(), out.end(), payload.begin()),
-         std::string(label) + " full match");
+  EXPECT_TRUE(codec.decode(all, payload.size(), out, err)) << std::string(label) + " decode full";
+  EXPECT_TRUE(out.size() == payload.size() &&
+             std::equal(out.begin(), out.end(), payload.begin())) << std::string(label) + " full match";
 }
 
 bool purge_shard_tip(aios::ObjectStore* store, const std::string& oid) {
@@ -107,78 +105,70 @@ void test_service_degraded_and_repair(aios::ObjectService& svc, aios::Config& cf
                                       const std::string& oid, const std::uint8_t* body,
                                       std::size_t len, const char* label) {
   using namespace aios;
-  using aios::test::expect;
-
   auto put = svc.api_put(oid, body, len, {{"k", "v"}}, true, {});
-  expect(put.ok, std::string(label) + " put");
-  expect(put.info && put.info->size == len, std::string(label) + " put size");
+  EXPECT_TRUE(put.ok) << std::string(label) + " put";
+  EXPECT_TRUE(put.info && put.info->size == len) << std::string(label) + " put size";
 
   auto got = svc.api_get(oid, std::nullopt, std::nullopt, {});
-  expect(got.ok && got.data &&
+  EXPECT_TRUE(got.ok && got.data &&
              std::string(got.data->begin(), got.data->end()) ==
-                 std::string(reinterpret_cast<const char*>(body), len),
-         std::string(label) + " get");
+                 std::string(reinterpret_cast<const char*>(body), len)) << std::string(label) + " get";
 
   auto pl = place(oid, map, "nvme");
-  expect(static_cast<int>(pl.acting_set.size()) >= 3, std::string(label) + " acting");
+  EXPECT_TRUE(static_cast<int>(pl.acting_set.size()) >= 3) << std::string(label) + " acting";
   auto* victim = stores.get(pl.acting_set[2].aios_path);
-  expect(purge_shard_tip(victim, oid), std::string(label) + " purge shard");
+  EXPECT_TRUE(purge_shard_tip(victim, oid)) << std::string(label) + " purge shard";
   std::string err;
-  expect(!victim->stat(oid, err), std::string(label) + " shard gone");
+  EXPECT_TRUE(!victim->stat(oid, err)) << std::string(label) + " shard gone";
 
   auto degraded = svc.api_get(oid, std::nullopt, std::nullopt, {});
-  expect(degraded.ok && degraded.data &&
+  EXPECT_TRUE(degraded.ok && degraded.data &&
              std::string(degraded.data->begin(), degraded.data->end()) ==
-                 std::string(reinterpret_cast<const char*>(body), len),
-         std::string(label) + " degraded get");
+                 std::string(reinterpret_cast<const char*>(body), len)) << std::string(label) + " degraded get";
 
   // Too few shards: drop a second one → GET fails.
   auto* victim2 = stores.get(pl.acting_set[1].aios_path);
-  expect(purge_shard_tip(victim2, oid), std::string(label) + " purge second");
+  EXPECT_TRUE(purge_shard_tip(victim2, oid)) << std::string(label) + " purge second";
   auto fail = svc.api_get(oid, std::nullopt, std::nullopt, {});
-  expect(!fail.ok, std::string(label) + " get fails with 2 missing");
+  EXPECT_TRUE(!fail.ok) << std::string(label) + " get fails with 2 missing";
 
   // Restore one shard via repair from the remaining copy, then GET works again.
   // Re-put to re-establish a healthy object for repair path testing below.
-  expect(svc.api_put(oid, body, len, {}, true, {}).ok, std::string(label) + " re-put");
-  expect(purge_shard_tip(stores.get(pl.acting_set[2].aios_path), oid),
-         std::string(label) + " purge for repair");
+  EXPECT_TRUE(svc.api_put(oid, body, len, {}, true, {}).ok) << std::string(label) + " re-put";
+  EXPECT_TRUE(purge_shard_tip(stores.get(pl.acting_set[2].aios_path), oid)) << std::string(label) + " purge for repair";
   auto stats = run_repair(cfg, "127.0.0.1:7400", map, stores, 256);
-  expect(stats.under_replicated >= 1, std::string(label) + " under-replicated");
-  expect(stats.repaired >= 1, std::string(label) + " repaired");
+  EXPECT_TRUE(stats.under_replicated >= 1) << std::string(label) + " under-replicated";
+  EXPECT_TRUE(stats.repaired >= 1) << std::string(label) + " repaired";
   int present = 0;
   for (const auto& t : pl.acting_set) {
     if (stores.get(t.aios_path)->stat(oid, err)) ++present;
   }
-  expect(present == 3, std::string(label) + " all shards after repair");
+  EXPECT_TRUE(present == 3) << std::string(label) + " all shards after repair";
 }
+
 
 }  // namespace
 
-int test_ec() {
-  using namespace aios;
-  using aios::test::expect;
-  using aios::test::failures;
-  failures() = 0;
-
+TEST(Ec, CodecEmptyUnalignedTooManyMissingFactoryErrors) {
+using namespace aios;
   // --- Codec: empty, unaligned, too-many-missing, factory errors ---
   {
     std::string err;
     auto xorc = make_xor_parity_codec(2, err);
-    expect(xorc != nullptr, "xor codec");
+    EXPECT_TRUE(xorc != nullptr) << "xor codec";
 
     // Empty object.
     {
       std::vector<std::uint8_t> empty;
       expect_roundtrip(*xorc, empty, "xor empty");
       std::vector<std::vector<std::uint8_t>> shards;
-      expect(xorc->encode(empty, shards, err), "xor empty encode");
+      EXPECT_TRUE(xorc->encode(empty, shards, err)) << "xor empty encode";
       std::vector<std::optional<std::vector<std::uint8_t>>> in(3);
       in[0] = shards[0];
       in[1] = shards[1];
       // parity missing
       std::vector<std::uint8_t> out;
-      expect(xorc->decode(in, 0, out, err) && out.empty(), "xor empty degraded");
+      EXPECT_TRUE(xorc->decode(in, 0, out, err) && out.empty()) << "xor empty degraded";
     }
 
     // Unaligned length (not divisible by k).
@@ -187,14 +177,14 @@ int test_ec() {
       expect_roundtrip(*xorc, std::span<const std::uint8_t>(p, 3), "xor unaligned");
       for (int missing = 0; missing < 3; ++missing) {
         std::vector<std::vector<std::uint8_t>> shards;
-        expect(xorc->encode(std::span<const std::uint8_t>(p, 3), shards, err), "enc");
+        EXPECT_TRUE(xorc->encode(std::span<const std::uint8_t>(p, 3), shards, err)) << "enc";
         std::vector<std::optional<std::vector<std::uint8_t>>> in(3);
         for (int i = 0; i < 3; ++i) {
           if (i != missing) in[static_cast<std::size_t>(i)] = shards[static_cast<std::size_t>(i)];
         }
         std::vector<std::uint8_t> out;
-        expect(xorc->decode(in, 3, out, err), "xor unaligned miss " + std::to_string(missing));
-        expect(std::string(out.begin(), out.end()) == "xyz", "xor unaligned body");
+        EXPECT_TRUE(xorc->decode(in, 3, out, err)) << "xor unaligned miss " + std::to_string(missing);
+        EXPECT_TRUE(std::string(out.begin(), out.end()) == "xyz") << "xor unaligned body";
       }
     }
 
@@ -202,45 +192,46 @@ int test_ec() {
     {
       const auto* p = reinterpret_cast<const std::uint8_t*>("abcdef");
       std::vector<std::vector<std::uint8_t>> shards;
-      expect(xorc->encode(std::span<const std::uint8_t>(p, 6), shards, err), "enc");
+      EXPECT_TRUE(xorc->encode(std::span<const std::uint8_t>(p, 6), shards, err)) << "enc";
       std::vector<std::optional<std::vector<std::uint8_t>>> in(3);
       in[0] = shards[0];  // only one present
       std::vector<std::uint8_t> out;
-      expect(!xorc->decode(in, 6, out, err), "xor too many missing");
+      EXPECT_TRUE(!xorc->decode(in, 6, out, err)) << "xor too many missing";
     }
 
     // Factory / config negatives.
-    expect(make_erasure_codec(2, 2, "xor", err) == nullptr, "xor rejects m=2");
-    expect(make_erasure_codec(0, 1, "", err) == nullptr, "k=0 rejected");
+    EXPECT_TRUE(make_erasure_codec(2, 2, "xor", err) == nullptr) << "xor rejects m=2";
+    EXPECT_TRUE(make_erasure_codec(0, 1, "", err) == nullptr) << "k=0 rejected";
     {
       Config bad;
       bad.durability = "ec";
       bad.ec_k = 2;
       bad.ec_m = 2;
       bad.ec_codec = "xor";
-      expect(!normalize_config(bad, err), "normalize xor+m=2 fails");
+      EXPECT_TRUE(!normalize_config(bad, err)) << "normalize xor+m=2 fails";
     }
     {
       Config ok;
       ok.durability = "ec";
       ok.ec_k = 2;
       ok.ec_m = 1;
-      expect(normalize_config(ok, err) && ok.ec_codec == "xor" && ok.replica_count == 3,
-             "normalize auto xor");
+      EXPECT_TRUE(normalize_config(ok, err) && ok.ec_codec == "xor" && ok.replica_count == 3) << "normalize auto xor";
     }
   }
+}
 
+TEST(Ec, XORCodecSingleLossServiceDegradedRepair) {
+using namespace aios;
   // --- XOR codec single-loss + service degraded/repair ---
   {
     std::string err;
     auto codec = make_xor_parity_codec(2, err);
     const std::string payload = "erasure-coding-payload-12345";
     std::vector<std::vector<std::uint8_t>> shards;
-    expect(codec->encode(std::span<const std::uint8_t>(
+    EXPECT_TRUE(codec->encode(std::span<const std::uint8_t>(
                              reinterpret_cast<const std::uint8_t*>(payload.data()),
                              payload.size()),
-                         shards, err),
-           "xor encode");
+                         shards, err)) << "xor encode";
     for (int missing = 0; missing < 3; ++missing) {
       std::vector<std::optional<std::vector<std::uint8_t>>> in(3);
       for (int i = 0; i < 3; ++i) {
@@ -248,23 +239,20 @@ int test_ec() {
         in[static_cast<std::size_t>(i)] = shards[static_cast<std::size_t>(i)];
       }
       std::vector<std::uint8_t> out;
-      expect(codec->decode(in, payload.size(), out, err), "xor miss decode");
-      expect(std::string(out.begin(), out.end()) == payload, "xor miss body");
+      EXPECT_TRUE(codec->decode(in, payload.size(), out, err)) << "xor miss decode";
+      EXPECT_TRUE(std::string(out.begin(), out.end()) == payload) << "xor miss body";
     }
 
     TripleStoreFixture fx;
     const auto* body = reinterpret_cast<const std::uint8_t*>("hello-ec-world!!");
     test_service_degraded_and_repair(*fx.svc, fx.cfg, fx.map, fx.stores, "ec/obj-xor", body, 16,
                                      "xor-svc");
-    expect(!fx.svc->api_put_range("ec/obj-xor", 0, body, 1, {}, false, {}).ok,
-           "xor range put rejected");
+    EXPECT_TRUE(!fx.svc->api_put_range("ec/obj-xor", 0, body, 1, {}, false, {}).ok) << "xor range put rejected";
   }
-
-  // --- ISA-L: 4+2 codec, empty/unaligned, degraded service + repair ---
   if (isal_ec_available()) {
     std::string err;
     auto codec = make_erasure_codec(4, 2, "isal", err);
-    expect(codec != nullptr, "isal 4+2");
+    EXPECT_TRUE(codec != nullptr) << "isal 4+2";
 
     std::vector<std::uint8_t> empty;
     expect_roundtrip(*codec, empty, "isal empty");
@@ -275,12 +263,11 @@ int test_ec() {
     const std::string payload =
         "isal-reed-solomon-payload-abcdefghijklmnopqrstuvwxyz-0123456789";
     std::vector<std::vector<std::uint8_t>> shards;
-    expect(codec->encode(std::span<const std::uint8_t>(
+    EXPECT_TRUE(codec->encode(std::span<const std::uint8_t>(
                              reinterpret_cast<const std::uint8_t*>(payload.data()),
                              payload.size()),
-                         shards, err),
-           "isal encode");
-    expect(shards.size() == 6, "isal 6 shards");
+                         shards, err)) << "isal encode";
+    EXPECT_TRUE(shards.size() == 6) << "isal 6 shards";
 
     // Two missing (data + parity).
     {
@@ -290,8 +277,8 @@ int test_ec() {
         in[static_cast<std::size_t>(i)] = shards[static_cast<std::size_t>(i)];
       }
       std::vector<std::uint8_t> out;
-      expect(codec->decode(in, payload.size(), out, err), "isal decode 2 missing");
-      expect(std::string(out.begin(), out.end()) == payload, "isal payload");
+      EXPECT_TRUE(codec->decode(in, payload.size(), out, err)) << "isal decode 2 missing";
+      EXPECT_TRUE(std::string(out.begin(), out.end()) == payload) << "isal payload";
     }
     // Three missing → fail.
     {
@@ -300,7 +287,7 @@ int test_ec() {
       in[2] = shards[2];
       in[3] = shards[3];
       std::vector<std::uint8_t> out;
-      expect(!codec->decode(in, payload.size(), out, err), "isal too many missing");
+      EXPECT_TRUE(!codec->decode(in, payload.size(), out, err)) << "isal too many missing";
     }
 
     {
@@ -308,18 +295,16 @@ int test_ec() {
       c.durability = "ec";
       c.ec_k = 4;
       c.ec_m = 2;
-      expect(normalize_config(c, err) && c.ec_codec == "isal" && c.replica_count == 6,
-             "normalize auto isal 4+2");
+      EXPECT_TRUE(normalize_config(c, err) && c.ec_codec == "isal" && c.replica_count == 6) << "normalize auto isal 4+2";
     }
 
     TripleStoreFixture fx("isal");
-    expect(fx.cfg.ec_codec == "isal", "fixture isal codec");
+    EXPECT_TRUE(fx.cfg.ec_codec == "isal") << "fixture isal codec";
     const auto* body = reinterpret_cast<const std::uint8_t*>("isal-two-plus-one!");
     test_service_degraded_and_repair(*fx.svc, fx.cfg, fx.map, fx.stores, "ec/obj-isal", body, 18,
                                      "isal-svc");
     auto got = fx.svc->api_get("ec/obj-isal", std::nullopt, std::nullopt, {});
-    expect(got.ok && got.attrs.count("aios.ec.codec") && got.attrs.at("aios.ec.codec") == "isal",
-           "isal attr after repair");
+    EXPECT_TRUE(got.ok && got.attrs.count("aios.ec.codec") && got.attrs.at("aios.ec.codec") == "isal") << "isal attr after repair";
 
     // Full 4+2 service path on six local targets: put, dual-loss GET, repair.
     {
@@ -351,7 +336,7 @@ int test_ec() {
       cfg.ec_m = 2;
       cfg.ec_codec = "isal";
       cfg.clone_required = false;
-      expect(normalize_config(cfg, err), "normalize 4+2");
+      EXPECT_TRUE(normalize_config(cfg, err)) << "normalize 4+2";
       auto map = ClusterMap::build(membership, fs_table, cfg.replica_count, PlacementConfig{});
       LocalStores stores;
       ObjectStoreOptions opts;
@@ -366,57 +351,56 @@ int test_ec() {
       const std::string payload = "0123456789abcdef-4plus2-payload!!";
       auto put = svc.api_put(oid, reinterpret_cast<const std::uint8_t*>(payload.data()),
                              payload.size(), {}, true, {});
-      expect(put.ok && put.replicas == 6, "4+2 put");
+      EXPECT_TRUE(put.ok && put.replicas == 6) << "4+2 put";
       auto pl = place(oid, map, "nvme");
-      expect(pl.acting_set.size() == 6, "4+2 acting");
+      EXPECT_TRUE(pl.acting_set.size() == 6) << "4+2 acting";
 
       // Drop two shards; GET must still reconstruct.
-      expect(purge_shard_tip(stores.get(pl.acting_set[1].aios_path), oid), "4+2 purge1");
-      expect(purge_shard_tip(stores.get(pl.acting_set[5].aios_path), oid), "4+2 purge2");
+      EXPECT_TRUE(purge_shard_tip(stores.get(pl.acting_set[1].aios_path), oid)) << "4+2 purge1";
+      EXPECT_TRUE(purge_shard_tip(stores.get(pl.acting_set[5].aios_path), oid)) << "4+2 purge2";
       auto deg = svc.api_get(oid, std::nullopt, std::nullopt, {});
-      expect(deg.ok && deg.data &&
-                 std::string(deg.data->begin(), deg.data->end()) == payload,
-             "4+2 dual-loss get");
+      EXPECT_TRUE(deg.ok && deg.data &&
+                 std::string(deg.data->begin(), deg.data->end()) == payload) << "4+2 dual-loss get";
 
       auto stats = run_repair(cfg, "127.0.0.1:7400", map, stores, 256);
-      expect(stats.repaired >= 1, "4+2 repair");
+      EXPECT_TRUE(stats.repaired >= 1) << "4+2 repair";
       int present = 0;
       for (const auto& t : pl.acting_set) {
         if (stores.get(t.aios_path)->stat(oid, err)) ++present;
       }
-      expect(present == 6, "4+2 all shards after repair");
+      EXPECT_TRUE(present == 6) << "4+2 all shards after repair";
       std::error_code ec;
       std::filesystem::remove_all(root, ec);
     }
   } else {
     std::string err;
-    expect(make_erasure_codec(4, 2, "isal", err) == nullptr, "isal unavailable without lib");
+    EXPECT_TRUE(make_erasure_codec(4, 2, "isal", err) == nullptr) << "isal unavailable without lib";
     Config c;
     c.durability = "ec";
     c.ec_k = 4;
     c.ec_m = 2;
-    expect(!normalize_config(c, err), "normalize isal without lib fails");
+    EXPECT_TRUE(!normalize_config(c, err)) << "normalize isal without lib fails";
   }
 
   // EC cluster + cross-object txn (prepare uses full-copy install; tip GET still works).
   {
     TripleStoreFixture fx;
     auto begin = fx.svc->api_txn_begin();
-    expect(begin.ok && begin.data, "ec txn begin");
+    EXPECT_TRUE(begin.ok && begin.data) << "ec txn begin";
     auto st = nlohmann::json::parse(begin.data->begin(), begin.data->end());
     const std::string txn_id = st.value("txn_id", "");
     const auto* a = reinterpret_cast<const std::uint8_t*>("txn-a");
     const auto* b = reinterpret_cast<const std::uint8_t*>("txn-b");
-    expect(fx.svc->api_txn_prepare_put(txn_id, "ec-txn/a", a, 5, {}, {}).ok, "ec txn prep a");
-    expect(fx.svc->api_txn_prepare_put(txn_id, "ec-txn/b", b, 5, {}, {}).ok, "ec txn prep b");
-    expect(fx.svc->api_get("ec-txn/a", std::nullopt, std::nullopt, {}).code == "not_found",
-           "ec txn hidden");
-    expect(fx.svc->api_txn_commit(txn_id).ok, "ec txn commit");
+    EXPECT_TRUE(fx.svc->api_txn_prepare_put(txn_id, "ec-txn/a", a, 5, {}, {}).ok) << "ec txn prep a";
+    EXPECT_TRUE(fx.svc->api_txn_prepare_put(txn_id, "ec-txn/b", b, 5, {}, {}).ok) << "ec txn prep b";
+    EXPECT_TRUE(fx.svc->api_get("ec-txn/a", std::nullopt, std::nullopt, {}).code == "not_found") << "ec txn hidden";
+    EXPECT_TRUE(fx.svc->api_txn_commit(txn_id).ok) << "ec txn commit";
     auto ga = fx.svc->api_get("ec-txn/a", std::nullopt, std::nullopt, {});
     auto gb = fx.svc->api_get("ec-txn/b", std::nullopt, std::nullopt, {});
-    expect(ga.ok && std::string(ga.data->begin(), ga.data->end()) == "txn-a", "ec txn a");
-    expect(gb.ok && std::string(gb.data->begin(), gb.data->end()) == "txn-b", "ec txn b");
+    EXPECT_TRUE(ga.ok && std::string(ga.data->begin(), ga.data->end()) == "txn-a") << "ec txn a";
+    EXPECT_TRUE(gb.ok && std::string(gb.data->begin(), gb.data->end()) == "txn-b") << "ec txn b";
   }
 
-  return failures();
-}
+  }
+
+

@@ -1,4 +1,5 @@
 #include "test_helpers.hpp"
+#include <gtest/gtest.h>
 
 #include "store/fs_clone.hpp"
 
@@ -8,15 +9,11 @@
 
 namespace fs = std::filesystem;
 
-int test_fs_clone() {
+TEST(FsClone, Basic) {
   using namespace aios;
-  using aios::test::expect;
-  using aios::test::failures;
   using aios::test::temp_root;
 
-  failures() = 0;
-
-  expect(clone_file_supported(), "clone_file_supported");
+  EXPECT_TRUE(clone_file_supported()) << "clone_file_supported";
 
   const auto root = temp_root("aios-fs-clone");
   const auto src = (root / "src.bin").string();
@@ -34,28 +31,27 @@ int test_fs_clone() {
   }
 
   std::string err;
-  expect(clone_or_copy_file(src, dst, /*allow_copy=*/true, err), "clone_or_copy allow_copy");
-  expect(fs::exists(dst), "dst exists");
+  EXPECT_TRUE(clone_or_copy_file(src, dst, /*allow_copy=*/true, err)) << "clone_or_copy allow_copy";
+  EXPECT_TRUE(fs::exists(dst)) << "dst exists";
   {
     std::ifstream in(dst, std::ios::binary);
     std::string got((std::istreambuf_iterator<char>(in)), {});
-    expect(got == "clone-payload-bytes", "cloned/copied content");
+    EXPECT_TRUE(got == "clone-payload-bytes") << "cloned/copied content";
   }
 
   err.clear();
-  expect(!clone_file(src, dst2, err), "clone to existing dest fails");
-  expect(!err.empty(), "clone existing err set");
+  EXPECT_TRUE(!clone_file(src, dst2, err)) << "clone to existing dest fails";
+  EXPECT_TRUE(!err.empty()) << "clone existing err set";
 
   err.clear();
-  expect(copy_file_full(src, copy_dst, err), "copy_file_full works");
-  expect(fs::exists(copy_dst), "copy dest exists");
+  EXPECT_TRUE(copy_file_full(src, copy_dst, err)) << "copy_file_full works";
+  EXPECT_TRUE(fs::exists(copy_dst)) << "copy dest exists";
   {
     std::ifstream in(copy_dst, std::ios::binary);
     std::string got((std::istreambuf_iterator<char>(in)), {});
-    expect(got == "clone-payload-bytes", "copied content");
+    EXPECT_TRUE(got == "clone-payload-bytes") << "copied content";
   }
 
   std::error_code ec;
   fs::remove_all(root, ec);
-  return failures();
-}
+  }

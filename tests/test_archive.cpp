@@ -1,4 +1,5 @@
 #include "object/archive_bag.hpp"
+#include <gtest/gtest.h>
 #include "object/archive_pack.hpp"
 #include "object/archive_tape.hpp"
 #include "object/object_layout.hpp"
@@ -15,7 +16,6 @@
 namespace {
 constexpr const char* kTestBagKey =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-}  // namespace
 
 namespace {
 
@@ -31,14 +31,14 @@ void write_executable(const std::filesystem::path& path, const std::string& body
                 std::filesystem::perms::others_exec);
 }
 
+
 }  // namespace
 
-int test_archive() {
-  using namespace aios;
-  using namespace aios::test;
-  int& failures = aios::test::failures();
-  failures = 0;
+}  // namespace
 
+TEST(Archive, BagEncodeDecodeRoundTrip) {
+using namespace aios;
+  using namespace aios::test;
   // Bag encode/decode round-trip.
   {
     std::vector<ArchiveMember> members(2);
@@ -49,26 +49,25 @@ int test_archive() {
     members[1].data = {'b', 'b', 'b', 'b'};
     std::vector<std::uint8_t> bag;
     std::string err;
-    expect(encode_archive_bag(members, bag, err), "encode bag");
+    EXPECT_TRUE(encode_archive_bag(members, bag, err)) << "encode bag";
     ArchiveBag decoded;
-    expect(decode_archive_bag(bag.data(), bag.size(), decoded, true, err), "decode bag");
-    expect(decoded.members.size() == 2, "member count");
-    expect(decoded.members[0].oid == "cold/a" && decoded.members[0].data.size() == 3, "m0");
-    expect(decoded.members[1].oid == "cold/b" && decoded.members[1].data.size() == 4, "m1");
-    expect(decoded.members[0].sha256_hex.size() == 64, "sha len");
+    EXPECT_TRUE(decode_archive_bag(bag.data(), bag.size(), decoded, true, err)) << "decode bag";
+    EXPECT_TRUE(decoded.members.size() == 2) << "member count";
+    EXPECT_TRUE(decoded.members[0].oid == "cold/a" && decoded.members[0].data.size() == 3) << "m0";
+    EXPECT_TRUE(decoded.members[1].oid == "cold/b" && decoded.members[1].data.size() == 4) << "m1";
+    EXPECT_TRUE(decoded.members[0].sha256_hex.size() == 64) << "sha len";
 
     // Plain transform is identity (no AITF).
     {
       BagTransformOpts opts;
       std::vector<std::uint8_t> stored;
       std::unordered_map<std::string, std::string> attrs;
-      expect(transform_bag_for_storage(bag, opts, "", stored, attrs, err), "xf none");
-      expect(stored == bag, "plain identity");
-      expect(!bag_body_is_transformed(stored.data(), stored.size()), "not AITF");
+      EXPECT_TRUE(transform_bag_for_storage(bag, opts, "", stored, attrs, err)) << "xf none";
+      EXPECT_TRUE(stored == bag) << "plain identity";
+      EXPECT_TRUE(!bag_body_is_transformed(stored.data(), stored.size())) << "not AITF";
       std::vector<std::uint8_t> plain;
-      expect(untransform_bag_from_storage(stored.data(), stored.size(), "", plain, err),
-             "unxf none");
-      expect(plain == bag, "plain roundtrip");
+      EXPECT_TRUE(untransform_bag_from_storage(stored.data(), stored.size(), "", plain, err)) << "unxf none";
+      EXPECT_TRUE(plain == bag) << "plain roundtrip";
     }
 
     // AES-GCM only.
@@ -77,19 +76,17 @@ int test_archive() {
       opts.encryption = "aes-256-gcm";
       std::vector<std::uint8_t> stored;
       std::unordered_map<std::string, std::string> attrs;
-      expect(transform_bag_for_storage(bag, opts, kTestBagKey, stored, attrs, err), "xf aes");
-      expect(bag_body_is_transformed(stored.data(), stored.size()), "AITF aes");
-      expect(attrs[kBagEncryptionAttr] == "aes-256-gcm", "enc attr");
+      EXPECT_TRUE(transform_bag_for_storage(bag, opts, kTestBagKey, stored, attrs, err)) << "xf aes";
+      EXPECT_TRUE(bag_body_is_transformed(stored.data(), stored.size())) << "AITF aes";
+      EXPECT_TRUE(attrs[kBagEncryptionAttr] == "aes-256-gcm") << "enc attr";
       std::vector<std::uint8_t> plain;
-      expect(untransform_bag_from_storage(stored.data(), stored.size(), kTestBagKey, plain, err),
-             "unxf aes");
-      expect(plain == bag, "aes roundtrip");
+      EXPECT_TRUE(untransform_bag_from_storage(stored.data(), stored.size(), kTestBagKey, plain, err)) << "unxf aes";
+      EXPECT_TRUE(plain == bag) << "aes roundtrip";
       std::string bad_err;
-      expect(!untransform_bag_from_storage(
+      EXPECT_TRUE(!untransform_bag_from_storage(
                  stored.data(), stored.size(),
                  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", plain,
-                 bad_err),
-             "wrong key fails");
+                 bad_err)) << "wrong key fails";
     }
 
 #if defined(AIOS_HAVE_ZSTD) && AIOS_HAVE_ZSTD
@@ -100,22 +97,24 @@ int test_archive() {
       opts.compression_level = 3;
       std::vector<std::uint8_t> stored;
       std::unordered_map<std::string, std::string> attrs;
-      expect(transform_bag_for_storage(bag, opts, "", stored, attrs, err), "xf zstd");
-      expect(bag_body_is_transformed(stored.data(), stored.size()), "AITF zstd");
+      EXPECT_TRUE(transform_bag_for_storage(bag, opts, "", stored, attrs, err)) << "xf zstd";
+      EXPECT_TRUE(bag_body_is_transformed(stored.data(), stored.size())) << "AITF zstd";
       std::vector<std::uint8_t> plain;
-      expect(untransform_bag_from_storage(stored.data(), stored.size(), "", plain, err),
-             "unxf zstd");
-      expect(plain == bag, "zstd roundtrip");
+      EXPECT_TRUE(untransform_bag_from_storage(stored.data(), stored.size(), "", plain, err)) << "unxf zstd";
+      EXPECT_TRUE(plain == bag) << "zstd roundtrip";
 
       opts.encryption = "aes-256-gcm";
-      expect(transform_bag_for_storage(bag, opts, kTestBagKey, stored, attrs, err), "xf both");
-      expect(untransform_bag_from_storage(stored.data(), stored.size(), kTestBagKey, plain, err),
-             "unxf both");
-      expect(plain == bag, "zstd+aes roundtrip");
+      EXPECT_TRUE(transform_bag_for_storage(bag, opts, kTestBagKey, stored, attrs, err)) << "xf both";
+      EXPECT_TRUE(untransform_bag_from_storage(stored.data(), stored.size(), kTestBagKey, plain, err)) << "unxf both";
+      EXPECT_TRUE(plain == bag) << "zstd+aes roundtrip";
     }
 #endif
   }
+}
 
+TEST(Archive, PackTipsBagStubsGETFromBagRecallRehydrate) {
+using namespace aios;
+  using namespace aios::test;
   // Pack tips → bag stubs → GET from bag → recall rehydrate.
   {
     DualStoreFixture fx("archive-pack", 2, 2, "nvme");
@@ -157,42 +156,41 @@ int test_archive() {
     req.storage_class = "nvme";
     const char* b1 = "hello-archive-1";
     const char* b2 = "hello-archive-2";
-    expect(fx.svc
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/f1", reinterpret_cast<const std::uint8_t*>(b1), std::strlen(b1),
                          {}, true, {}, std::nullopt, req)
-               .ok,
-           "put f1");
-    expect(fx.svc
+               .ok) << "put f1";
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/f2", reinterpret_cast<const std::uint8_t*>(b2), std::strlen(b2),
                          {}, true, {}, std::nullopt, req)
-               .ok,
-           "put f2");
+               .ok) << "put f2";
 
     auto stats = run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64);
-    expect(stats.bags_sealed >= 1, "bag sealed");
-    expect(stats.packed >= 2, "members packed");
+    EXPECT_TRUE(stats.bags_sealed >= 1) << "bag sealed";
+    EXPECT_TRUE(stats.packed >= 2) << "members packed";
 
     auto g1 = fx.svc->api_get("cold/f1", std::nullopt, std::nullopt, {});
-    expect(g1.ok && g1.data &&
-               std::string(g1.data->begin(), g1.data->end()) == b1,
-           "get frozen f1 from bag");
-    expect(attrs_are_frozen(g1.attrs), "f1 frozen attrs");
+    EXPECT_TRUE(g1.ok && g1.data &&
+               std::string(g1.data->begin(), g1.data->end()) == b1) << "get frozen f1 from bag";
+    EXPECT_TRUE(attrs_are_frozen(g1.attrs)) << "f1 frozen attrs";
 
     auto put_fail =
         fx.svc->api_put("cold/f1", reinterpret_cast<const std::uint8_t*>("x"), 1, {}, true, {},
                         std::nullopt, req);
-    expect(!put_fail.ok && put_fail.code == "frozen", "put rejected while frozen");
+    EXPECT_TRUE(!put_fail.ok && put_fail.code == "frozen") << "put rejected while frozen";
 
     std::string err;
-    expect(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/f1", err),
-           "recall f1");
+    EXPECT_TRUE(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/f1", err)) << "recall f1";
     auto g1b = fx.svc->api_get("cold/f1", std::nullopt, std::nullopt, {});
-    expect(g1b.ok && g1b.data &&
-               std::string(g1b.data->begin(), g1b.data->end()) == b1,
-           "get after recall");
-    expect(!attrs_are_frozen(g1b.attrs), "not frozen after recall");
+    EXPECT_TRUE(g1b.ok && g1b.data &&
+               std::string(g1b.data->begin(), g1b.data->end()) == b1) << "get after recall";
+    EXPECT_TRUE(!attrs_are_frozen(g1b.attrs)) << "not frozen after recall";
   }
+}
 
+TEST(Archive, PackWithAESGCMOptionalZstdGETFrozenMemberStillWorks) {
+using namespace aios;
+  using namespace aios::test;
   // Pack with AES-GCM (+ optional zstd) → GET frozen member still works.
   {
     DualStoreFixture fx("archive-xf", 2, 2, "nvme");
@@ -238,25 +236,25 @@ int test_archive() {
     req.storage_class = "nvme";
     const char* b1 = "secret-payload-one";
     const char* b2 = "secret-payload-two";
-    expect(fx.svc
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/e1", reinterpret_cast<const std::uint8_t*>(b1), std::strlen(b1),
                          {}, true, {}, std::nullopt, req)
-               .ok,
-           "put e1");
-    expect(fx.svc
+               .ok) << "put e1";
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/e2", reinterpret_cast<const std::uint8_t*>(b2), std::strlen(b2),
                          {}, true, {}, std::nullopt, req)
-               .ok,
-           "put e2");
+               .ok) << "put e2";
 
-    expect(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1,
-           "xf bag sealed");
+    EXPECT_TRUE(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1) << "xf bag sealed";
     auto g1 = fx.svc->api_get("cold/e1", std::nullopt, std::nullopt, {});
-    expect(g1.ok && g1.data && std::string(g1.data->begin(), g1.data->end()) == b1,
-           "get encrypted bag member");
-    expect(attrs_are_frozen(g1.attrs), "e1 frozen");
+    EXPECT_TRUE(g1.ok && g1.data && std::string(g1.data->begin(), g1.data->end()) == b1) << "get encrypted bag member";
+    EXPECT_TRUE(attrs_are_frozen(g1.attrs)) << "e1 frozen";
   }
+}
 
+TEST(Archive, PackDrainToTapeRootGETBusyRecallRestoresBagAndRehydrates) {
+using namespace aios;
+  using namespace aios::test;
   // Pack → drain to tape_root → GET busy → recall restores bag and rehydrates.
   {
     DualStoreFixture fx("archive-tape", 2, 2, "nvme");
@@ -302,19 +300,17 @@ int test_archive() {
     req.storage_class = "nvme";
     const char* b1 = "tape-body-1";
     const char* b2 = "tape-body-2";
-    expect(fx.svc
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/t1", reinterpret_cast<const std::uint8_t*>(b1), std::strlen(b1),
                          {}, true, {}, std::nullopt, req)
-               .ok,
-           "put t1");
-    expect(fx.svc
+               .ok) << "put t1";
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/t2", reinterpret_cast<const std::uint8_t*>(b2), std::strlen(b2),
                          {}, true, {}, std::nullopt, req)
-               .ok,
-           "put t2");
+               .ok) << "put t2";
 
     auto stats = run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64);
-    expect(stats.bags_sealed >= 1, "tape bag sealed");
+    EXPECT_TRUE(stats.bags_sealed >= 1) << "tape bag sealed";
 
     std::string err;
     std::string bag_id;
@@ -324,14 +320,14 @@ int test_archive() {
       auto info = s->stat("cold/t1", err);
       if (!info || info->is_delete) continue;
       auto attrs = s->list_attrs("cold/t1", err);
-      expect(archive_state_for_attrs(attrs) == kArchiveStateOnTape, "t1 on_tape after seal");
+      EXPECT_TRUE(archive_state_for_attrs(attrs) == kArchiveStateOnTape) << "t1 on_tape after seal";
       bag_id = attrs[kBagIdAttr];
       break;
     }
-    expect(!bag_id.empty(), "bag id from stub");
+    EXPECT_TRUE(!bag_id.empty()) << "bag id from stub";
 
     auto drain = run_archive_drain(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64);
-    expect(drain.drained >= 1, "bag drained");
+    EXPECT_TRUE(drain.drained >= 1) << "bag drained";
 
     std::uint64_t bag_size = 0;
     std::string tape_uri;
@@ -345,28 +341,28 @@ int test_archive() {
       tape_uri = attrs[kTapeUriAttr];
       break;
     }
-    expect(bag_size == 0, "staging bag body reclaimed");
-    expect(!tape_uri.empty(), "tape_uri set");
-    expect(std::filesystem::exists(tape_root / tape_uri), "tape file exists");
+    EXPECT_TRUE(bag_size == 0) << "staging bag body reclaimed";
+    EXPECT_TRUE(!tape_uri.empty()) << "tape_uri set";
+    EXPECT_TRUE(std::filesystem::exists(tape_root / tape_uri)) << "tape file exists";
 
     auto gbusy = fx.svc->api_get("cold/t1", std::nullopt, std::nullopt, {});
-    expect(!gbusy.ok && gbusy.code == "restoring", "get on_tape is restoring");
+    EXPECT_TRUE(!gbusy.ok && gbusy.code == "restoring") << "get on_tape is restoring";
 
-    expect(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/t1", err),
-           "recall t1 from tape");
+    EXPECT_TRUE(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/t1", err)) << "recall t1 from tape";
     auto g1 = fx.svc->api_get("cold/t1", std::nullopt, std::nullopt, {});
-    expect(g1.ok && g1.data && std::string(g1.data->begin(), g1.data->end()) == b1,
-           "get t1 after tape recall");
-    expect(!attrs_are_frozen(g1.attrs), "t1 unfrozen");
+    EXPECT_TRUE(g1.ok && g1.data && std::string(g1.data->begin(), g1.data->end()) == b1) << "get t1 after tape recall";
+    EXPECT_TRUE(!attrs_are_frozen(g1.attrs)) << "t1 unfrozen";
 
     // Second member still on tape; recall independently.
-    expect(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/t2", err),
-           "recall t2");
+    EXPECT_TRUE(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/t2", err)) << "recall t2";
     auto g2 = fx.svc->api_get("cold/t2", std::nullopt, std::nullopt, {});
-    expect(g2.ok && g2.data && std::string(g2.data->begin(), g2.data->end()) == b2,
-           "get t2 after tape recall");
+    EXPECT_TRUE(g2.ok && g2.data && std::string(g2.data->begin(), g2.data->end()) == b2) << "get t2 after tape recall";
   }
+}
 
+TEST(Archive, S3DriverViaFakeAwsS3Cp) {
+using namespace aios;
+  using namespace aios::test;
   // s3 driver via fake `aws s3 cp`.
   {
     DualStoreFixture fx("archive-s3", 2, 2, "nvme");
@@ -433,15 +429,12 @@ int test_archive() {
     LayoutRequest req;
     req.storage_class = "nvme";
     const char* body = "s3-bag-payload";
-    expect(fx.svc
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/s3a", reinterpret_cast<const std::uint8_t*>(body),
                          std::strlen(body), {}, true, {}, std::nullopt, req)
-               .ok,
-           "put s3a");
-    expect(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1,
-           "s3 bag sealed");
-    expect(run_archive_drain(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).drained >= 1,
-           "s3 drained");
+               .ok) << "put s3a";
+    EXPECT_TRUE(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1) << "s3 bag sealed";
+    EXPECT_TRUE(run_archive_drain(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).drained >= 1) << "s3 drained";
 
     std::string err;
     std::string tape_uri;
@@ -458,22 +451,24 @@ int test_archive() {
         if (!bi || bi->is_delete) continue;
         auto ba = bagstore->list_attrs(attrs[kBagIdAttr], err);
         tape_uri = ba[kTapeUriAttr];
-        expect(bi->size == 0, "s3 staging reclaimed");
+        EXPECT_TRUE(bi->size == 0) << "s3 staging reclaimed";
         break;
       }
       break;
     }
-    expect(tape_uri.rfind("s3://cold/bags/", 0) == 0, "s3 tape_uri");
+    EXPECT_TRUE(tape_uri.rfind("s3://cold/bags/", 0) == 0) << "s3 tape_uri";
     const std::string key = tape_uri.substr(std::strlen("s3://"));
-    expect(std::filesystem::exists(fake_root / key), "fake s3 object");
+    EXPECT_TRUE(std::filesystem::exists(fake_root / key)) << "fake s3 object";
 
-    expect(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/s3a", err),
-           "recall s3a");
+    EXPECT_TRUE(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/s3a", err)) << "recall s3a";
     auto g = fx.svc->api_get("cold/s3a", std::nullopt, std::nullopt, {});
-    expect(g.ok && g.data && std::string(g.data->begin(), g.data->end()) == body,
-           "get after s3 recall");
+    EXPECT_TRUE(g.ok && g.data && std::string(g.data->begin(), g.data->end()) == body) << "get after s3 recall";
   }
+}
 
+TEST(Archive, XrdcpDriverViaFakeBinary) {
+using namespace aios;
+  using namespace aios::test;
   // xrdcp driver via fake binary.
   {
     DualStoreFixture fx("archive-xrdcp", 2, 2, "nvme");
@@ -539,15 +534,12 @@ int test_archive() {
     LayoutRequest req;
     req.storage_class = "nvme";
     const char* body = "xrd-bag-payload";
-    expect(fx.svc
+    EXPECT_TRUE(fx.svc
                ->api_put("cold/x1", reinterpret_cast<const std::uint8_t*>(body),
                          std::strlen(body), {}, true, {}, std::nullopt, req)
-               .ok,
-           "put x1");
-    expect(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1,
-           "xrd bag sealed");
-    expect(run_archive_drain(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).drained >= 1,
-           "xrd drained");
+               .ok) << "put x1";
+    EXPECT_TRUE(run_archive(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).bags_sealed >= 1) << "xrd bag sealed";
+    EXPECT_TRUE(run_archive_drain(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, 64).drained >= 1) << "xrd drained";
 
     std::string err;
     std::string tape_uri;
@@ -568,20 +560,18 @@ int test_archive() {
       }
       break;
     }
-    expect(tape_uri.rfind("root://eos.test//eos/archive/bags/", 0) == 0, "xrd tape_uri");
+    EXPECT_TRUE(tape_uri.rfind("root://eos.test//eos/archive/bags/", 0) == 0) << "xrd tape_uri";
     // root://eos.test//eos/archive/bags/NAME → eos/archive/bags/NAME under fake root
     const std::string host_end = "root://eos.test/";
-    expect(tape_uri.size() > host_end.size(), "xrd uri length");
+    EXPECT_TRUE(tape_uri.size() > host_end.size()) << "xrd uri length";
     std::string rel = tape_uri.substr(host_end.size());
     while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
-    expect(std::filesystem::exists(fake_root / rel), "fake xrd object");
+    EXPECT_TRUE(std::filesystem::exists(fake_root / rel)) << "fake xrd object";
 
-    expect(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/x1", err),
-           "recall x1");
+    EXPECT_TRUE(recall_archived_oid(fx.cfg, "127.0.0.1:7400", fx.map, fx.stores, "cold/x1", err)) << "recall x1";
     auto g = fx.svc->api_get("cold/x1", std::nullopt, std::nullopt, {});
-    expect(g.ok && g.data && std::string(g.data->begin(), g.data->end()) == body,
-           "get after xrd recall");
+    EXPECT_TRUE(g.ok && g.data && std::string(g.data->begin(), g.data->end()) == body) << "get after xrd recall";
   }
-
-  return failures;
 }
+
+

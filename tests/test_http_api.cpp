@@ -1,4 +1,5 @@
 #include "cluster/cluster_map.hpp"
+#include <gtest/gtest.h>
 #include "config.hpp"
 #include "fs/aios_scan.hpp"
 #include "fs/fs_table.hpp"
@@ -15,19 +16,8 @@
 
 namespace fs = std::filesystem;
 
-namespace {
 
-int failures = 0;
-void expect(bool cond, const char* msg) {
-  if (!cond) {
-    std::cerr << "FAIL: " << msg << "\n";
-    ++failures;
-  }
-}
-
-}  // namespace
-
-int test_http_api() {
+TEST(HttpApi, Basic) {
   using namespace aios;
   // Exercise ObjectService HTTP-facing API (range, preds, list) without sockets.
   const auto root = fs::temp_directory_path() / ("aios-http-" + std::to_string(::getpid()));
@@ -73,8 +63,8 @@ int test_http_api() {
   };
   auto put = svc.api_put(oid, reinterpret_cast<const std::uint8_t*>("ABCDEFGH"), 8,
                          {{"ver", "1"}}, true, create);
-  expect(put.ok, "api_put");
-  expect(put.replicas == 2, "replicated");
+  EXPECT_TRUE(put.ok) << "api_put";
+  EXPECT_TRUE(put.replicas == 2) << "replicated";
 
   // Partial overwrite
   const std::string patch = "xy";
@@ -83,7 +73,7 @@ int test_http_api() {
   };
   auto pr = svc.api_put_range(oid, 2, reinterpret_cast<const std::uint8_t*>(patch.data()),
                               patch.size(), {{"ver", "2"}}, false, ver_ok);
-  expect(pr.ok, "api_put_range");
+  EXPECT_TRUE(pr.ok) << "api_put_range";
 
   std::vector<AttrPrecondition> ver_bad = {
       {AttrPrecondition::Kind::Eq, "ver", "1"},
@@ -91,38 +81,37 @@ int test_http_api() {
   auto conflict =
       svc.api_put_range(oid, 0, reinterpret_cast<const std::uint8_t*>("Z"), 1, {}, false,
                         ver_bad);
-  expect(!conflict.ok && conflict.code == "precondition_failed", "pred 412");
+  EXPECT_TRUE(!conflict.ok && conflict.code == "precondition_failed") << "pred 412";
 
   auto got = svc.api_get(oid, std::nullopt, std::nullopt, {});
-  expect(got.ok && got.data.has_value(), "get");
-  expect(std::string(got.data->begin(), got.data->end()) == "ABxyEFGH", "patched body");
+  EXPECT_TRUE(got.ok && got.data.has_value()) << "get";
+  EXPECT_TRUE(std::string(got.data->begin(), got.data->end()) == "ABxyEFGH") << "patched body";
 
   auto ranged = svc.api_get(oid, 2, 3, {});
-  expect(ranged.ok && ranged.data.has_value(), "range get");
-  expect(std::string(ranged.data->begin(), ranged.data->end()) == "xy", "range bytes");
+  EXPECT_TRUE(ranged.ok && ranged.data.has_value()) << "range get";
+  EXPECT_TRUE(std::string(ranged.data->begin(), ranged.data->end()) == "xy") << "range bytes";
 
   auto unsat = svc.api_get(oid, 100, 110, {});
-  expect(!unsat.ok && unsat.code == "range_unsatisfiable", "416");
+  EXPECT_TRUE(!unsat.ok && unsat.code == "range_unsatisfiable") << "416";
 
   auto lst = svc.api_list("dir/", "", "", 10, "", true);
-  expect(lst.ok && !lst.list.objects.empty(), "list");
+  EXPECT_TRUE(lst.ok && !lst.list.objects.empty()) << "list";
 
   // Redirect object → target.
   const std::string alias = "dir/alias";
   auto redir = svc.api_put_redirect(alias, oid, {{"kind", "link"}}, true, {});
-  expect(redir.ok, "put_redirect");
-  expect(redir.redirect_oid == oid, "redirect target");
+  EXPECT_TRUE(redir.ok) << "put_redirect";
+  EXPECT_TRUE(redir.redirect_oid == oid) << "redirect target";
   auto redir_get = svc.api_get(alias, std::nullopt, std::nullopt, {});
-  expect(redir_get.ok && redir_get.code == "redirect", "get redirect");
-  expect(redir_get.redirect_oid == oid, "get redirect oid");
-  expect(!redir_get.data.has_value(), "redirect has no body");
+  EXPECT_TRUE(redir_get.ok && redir_get.code == "redirect") << "get redirect";
+  EXPECT_TRUE(redir_get.redirect_oid == oid) << "get redirect oid";
+  EXPECT_TRUE(!redir_get.data.has_value()) << "redirect has no body";
 
   auto self = svc.api_put_redirect(alias, alias, {}, true, {});
-  expect(!self.ok, "reject self-redirect");
+  EXPECT_TRUE(!self.ok) << "reject self-redirect";
 
   auto del = svc.api_del(oid, {});
-  expect(del.ok, "del");
+  EXPECT_TRUE(del.ok) << "del";
 
   fs::remove_all(root);
-  return failures;
-}
+  }
