@@ -3,6 +3,7 @@
 
 #include <linux/blk-mq.h>
 #include <linux/module.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
 
@@ -10,9 +11,16 @@ static void aiosvd_req_workfn(struct work_struct *work)
 {
 	struct aiosvd_req *areq = container_of(work, struct aiosvd_req, work);
 	struct request *rq = areq->rq;
+	unsigned int noio;
 	int err;
 
+	/* queue_rq allocates GFP_NOIO, but that ends at the workqueue boundary:
+	 * everything below runs on a fresh kworker with no such constraint. This is
+	 * the I/O path of a block device, so an allocation that enters reclaim can
+	 * be asked to write back through this same device. */
+	noio = memalloc_noio_save();
 	err = aiosvd_dev_io(areq->dev, rq);
+	memalloc_noio_restore(noio);
 	blk_mq_end_request(rq, errno_to_blk_status(err));
 	kfree(areq);
 }
@@ -139,13 +147,25 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 	unsigned int hwqs;
 	unsigned int max_sectors;
 	unsigned int qd;
+	unsigned int nclients;
 	int err;
 
-	dev->req_wq = alloc_workqueue("aiosvd%d-rq", WQ_MEM_RECLAIM | WQ_UNBOUND, 0, dev->id);
+	/* Every stripe job's first act is to take an HTTP client, so the client pool
+	 * is the real concurrency limit. Left at the default (256 per NUMA node) the
+	 * queues just convert queue depth into kworkers blocked in an uninterruptible
+	 * down() on the pool semaphore, one kernel stack each. Sizing max_active to
+	 * the pool makes the workqueue the throttle and leaves the semaphore
+	 * uncontended. req_wq gets headroom for requests that take a client without
+	 * fanning out to a stripe job (flush). */
+	nclients = dev->http_pool ? aios_http_pool_size(dev->http_pool) : 0;
+	if (nclients < 1)
+		nclients = AIOSVD_MAX_CLIENTS;
+	dev->req_wq = alloc_workqueue("aiosvd%d-rq", WQ_MEM_RECLAIM | WQ_UNBOUND,
+				      nclients * 2, dev->id);
 	if (!dev->req_wq)
 		return -ENOMEM;
-	dev->stripe_wq =
-		alloc_workqueue("aiosvd%d-io", WQ_MEM_RECLAIM | WQ_UNBOUND, 0, dev->id);
+	dev->stripe_wq = alloc_workqueue("aiosvd%d-io", WQ_MEM_RECLAIM | WQ_UNBOUND,
+					 nclients, dev->id);
 	if (!dev->stripe_wq) {
 		err = -ENOMEM;
 		goto err_req_wq;

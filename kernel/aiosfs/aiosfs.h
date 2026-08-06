@@ -9,6 +9,7 @@
 #include <linux/seq_file.h>
 #include <linux/uio.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <linux/writeback.h>
 #include <linux/xattr.h>
 
@@ -33,6 +34,9 @@ struct aios_sb_info {
 	struct aios_conn *conn;
 	struct aios_http_client *http;
 	struct aios_http_pool *http_pool;
+	/* Writeback fan-out. Must not be system_wq: these items do socket I/O and
+	 * allocate, so on the reclaim path they need a rescuer to make progress. */
+	struct workqueue_struct *wb_wq;
 	struct mutex http_mu;
 	int mount_id;
 	char endpoint[256];

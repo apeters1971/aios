@@ -339,10 +339,12 @@ struct HttpTestServer {
   std::unique_ptr<aios::HttpServer> http;
   std::thread th;
 
-  HttpTestServer(const char* prefix, int base_port)
+  HttpTestServer(const char* prefix, int base_port, int idle_ms = -1, int workers = 0)
       : fx(prefix), port(std::to_string(unique_port(base_port))),
         work(boost::asio::make_work_guard(ioc)) {
     fx.cfg.http_listen = "127.0.0.1:" + port;
+    if (idle_ms >= 0) fx.cfg.http_idle_timeout_ms = idle_ms;
+    if (workers > 0) fx.cfg.http_workers = workers;
     http = std::make_unique<aios::HttpServer>(ioc, fx.cfg, *fx.svc, fx.membership);
     http->start();
     th = std::thread([this] { ioc.run(); });
@@ -453,6 +455,60 @@ TEST(TcpServerRegression, IdleSessionDoesNotBlockTheIoContextThread) {
   work.reset();
   ioc.stop();
   io.join();
+}
+
+// A session owns its worker thread for its whole keep-alive lifetime and used to
+// block in read_line with no deadline, so a client that connected and sent nothing
+// pinned a worker forever. A handful of them starved the pool.
+TEST(HttpServerRegression, IdleKeepAliveConnectionIsReaped) {
+  using namespace aios;
+  HttpTestServer srv("aios-idle", 19000, /*idle_ms=*/400, /*workers=*/2);
+
+  boost::asio::io_context ioc;
+  tcp::resolver resolver(ioc);
+  boost::system::error_code ec;
+  auto endpoints = resolver.resolve("127.0.0.1", srv.port, ec);
+  ASSERT_FALSE(ec);
+
+  // Fill the pool with connections that never send a byte.
+  std::vector<std::unique_ptr<tcp::socket>> idle;
+  for (int i = 0; i < 2; ++i) {
+    auto s = std::make_unique<tcp::socket>(ioc);
+    boost::asio::connect(*s, endpoints, ec);
+    ASSERT_FALSE(ec);
+    idle.push_back(std::move(s));
+  }
+
+  // The server must drop them on its own; nothing else will.
+  std::atomic<bool> closed{false};
+  std::thread reader([&] {
+    char c = 0;
+    boost::system::error_code rec;
+    boost::asio::read(*idle[0], boost::asio::buffer(&c, 1), rec);
+    closed.store(true);
+  });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+  while (!closed.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  const bool reaped = closed.load();
+  if (!reaped) {
+    boost::system::error_code ignored;
+    idle[0]->close(ignored);
+  }
+  reader.join();
+  EXPECT_TRUE(reaped) << "an idle keep-alive connection must not hold a worker forever";
+
+  // With the idle sessions gone the pool serves requests again.
+  std::ostringstream req;
+  req << "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:" << srv.port << "\r\nConnection: close\r\n\r\n";
+  const int status = raw_request(srv.port, req.str());
+  EXPECT_GT(status, 0) << "pool must still accept work after reaping idle sessions";
+
+  for (auto& s : idle) {
+    boost::system::error_code ignored;
+    s->close(ignored);
+  }
 }
 
 // Long polls answer from a detached thread holding a raw ObjectService pointer.

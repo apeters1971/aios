@@ -21,6 +21,12 @@
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+#include <cerrno>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -236,6 +242,80 @@ int status_for(const ApiResult& r) {
   return 500;
 }
 
+// Sessions are synchronous, so one thread is occupied per live connection for the
+// whole keep-alive lifetime. Size for connections, not for cores.
+std::size_t http_worker_count(const Config& cfg) {
+  if (cfg.http_workers > 0) return static_cast<std::size_t>(cfg.http_workers);
+  const unsigned hw = std::thread::hardware_concurrency();
+  const unsigned n = (hw ? hw : 2u) * 4u;
+  return static_cast<std::size_t>(std::clamp(n, 8u, 64u));
+}
+
+// Bounds how long a session may sit in a blocking read or write. Without it an
+// idle keep-alive client (one that connects and never sends, or that stops reading
+// a large response) owns its worker forever, and a handful of them starve the pool.
+void set_session_timeouts(tcp::socket& sock, int idle_ms) {
+  if (idle_ms <= 0) return;
+  const int fd = static_cast<int>(sock.native_handle());
+  // recv/send have to actually block for SO_*TIMEO to mean anything.
+  const int fl = ::fcntl(fd, F_GETFL, 0);
+  if (fl >= 0 && (fl & O_NONBLOCK)) ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+  struct timeval tv;
+  tv.tv_sec = idle_ms / 1000;
+  tv.tv_usec = (idle_ms % 1000) * 1000;
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+// Asio's synchronous read/write carry no deadline of their own: on SO_RCVTIMEO
+// expiry recv reports EAGAIN, which asio reads as "not ready yet" and answers with
+// another unbounded poll. The timeout is only observable from the raw syscall.
+bool sock_read_exact(tcp::socket& sock, void* out, std::size_t n,
+                     boost::system::error_code& ec) {
+  const int fd = static_cast<int>(sock.native_handle());
+  auto* p = static_cast<char*>(out);
+  std::size_t done = 0;
+  while (done < n) {
+    const auto r = ::recv(fd, p + done, n - done, 0);
+    if (r > 0) {
+      done += static_cast<std::size_t>(r);
+      continue;
+    }
+    if (r == 0) {
+      ec = boost::asio::error::eof;
+      return false;
+    }
+    if (errno == EINTR) continue;
+    ec = boost::system::error_code(errno, boost::system::system_category());
+    return false;
+  }
+  ec = {};
+  return true;
+}
+
+bool sock_write_all(tcp::socket& sock, const void* in, std::size_t n,
+                    boost::system::error_code& ec) {
+  const int fd = static_cast<int>(sock.native_handle());
+  const auto* p = static_cast<const char*>(in);
+  std::size_t done = 0;
+  while (done < n) {
+#ifdef MSG_NOSIGNAL
+    const auto r = ::send(fd, p + done, n - done, MSG_NOSIGNAL);
+#else
+    const auto r = ::send(fd, p + done, n - done, 0);
+#endif
+    if (r > 0) {
+      done += static_cast<std::size_t>(r);
+      continue;
+    }
+    if (r < 0 && errno == EINTR) continue;
+    ec = boost::system::error_code(r == 0 ? EPIPE : errno, boost::system::system_category());
+    return false;
+  }
+  ec = {};
+  return true;
+}
+
 void write_response(tcp::socket& sock, int status, const std::string& reason,
                     const std::unordered_map<std::string, std::string>& headers,
                     const std::uint8_t* body, std::size_t body_len, bool keep_alive) {
@@ -249,9 +329,8 @@ void write_response(tcp::socket& sock, int status, const std::string& reason,
   oss << "\r\n";
   const auto head = oss.str();
   boost::system::error_code ec;
-  boost::asio::write(sock, boost::asio::buffer(head), ec);
-  if (!ec && body_len > 0 && body) {
-    boost::asio::write(sock, boost::asio::buffer(body, body_len), ec);
+  if (sock_write_all(sock, head.data(), head.size(), ec) && body_len > 0 && body) {
+    sock_write_all(sock, body, body_len, ec);
   }
 }
 
@@ -315,8 +394,8 @@ bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
   oss << "\r\n";
   const auto head = oss.str();
   boost::system::error_code ec;
-  boost::asio::write(sock, boost::asio::buffer(head), ec);
-  if (ec || head_only || size == 0) return !ec;
+  if (!sock_write_all(sock, head.data(), head.size(), ec)) return false;
+  if (head_only || size == 0) return true;
   std::ifstream in(path, std::ios::binary);
   if (!in) return false;
   std::vector<char> buf(256 * 1024);
@@ -327,9 +406,7 @@ bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
     in.read(buf.data(), chunk);
     const auto n = in.gcount();
     if (n <= 0) break;
-    boost::asio::write(sock, boost::asio::buffer(buf.data(), static_cast<std::size_t>(n)),
-                       ec);
-    if (ec) return false;
+    if (!sock_write_all(sock, buf.data(), static_cast<std::size_t>(n), ec)) return false;
     left -= static_cast<std::uint64_t>(n);
   }
   return left == 0;
@@ -363,8 +440,7 @@ bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& 
   line.clear();
   char c;
   while (true) {
-    boost::asio::read(sock, boost::asio::buffer(&c, 1), ec);
-    if (ec) return false;
+    if (!sock_read_exact(sock, &c, 1, ec)) return false;
     if (c == '\n') {
       if (!line.empty() && line.back() == '\r') line.pop_back();
       return true;
@@ -720,7 +796,8 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService&
       backup_policies_(std::move(backup_policies)),
       posix_layout_(std::move(posix_layout)),
       vbd_registry_(std::move(vbd_registry)),
-      acceptor_(ioc) {
+      acceptor_(ioc),
+      workers_(http_worker_count(cfg)) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
     throw std::runtime_error("invalid http_listen: " + cfg_.http_listen);
@@ -809,6 +886,7 @@ void HttpServer::do_accept() {
         std::lock_guard lock(sessions_mu_);
         sessions_.insert(sock);
       }
+      set_session_timeouts(*sock, cfg_.http_idle_timeout_ms);
       // Session I/O is synchronous; run off ioc_ so parallel browser connections
       // (HTML + CSS + JS) are not stalled by keep-alive reads.
       boost::asio::post(workers_, [this, sock] {
@@ -899,8 +977,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       std::uint32_t crc = 0;
       while (left > 0) {
         const auto n = std::min(left, buf.size());
-        boost::asio::read(*sock, boost::asio::buffer(buf.data(), n), ec);
-        if (ec) {
+        if (!sock_read_exact(*sock, buf.data(), n, ec)) {
           out.close();
           fs::remove(upload_path);
           return;
@@ -913,8 +990,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       upload_crc = crc;
     } else if (content_length > 0) {
       body.resize(content_length);
-      boost::asio::read(*sock, boost::asio::buffer(body), ec);
-      if (ec) return;
+      if (!sock_read_exact(*sock, body.data(), body.size(), ec)) return;
     }
 
     // Header names are lowercased above, values are not; Connection is a token and

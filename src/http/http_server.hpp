@@ -76,7 +76,9 @@ class HttpServer {
   std::function<void()> on_lifecycle_changed_;
   boost::asio::ip::tcp::acceptor acceptor_;
   // Blocking read/write session loop must not run on ioc_ (would stall accepts).
-  boost::asio::thread_pool workers_{4};
+  // A session owns its thread for its whole keep-alive lifetime, so the pool size
+  // is the concurrent client limit; see cfg_.http_workers.
+  boost::asio::thread_pool workers_;
   std::mutex sessions_mu_;
   std::unordered_set<std::shared_ptr<boost::asio::ip::tcp::socket>> sessions_;
   std::mutex detached_mu_;

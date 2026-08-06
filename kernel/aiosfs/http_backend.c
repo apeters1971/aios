@@ -13,6 +13,7 @@
 #include <linux/mm.h>
 #include <linux/namei.h>
 #include <linux/pagemap.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/statfs.h>
@@ -2223,11 +2224,19 @@ static int aios_http_wb_cmp(const void *a, const void *b)
 static void aios_http_wb_chunk_work(struct work_struct *work)
 {
 	struct aios_http_wb_chunk *cw = container_of(work, struct aios_http_wb_chunk, work);
-	struct aios_http_client *c = aios_http_pool_get(cw->info->http_pool);
+	struct aios_http_client *c;
 	unsigned int i;
+	unsigned int noio;
 	int err = 0;
 
+	/* This is writeback: every allocation below, including the ones inside
+	 * aios_http, must not be allowed to recurse into reclaim and wait on the
+	 * very pages this item was queued to write out. The flag is per-task, so
+	 * it has to be set here rather than inherited from the caller. */
+	noio = memalloc_noio_save();
+	c = aios_http_pool_get(cw->info->http_pool);
 	if (!c) {
+		memalloc_noio_restore(noio);
 		cw->err = -ENOMEM;
 		complete(&cw->done);
 		return;
@@ -2237,6 +2246,7 @@ static void aios_http_wb_chunk_work(struct work_struct *work)
 				       cw->pages[i].data, cw->pages[i].len);
 	}
 	aios_http_pool_put(cw->info->http_pool, c);
+	memalloc_noio_restore(noio);
 	cw->err = err;
 	complete(&cw->done);
 }
@@ -2280,7 +2290,8 @@ static int aios_http_wb_collect(struct page *page, struct writeback_control *wbc
 	return 0;
 }
 
-int aios_http_writepages(struct address_space *mapping, struct writeback_control *wbc)
+static int aios_http_writepages_noio(struct address_space *mapping,
+				     struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
@@ -2291,7 +2302,7 @@ int aios_http_writepages(struct address_space *mapping, struct writeback_control
 	u64 unit, max_end = 0;
 	int err;
 
-	if (!info->http_pool)
+	if (!info->http_pool || !info->wb_wq)
 		return -EINVAL;
 
 	batch = kcalloc(AIOS_HTTP_WB_MAX, sizeof(*batch), GFP_KERNEL);
@@ -2365,7 +2376,7 @@ int aios_http_writepages(struct address_space *mapping, struct writeback_control
 	}
 
 	for (i = 0; i < nchunks; i++)
-		schedule_work(&chunks[i].work);
+		queue_work(info->wb_wq, &chunks[i].work);
 	err = 0;
 	for (i = 0; i < nchunks; i++) {
 		wait_for_completion(&chunks[i].done);
@@ -2413,6 +2424,20 @@ out_pages:
 	}
 	kfree(batch);
 	kfree(chunks);
+	return err;
+}
+
+int aios_http_writepages(struct address_space *mapping, struct writeback_control *wbc)
+{
+	/* Everything below writes dirty pages out over a socket. Allocations on
+	 * that path must not re-enter reclaim, which would wait on writeback of
+	 * the pages this call is holding. */
+	unsigned int noio;
+	int err;
+
+	noio = memalloc_noio_save();
+	err = aios_http_writepages_noio(mapping, wbc);
+	memalloc_noio_restore(noio);
 	return err;
 }
 
@@ -2804,6 +2829,12 @@ static void http_put_super(struct super_block *sb)
 
 	if (!info)
 		return;
+	if (info->wb_wq) {
+		/* Chunk work dereferences info->http_pool and info->volume, so it has
+		 * to be drained before either goes away. */
+		destroy_workqueue(info->wb_wq);
+		info->wb_wq = NULL;
+	}
 	if (info->http_pool) {
 		if (info->http) {
 			aios_http_pool_put(info->http_pool, info->http);
@@ -2857,11 +2888,19 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 		return PTR_ERR(pool);
 	aios_http_pool_set_timeout_ms(pool, 30000);
 	info->http_pool = pool;
-	c = aios_http_pool_get(pool);
-	if (!c) {
+	/* max_active tracks the client pool: extra workers would only pile up
+	 * blocked in aios_http_pool_get, one kernel stack each. */
+	info->wb_wq = alloc_workqueue("aiosfs-wb", WQ_MEM_RECLAIM | WQ_UNBOUND,
+				      AIOSFS_HTTP_POOL_SIZE);
+	if (!info->wb_wq) {
 		aios_http_pool_destroy(pool);
 		info->http_pool = NULL;
 		return -ENOMEM;
+	}
+	c = aios_http_pool_get(pool);
+	if (!c) {
+		err = -ENOMEM;
+		goto fail;
 	}
 	info->http = c;
 
@@ -2888,6 +2927,12 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	return 0;
 
 fail:
+	if (info->wb_wq) {
+		/* Nothing can be queued yet, but destroy before the pool the work
+		 * items reach into. */
+		destroy_workqueue(info->wb_wq);
+		info->wb_wq = NULL;
+	}
 	if (info->http && info->http_pool)
 		aios_http_pool_put(info->http_pool, info->http);
 	info->http = NULL;

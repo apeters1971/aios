@@ -253,6 +253,8 @@ placement:
 # ec_k: 2
 # ec_m: 1                   # m=1 → XOR; m>1 needs ISA-L
 http_listen: "0.0.0.0:7480"
+# http_workers: 0            # session threads; 0 → 4/core clamped to [8, 64]
+# http_idle_timeout_ms: 30000  # reap a keep-alive session idle this long
 # max_versions: 16
 # max_object_bytes: 68719476736
 # layout_rules:

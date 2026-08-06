@@ -392,6 +392,10 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
       cfg.backup_interval_ms = root["backup_interval_ms"].as<int>();
     if (root["backup_batch_oids"]) cfg.backup_batch_oids = root["backup_batch_oids"].as<int>();
     if (root["http_listen"]) cfg.http_listen = root["http_listen"].as<std::string>();
+    if (root["http_workers"]) cfg.http_workers = root["http_workers"].as<int>();
+    if (root["http_idle_timeout_ms"]) {
+      cfg.http_idle_timeout_ms = root["http_idle_timeout_ms"].as<int>();
+    }
     if (root["s3_listen"]) cfg.s3_listen = root["s3_listen"].as<std::string>();
     if (root["s3_volume"]) cfg.s3_volume = root["s3_volume"].as<std::string>();
     if (root["s3_access_key"]) cfg.s3_access_key = root["s3_access_key"].as<std::string>();
@@ -794,6 +798,14 @@ bool normalize_config(Config& cfg, std::string& err) {
   }
   if (cfg.replica_count < 1) {
     err = "replica_count must be >= 1";
+    return false;
+  }
+  if (cfg.http_workers < 0) {
+    err = "http_workers must be >= 0 (0 = auto)";
+    return false;
+  }
+  if (cfg.http_idle_timeout_ms < 0) {
+    err = "http_idle_timeout_ms must be >= 0 (0 = no timeout)";
     return false;
   }
   if (cfg.write_quorum < 0) {

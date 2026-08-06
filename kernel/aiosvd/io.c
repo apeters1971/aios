@@ -11,6 +11,7 @@
 #include <linux/completion.h>
 #include <linux/highmem.h>
 #include <linux/mm.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 
@@ -560,8 +561,13 @@ static void aiosvd_stripe_workfn(struct work_struct *work)
 	struct aiosvd_stripe_job *job = container_of(work, struct aiosvd_stripe_job, work);
 	struct aios_http_client *http;
 	void *buf = NULL;
+	unsigned int noio;
 	int err = 0;
 
+	/* Serving block I/O: the kvmalloc below and every allocation inside
+	 * aios_http must not recurse into reclaim, which could queue writeback to
+	 * this device behind the job currently blocked in the allocator. */
+	noio = memalloc_noio_save();
 	http = aiosvd_client_get(job->dev);
 	if (!http) {
 		err = -ENODEV;
@@ -592,6 +598,7 @@ static void aiosvd_stripe_workfn(struct work_struct *work)
 put:
 	aiosvd_client_put(job->dev, http);
 out:
+	memalloc_noio_restore(noio);
 	if (err)
 		atomic_cmpxchg(job->err_atom, 0, err);
 	if (atomic_dec_and_test(job->pending))
