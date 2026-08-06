@@ -302,7 +302,7 @@ Place a file named `.aios` in the **top level** of a mounted filesystem the daem
 | Field | Effect |
 |-------|--------|
 | `storage_class: nvme` | Placement pool / class-scoped consistent-hash ring (required) |
-| `weight: 4` | Relative capacity for CH (default 1). Set proportional to device size (e.g. 4 TB → `4`, 16 TB → `16`); not auto-derived from free space |
+| `weight: 4` | Relative CH capacity in TiB units. **Omit** to use total filesystem size (`statvfs` → nearest TiB, min 1). With `weight_autotune`, free space drives weight instead (thresholded) |
 | `state: up` | Lifecycle: `up` \| `drain` \| `off` (default `up`) |
 | `targets: [data, scratch]` | `<mount>/data/aios/` and `<mount>/scratch/aios/` (omit → `<mount>/aios/`) |
 
@@ -316,7 +316,9 @@ Place a file named `.aios` in the **top level** of a mounted filesystem the daem
 
 Effective state is the worse of **node** (`node_state` in aiosd YAML / live admin) and **target** (`.aios` `state`): `off` > `drain` > `up`.
 
-Replace playbook: set target (or node) **drain** → wait/run repair until evacuated → **off** / unmount → replace disk → new `.aios` with `state: up` and capacity **weight** → scan → repair fills. Admin: `aios admin lifecycle show|node|target …`, Web UI **Lifecycle** tab, `GET/PUT /admin/api/lifecycle*`.
+Replace playbook: set target (or node) **drain** → wait/run repair until evacuated → **off** / unmount → replace disk → new `.aios` with `state: up` (and optional capacity **weight**) → scan → repair fills. Admin: `aios admin lifecycle show|node|target|autotune …`, Web UI **Lifecycle** tab, `GET/PUT /admin/api/lifecycle*`.
+
+**Weight autotune** (`weight_autotune` in YAML or live admin): advertise weight from **free** space (TiB). A new value applies only when `|Δ| ≥ max(min_delta, ceil(current × threshold_pct / 100))` (defaults: threshold **20%**, min_delta **1**) so small free-space noise does not churn the map epoch.
 
 The daemon creates each `aios/` directory if missing, then requires ownership to match the process **euid/egid**. Mismatches are logged and the target is **not** advertised.
 

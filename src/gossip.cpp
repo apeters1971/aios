@@ -1,6 +1,7 @@
 #include "gossip.hpp"
 
 #include "cluster/lifecycle.hpp"
+#include "cluster/weight.hpp"
 #include "fs/aios_scan.hpp"
 #include "net/client.hpp"
 #include "node_id.hpp"
@@ -127,6 +128,8 @@ void GossipEngine::start() {
                                                 s3_iam_, quota_, qos_, backup_policies_,
                                                 posix_layout_, vbd_registry_);
     http_server_->set_on_lifecycle_changed([this] {
+      // Reset hysteresis so a policy change (incl. autotune on/off) applies on this scan.
+      autotune_weights_.clear();
       run_scan();
       rebuild_cluster_map();
       sync_local_stores();
@@ -242,19 +245,51 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
   gossip_timer_.async_wait([this](auto e) { on_gossip_timer(e); });
 }
 
+void GossipEngine::apply_target_weights(std::vector<AiosTarget>& targets) {
+  if (!cfg_.weight_autotune) {
+    autotune_weights_.clear();
+    return;  // prepare_target already set explicit or capacity-derived weight
+  }
+  for (auto& t : targets) {
+    if (!t.usable) continue;
+    const std::uint64_t free_bytes =
+        (t.bsize > 0 && t.bavail > 0) ? t.bsize * t.bavail : 0;
+    const int proposed = bytes_to_weight(free_bytes);
+    auto it = autotune_weights_.find(t.aios_path);
+    if (it == autotune_weights_.end()) {
+      t.weight = proposed;
+      autotune_weights_[t.aios_path] = proposed;
+      AIOS_LOG_INFO("weight autotune init ", t.aios_path, " weight=", proposed,
+                    " (free TiB units)");
+      continue;
+    }
+    if (weight_autotune_should_update(it->second, proposed, cfg_.weight_autotune_threshold_pct,
+                                      cfg_.weight_autotune_min_delta)) {
+      AIOS_LOG_INFO("weight autotune ", t.aios_path, " ", it->second, " -> ", proposed);
+      it->second = proposed;
+      t.weight = proposed;
+    } else {
+      t.weight = it->second;
+    }
+  }
+}
+
 void GossipEngine::run_scan() {
   auto targets = scan_aios_filesystems();
+  apply_target_weights(targets);
   std::size_t usable = 0;
   for (const auto& t : targets) {
     if (t.usable) {
       ++usable;
-      AIOS_LOG_DEBUG("target usable ", t.aios_path, " bavail=", t.bavail);
+      AIOS_LOG_DEBUG("target usable ", t.aios_path, " weight=", t.weight,
+                     " bavail=", t.bavail);
     } else if (!t.error.empty()) {
       AIOS_LOG_WARN("target unusable ", t.aios_path, ": ", t.error);
     }
   }
   fs_table_.set_local(cfg_.node_id, targets, lifecycle_state_from_string(cfg_.node_state));
-  AIOS_LOG_INFO("fs scan: ", targets.size(), " targets, ", usable, " usable");
+  AIOS_LOG_INFO("fs scan: ", targets.size(), " targets, ", usable, " usable",
+                cfg_.weight_autotune ? " (weight autotune on)" : "");
 }
 
 void GossipEngine::on_scan_timer(const boost::system::error_code& ec) {

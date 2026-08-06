@@ -1,5 +1,6 @@
 #include "fs/aios_scan.hpp"
 
+#include "cluster/weight.hpp"
 #include "fs/mounts.hpp"
 #include "util/log.hpp"
 #include "util/uid.hpp"
@@ -91,6 +92,7 @@ bool parse_aios_marker(const std::string& yaml_text, const std::string& mount_ro
         err = "weight must be >= 1";
         return false;
       }
+      out.weight_specified = true;
     }
     if (root["state"]) {
       const auto st = lower_copy(root["state"].as<std::string>());
@@ -134,13 +136,15 @@ bool parse_aios_marker(const std::string& yaml_text, const std::string& mount_ro
 }
 
 AiosTarget prepare_target(const std::string& mount, const std::string& target_path,
-                          const std::string& storage_class, int weight, LifecycleState state) {
+                          const std::string& storage_class, std::optional<int> weight,
+                          LifecycleState state) {
   AiosTarget t;
   t.mount = mount;
   t.target_path = target_path;
   t.aios_path = (fs::path(target_path) / "aios").string();
   t.storage_class = storage_class;
-  t.weight = weight > 0 ? weight : 1;
+  t.weight_explicit = weight.has_value();
+  t.weight = (weight && *weight > 0) ? *weight : 1;
   t.state = state;
 
   std::error_code ec;
@@ -192,6 +196,11 @@ AiosTarget prepare_target(const std::string& mount, const std::string& target_pa
   t.bavail = static_cast<std::uint64_t>(vfs.f_bavail);
   t.files = static_cast<std::uint64_t>(vfs.f_files);
   t.ffree = static_cast<std::uint64_t>(vfs.f_ffree);
+  if (!t.weight_explicit) {
+    const std::uint64_t total =
+        (t.bsize > 0 && t.blocks > 0) ? t.bsize * t.blocks : 0;
+    t.weight = bytes_to_weight(total);
+  }
   t.usable = true;
   return t;
 }
@@ -217,8 +226,9 @@ std::vector<AiosTarget> scan_aios_filesystems() {
       continue;
     }
     for (const auto& tp : parsed.target_paths) {
-      out.push_back(
-          prepare_target(m.path, tp, parsed.storage_class, parsed.weight, parsed.state));
+      std::optional<int> w;
+      if (parsed.weight_specified) w = parsed.weight;
+      out.push_back(prepare_target(m.path, tp, parsed.storage_class, w, parsed.state));
     }
   }
   return out;

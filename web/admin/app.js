@@ -416,6 +416,16 @@
   function renderLifecycle(doc) {
     const ns = document.getElementById("lifecycle-node-state");
     if (ns && doc && doc.node_state) ns.value = doc.node_state;
+    const en = document.getElementById("lifecycle-autotune-enabled");
+    const th = document.getElementById("lifecycle-autotune-threshold");
+    const md = document.getElementById("lifecycle-autotune-min-delta");
+    if (en && doc) en.checked = !!doc.weight_autotune;
+    if (th && doc && typeof doc.weight_autotune_threshold_pct === "number") {
+      th.value = doc.weight_autotune_threshold_pct;
+    }
+    if (md && doc && typeof doc.weight_autotune_min_delta === "number") {
+      md.value = doc.weight_autotune_min_delta;
+    }
     const rows = ((doc && doc.targets) || [])
       .map(
         (t) =>
@@ -459,6 +469,31 @@
     if (!res.ok) {
       errEl.hidden = false;
       errEl.textContent = (json && json.error) || "Set node state failed";
+      return;
+    }
+    out.classList.remove("hidden");
+    out.textContent = JSON.stringify(json, null, 2);
+    await refreshLifecycle();
+  });
+
+  document.getElementById("lifecycle-autotune-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("lifecycle-error");
+    const out = document.getElementById("lifecycle-result");
+    errEl.hidden = true;
+    out.classList.add("hidden");
+    const body = {
+      enabled: document.getElementById("lifecycle-autotune-enabled").checked,
+      threshold_pct: parseInt(document.getElementById("lifecycle-autotune-threshold").value, 10),
+      min_delta: parseInt(document.getElementById("lifecycle-autotune-min-delta").value, 10),
+    };
+    const { res, json } = await api("/admin/api/lifecycle/autotune", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Save autotune failed";
       return;
     }
     out.classList.remove("hidden");

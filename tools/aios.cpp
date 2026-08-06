@@ -62,7 +62,7 @@ void usage() {
       << "  admin backup show|run|snapshot|policy ...\n"
       << "  admin vbd list|delete|backup ...\n"
       << "  admin posix-layout show|set ...\n"
-      << "  admin lifecycle show|node|target ...\n"
+      << "  admin lifecycle show|node|target|autotune ...\n"
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
       << "  admin qos show|set|project ...\n"
@@ -565,7 +565,7 @@ void admin_console_help() {
             << "  backup [show|run]\n"
             << "  vbd [list|delete|backup ...]\n"
             << "  posix-layout [show|set ...]\n"
-            << "  lifecycle [show|node|target ...]\n";
+            << "  lifecycle [show|node|target|autotune ...]\n";
 }
 
 HttpResp admin_exchange(std::string host, std::string port, const std::string& method,
@@ -940,7 +940,73 @@ int cmd_admin_lifecycle(std::string host, std::string port, const std::string& k
     std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
     return 0;
   }
-  std::cerr << "usage: admin lifecycle show|node|target ...\n";
+  if (action == "autotune") {
+    // admin lifecycle autotune [show|on|off] [--threshold PCT] [--min-delta N]
+    std::string mode = args.size() >= 3 ? args[2] : "show";
+    std::optional<bool> enabled;
+    std::optional<int> threshold;
+    std::optional<int> min_delta;
+    if (mode == "show") {
+      auto r = admin_get(std::move(host), std::move(port), "/admin/api/lifecycle", key);
+      if (r.status != 200) {
+        std::cerr << "lifecycle autotune show failed status=" << r.status << " " << r.body
+                  << "\n";
+        return 1;
+      }
+      auto j = nlohmann::json::parse(r.body);
+      nlohmann::json out{{"weight_autotune", j.value("weight_autotune", false)},
+                         {"weight_autotune_threshold_pct",
+                          j.value("weight_autotune_threshold_pct", 20)},
+                         {"weight_autotune_min_delta", j.value("weight_autotune_min_delta", 1)}};
+      std::cout << out.dump(2) << "\n";
+      return 0;
+    }
+    if (mode == "on" || mode == "enable" || mode == "true") {
+      enabled = true;
+    } else if (mode == "off" || mode == "disable" || mode == "false") {
+      enabled = false;
+    } else if (mode.rfind("--", 0) == 0) {
+      // flags only — keep current enabled unless --on/--off appears later
+      mode.clear();
+    } else {
+      std::cerr << "usage: admin lifecycle autotune show|on|off "
+                   "[--threshold PCT] [--min-delta N]\n";
+      return 2;
+    }
+    const std::size_t start = mode.empty() ? 2 : 3;
+    for (std::size_t i = start; i < args.size(); ++i) {
+      if ((args[i] == "--threshold" || args[i] == "--threshold-pct") && i + 1 < args.size()) {
+        threshold = std::stoi(args[++i]);
+      } else if ((args[i] == "--min-delta" || args[i] == "--min_delta") && i + 1 < args.size()) {
+        min_delta = std::stoi(args[++i]);
+      } else if (args[i] == "--on") {
+        enabled = true;
+      } else if (args[i] == "--off") {
+        enabled = false;
+      } else {
+        std::cerr << "usage: admin lifecycle autotune show|on|off "
+                     "[--threshold PCT] [--min-delta N]\n";
+        return 2;
+      }
+    }
+    nlohmann::json body;
+    if (enabled) body["enabled"] = *enabled;
+    if (threshold) body["threshold_pct"] = *threshold;
+    if (min_delta) body["min_delta"] = *min_delta;
+    if (body.empty()) {
+      std::cerr << "autotune requires on|off and/or --threshold/--min-delta\n";
+      return 2;
+    }
+    auto r = admin_exchange(std::move(host), std::move(port), "PUT",
+                            "/admin/api/lifecycle/autotune", body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "lifecycle autotune failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  std::cerr << "usage: admin lifecycle show|node|target|autotune ...\n";
   return 2;
 }
 

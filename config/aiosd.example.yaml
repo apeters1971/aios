@@ -136,3 +136,7 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # Web UI: http://HOST:7480/admin/  (login with cluster_key; assets in web/admin or AIOS_ADMIN_WEB)
 # Planned node lifecycle (worse of this and each .aios state; gossip Alive/Suspect/Dead separate):
 # node_state: up               # up | drain | off — live toggle via admin lifecycle API/CLI/UI
+# Weight: omit in .aios → total FS capacity (TiB). Autotune uses free space with hysteresis:
+# weight_autotune: false
+# weight_autotune_threshold_pct: 20   # apply only if |Δ| >= ceil(cur*pct/100)
+# weight_autotune_min_delta: 1         # and |Δ| >= this absolute floor

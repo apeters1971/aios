@@ -38,10 +38,21 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
 
 ```yaml
 storage_class: nvme   # required; [a-z0-9_-]+
-weight: 4             # relative capacity (e.g. TB units); feeds vnode count
+weight: 4             # optional; TiB units. Omit → total FS size (statvfs)
 state: up             # up | drain | off (default up)
 targets: [data]       # optional; default = mount root
 ```
+
+Daemon knobs (YAML / live admin):
+
+```yaml
+weight_autotune: false                 # true → weight from free space (TiB)
+weight_autotune_threshold_pct: 20      # relative hysteresis
+weight_autotune_min_delta: 1           # absolute floor on |Δweight|
+```
+
+Autotune updates advertised weight only when
+`|Δ| ≥ max(min_delta, ceil(current × threshold_pct / 100))`.
 
 ## Layout descriptor (version attrs)
 

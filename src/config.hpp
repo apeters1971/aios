@@ -168,6 +168,12 @@ struct Config {
   bool admin_metrics_public{false};
   // Operator lifecycle for this node (up | drain | off). Folded into local target states.
   std::string node_state{"up"};
+  // When true, advertise placement weights from free space (TiB), with hysteresis.
+  // When false: explicit .aios weight, or total capacity (TiB) if weight omitted.
+  bool weight_autotune{false};
+  // Autotune applies a new weight only if |Δ| >= max(min_delta, ceil(cur*pct/100)).
+  int weight_autotune_threshold_pct{20};
+  int weight_autotune_min_delta{1};
   // Whole-object PUT compression: "none" | "zstd" (range/append rejected on compressed tips).
   std::string compression{"none"};
   int compression_level{3};                 // zstd level 1..22

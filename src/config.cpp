@@ -395,6 +395,11 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["admin_metrics_public"])
       cfg.admin_metrics_public = root["admin_metrics_public"].as<bool>();
     if (root["node_state"]) cfg.node_state = root["node_state"].as<std::string>();
+    if (root["weight_autotune"]) cfg.weight_autotune = root["weight_autotune"].as<bool>();
+    if (root["weight_autotune_threshold_pct"])
+      cfg.weight_autotune_threshold_pct = root["weight_autotune_threshold_pct"].as<int>();
+    if (root["weight_autotune_min_delta"])
+      cfg.weight_autotune_min_delta = root["weight_autotune_min_delta"].as<int>();
     if (root["compression"]) cfg.compression = root["compression"].as<std::string>();
     if (root["compression_level"]) cfg.compression_level = root["compression_level"].as<int>();
     if (root["compression_min_bytes"])
@@ -737,6 +742,14 @@ bool normalize_config(Config& cfg, std::string& err) {
   if (cfg.node_state.empty()) cfg.node_state = "up";
   if (!valid_lifecycle_state_string(cfg.node_state)) {
     err = "node_state must be up, drain, or off";
+    return false;
+  }
+  if (cfg.weight_autotune_threshold_pct < 0 || cfg.weight_autotune_threshold_pct > 100) {
+    err = "weight_autotune_threshold_pct must be 0..100";
+    return false;
+  }
+  if (cfg.weight_autotune_min_delta < 1) {
+    err = "weight_autotune_min_delta must be >= 1";
     return false;
   }
   if (cfg.durability.empty() || cfg.durability == "replica") {

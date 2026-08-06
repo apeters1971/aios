@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 namespace aios {
 
@@ -48,6 +49,7 @@ class GossipEngine {
   void on_archive_timer(const boost::system::error_code& ec);
   void on_backup_timer(const boost::system::error_code& ec);
   void run_scan();
+  void apply_target_weights(std::vector<AiosTarget>& targets);
   void rebuild_cluster_map();
   void sync_local_stores();
   void write_status();
@@ -71,6 +73,8 @@ class GossipEngine {
   std::shared_ptr<VbdRegistryStore> vbd_registry_;
   std::unique_ptr<TcpServer> server_;
   std::unique_ptr<HttpServer> http_server_;
+  // Last advertised autotune weight per aios_path (hysteresis).
+  std::unordered_map<std::string, int> autotune_weights_;
   boost::asio::steady_timer gossip_timer_;
   boost::asio::steady_timer scan_timer_;
   boost::asio::steady_timer status_timer_;

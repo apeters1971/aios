@@ -66,6 +66,7 @@ Logout: `POST /admin/logout`.
 | `GET /admin/api/lifecycle` | cookie **or** HMAC | Node + target lifecycle (effective state, weight, class, path) |
 | `PUT /admin/api/lifecycle/node` | cookie **or** HMAC | `{state: up\|drain\|off}` — live `node_state` (triggers rescan) |
 | `PUT /admin/api/lifecycle/target` | cookie **or** HMAC | `{aios_path\|mount, state?, weight?}` — rewrite local `.aios` + rescan |
+| `PUT /admin/api/lifecycle/autotune` | cookie **or** HMAC | `{enabled?, threshold_pct?, min_delta?}` — free-space weight autotune + hysteresis |
 
 CLI: `aios admin archive …`, `aios admin backup …`, `aios admin posix-layout …`, `aios admin lifecycle …`, `aios admin s3-cred …`, `aios admin quota …`, `aios admin qos …`. Web UI: **Actions** (archive/backup), **S3 credentials** / **Quotas** / **QoS** / **POSIX layout** / **Lifecycle** tabs. See [`archive.md`](archive.md), [`backup.md`](backup.md), [`posix_fuse.md`](posix_fuse.md), [`layout.md`](layout.md), [`s3.md`](s3.md), [`quota.md`](quota.md), [`qos.md`](qos.md).
 
@@ -87,6 +88,9 @@ aios admin lifecycle show
 aios admin lifecycle node drain
 aios admin lifecycle target --mount /mnt/disk0 --state drain
 aios admin lifecycle target --aios-path /mnt/disk0/aios --weight 16
+aios admin lifecycle autotune show
+aios admin lifecycle autotune on --threshold 20 --min-delta 1
+aios admin lifecycle autotune off
 ```
 
 Archive **rules** are YAML-only (restart to change). Backup has YAML `backup_rules` plus live policies in cluster object `backup/policies` (CLI/UI CRUD, daily UTC + GFS retention). POSIX subtree layout uses YAML `posix_layout_rules` as seed plus live object `posix/layout_rules` (CLI/UI replace-all).

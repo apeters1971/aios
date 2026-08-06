@@ -612,6 +612,9 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"admin", cfg_.admin},
       {"admin_metrics_public", cfg_.admin_metrics_public},
       {"node_state", cfg_.node_state},
+      {"weight_autotune", cfg_.weight_autotune},
+      {"weight_autotune_threshold_pct", cfg_.weight_autotune_threshold_pct},
+      {"weight_autotune_min_delta", cfg_.weight_autotune_min_delta},
       {"s3_listen", c.s3_listen},
       {"s3_volume", c.s3_volume},
       {"s3_access_key", c.s3_access_key},
@@ -676,6 +679,9 @@ nlohmann::json HttpServer::admin_lifecycle_json() const {
   return nlohmann::json{
       {"node_id", cfg_.node_id},
       {"node_state", cfg_.node_state},
+      {"weight_autotune", cfg_.weight_autotune},
+      {"weight_autotune_threshold_pct", cfg_.weight_autotune_threshold_pct},
+      {"weight_autotune_min_delta", cfg_.weight_autotune_min_delta},
       {"map_epoch", objects_.map().epoch},
       {"nodes", std::move(nodes)},
       {"targets", std::move(targets)},
@@ -1423,6 +1429,65 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           if (on_lifecycle_changed_) on_lifecycle_changed_();
           write_json(*sock, 200, "OK",
                      {{"ok", true}, {"node_id", cfg_.node_id}, {"node_state", cfg_.node_state}},
+                     keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "PUT" && path == "/admin/api/lifecycle/autotune") {
+        try {
+          const std::string raw =
+              body.empty() ? "{}"
+                           : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+          auto j = nlohmann::json::parse(raw);
+          if (j.contains("enabled")) {
+            if (!j["enabled"].is_boolean()) {
+              write_json(*sock, 400, "Bad Request", {{"error", "enabled must be boolean"}},
+                         keep_alive);
+              continue;
+            }
+            cfg_.weight_autotune = j["enabled"].get<bool>();
+          } else if (j.contains("weight_autotune")) {
+            if (!j["weight_autotune"].is_boolean()) {
+              write_json(*sock, 400, "Bad Request",
+                         {{"error", "weight_autotune must be boolean"}}, keep_alive);
+              continue;
+            }
+            cfg_.weight_autotune = j["weight_autotune"].get<bool>();
+          }
+          if (j.contains("threshold_pct") || j.contains("weight_autotune_threshold_pct")) {
+            const auto& v = j.contains("threshold_pct") ? j["threshold_pct"]
+                                                        : j["weight_autotune_threshold_pct"];
+            if (!v.is_number_integer()) {
+              write_json(*sock, 400, "Bad Request",
+                         {{"error", "threshold_pct must be integer 0..100"}}, keep_alive);
+              continue;
+            }
+            const int pct = v.get<int>();
+            if (pct < 0 || pct > 100) {
+              write_json(*sock, 400, "Bad Request",
+                         {{"error", "threshold_pct must be 0..100"}}, keep_alive);
+              continue;
+            }
+            cfg_.weight_autotune_threshold_pct = pct;
+          }
+          if (j.contains("min_delta") || j.contains("weight_autotune_min_delta")) {
+            const auto& v = j.contains("min_delta") ? j["min_delta"]
+                                                    : j["weight_autotune_min_delta"];
+            if (!v.is_number_integer() || v.get<int>() < 1) {
+              write_json(*sock, 400, "Bad Request", {{"error", "min_delta must be >= 1"}},
+                         keep_alive);
+              continue;
+            }
+            cfg_.weight_autotune_min_delta = v.get<int>();
+          }
+          if (on_lifecycle_changed_) on_lifecycle_changed_();
+          write_json(*sock, 200, "OK",
+                     {{"ok", true},
+                      {"weight_autotune", cfg_.weight_autotune},
+                      {"weight_autotune_threshold_pct", cfg_.weight_autotune_threshold_pct},
+                      {"weight_autotune_min_delta", cfg_.weight_autotune_min_delta}},
                      keep_alive);
         } catch (...) {
           write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
