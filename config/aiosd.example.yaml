@@ -12,6 +12,11 @@ gossip_interval_ms: 1000
 suspect_after_ms: 5000
 dead_after_ms: 15000
 scan_interval_ms: 5000
+# Extra directories to scan for a top-level .aios (in addition to mount roots).
+# CLI: --scan-root PATH / --scan-prefix PATH (repeatable).
+# scan_roots:
+#   - /data/nvme0
+#   - /data/hdd0
 # Server-side redundancy (primary fans out to secondaries).
 replica_count: 3
 # write_quorum: 0          # 0 => same as replica_count (capped by acting set size)

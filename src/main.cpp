@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     std::cout
         << "usage: aiosd --cluster-key UUID [--config PATH] [--listen HOST:PORT]\n"
         << "             [--peer HOST:PORT] [--node-id ID] [--status-file PATH]\n"
+        << "             [--scan-root PATH] [--scan-prefix PATH]\n"
         << "             [--replica-count N] [--write-quorum N]\n"
         << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
         << "             [--s3-listen HOST:PORT] [--s3-volume NAME] [--s3-access-key ID]\n"
@@ -50,6 +51,8 @@ int main(int argc, char** argv) {
         << "RPCs and HTTP Authorization use HMAC-SHA256. S3 uses AWS SigV4 with\n"
         << "global s3_access_key/cluster_key plus optional per-bucket IAM keys\n"
         << "(FS-backed via libaios_posix).\n"
+        << "--scan-root/--scan-prefix PATH looks for PATH/.aios in addition to\n"
+        << "mount roots (repeatable; also config scan_roots).\n"
         << "--admin enables /admin/* and /metrics on http_listen.\n"
         << "--admin-metrics-public allows unauthenticated GET /metrics (scrape).\n";
     return 0;

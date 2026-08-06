@@ -103,6 +103,8 @@ struct Config {
   int suspect_after_ms{5000};
   int dead_after_ms{15000};
   int scan_interval_ms{5000};
+  // Extra directories to scan for a top-level .aios (in addition to mount roots).
+  std::vector<std::string> scan_roots;
   std::string status_file;
   // Server-side replication: primary fans out to replica_count targets.
   int replica_count{3};

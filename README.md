@@ -297,7 +297,7 @@ Soft quotas and QoS (FUSE + S3): see [Quotas and QoS](#quotas-and-qos) and [`pro
 
 ## Storage targets (`.aios`)
 
-Place a file named `.aios` in the **top level** of a mounted filesystem the daemon can see. **`storage_class` is required.**
+Place a file named `.aios` in the **top level** of a mounted filesystem the daemon can see, or pass extra roots with `--scan-root PATH` / `--scan-prefix PATH` (repeatable) or YAML `scan_roots:`. **`storage_class` is required.**
 
 | Field | Effect |
 |-------|--------|

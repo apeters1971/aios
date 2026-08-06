@@ -339,6 +339,17 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["dead_after_ms"]) cfg.dead_after_ms = root["dead_after_ms"].as<int>();
     if (root["scan_interval_ms"])
       cfg.scan_interval_ms = root["scan_interval_ms"].as<int>();
+    if (root["scan_roots"]) {
+      cfg.scan_roots.clear();
+      if (!root["scan_roots"].IsSequence()) {
+        err = "scan_roots must be a sequence of paths";
+        return false;
+      }
+      for (const auto& n : root["scan_roots"]) {
+        const auto p = n.as<std::string>();
+        if (!p.empty()) cfg.scan_roots.push_back(p);
+      }
+    }
     if (root["status_file"]) cfg.status_file = root["status_file"].as<std::string>();
     if (root["cluster_key"]) cfg.cluster_key = root["cluster_key"].as<std::string>();
     if (root["auth_skew_ms"]) cfg.auth_skew_ms = root["auth_skew_ms"].as<int>();
@@ -628,6 +639,12 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       const char* v = need("--status-file");
       if (!v) return false;
       cfg.status_file = v;
+      continue;
+    }
+    if (arg == "--scan-root" || arg == "--scan-prefix") {
+      const char* v = need(arg.c_str());
+      if (!v) return false;
+      if (*v) cfg.scan_roots.emplace_back(v);
       continue;
     }
     if (arg == "--cluster-key") {

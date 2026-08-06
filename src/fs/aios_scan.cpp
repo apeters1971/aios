@@ -214,10 +214,25 @@ AiosTarget prepare_target(const std::string& mount, const std::string& target_pa
   return t;
 }
 
-std::vector<AiosTarget> scan_aios_filesystems() {
+std::vector<AiosTarget> scan_aios_filesystems(const std::vector<std::string>& extra_roots) {
+  std::vector<std::string> roots;
+  roots.reserve(extra_roots.size() + 16);
+  auto add_root = [&](std::string path) {
+    if (path.empty()) return;
+    std::error_code ec;
+    auto norm = fs::path(path).lexically_normal().string();
+    if (norm.size() > 1 && norm.back() == '/') norm.pop_back();
+    for (const auto& existing : roots) {
+      if (existing == norm) return;
+    }
+    roots.push_back(std::move(norm));
+  };
+  for (const auto& m : list_mounts()) add_root(m.path);
+  for (const auto& r : extra_roots) add_root(r);
+
   std::vector<AiosTarget> out;
-  for (const auto& m : list_mounts()) {
-    const fs::path marker = fs::path(m.path) / ".aios";
+  for (const auto& root : roots) {
+    const fs::path marker = fs::path(root) / ".aios";
     std::error_code ec;
     if (!fs::is_regular_file(marker, ec)) continue;
 
@@ -230,14 +245,14 @@ std::vector<AiosTarget> scan_aios_filesystems() {
     ss << in.rdbuf();
     AiosMarker parsed;
     std::string err;
-    if (!parse_aios_marker(ss.str(), m.path, parsed, err)) {
-      AIOS_LOG_ERROR(".aios parse on ", m.path, ": ", err);
+    if (!parse_aios_marker(ss.str(), root, parsed, err)) {
+      AIOS_LOG_ERROR(".aios parse on ", root, ": ", err);
       continue;
     }
     for (const auto& tp : parsed.target_paths) {
       std::optional<int> w;
       if (parsed.weight_specified) w = parsed.weight;
-      auto t = prepare_target(m.path, tp, parsed.storage_class, w, parsed.state);
+      auto t = prepare_target(root, tp, parsed.storage_class, w, parsed.state);
       if (parsed.rack_specified) {
         t.rack = parsed.rack;
         t.rack_explicit = true;

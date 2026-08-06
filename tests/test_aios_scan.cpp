@@ -107,6 +107,30 @@ TEST(AiosScan, Basic) {
     EXPECT_TRUE(m.state == LifecycleState::Drain) << "updated state";
     EXPECT_TRUE(m.weight == 8) << "updated weight";
   }
+  {
+    // Extra scan roots find .aios outside mount enumeration.
+    const auto root = base / "extra-root";
+    fs::create_directories(root / "vol");
+    {
+      std::ofstream out(root / ".aios");
+      out << "storage_class: hdd\nweight: 3\ntargets: [vol]\n";
+    }
+    auto found = scan_aios_filesystems({root.string()});
+    bool hit = false;
+    for (const auto& t : found) {
+      if (t.mount == root.lexically_normal().string() ||
+          t.mount == root.string()) {
+        EXPECT_TRUE(t.usable) << "extra-root usable";
+        EXPECT_TRUE(t.storage_class == "hdd") << "extra-root class";
+        EXPECT_TRUE(t.weight == 3) << "extra-root weight";
+        EXPECT_TRUE(t.aios_path == (root / "vol" / "aios").lexically_normal().string() ||
+                    t.aios_path == (root / "vol" / "aios").string())
+            << "extra-root aios path";
+        hit = true;
+      }
+    }
+    EXPECT_TRUE(hit) << "scan_roots discovers non-mount .aios";
+  }
 
   fs::remove_all(base);
   }

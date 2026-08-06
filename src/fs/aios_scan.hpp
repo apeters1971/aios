@@ -57,7 +57,9 @@ AiosTarget prepare_target(const std::string& mount, const std::string& target_pa
 bool update_aios_marker_file(const std::string& marker_path, const std::optional<std::string>& state,
                              const std::optional<int>& weight, std::string& err);
 
-// Scan all mounts for .aios markers and prepare targets.
-std::vector<AiosTarget> scan_aios_filesystems();
+// Scan mount roots (and optional extra_roots) for top-level .aios markers.
+// Each path is treated like a mount root: look for <path>/.aios.
+std::vector<AiosTarget> scan_aios_filesystems(
+    const std::vector<std::string>& extra_roots = {});
 
 }  // namespace aios

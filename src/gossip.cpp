@@ -275,7 +275,7 @@ void GossipEngine::apply_target_weights(std::vector<AiosTarget>& targets) {
 }
 
 void GossipEngine::run_scan() {
-  auto targets = scan_aios_filesystems();
+  auto targets = scan_aios_filesystems(cfg_.scan_roots);
   apply_target_weights(targets);
   std::size_t usable = 0;
   for (const auto& t : targets) {
