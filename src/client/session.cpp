@@ -297,7 +297,8 @@ ObjectSnapshot Session::get_range(const std::string& oid, std::uint64_t start,
 std::uint64_t Session::put_bytes(const std::string& oid, const std::string& body,
                                  const std::unordered_map<std::string, std::string>& attrs,
                                  std::optional<std::uint64_t> expected_cas,
-                                 const std::optional<std::string>& lock_token) {
+                                 const std::optional<std::string>& lock_token,
+                                 const PutLayout& layout) {
   if (body.size() > kMaxBodyBytes) {
     throw client_error("payload_too_large", "put_bytes exceeds 16 MiB");
   }
@@ -306,6 +307,7 @@ std::uint64_t Session::put_bytes(const std::string& oid, const std::string& body
   for (const auto& [k, v] : attrs) {
     headers["x-aios-attr-" + k] = v;
   }
+  apply_put_layout_headers(headers, layout);
   const std::uint64_t new_cas = apply_posix_cas_headers(*this, oid, expected_cas, headers);
   if (lock_token) headers["x-aios-lock-token"] = *lock_token;
   const auto path = "/o/" + url_encode_oid(oid);

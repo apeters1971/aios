@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -52,13 +53,14 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  admin [status|ops|config|cluster|metrics|console|archive|backup|s3-cred|quota|qos ...]\n"
+      << "  admin [status|ops|config|cluster|metrics|console|archive|backup|posix-layout|s3-cred|quota|qos ...]\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
       << "  admin status|ops|config|cluster|metrics   one-shot\n"
       << "  admin archive show|run|drain|recall OID\n"
       << "  admin backup show|run|snapshot|policy ...\n"
+      << "  admin posix-layout show|set ...\n"
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
       << "  admin qos show|set|project ...\n"
@@ -556,9 +558,10 @@ int cmd_admin_cluster(std::string host, std::string port, const std::string& key
 
 void admin_console_help() {
   std::cout << "commands: status | ops | config | cluster | metrics | archive | backup | "
-               "help | quit\n"
+               "posix-layout | help | quit\n"
             << "  archive [show|run|drain]\n"
-            << "  backup [show|run]\n";
+            << "  backup [show|run]\n"
+            << "  posix-layout [show|set ...]\n";
 }
 
 HttpResp admin_exchange(std::string host, std::string port, const std::string& method,
@@ -788,6 +791,60 @@ int cmd_admin_backup(std::string host, std::string port, const std::string& key,
     return 2;
   }
   std::cerr << "usage: admin backup show|run|snapshot|policy ...\n";
+  return 2;
+}
+
+int cmd_admin_posix_layout(std::string host, std::string port, const std::string& key,
+                           const std::vector<std::string>& args) {
+  const std::string action = args.size() >= 2 ? args[1] : "show";
+  if (action == "show") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/posix-layout", key);
+    if (r.status != 200) {
+      std::cerr << "posix-layout show failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "set") {
+    std::string raw;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      if (args[i] == "--file") {
+        if (i + 1 >= args.size()) {
+          std::cerr << "usage: admin posix-layout set --file PATH.json\n";
+          return 2;
+        }
+        std::ifstream in(args[++i]);
+        if (!in) {
+          std::cerr << "cannot read " << args[i] << "\n";
+          return 1;
+        }
+        raw.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        break;
+      }
+      if (args[i] == "-") {
+        raw.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+        break;
+      }
+      raw = args[i];
+      break;
+    }
+    if (raw.empty()) {
+      std::cerr << "usage: admin posix-layout set --file PATH.json\n"
+                << "       admin posix-layout set '{\"posix_layout_rules\":[...]}'\n"
+                << "       admin posix-layout set -   # JSON on stdin\n";
+      return 2;
+    }
+    auto r = admin_exchange(std::move(host), std::move(port), "PUT", "/admin/api/posix-layout",
+                            raw, key);
+    if (r.status != 200) {
+      std::cerr << "posix-layout set failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  std::cerr << "usage: admin posix-layout show|set ...\n";
   return 2;
 }
 
@@ -1223,6 +1280,14 @@ int run_admin_console(std::string host, std::string port, const std::string& key
         while (iss >> tok) a.push_back(tok);
       }
       rc = cmd_admin_backup(host, port, key, a);
+    } else if (line == "posix-layout" || line.rfind("posix-layout ", 0) == 0) {
+      std::vector<std::string> a{"posix-layout"};
+      if (line.size() > 12) {
+        std::istringstream iss(line.substr(13));
+        std::string tok;
+        while (iss >> tok) a.push_back(tok);
+      }
+      rc = cmd_admin_posix_layout(host, port, key, a);
     } else {
       std::cout << "unknown: " << line << "\n";
       admin_console_help();
@@ -1378,6 +1443,8 @@ int main(int argc, char** argv) {
         return cmd_admin_archive(host, port, args.cluster_key, args.positional);
       if (sub == "backup")
         return cmd_admin_backup(host, port, args.cluster_key, args.positional);
+      if (sub == "posix-layout")
+        return cmd_admin_posix_layout(host, port, args.cluster_key, args.positional);
       if (sub == "s3-cred")
         return cmd_admin_s3_cred(host, port, args.cluster_key, args.positional);
       if (sub == "quota") return cmd_admin_quota(host, port, args.cluster_key, args.positional);

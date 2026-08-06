@@ -1,11 +1,14 @@
 #pragma once
 
+#include "client/put_layout.hpp"
 #include "client/session.hpp"
+#include "config.hpp"
 #include "posix/aios_posix.h"
 #include "posix/qos_controller.hpp"
 #include "posix/quota_ledger.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -92,6 +95,7 @@ class DirTable {
   void unlink(const std::string& name);
   void rename_same(const std::string& old_name, const std::string& new_name);
   void compact_if_needed();
+  void set_put_layout(PutLayout layout) { put_layout_ = std::move(layout); }
 
   // Mutable entry map for planning a transactional compact rewrite.
   std::unordered_map<std::string, uint64_t>& mutable_entries() { return entries_; }
@@ -116,6 +120,7 @@ class DirTable {
   uint64_t log_bytes_{0};
   uint64_t snapshot_op_{0};
   uint64_t meta_cas_{0};
+  PutLayout put_layout_{};
 
   void store_meta();
   void apply_record(uint64_t op_id, uint32_t op, const std::vector<std::string>& args);
@@ -138,6 +143,8 @@ struct FsState {
   int rstat_interval_ms{60000};
   std::atomic<bool> rstat_stop{false};
   std::thread rstat_thread;
+  std::vector<PosixLayoutRule> layout_rules;
+  std::chrono::steady_clock::time_point layout_rules_loaded{};
   std::unique_ptr<QuotaLedger> quota;
   std::unique_ptr<QosController> qos;
 
@@ -158,7 +165,9 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
                      uint64_t new_parent, const std::string& new_name);
 
 InodeMeta load_inode(FsState& st, uint64_t ino);
-void store_inode(FsState& st, InodeMeta& m);
+// path_for_layout: use when the dentry is not linked yet (create/mkdir).
+void store_inode(FsState& st, InodeMeta& m,
+                 const std::optional<std::string>& path_for_layout = std::nullopt);
 uint64_t alloc_ino(FsState& st);
 void ensure_super(FsState& st);
 void ensure_root(FsState& st);

@@ -52,7 +52,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/archive.md`](proto/archive.md) / [`proto/backup.md`](proto/backup.md) (cold archive & backup), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/archive.md`](proto/archive.md) / [`proto/backup.md`](proto/backup.md) (cold archive & backup), [`proto/quota.md`](proto/quota.md) / [`proto/qos.md`](proto/qos.md) (quotas & QoS), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
 
 ---
 
@@ -67,6 +67,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - [Storage targets (`.aios`)](#storage-targets-aios)
 - [Placement, storage classes, and layout](#placement-storage-classes-and-layout)
 - [Cold archive and backup](#cold-archive-and-backup)
+- [Quotas and QoS](#quotas-and-qos)
 - [HTTP object API](#http-object-api)
 - [S3-compatible API](#s3-compatible-api)
 - [Local object store](#local-object-store)
@@ -99,6 +100,8 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - **Class transitions** (`transition_rules`): background tip migration between classes (e.g. `nvme` → `hdd`)
 - **Cold archive**: pack many tips into large bag objects, freeze stubs, optional ZSTD + AES-256-GCM, drain bags to tape/S3/XRootD
 - **Backup**: crash-consistent POSIX/VBD snapshots (whole volume or subtree), then pack + drain via the same bag path; YAML rules and live GFS policies
+- **Soft quotas**: per-uid / per-gid / project-subtree byte limits on a POSIX volume (FUSE + S3); `-EDQUOT` / S3 `403 QuotaExceeded`
+- **Soft QoS**: per-uid / per-gid / project IOPS and bandwidth token buckets on the same path; `-EAGAIN` / S3 `503 SlowDown`
 
 **HTTP API** (`http_listen`, default `:7480`)
 
@@ -121,6 +124,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - Status JSON file, HMAC shared-secret auth on gossip/RPC/HTTP
 - Admin web UI + JSON API + Prometheus (`/admin/`, `/admin/api/*`, `/metrics`); login with cluster key; application labels for per-workload OPS
 - Archive pack/drain/recall and backup run/snapshot/live policies from CLI and the Actions panel
+- **Quotas** and **QoS** admin tabs / CLI for soft limits on the POSIX volume
 - Optional Intel ISA-L Reed–Solomon for EC with `m > 1`
 
 **Kernel (AlmaLinux 9 / 5.14)**
@@ -273,7 +277,7 @@ status_file: "/tmp/aios-a.json"
 
 Enable on selected nodes with `admin: true` / `--admin`.
 
-**Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config / actions, plus **S3 credentials** (when `s3_listen` is enabled) and **Quotas** (soft uid/gid + project/subtree). Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
+**Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config / actions, plus **S3 credentials** (when `s3_listen` is enabled), **Quotas**, and **QoS**. Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
 
 Also exposes JSON (`/admin/status|ops|config|cluster|…`, cookie-aware `/admin/api/*`) and Prometheus `/metrics` (optionally unauthenticated via `admin_metrics_public`). OPS counters are process-local; use `aios admin cluster` to sum them across peers.
 
@@ -287,7 +291,7 @@ aios --cluster-key "$KEY" --endpoint 127.0.0.1:7480 admin qos show
 
 Clients may tag traffic with `x-aios-app-label` / `--app-label` / `SessionConfig::app_label` for per-workload OPS counters. Reserved frontend labels: `s3`, `fs` (FUSE/posix), `vbd` (block) — see admin `io_frontends`.
 
-Soft quotas (uid/gid + optional project subtrees): [`proto/quota.md`](proto/quota.md). Soft IOPS/bandwidth QoS (FUSE/S3): [`proto/qos.md`](proto/qos.md). Optional whole-object ZSTD compression (`compression: zstd`); overall ratio is in `/admin/ops` → `compression.ratio`. Details: [`proto/admin.md`](proto/admin.md).
+Soft quotas and QoS (FUSE + S3): see [Quotas and QoS](#quotas-and-qos) and [`proto/quota.md`](proto/quota.md) / [`proto/qos.md`](proto/qos.md). Optional whole-object ZSTD compression (`compression: zstd`); overall ratio is in `/admin/ops` → `compression.ratio`. Details: [`proto/admin.md`](proto/admin.md).
 
 ---
 
@@ -460,6 +464,53 @@ aios admin backup policy set --volume default --path /home --at 00:00 \
 ```
 
 Admin HTTP/UI: pack/drain/recall and backup run/snapshot/policies under `/admin` (see [`proto/admin.md`](proto/admin.md)).
+
+---
+
+## Quotas and QoS
+
+Logical limits on a **POSIX volume** (shared by FUSE and the S3 gateway). Both are **soft / delayed**: each node admits or denies on the local write/read path from durable limit objects, then flushes usage (quotas) or observes rates (QoS) asynchronously. Details: [`proto/quota.md`](proto/quota.md), [`proto/qos.md`](proto/qos.md).
+
+Identity uses the same domains:
+
+| Domain | Key | Used for |
+|--------|-----|----------|
+| Volume | `project_id = 0` | Per-uid and optional per-gid limits |
+| Project | `project_id > 0` | Subtree rooted at a directory; total + optional per-uid / per-gid inside the project |
+
+Inodes inherit `project_id` from the parent on create; cross-project rename updates it (see [Special / virtual attributes](#special--virtual-attributes)). Nested projects are not supported in v1. Volume name defaults to `s3_volume` when S3 is enabled, else `default`.
+
+### Quotas (stored bytes)
+
+Durable objects: `quota/{volume}/limits` (admin) and `quota/{volume}/usage` (aggregated deltas). On file grow (`write` / `truncate` up), posix returns **`-EDQUOT`** if any applicable limit would be exceeded; S3 maps that to **`403 QuotaExceeded`**. Shrinks and deletes always apply (negative deltas).
+
+```bash
+aios admin quota show
+aios admin quota set --uid 1001 --bytes 10G
+aios admin quota set --gid 100 --bytes 50G
+aios admin quota set --uid 1001 --clear
+aios admin quota project create --name photos --root-ino 42 --bytes 20G
+aios admin quota project set --id 1 --uid 1001 --bytes 5G
+aios admin quota project delete --id 1
+aios admin quota reconcile
+```
+
+HTTP: `GET/PUT /admin/api/quota…`, project create/set/delete, `POST …/reconcile`. Web UI: **Quotas** tab.
+
+### QoS (IOPS / bandwidth)
+
+Node-local **token buckets** on the same posix read/write choke point S3 uses. Limits live in `qos/{volume}/limits` (`iops` ops/s, `bps` bytes/s). A request is denied if **any** applicable bucket lacks tokens → posix **`-EAGAIN`**, S3 **`503 SlowDown`**. Project QoS reuses quota project ids (no separate QoS project create).
+
+```bash
+aios admin qos show
+aios admin qos set --uid 1001 --iops 1000 --bps 100M
+aios admin qos set --gid 100 --iops 5000
+aios admin qos set --uid 1001 --clear
+aios admin qos project set --id 1 --iops 2000 --bps 50M
+aios admin qos project set --id 1 --uid 1001 --iops 100
+```
+
+`GET /admin/api/qos` returns configured limits plus node OPS rates and observed posix admit windows. Web UI: **QoS** tab.
 
 ---
 
@@ -667,13 +718,14 @@ Wire format, append, and API notes: [`proto/stl_client.md`](proto/stl_client.md)
 
 ## POSIX filesystem + FUSE3
 
-`libaios_posix` implements a hierarchical filesystem on AIOS objects with a **C ABI** ([`src/posix/aios_posix.h`](src/posix/aios_posix.h)) aimed at a future kernel port:
+`libaios_posix` implements a hierarchical filesystem on AIOS objects with a **C ABI** ([`src/posix/aios_posix.h`](src/posix/aios_posix.h)), used by FUSE and the kernel `aiosfs` upcall path (`aios-kbridge`):
 
 - **Inode 1** is `/`
-- Directories use an append-only **dentry changelog**
+- Directories use an append-only **dentry changelog** (no dedicated MDS — meta is ordinary objects)
 - File data is **chunk-striped** (`posix/{vol}/data/{ino}/c/{chunk}`, default 1 MiB chunks, parallel PUTs bounded by `stripe_width`)
 - Stored **xattrs** in inode meta, **hard links** (files only), **flock** via AIOS locks on the inode object
 - **Parent pointers** (`parent_ino`) and lazy **recursive directory stats** (see below)
+- **Subtree layout rules** place meta vs data independently by path prefix; cross-domain `rename` returns `EXDEV` (copy)
 - Volume / subtree **snapshots** for backup (`aios_posix_snapshot` / `snapshot_at`)
 
 Cross-directory `rename` uses a multi-object `/txn` compact rewrite of both directory tips; cross-directory `link` remains best-effort. Details: [`proto/posix_fuse.md`](proto/posix_fuse.md).
@@ -711,6 +763,29 @@ getfattr -d /mnt/aios/home    # includes aios.rbytes, aios.rfiles, aios.rdirs, a
 **Projects:** `project_id` is copied from the parent on create and updated on cross-project rename. Soft uid/gid and project quotas / QoS use it — see [`proto/quota.md`](proto/quota.md), [`proto/qos.md`](proto/qos.md).
 
 **Object-store attrs** on cold-archived tips (`aios.frozen`, `aios.bag_id`, `aios.archive_state`, …) live on the underlying object tip, not as POSIX xattrs — see [Cold archive and backup](#cold-archive-and-backup).
+
+### Subtree meta/data layout
+
+Configure longest-match **path** rules (optionally per `volume`) so inode/dir tips and file chunks land on different `storage_class` / layouts:
+
+```yaml
+posix_layout_rules:
+  - path: /
+    meta: { layout: replica, storage_class: nvme }
+    data: { layout: replica, storage_class: hdd }
+  - path: /scratch
+    meta: { storage_class: nvme }
+    data: { storage_class: hdd }
+```
+
+YAML seeds cluster object `posix/layout_rules` when empty. Live edits:
+
+```bash
+aios admin posix-layout show
+aios admin posix-layout set --file rules.json
+```
+
+Web UI: **POSIX layout** tab. Mounts refresh rules about every 30s. Rename between paths whose matched meta/data placement differs returns **`EXDEV`** so `mv`/`cp` fall back to copy.
 
 ---
 

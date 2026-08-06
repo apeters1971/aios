@@ -41,6 +41,7 @@
         <button type="button" data-tab="s3" class="tab">S3 credentials</button>
         <button type="button" data-tab="quota" class="tab">Quotas</button>
         <button type="button" data-tab="qos" class="tab">QoS</button>
+        <button type="button" data-tab="posix-layout" class="tab">POSIX layout</button>
       </nav>
       <button type="button" id="logout-btn" class="btn ghost">Log out</button>
     </header>
@@ -219,6 +220,20 @@
           <button type="submit" class="btn primary">Set project limit</button>
         </form>
         <p id="qos-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-posix-layout" class="panel hidden">
+        <h2>POSIX layout</h2>
+        <p class="note">Path-prefix rules for meta (inodes/dir tips) vs data (chunks). Longest match wins. Live rules are stored as cluster object <code>posix/layout_rules</code> (YAML seeds when empty). Rename across differing domains returns <code>EXDEV</code> so clients copy.</p>
+        <div id="posix-layout-table" class="table-wrap"></div>
+        <h3>Replace rules (JSON)</h3>
+        <textarea id="posix-layout-json" class="code-block" rows="14" spellcheck="false"></textarea>
+        <div class="btn-row">
+          <button type="button" id="posix-layout-reload" class="btn">Reload</button>
+          <button type="button" id="posix-layout-save" class="btn primary">Save</button>
+        </div>
+        <pre id="posix-layout-result" class="code-block small hidden"></pre>
+        <p id="posix-layout-error" class="error" hidden></p>
       </section>
     </main>
   </div>

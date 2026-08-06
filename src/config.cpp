@@ -48,6 +48,64 @@ bool valid_storage_class_name(const std::string& s) {
   return true;
 }
 
+bool validate_posix_layout_spec(PosixLayoutSpec& spec, const Config& cfg, const char* which,
+                                std::string& err) {
+  if (!spec.layout.empty()) {
+    spec.layout = lower_copy(spec.layout);
+    if (spec.layout != "replica" && spec.layout != "ec") {
+      err = std::string("posix_layout_rules ") + which + " layout must be 'replica' or 'ec'";
+      return false;
+    }
+  }
+  if (spec.storage_class) {
+    *spec.storage_class = lower_copy(*spec.storage_class);
+    if (!valid_storage_class_name(*spec.storage_class)) {
+      err = std::string("posix_layout_rules ") + which + " storage_class must match [a-z0-9_-]+";
+      return false;
+    }
+  }
+  if (spec.layout == "ec") {
+    const int k = spec.ec_k.value_or(cfg.ec_k);
+    const int m = spec.ec_m.value_or(cfg.ec_m);
+    if (k < 1 || m < 1) {
+      err = std::string("posix_layout_rules ") + which + " ec_k and ec_m must be >= 1";
+      return false;
+    }
+    std::string codec = spec.ec_codec.value_or(cfg.ec_codec);
+    if (!validate_ec_codec_choice(m, codec, err)) {
+      err = std::string("posix_layout_rules ") + which + ": " + err;
+      return false;
+    }
+    if (spec.ec_codec.has_value()) spec.ec_codec = codec;
+  }
+  return true;
+}
+
+bool validate_posix_layout_rule(PosixLayoutRule& rule, const Config& cfg, std::string& err) {
+  if (rule.path.empty() || rule.path[0] != '/') {
+    err = "posix_layout_rules path must start with /";
+    return false;
+  }
+  while (rule.path.size() > 1 && rule.path.back() == '/') rule.path.pop_back();
+  if (rule.volume) *rule.volume = lower_copy(*rule.volume);
+  if (!validate_posix_layout_spec(rule.meta, cfg, "meta", err)) return false;
+  if (!validate_posix_layout_spec(rule.data, cfg, "data", err)) return false;
+  return true;
+}
+
+bool parse_posix_layout_spec_yaml(const YAML::Node& node, PosixLayoutSpec& spec, std::string& err) {
+  if (!node || !node.IsMap()) {
+    err = "posix_layout_rules meta/data must be a mapping";
+    return false;
+  }
+  if (node["layout"]) spec.layout = node["layout"].as<std::string>();
+  if (node["storage_class"]) spec.storage_class = node["storage_class"].as<std::string>();
+  if (node["ec_k"]) spec.ec_k = node["ec_k"].as<int>();
+  if (node["ec_m"]) spec.ec_m = node["ec_m"].as<int>();
+  if (node["ec_codec"]) spec.ec_codec = node["ec_codec"].as<std::string>();
+  return true;
+}
+
 bool validate_layout_rule(LayoutRule& rule, const Config& cfg, std::string& err) {
   rule.layout = lower_copy(rule.layout);
   if (rule.layout != "replica" && rule.layout != "ec") {
@@ -371,6 +429,33 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
         cfg.layout_rules.push_back(std::move(rule));
       }
     }
+    if (root["posix_layout_rules"]) {
+      if (!root["posix_layout_rules"].IsSequence()) {
+        err = "posix_layout_rules must be a sequence";
+        return false;
+      }
+      cfg.posix_layout_rules.clear();
+      for (const auto& node : root["posix_layout_rules"]) {
+        if (!node.IsMap()) {
+          err = "posix_layout_rules entries must be mappings";
+          return false;
+        }
+        if (!node["path"]) {
+          err = "posix_layout_rules entries require path";
+          return false;
+        }
+        PosixLayoutRule rule;
+        rule.path = node["path"].as<std::string>();
+        if (node["volume"]) rule.volume = node["volume"].as<std::string>();
+        if (node["meta"]) {
+          if (!parse_posix_layout_spec_yaml(node["meta"], rule.meta, err)) return false;
+        }
+        if (node["data"]) {
+          if (!parse_posix_layout_spec_yaml(node["data"], rule.data, err)) return false;
+        }
+        cfg.posix_layout_rules.push_back(std::move(rule));
+      }
+    }
     if (root["transition_rules"]) {
       if (!root["transition_rules"].IsSequence()) {
         err = "transition_rules must be a sequence";
@@ -683,6 +768,9 @@ bool normalize_config(Config& cfg, std::string& err) {
 
   for (auto& rule : cfg.layout_rules) {
     if (!validate_layout_rule(rule, cfg, err)) return false;
+  }
+  for (auto& rule : cfg.posix_layout_rules) {
+    if (!validate_posix_layout_rule(rule, cfg, err)) return false;
   }
   for (auto& rule : cfg.transition_rules) {
     if (!validate_transition_rule(rule, cfg, err)) return false;

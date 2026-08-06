@@ -1,13 +1,17 @@
 #include "test_helpers.hpp"
 
+#include "client/session.hpp"
 #include "http/http_server.hpp"
 #include "posix/aios_posix.h"
+
+#include <nlohmann/json.hpp>
 
 #include <boost/asio.hpp>
 
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <errno.h>
 #include <string>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -63,6 +67,26 @@ int test_posix_fs() {
   cfg.stripe_width = 2;
   cfg.uid = 1000;
   cfg.gid = 1000;
+
+  // Seed path layout rules before mount so the first refresh sees them.
+  {
+    aios::SessionConfig sc;
+    sc.endpoint = ep;
+    sc.cluster_key = http.fx.cfg.cluster_key;
+    aios::Session sess(std::move(sc));
+    // Domains differ via layout field only (both use the fixture's nvme targets).
+    nlohmann::json doc{
+        {"aios_posix_layout", 1},
+        {"rules",
+         nlohmann::json::array(
+             {{{"path", "/"},
+               {"meta", {{"storage_class", "nvme"}}},
+               {"data", {{"storage_class", "nvme"}}}},
+              {{"path", "/cold"},
+               {"meta", {{"layout", "replica"}, {"storage_class", "nvme"}}},
+               {"data", {{"layout", "replica"}, {"storage_class", "nvme"}}}}})}};
+    sess.put_bytes("posix/layout_rules", doc.dump());
+  }
 
   int err = 0;
   aios_posix_fs* fs = aios_posix_mount(&cfg, &err);
@@ -260,6 +284,17 @@ int test_posix_fs() {
   expect(aios_posix_rmdir(fs, roll, "nested") == 0, "rmdir nested");
   expect(aios_posix_rmdir(fs, 1, "roll") == 0, "rmdir roll");
   expect(aios_posix_rmdir(fs, 1, "roll2") == 0, "rmdir roll2");
+
+  // Cross layout-domain rename must return EXDEV (copy, don't move tips).
+  expect(aios_posix_mkdir(fs, 1, "cold", 0755, &st) == 0, "mkdir cold");
+  const uint64_t cold_ino = st.ino;
+  expect(aios_posix_create(fs, 1, "warm.txt", 0644, &st) == 0, "create warm");
+  expect(aios_posix_rename(fs, 1, "warm.txt", cold_ino, "warm.txt") == -EXDEV,
+         "rename across layout domains EXDEV");
+  expect(aios_posix_rename(fs, 1, "warm.txt", 1, "warm2.txt") == 0,
+         "rename within same layout domain");
+  expect(aios_posix_unlink(fs, 1, "warm2.txt") == 0, "unlink warm2");
+  expect(aios_posix_rmdir(fs, 1, "cold") == 0, "rmdir cold");
 
   aios_posix_unmount(fs);
   return failures();

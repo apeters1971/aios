@@ -166,6 +166,7 @@ add_library(aios_core STATIC
   src/http/quota_admin.cpp
   src/http/qos_admin.cpp
   src/http/backup_policy.cpp
+  src/http/posix_layout_store.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
   src/metrics/qos_rates.cpp
@@ -226,6 +227,7 @@ target_link_libraries(aios_client PUBLIC aios_core)
 
 add_library(aios_posix STATIC
   src/posix/posix_fs.cpp
+  src/posix/posix_layout.cpp
   src/posix/posix_rstat.cpp
   src/posix/quota_ledger.cpp
   src/posix/qos_controller.cpp

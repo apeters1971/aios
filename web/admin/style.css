@@ -283,6 +283,15 @@ tr:last-child td { border-bottom: 0; }
   background: #1a2a33;
 }
 
+textarea.code-block {
+  display: block;
+  width: 100%;
+  max-width: 52rem;
+  border: 1px solid var(--border, #2a3a44);
+  resize: vertical;
+  box-sizing: border-box;
+}
+
 .note {
   color: var(--muted);
   margin: 0 0 1rem;

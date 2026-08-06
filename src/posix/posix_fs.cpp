@@ -1,5 +1,6 @@
 #include "posix/aios_posix.h"
 #include "posix/posix_internal.hpp"
+#include "posix/posix_layout.hpp"
 
 #include "client/changelog.hpp"
 #include "metrics/frontend_io.hpp"
@@ -287,7 +288,7 @@ void DirTable::store_meta() {
                    {"log_bytes", log_bytes_},
                    {"snapshot_op", snapshot_op_},
                    {"snapshot_oid", snap_oid_}};
-  meta_cas_ = session_.put_bytes(meta_oid_, j.dump(), {}, meta_cas_);
+  meta_cas_ = session_.put_bytes(meta_oid_, j.dump(), {}, meta_cas_, std::nullopt, put_layout_);
 }
 
 void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std::string>>>& ops) {
@@ -335,10 +336,10 @@ void DirTable::compact_if_needed() {
   nlohmann::json entries = nlohmann::json::object();
   for (const auto& [n, i] : entries_) entries[n] = i;
   nlohmann::json snap{{"entries", entries}};
-  session_.put_bytes(snap_oid_, snap.dump(), {}, std::nullopt);
+  session_.put_bytes(snap_oid_, snap.dump(), {}, std::nullopt, std::nullopt, put_layout_);
   snapshot_op_ = next_op_ - 1;
   // Truncate log by replacing with empty object.
-  session_.put_bytes(log_oid_, "", {}, std::nullopt);
+  session_.put_bytes(log_oid_, "", {}, std::nullopt, std::nullopt, put_layout_);
   log_bytes_ = 0;
   store_meta();
 }
@@ -597,10 +598,13 @@ InodeMeta load_inode(FsState& st, uint64_t ino) {
   return m;
 }
 
-void store_inode(FsState& st, InodeMeta& m) {
+void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& path_for_layout) {
+  const auto layout =
+      path_for_layout ? meta_layout_for_path(st, *path_for_layout) : meta_layout_for_ino(st, m.ino);
   for (int attempt = 0; attempt < 8; ++attempt) {
     try {
-      m.cas = st.session.put_bytes(ino_oid(st.volume, m.ino), inode_to_json(m), {}, m.cas);
+      m.cas = st.session.put_bytes(ino_oid(st.volume, m.ino), inode_to_json(m), {}, m.cas,
+                                   std::nullopt, layout);
       m.exists = true;
       std::lock_guard lock(st.mu);
       st.inode_cache[m.ino] = m;
@@ -804,10 +808,12 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
     }
     std::vector<std::thread> threads;
     std::atomic<int> err{0};
+    const auto data_layout = data_layout_for_ino(st, ino);
     for (auto& job : jobs) {
-      threads.emplace_back([&st, ino, &job, &err] {
+      threads.emplace_back([&st, ino, &job, &err, data_layout] {
         try {
-          st.session.put_bytes(chunk_oid(st.volume, ino, job.chunk), job.body, {}, std::nullopt);
+          st.session.put_bytes(chunk_oid(st.volume, ino, job.chunk), job.body, {}, std::nullopt,
+                               std::nullopt, data_layout);
         } catch (const client_error& e) {
           err.store(map_error(e));
         } catch (...) {
@@ -865,7 +871,8 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
         if (snap.exists) {
           if (snap.body.size() > keep) {
             snap.body.resize(static_cast<size_t>(keep));
-            st.session.put_bytes(chunk_oid(st.volume, ino, last), snap.body, {}, std::nullopt);
+            st.session.put_bytes(chunk_oid(st.volume, ino, last), snap.body, {}, std::nullopt,
+                                 std::nullopt, data_layout_for_ino(st, ino));
           }
         }
       } catch (const client_error& e) {
@@ -1105,6 +1112,7 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     if (dir.entries().count(name)) return -EEXIST;
     const uint64_t ino = aios::posix::alloc_ino(*fs->st);
@@ -1120,7 +1128,12 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    aios::posix::store_inode(*fs->st, m);
+    {
+      const std::string parent_path = aios::posix::path_of_ino(*fs->st, parent);
+      const std::string child_path =
+          parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
+      aios::posix::store_inode(*fs->st, m, child_path);
+    }
     dir.link(name, ino);
     pmeta.mtime_ns = pmeta.ctime_ns = ts;
     pmeta.nlink += 1;
@@ -1144,6 +1157,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     if (dir.entries().count(name)) return -EEXIST;
     const uint64_t ino = aios::posix::alloc_ino(*fs->st);
@@ -1159,7 +1173,12 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    aios::posix::store_inode(*fs->st, m);
+    {
+      const std::string parent_path = aios::posix::path_of_ino(*fs->st, parent);
+      const std::string child_path =
+          parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
+      aios::posix::store_inode(*fs->st, m, child_path);
+    }
     dir.link(name, ino);
     pmeta.mtime_ns = pmeta.ctime_ns = ts;
     aios::posix::store_inode(*fs->st, pmeta);
@@ -1181,6 +1200,7 @@ int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     auto it = dir.entries().find(name);
     if (it == dir.entries().end()) return -ENOENT;
@@ -1211,6 +1231,7 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
     if (!S_ISDIR(op.mode)) return -ENOTDIR;
     if (int ac = aios::posix::check_access(cred, op, kWantX)) return ac;
     aios::posix::DirTable old_dir(fs->st->session, fs->st->volume, old_parent);
+    old_dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, old_parent));
     old_dir.load();
     auto it = old_dir.entries().find(old_name);
     if (it == old_dir.entries().end()) return -ENOENT;
@@ -1220,6 +1241,7 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
     if (S_ISDIR(m.mode)) return -EPERM;
 
     aios::posix::DirTable new_dir(fs->st->session, fs->st->volume, new_parent);
+    new_dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, new_parent));
     new_dir.load();
     if (new_dir.entries().count(new_name)) return -EEXIST;
     auto np = aios::posix::load_inode(*fs->st, new_parent);
@@ -1252,6 +1274,7 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
     aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     auto it = dir.entries().find(name);
     if (it == dir.entries().end()) return -ENOENT;
@@ -1260,6 +1283,7 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     if (!m.exists || !S_ISDIR(m.mode)) return -ENOTDIR;
     if (int ac = aios::posix::check_sticky_unlink(cred, pmeta, m)) return ac;
     aios::posix::DirTable child(fs->st->session, fs->st->volume, ino);
+    child.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, ino));
     child.load();
     if (!child.entries().empty()) return -ENOTEMPTY;
     dir.unlink(name);
@@ -1296,8 +1320,22 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
     if (!S_ISDIR(np_meta.mode)) return -ENOTDIR;
     if (int ac = aios::posix::check_access(cred, np_meta, kWantW | kWantX)) return ac;
 
+    // Cross layout-rule rename is not in-place; clients should copy (EXDEV).
+    {
+      auto join_path = [](const std::string& dir, const char* name) {
+        if (dir == "/") return std::string("/") + name;
+        return dir + "/" + name;
+      };
+      const std::string src =
+          join_path(aios::posix::path_of_ino(*fs->st, old_parent), old_name);
+      const std::string dst =
+          join_path(aios::posix::path_of_ino(*fs->st, new_parent), new_name);
+      if (aios::posix::layout_domains_differ(*fs->st, src, dst)) return -EXDEV;
+    }
+
     if (old_parent == new_parent) {
       aios::posix::DirTable dir(fs->st->session, fs->st->volume, old_parent);
+      dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, old_parent));
       dir.load();
       auto oit = dir.entries().find(old_name);
       if (oit == dir.entries().end()) return -ENOENT;

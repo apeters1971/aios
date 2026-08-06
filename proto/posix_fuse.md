@@ -57,6 +57,19 @@ Exposed as **virtual** xattrs on directories (not writable): `aios.rbytes`, `aio
 
 `aios_posix_flock(ino, op)` maps `LOCK_SH` / `LOCK_EX` / `LOCK_UN` (+ optional `LOCK_NB`) onto exclusive AIOS object locks on the inode OID. Shared and exclusive are both exclusive at the cluster layer. Tokens are tracked per mount and released on `LOCK_UN` / unmount / inode delete. Non-blocking contention returns `-EWOULDBLOCK`.
 
+## Subtree layout (meta vs data)
+
+POSIX mounts apply **path-prefix** placement rules (longest match) separately for:
+
+- **meta** — inode JSON and directory tips (`posix/{vol}/ino/…`, `dir/…`)
+- **data** — file chunks (`posix/{vol}/data/…`)
+
+Rules live in cluster object `posix/layout_rules` (YAML `posix_layout_rules` seeds when empty). Edit via `aios admin posix-layout show|set` or the Web UI **POSIX layout** tab. Each rule may set `layout` (`replica`/`ec`), `storage_class`, and EC fields; omitted fields use cluster defaults. Optional `volume` scopes a rule.
+
+**Rename across domains:** if the source and destination paths match rules whose meta/data placement differs, `rename` returns **`-EXDEV`** so tools copy instead of moving tips across storage classes/layouts. Same-domain rename (including cross-directory `/txn`) is unchanged.
+
+There is **no dedicated MDS**: directory and inode metadata are regular objects with changelog tips, placed by the same rules as above.
+
 ## Cross-directory rename
 
 Uses the cluster **multi-object transaction** API (`POST /txn` … commit):

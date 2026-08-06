@@ -554,6 +554,14 @@ nlohmann::json HttpServer::admin_config_json() const {
                        {"bag_compression_level", r.bag_compression_level},
                        {"bag_encryption", r.bag_encryption}});
   }
+  nlohmann::json posix_layout_seed = nlohmann::json::array();
+  for (const auto& r : c.posix_layout_rules) {
+    posix_layout_seed.push_back(PosixLayoutStore::rule_to_json(r));
+  }
+  nlohmann::json posix_layout_live = nlohmann::json::array();
+  if (posix_layout_) {
+    posix_layout_live = posix_layout_->list_json()["posix_layout_rules"];
+  }
   return nlohmann::json{
       {"node_id", c.node_id},
       {"listen", c.listen},
@@ -582,6 +590,8 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"max_ec_m", c.max_ec_m},
       {"max_replica_count", c.max_replica_count},
       {"layout_rules", std::move(rules)},
+      {"posix_layout_rules_seed", std::move(posix_layout_seed)},
+      {"posix_layout_rules", std::move(posix_layout_live)},
       {"transition_rules", std::move(transitions)},
       {"archive_rules", std::move(archives)},
       {"backup_rules", std::move(backups)},
@@ -635,7 +645,8 @@ nlohmann::json HttpServer::admin_status_json() const {
 HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
                        MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam,
                        std::shared_ptr<QuotaAdminStore> quota, std::shared_ptr<QosAdminStore> qos,
-                       std::shared_ptr<BackupPolicyStore> backup_policies)
+                       std::shared_ptr<BackupPolicyStore> backup_policies,
+                       std::shared_ptr<PosixLayoutStore> posix_layout)
     : ioc_(ioc),
       cfg_(std::move(cfg)),
       objects_(objects),
@@ -644,6 +655,7 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& 
       quota_(std::move(quota)),
       qos_(std::move(qos)),
       backup_policies_(std::move(backup_policies)),
+      posix_layout_(std::move(posix_layout)),
       acceptor_(ioc) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
@@ -1030,6 +1042,64 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             continue;
           }
           write_json(*sock, 200, "OK", {{"ok", true}, {"oid", oid}}, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "GET" && path == "/admin/api/posix-layout") {
+        if (!posix_layout_) {
+          write_json(*sock, 503, "Unavailable", {{"error", "posix layout admin disabled"}},
+                     keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", posix_layout_->list_json(), keep_alive);
+        continue;
+      }
+      if (method == "PUT" && path == "/admin/api/posix-layout") {
+        if (!posix_layout_) {
+          write_json(*sock, 503, "Unavailable", {{"error", "posix layout admin disabled"}},
+                     keep_alive);
+          continue;
+        }
+        try {
+          const std::string raw =
+              body.empty() ? "{}"
+                           : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+          auto j = nlohmann::json::parse(raw);
+          nlohmann::json arr;
+          if (j.is_array()) {
+            arr = j;
+          } else if (j.contains("posix_layout_rules") && j["posix_layout_rules"].is_array()) {
+            arr = j["posix_layout_rules"];
+          } else if (j.contains("rules") && j["rules"].is_array()) {
+            arr = j["rules"];
+          } else {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "expected rules array or {posix_layout_rules:[...]}"}},
+                       keep_alive);
+            continue;
+          }
+          std::vector<PosixLayoutRule> rules;
+          std::string err;
+          bool bad = false;
+          for (const auto& jr : arr) {
+            PosixLayoutRule r;
+            if (!PosixLayoutStore::rule_from_json(jr, r, err)) {
+              bad = true;
+              break;
+            }
+            rules.push_back(std::move(r));
+          }
+          if (bad) {
+            write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+            continue;
+          }
+          if (!posix_layout_->replace_all(std::move(rules), err)) {
+            write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK", posix_layout_->list_json(), keep_alive);
         } catch (...) {
           write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
         }

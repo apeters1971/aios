@@ -208,6 +208,7 @@
     if (activeTab === "s3") await refreshS3();
     if (activeTab === "quota") await refreshQuota();
     if (activeTab === "qos") await refreshQos();
+    if (activeTab === "posix-layout") await refreshPosixLayout();
     if (activeTab === "actions") await refreshArchiveBackup();
   }
 
@@ -372,7 +373,73 @@
     if (btn.dataset.tab === "s3") refreshS3().catch(() => {});
     if (btn.dataset.tab === "quota") refreshQuota().catch(() => {});
     if (btn.dataset.tab === "qos") refreshQos().catch(() => {});
+    if (btn.dataset.tab === "posix-layout") refreshPosixLayout().catch(() => {});
     if (btn.dataset.tab === "actions") refreshArchiveBackup().catch(() => {});
+  });
+
+  function renderPosixLayout(doc) {
+    const rules = (doc && doc.posix_layout_rules) || [];
+    const rows = rules
+      .map((r) => {
+        const meta = r.meta || {};
+        const data = r.data || {};
+        const fmt = (s) =>
+          [s.layout || "—", s.storage_class || "—"].join(" / ");
+        return `<tr><td>${r.path || "/"}</td><td>${r.volume || "*"}</td><td>${fmt(
+          meta
+        )}</td><td>${fmt(data)}</td></tr>`;
+      })
+      .join("");
+    document.getElementById("posix-layout-table").innerHTML =
+      `<table><thead><tr><th>Path</th><th>Volume</th><th>Meta</th><th>Data</th></tr></thead><tbody>${
+        rows || "<tr><td colspan=4>No rules (cluster defaults)</td></tr>"
+      }</tbody></table>`;
+    document.getElementById("posix-layout-json").value = JSON.stringify(
+      { posix_layout_rules: rules },
+      null,
+      2
+    );
+  }
+
+  async function refreshPosixLayout() {
+    const { res, json } = await api("/admin/api/posix-layout");
+    if (res.status === 401) {
+      showLogin("Session expired — sign in again.");
+      return;
+    }
+    if (res.ok) renderPosixLayout(json);
+    else renderPosixLayout({ posix_layout_rules: [] });
+  }
+
+  document.getElementById("posix-layout-reload").addEventListener("click", () => {
+    refreshPosixLayout().catch(() => {});
+  });
+
+  document.getElementById("posix-layout-save").addEventListener("click", async () => {
+    const errEl = document.getElementById("posix-layout-error");
+    const out = document.getElementById("posix-layout-result");
+    errEl.hidden = true;
+    out.classList.add("hidden");
+    let body;
+    try {
+      body = JSON.parse(document.getElementById("posix-layout-json").value);
+    } catch (e) {
+      errEl.hidden = false;
+      errEl.textContent = "Invalid JSON";
+      return;
+    }
+    const { res, json } = await api("/admin/api/posix-layout", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Save failed";
+      return;
+    }
+    renderPosixLayout(json);
+    out.classList.remove("hidden");
+    out.textContent = "Saved.";
   });
 
   async function qosPutLimits(body) {

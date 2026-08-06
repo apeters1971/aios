@@ -38,6 +38,16 @@ placement:
 #     ec_k: 2
 #     ec_m: 1
 #     ec_codec: xor
+# POSIX path → meta/data placement (longest path match). Seeds cluster object
+# posix/layout_rules when empty; edit live via CLI/UI. Rename across differing
+# domains returns EXDEV so tools copy instead of moving tips in place.
+# posix_layout_rules:
+#   - path: /
+#     meta: { layout: replica, storage_class: nvme }
+#     data: { layout: replica, storage_class: hdd }
+#   - path: /scratch
+#     meta: { storage_class: nvme }
+#     data: { storage_class: hdd }
 # Background tip migration between storage classes:
 # transition_rules:
 #   - prefix: "cold/"

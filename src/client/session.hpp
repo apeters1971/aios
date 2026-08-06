@@ -1,6 +1,7 @@
 #pragma once
 
 #include "client/error.hpp"
+#include "client/put_layout.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -81,10 +82,12 @@ class Session {
   // Generic full PUT. If expected_cas has_value, uses attr aios.posix.cas:
   // nullopt = unconditional; 0 = create-if-absent; N = require cas==N, write N+1.
   // Returns new cas (0 if CAS not used).
+  // Optional PutLayout sets x-aios-layout / storage-class / ec-* on the request.
   std::uint64_t put_bytes(const std::string& oid, const std::string& body,
                           const std::unordered_map<std::string, std::string>& attrs = {},
                           std::optional<std::uint64_t> expected_cas = std::nullopt,
-                          const std::optional<std::string>& lock_token = std::nullopt);
+                          const std::optional<std::string>& lock_token = std::nullopt,
+                          const PutLayout& layout = {});
 
   // Partial PUT via Content-Range (replica tips only on server).
   void put_range(const std::string& oid, std::uint64_t offset, const std::string& data,

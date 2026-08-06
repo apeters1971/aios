@@ -118,9 +118,12 @@ void GossipEngine::start() {
       quota_ = std::make_shared<QuotaAdminStore>(cfg_, *object_service_);
       qos_ = std::make_shared<QosAdminStore>(cfg_, *object_service_);
       backup_policies_ = std::make_shared<BackupPolicyStore>(cfg_, *object_service_);
+      posix_layout_ = std::make_shared<PosixLayoutStore>(cfg_, *object_service_);
+      posix_layout_->seed_from_config_if_empty();
     }
     http_server_ = std::make_unique<HttpServer>(ioc_, cfg_, *object_service_, membership_,
-                                                s3_iam_, quota_, qos_, backup_policies_);
+                                                s3_iam_, quota_, qos_, backup_policies_,
+                                                posix_layout_);
     http_server_->start();
     if (cfg_.admin) {
       AIOS_LOG_INFO("admin API enabled on ", cfg_.http_listen,

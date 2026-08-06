@@ -61,8 +61,10 @@ Logout: `POST /admin/logout`.
 | `POST /admin/api/quota/reconcile` | cookie **or** HMAC | Rebuild usage from inodes |
 | `GET /admin/api/qos` | cookie **or** HMAC | Soft IOPS/BW limits + monitoring rates |
 | `PUT /admin/api/qos/limits` | cookie **or** HMAC | `{uid\|gid\|project_id, iops?, bps?, clear?}` |
+| `GET /admin/api/posix-layout` | cookie **or** HMAC | Live POSIX path → meta/data layout rules |
+| `PUT /admin/api/posix-layout` | cookie **or** HMAC | Replace rules (`{posix_layout_rules:[…]}` or array) |
 
-CLI: `aios admin archive …`, `aios admin backup …`, `aios admin s3-cred …`, `aios admin quota …`, `aios admin qos …`. Web UI: **Actions** (archive/backup), **S3 credentials** / **Quotas** / **QoS** tabs. See [`archive.md`](archive.md), [`backup.md`](backup.md), [`s3.md`](s3.md), [`quota.md`](quota.md), [`qos.md`](qos.md).
+CLI: `aios admin archive …`, `aios admin backup …`, `aios admin posix-layout …`, `aios admin s3-cred …`, `aios admin quota …`, `aios admin qos …`. Web UI: **Actions** (archive/backup), **S3 credentials** / **Quotas** / **QoS** / **POSIX layout** tabs. See [`archive.md`](archive.md), [`backup.md`](backup.md), [`posix_fuse.md`](posix_fuse.md), [`s3.md`](s3.md), [`quota.md`](quota.md), [`qos.md`](qos.md).
 
 ```bash
 aios admin archive show
@@ -76,9 +78,11 @@ aios admin backup snapshot vbd --pool rbd --name disk0
 aios admin backup policy set --volume default --path / --at 00:00 --keep-days 7 --keep-monthly 12
 aios admin backup policy list
 aios admin backup policy rm ID
+aios admin posix-layout show
+aios admin posix-layout set --file rules.json
 ```
 
-Archive **rules** are YAML-only (restart to change). Backup has YAML `backup_rules` plus live policies in cluster object `backup/policies` (CLI/UI CRUD, daily UTC + GFS retention).
+Archive **rules** are YAML-only (restart to change). Backup has YAML `backup_rules` plus live policies in cluster object `backup/policies` (CLI/UI CRUD, daily UTC + GFS retention). POSIX subtree layout uses YAML `posix_layout_rules` as seed plus live object `posix/layout_rules` (CLI/UI replace-all).
 
 ### Legacy JSON (CLI / HMAC)
 

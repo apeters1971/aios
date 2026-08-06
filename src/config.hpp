@@ -51,6 +51,24 @@ struct BackupRule {
   std::string bag_encryption{"none"};   // none | aes-256-gcm
 };
 
+// Per-request layout knobs for POSIX meta (ino/dir) vs data (chunks) under a path prefix.
+struct PosixLayoutSpec {
+  std::string layout;  // empty = omit (cluster default); "replica" | "ec"
+  std::optional<std::string> storage_class;
+  std::optional<int> ec_k;
+  std::optional<int> ec_m;
+  std::optional<std::string> ec_codec;
+};
+
+// Longest-match volume-relative path prefix (default configure "/").
+// Rename across rules that differ in meta/data placement returns EXDEV (copy instead).
+struct PosixLayoutRule {
+  std::string path{"/"};
+  std::optional<std::string> volume;  // omit = all volumes
+  PosixLayoutSpec meta;
+  PosixLayoutSpec data;
+};
+
 // Pack many small tips into large bag objects, then stub members (cold/tape path).
 struct ArchiveRule {
   std::string prefix;
@@ -109,6 +127,8 @@ struct Config {
   int max_replica_count{64};
   // Prefix → layout / storage_class defaults (longest matching prefix).
   std::vector<LayoutRule> layout_rules;
+  // POSIX path-prefix → separate meta/data placement (longest match). Seed for live store.
+  std::vector<PosixLayoutRule> posix_layout_rules;
   // Prefix → class transition policies.
   std::vector<TransitionRule> transition_rules;
   // Prefix → archive (pack-to-bag) policies.
