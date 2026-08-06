@@ -8,35 +8,10 @@ billing meter (Cursor/Grok totals are not available in this environment).
 
 ---
 
-## 1. Lifecycle + weights + rack (feature arc)
+## 1. Cursor chat (Aug 1–6)
 
-User discussion → last commit ask: **Thu 6 Aug 2026, 11:28 → 11:59 (UTC+2)**.
-
-| Metric | Value | Notes |
-|--------|------:|-------|
-| Calendar wall | **~31 min** | 11:28–11:59 |
-| Active estimate | **~25–45 min** | Plan implement from ~11:34; idle gaps capped |
-| Commits | **3** | `97e56ab`, `344cc43`, `3576728` |
-| Commit window | **~10 min** | First commit 11:49 → rack commit 11:59 |
-| Lines added | **+1,367** | Combined `97e56ab^..3576728` |
-| Lines removed | **−88** | |
-| Net LOC | **+1,279** | |
-| Files touched | **33** | |
-
-| Commit | Time (UTC+2) | +LOC | −LOC | Subject |
-|--------|--------------|-----:|-----:|---------|
-| `97e56ab` | 11:49 | 831 | 36 | Node/filesystem lifecycle (up/drain/off) + capacity weights |
-| `344cc43` | 11:52 | 350 | 15 | Capacity-derived weights + free-space autotune |
-| `3576728` | 11:59 | 210 | 63 | Rack failure domain + gossip online/suspect/offline |
-
-Added-line split (same combined range): **src-ish +871**, **tests +247**, **docs/web/yaml +249**.
-
----
-
-## 2. Whole AIOS Cursor chat (Aug 1–6)
-
-Same transcript; calendar span **Sat 1 Aug 09:59 → Thu 6 Aug 12:08 (UTC+2)** (~122 h),
-across **6** active calendar days.
+Calendar span **Sat 1 Aug 09:59 → Thu 6 Aug 12:08 (UTC+2)** (~122 h), across **6**
+active calendar days.
 
 | Metric | Value | Notes |
 |--------|------:|-------|
@@ -49,11 +24,10 @@ overnight pauses are not counted as work.
 
 ---
 
-## 3. Grok 4.5 tokens
+## 2. Grok 4.5 tokens
 
 | Scope | Exact billed tokens | Rough lower bound (message text only) |
 |-------|---------------------|----------------------------------------|
-| Feature arc (~31 min) | **Unknown** | ~**3k** (chars ÷ 3.5) |
 | Whole chat (Aug 1–6) | **Unknown** | ~**60–65k** (chars ÷ 3.5) |
 
 Message-text estimates **exclude** tool results, file contents, and multi-turn
@@ -62,17 +36,17 @@ Authoritative source: Cursor **Settings → Usage / Billing**.
 
 ---
 
-## 4. Repository log (since 2026-08-01)
+## 3. Repository log (since 2026-08-01)
 
 Range: parent of first Aug 1 commit → `HEAD` at generation time.
 
 | Metric | Value |
 |--------|------:|
-| Commits | **58** (`f43b067` … `267049b`) |
-| Files changed | **~236** |
-| Insertions | **+51,326** |
+| Commits | **59** (`f43b067` … `403cda0`) |
+| Files changed | **~237** |
+| Insertions | **+51,471** |
 | Deletions | **−752** |
-| Net | **+50,574** |
+| Net | **+50,719** |
 
 ### Commit log (oldest → newest)
 
@@ -135,6 +109,7 @@ f28fd5b 2026-08-05 14:54:33 +0200 Add whole-bag ZSTD compression and AES-256-GCM
 d1513f3 2026-08-06 11:56:54 +0200 Build static libs with -fPIC for libXrdAios.so on Linux.
 3576728 2026-08-06 11:59:26 +0200 Add rack failure domain and rename gossip liveness to online/offline.
 267049b 2026-08-06 12:02:58 +0200 Silence GCC -Wmissing-field-initializers on partial aggregate inits.
+403cda0 2026-08-06 12:10:44 +0200 Add development statistics and August commit log snapshot.
 ```
 
 Refresh the log with:
