@@ -32,6 +32,8 @@ namespace {
 using tcp = boost::asio::ip::tcp;
 
 constexpr uint64_t kRootIno = 1;
+// Request headers arrive before any authentication, so they need a hard ceiling.
+constexpr std::size_t kMaxRequestHeaderBytes = 64u * 1024u;
 constexpr const char* kMultipartDir = ".s3multipart";
 constexpr const char* kXattrContentType = "user.aios.s3.content-type";
 constexpr const char* kXattrMetaPrefix = "user.aios.s3.meta.";
@@ -537,10 +539,16 @@ void S3Server::do_accept() {
 
 void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
   try {
-    boost::asio::streambuf buf;
+    boost::asio::streambuf buf(kMaxRequestHeaderBytes);
     boost::system::error_code ec;
     boost::asio::read_until(*sock, buf, "\r\n\r\n", ec);
-    if (ec) return;
+    if (ec) {
+      if (ec == boost::asio::error::not_found) {
+        write_s3_error(*sock, 431, "RequestHeaderSectionTooLarge",
+                       "Request header section too large", "/");
+      }
+      return;
+    }
 
     std::istream is(&buf);
     std::string req_line;
@@ -578,7 +586,16 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     const std::string rdma_token = header_get(headers, kAmzRdmaToken);
     std::size_t content_len = 0;
     if (auto cl = header_get(headers, "content-length"); !cl.empty()) {
-      content_len = static_cast<std::size_t>(std::stoull(cl));
+      try {
+        content_len = static_cast<std::size_t>(std::stoull(cl));
+      } catch (...) {
+        write_s3_error(*sock, 400, "InvalidArgument", "Invalid Content-Length", path);
+        return;
+      }
+    }
+    if (content_len > cfg_.max_object_bytes) {
+      write_s3_error(*sock, 413, "EntityTooLarge", "Body exceeds max_object_bytes", path);
+      return;
     }
     const bool rdma_put =
         method == "PUT" && !rdma_token.empty() && qmap.find("uploadId") == qmap.end();
@@ -588,19 +605,21 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       rdma_object_size = content_len;
       // Do not wait for TCP payload bytes.
     } else {
-      body.resize(content_len);
-      std::size_t already = buf.size();
-      std::size_t got = 0;
-      if (already && content_len) {
-        got = std::min(already, content_len);
-        is.read(body.data(), static_cast<std::streamsize>(got));
+      // Grow the buffer with bytes actually received. Pre-sizing to Content-Length
+      // would let an unauthenticated client reserve memory it never sends.
+      const std::size_t already = std::min(buf.size(), content_len);
+      if (already) {
+        body.resize(already);
+        is.read(body.data(), static_cast<std::streamsize>(already));
+        body.resize(static_cast<std::size_t>(is.gcount()));
       }
-      while (got < content_len) {
-        auto n = sock->read_some(boost::asio::buffer(body.data() + got, content_len - got), ec);
+      char chunk[64u * 1024u];
+      while (body.size() < content_len) {
+        const std::size_t want = std::min(sizeof(chunk), content_len - body.size());
+        const auto n = sock->read_some(boost::asio::buffer(chunk, want), ec);
+        if (n) body.append(chunk, n);
         if (ec) break;
-        got += n;
       }
-      body.resize(got);
     }
 
     std::string payload_hash = header_get(headers, "x-amz-content-sha256");
@@ -1119,6 +1138,13 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       std::string put_data;
       std::string rdma_reply;
       if (rdma_put) {
+        if (rdma_object_size == 0 || rdma_object_size > kCuObjectMaxTransferBytes) {
+          write_s3_error(*sock, 400, "InvalidArgument",
+                         "RDMA PUT size out of range; retry without " +
+                             std::string(kAmzRdmaToken),
+                         path);
+          return;
+        }
         put_data.resize(rdma_object_size);
         std::string rdma_err;
         if (!s3_try_rdma_put(cuobject_.get(), bucket + "/" + key, rdma_token, put_data.data(),

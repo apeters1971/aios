@@ -11,3 +11,6 @@ compile_commands.json
 *.user
 .vscode/
 .idea/
+/.token
+*.pem
+*.key

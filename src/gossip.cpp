@@ -55,7 +55,14 @@ void GossipEngine::rebuild_cluster_map() {
   pc.vnodes_per_target = cfg_.vnodes_per_target;
   pc.min_vnodes = cfg_.min_vnodes;
   pc.max_vnodes = cfg_.max_vnodes;
-  cluster_map_ = ClusterMap::build(membership_, fs_table_, cfg_.replica_count, pc);
+  auto built = ClusterMap::build(membership_, fs_table_, cfg_.replica_count, pc);
+  if (object_service_) {
+    // Publishing through ObjectService serializes the swap against in-flight
+    // requests on the HTTP worker threads, which read the map by reference.
+    object_service_->update_cluster_map(std::move(built));
+  } else {
+    cluster_map_ = std::move(built);
+  }
   if (cluster_map_.epoch != prev) {
     AIOS_LOG_INFO("cluster map epoch=", cluster_map_.epoch,
                   " targets=", cluster_map_.targets.size(),
@@ -206,8 +213,11 @@ void GossipEngine::stop() {
   if (server_) server_->close();
   if (http_server_) http_server_->close_sessions();
   // Join HTTP workers while sockets are closed (unblocks keep-alive reads).
+  // HttpServer owns its worker pool, so its destructor joins them here safely.
   http_server_.reset();
-  server_.reset();
+  // TcpServer sessions run on the shared io_context, which the caller stops and
+  // joins after this returns. Destroying it here would free handlers_ underneath
+  // an in-flight session, so only close it and let ~GossipEngine reclaim it.
 }
 
 Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,

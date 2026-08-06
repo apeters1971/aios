@@ -119,6 +119,11 @@ void ObjectService::set_advertise(std::string advertise) {
   advertise_ = std::move(advertise);
 }
 
+void ObjectService::update_cluster_map(ClusterMap m) {
+  std::lock_guard lock(mu_);
+  map_ = std::move(m);
+}
+
 Frame ObjectService::reply_ok(std::uint64_t epoch) const {
   Frame f;
   f.type = MsgType::ObjectReply;
@@ -1070,10 +1075,16 @@ ApiResult ObjectService::commit_ec_put(
       AIOS_LOG_WARN("ec shard install failed i=", i, " ", err);
   }
 
-  if (total_ok < quorum_need(placement)) {
+  // An EC object needs any k of its k+m shards to decode, so k is a hard floor
+  // regardless of the configured replication write quorum.
+  const int ec_need = std::max(codec->k(), quorum_need(placement));
+  if (total_ok < ec_need) {
     store->abort_version(oid, pv.seq, err);
     replicate_abort(placement, oid, pv.seq);
-    return fail("quorum_failed", "ec shard quorum failed");
+    return fail("quorum_failed", "ec shard quorum failed: installed " +
+                                     std::to_string(total_ok) + " of " +
+                                     std::to_string(codec->shard_count()) + ", need " +
+                                     std::to_string(ec_need));
   }
 
   if (!store->publish_tip(oid, pv.seq, err)) {

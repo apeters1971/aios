@@ -112,14 +112,35 @@ void TcpServer::start() { do_accept(); }
 void TcpServer::close() {
   boost::system::error_code ec;
   acceptor_.close(ec);
+  std::unordered_set<std::shared_ptr<tcp::socket>> socks;
+  {
+    std::lock_guard lock(sessions_mu_);
+    socks.swap(sessions_);
+  }
+  for (const auto& s : socks) {
+    boost::system::error_code ignored;
+    s->cancel(ignored);
+    s->shutdown(tcp::socket::shutdown_both, ignored);
+    s->close(ignored);
+  }
 }
+
+TcpServer::~TcpServer() { close(); }
 
 void TcpServer::do_accept() {
   if (!acceptor_.is_open()) return;
   auto sock = std::make_shared<tcp::socket>(ioc_);
   acceptor_.async_accept(*sock, [this, sock](boost::system::error_code ec) {
     if (!ec) {
-      boost::asio::post(ioc_, [this, sock] { handle_session(sock); });
+      {
+        std::lock_guard lock(sessions_mu_);
+        sessions_.insert(sock);
+      }
+      boost::asio::post(ioc_, [this, sock] {
+        handle_session(sock);
+        std::lock_guard lock(sessions_mu_);
+        sessions_.erase(sock);
+      });
       do_accept();
     } else if (ec != boost::asio::error::operation_aborted) {
       AIOS_LOG_WARN("accept error: ", ec.message());

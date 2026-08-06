@@ -1949,7 +1949,12 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get_range(
     done += static_cast<std::size_t>(n);
   }
   ::close(fd);
-  out.resize(done);
+  if (done != want) {
+    // Short read means the backing file is truncated or was concurrently modified;
+    // returning the partial buffer would silently hand truncated data to the client.
+    err = "short read: got " + std::to_string(done) + " of " + std::to_string(want) + " bytes";
+    return std::nullopt;
+  }
   return out;
 }
 

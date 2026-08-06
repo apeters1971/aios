@@ -6,8 +6,10 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 
 namespace aios {
 
@@ -43,8 +45,11 @@ class TcpServer {
  public:
   TcpServer(boost::asio::io_context& ioc, const std::string& listen_host,
             const std::string& listen_port, RpcHandlers handlers);
+  ~TcpServer();
 
   void start();
+  // Closes the acceptor and every live session so blocking session reads return.
+  // Must be called before the object is destroyed while the io_context still runs.
   void close();
 
  private:
@@ -54,6 +59,8 @@ class TcpServer {
   boost::asio::io_context& ioc_;
   tcp::acceptor acceptor_;
   RpcHandlers handlers_;
+  std::mutex sessions_mu_;
+  std::unordered_set<std::shared_ptr<tcp::socket>> sessions_;
 };
 
 }  // namespace aios

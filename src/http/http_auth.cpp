@@ -5,7 +5,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <ctime>
 #include <sstream>
+
+#include <time.h>
 
 namespace aios {
 namespace {
@@ -13,6 +17,44 @@ namespace {
 std::string lower(std::string s) {
   for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return s;
+}
+
+bool const_time_eq(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+  }
+  return diff == 0;
+}
+
+// Parse an auth date into unix milliseconds. Accepts unix-ms integers plus the
+// calendar formats curl and the AWS SDKs emit, so that every accepted date can be
+// skew-checked rather than exempted from it.
+bool parse_auth_date_ms(const std::string& date, std::int64_t& out_ms) {
+  if (date.empty()) return false;
+  if (date.find_first_not_of("0123456789") == std::string::npos) {
+    try {
+      out_ms = std::stoll(date);
+    } catch (...) {
+      return false;
+    }
+    return true;
+  }
+  static constexpr const char* kFormats[] = {
+      "%a, %d %b %Y %H:%M:%S",  // RFC 7231 IMF-fixdate
+      "%Y%m%dT%H%M%SZ",         // ISO 8601 basic, as in x-amz-date
+      "%Y-%m-%dT%H:%M:%SZ",     // ISO 8601 extended
+  };
+  for (const char* fmt : kFormats) {
+    std::tm tm{};
+    if (::strptime(date.c_str(), fmt, &tm) == nullptr) continue;
+    const std::time_t secs = ::timegm(&tm);
+    if (secs == static_cast<std::time_t>(-1)) continue;
+    out_ms = static_cast<std::int64_t>(secs) * 1000;
+    return true;
+  }
+  return false;
 }
 
 std::vector<std::string> split_csv(const std::string& s) {
@@ -100,16 +142,12 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
     return r;
   }
 
-  // Accept unix-ms in x-aios-date, else skip strict parse and only check if numeric.
   std::int64_t ts = 0;
-  try {
-    ts = std::stoll(date);
-  } catch (...) {
-    // Non-numeric Date header: accept without skew check for curl convenience when
-    // paired with valid signature over that date string.
-    ts = now_ms();
+  if (!parse_auth_date_ms(date, ts)) {
+    r.error = "unparsable date";
+    return r;
   }
-  if (std::llabs(now_ms() - ts) > skew_ms && date.find_first_not_of("0123456789") == std::string::npos) {
+  if (std::llabs(now_ms() - ts) > skew_ms) {
     r.error = "date skew too large";
     return r;
   }
@@ -117,7 +155,7 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
   const auto canon =
       http_canonical(method, path_with_query, date, signed_headers, headers, payload_hash_hex);
   const auto expect = http_sign(cluster_key, canon);
-  if (expect != signature) {
+  if (!const_time_eq(expect, signature)) {
     r.error = "bad signature";
     return r;
   }

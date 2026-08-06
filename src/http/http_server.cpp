@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -2594,7 +2595,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             write_json(*sock, 400, "Bad Request", {{"error", perr}}, keep_alive);
             continue;
           }
-          if (end - start + 1 != body.size()) {
+          // end == UINT64_MAX would wrap this length to 0 and match an empty body.
+          if (end == std::numeric_limits<std::uint64_t>::max() ||
+              end - start + 1 != body.size()) {
             write_json(*sock, 400, "Bad Request",
                        {{"error", "Content-Range length mismatch"}}, keep_alive);
             continue;

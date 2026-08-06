@@ -166,6 +166,10 @@ class ObjectService {
   ApiResult api_txn_commit(const std::string& txn_id);
   ApiResult api_txn_abort(const std::string& txn_id);
 
+  // Publish a rebuilt cluster map. Takes the same lock that serializes request
+  // handling, so worker threads never observe a half-written map.
+  void update_cluster_map(ClusterMap m);
+
   ClusterMap& map() { return map_; }
   const ClusterMap& map() const { return map_; }
   const Config& config() const { return cfg_; }

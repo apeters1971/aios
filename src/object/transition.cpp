@@ -167,6 +167,99 @@ bool migrate_one(const Config& cfg, const std::string& advertise, const ClusterM
   return install_replica_version(cfg, advertise, map, stores, dest, oid, data, new_attrs);
 }
 
+// Finalize transition bookkeeping on an EC object. Every target keeps its own shard
+// body and its own aios.ec.i index; only the attrs change. Broadcasting a single
+// shard to the whole acting set (as the replicated path does) would leave every
+// target holding the same shard and make the object undecodable.
+bool drain_ec_one(const Config& cfg, const std::string& advertise, const ClusterMap& map,
+                  LocalStores& stores, const Placement& dest, const std::string& oid) {
+  auto finalize = [](std::unordered_map<std::string, std::string> a) {
+    a.erase(kStorageClassPrevAttr);
+    a[kTransitionAttr] = "done";
+    return a;
+  };
+
+  auto* primary = stores.get(dest.acting_set[0].aios_path);
+  if (!primary) return false;
+  std::string err;
+  auto primary_body = primary->get(oid, err);
+  if (!primary_body) return false;
+  const auto primary_attrs = finalize(primary->list_attrs(oid, err));
+
+  PreparedVersion pv;
+  if (!primary->prepare_put(oid, primary_body->data(), primary_body->size(), primary_attrs, true,
+                            std::nullopt, pv, err)) {
+    AIOS_LOG_WARN("ec drain prepare ", oid, ": ", err);
+    return false;
+  }
+
+  int ok = 1;
+  for (std::size_t i = 1; i < dest.acting_set.size(); ++i) {
+    const auto& t = dest.acting_set[i];
+    if (t.node_id == cfg.node_id) {
+      auto* s = stores.get(t.aios_path);
+      if (!s) continue;
+      auto body = s->get(oid, err);
+      if (!body) continue;
+      PreparedVersion sv = pv;
+      sv.size = body->size();
+      sv.crc32c = crc32c(body->data(), body->size());
+      sv.fs_path.clear();
+      sv.inline_body = sv.size <= 64 * 1024;
+      if (s->install_version(sv, body->data(), body->size(), finalize(s->list_attrs(oid, err)),
+                             err)) {
+        ++ok;
+      }
+      continue;
+    }
+    auto st = object_stat_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                 cfg.auth_skew_ms, map.epoch, t.aios_path, oid);
+    if (!st.ok) continue;
+    std::unordered_map<std::string, std::string> shard_attrs;
+    if (st.body.contains("attrs") && st.body["attrs"].is_object()) {
+      for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
+        if (it.value().is_string()) shard_attrs[it.key()] = it.value().get<std::string>();
+      }
+    }
+    auto g = object_get_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key, cfg.auth_skew_ms,
+                               map.epoch, t.aios_path, oid);
+    if (!g.ok || !g.data) continue;
+    PreparedVersion sv = pv;
+    sv.size = g.data->size();
+    sv.crc32c = crc32c(g.data->data(), g.data->size());
+    sv.fs_path.clear();
+    sv.inline_body = sv.size <= 64 * 1024;
+    auto r = object_install_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                   cfg.auth_skew_ms, map.epoch, t.aios_path, sv, g.data->data(),
+                                   g.data->size(), finalize(shard_attrs));
+    if (r.ok) ++ok;
+  }
+
+  const auto meta = parse_ec_attrs(primary_attrs);
+  const int k = meta ? meta->k : 0;
+  if (k > 0 && ok < k) {
+    primary->abort_version(oid, pv.seq, err);
+    AIOS_LOG_WARN("ec drain ", oid, ": only ", ok, " of ", dest.acting_set.size(),
+                  " shards rewritten, need ", k);
+    return false;
+  }
+  if (!primary->publish_tip(oid, pv.seq, err)) {
+    primary->abort_version(oid, pv.seq, err);
+    return false;
+  }
+  for (std::size_t i = 1; i < dest.acting_set.size(); ++i) {
+    const auto& t = dest.acting_set[i];
+    if (t.node_id == cfg.node_id) {
+      auto* s = stores.get(t.aios_path);
+      if (s) s->publish_tip(oid, pv.seq, err);
+    } else {
+      object_publish_tip_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                cfg.auth_skew_ms, map.epoch, t.aios_path, oid, pv.seq);
+    }
+  }
+  return true;
+}
+
 bool drain_one(const Config& cfg, const std::string& advertise, const ClusterMap& map,
                LocalStores& stores, const std::string& oid, const TransitionRule& rule) {
   std::string err;
@@ -192,14 +285,14 @@ bool drain_one(const Config& cfg, const std::string& advertise, const ClusterMap
   if (dest.acting_set.empty() || dest.acting_set[0].node_id != cfg.node_id) return false;
   if (!dest_quorum_ready(cfg, advertise, map, stores, dest, oid)) return false;
 
+  if (attrs_are_ec(attrs)) {
+    return drain_ec_one(cfg, advertise, map, stores, dest, oid);
+  }
+
   auto got = local->get(oid, err);
   if (!got) return false;
   attrs.erase(kStorageClassPrevAttr);
   attrs[kTransitionAttr] = "done";
-  if (attrs_are_ec(attrs)) {
-    // Attr-only drain for EC: rewrite via primary shard body already local.
-    return install_replica_version(cfg, advertise, map, stores, dest, oid, *got, attrs);
-  }
   return install_replica_version(cfg, advertise, map, stores, dest, oid, *got, attrs);
 }
 
