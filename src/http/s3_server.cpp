@@ -17,6 +17,7 @@
 #include <cctype>
 #include <cstring>
 #include <ctime>
+#include <future>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -423,11 +424,45 @@ S3Server::S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_h
       cuobject_(cuobject ? std::move(cuobject) : make_cuobject_endpoint(cfg_)),
       acceptor_(ioc) {}
 
-S3Server::~S3Server() {
+S3Server::~S3Server() { stop(); }
+
+void S3Server::stop() {
+  bool expected = false;
+  if (!stopping_.compare_exchange_strong(expected, true)) {
+    std::unique_lock lock(stop_mu_);
+    stop_cv_.wait(lock, [this] { return sessions_.load() == 0 && fs_ == nullptr; });
+    return;
+  }
+
+  auto close_acceptor = [this] {
+    boost::system::error_code ec;
+    acceptor_.close(ec);
+  };
+
+  // Cancel accept on the ioc thread, then drain so the completion handler cannot
+  // observe a destroyed S3Server (it captures this).
+  if (!ioc_.stopped()) {
+    std::promise<void> drained;
+    auto fut = drained.get_future();
+    boost::asio::post(ioc_, [this, close_acceptor, &drained] {
+      close_acceptor();
+      boost::asio::post(ioc_, [&drained] { drained.set_value(); });
+    });
+    fut.wait();
+  } else {
+    close_acceptor();
+  }
+
+  {
+    std::unique_lock lock(stop_mu_);
+    stop_cv_.wait(lock, [this] { return sessions_.load() == 0; });
+  }
+
   if (fs_) {
     aios_posix_unmount(fs_);
     fs_ = nullptr;
   }
+  stop_cv_.notify_all();
 }
 
 void S3Server::start() {
@@ -480,14 +515,23 @@ void S3Server::start() {
 }
 
 void S3Server::do_accept() {
+  if (stopping_.load()) return;
   auto sock = std::make_shared<tcp::socket>(ioc_);
   acceptor_.async_accept(*sock, [this, sock](const boost::system::error_code& ec) {
-    if (!ec) {
+    if (!ec && !stopping_.load()) {
       // Run off the io_context thread: handle_session blocks in libaios_posix, which
       // performs synchronous HTTP back to http_listen on the same ioc.
-      std::thread([this, sock] { handle_session(sock); }).detach();
+      sessions_.fetch_add(1);
+      std::thread([this, sock] {
+        try {
+          handle_session(sock);
+        } catch (...) {
+        }
+        sessions_.fetch_sub(1);
+        stop_cv_.notify_all();
+      }).detach();
     }
-    if (acceptor_.is_open()) do_accept();
+    if (!stopping_.load() && acceptor_.is_open()) do_accept();
   });
 }
 

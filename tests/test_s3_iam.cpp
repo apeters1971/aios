@@ -244,8 +244,9 @@ int test_s3_iam() {
     HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership, iam);
     http.start();
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    S3Server s3(ioc, fx.cfg, "127.0.0.1:" + http_port, iam);
-    s3.start();
+    // unique_ptr so we can unmount before stopping ioc (rstat flush uses HTTP).
+    auto s3 = std::make_unique<S3Server>(ioc, fx.cfg, "127.0.0.1:" + http_port, iam);
+    s3->start();
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     const std::string key = fx.cfg.cluster_key;
@@ -384,6 +385,8 @@ int test_s3_iam() {
       expect(r.status == 403, "deleted iam key rejected");
     }
 
+    s3->stop();  // close accept + unmount while HTTP still serves rstat flush
+    s3.reset();
     work.reset();
     ioc.stop();
     th.join();

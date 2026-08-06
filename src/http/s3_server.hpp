@@ -6,7 +6,10 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
 
 struct aios_posix_fs;
@@ -26,6 +29,10 @@ class S3Server {
   S3Server& operator=(const S3Server&) = delete;
 
   void start();
+  // Close acceptor (on ioc), wait for in-flight sessions, then posix unmount.
+  // Safe to call while ioc is still running; required before ioc.stop() so rstat
+  // flush can use loopback HTTP.
+  void stop();
 
   // Tests: replace RDMA endpoint after construction (before or after start).
   void set_cuobject_endpoint(std::shared_ptr<CuObjectEndpoint> ep) { cuobject_ = std::move(ep); }
@@ -42,6 +49,10 @@ class S3Server {
   std::shared_ptr<CuObjectEndpoint> cuobject_;
   aios_posix_fs* fs_{nullptr};
   boost::asio::ip::tcp::acceptor acceptor_;
+  std::atomic<bool> stopping_{false};
+  std::atomic<int> sessions_{0};
+  std::mutex stop_mu_;
+  std::condition_variable stop_cv_;
 };
 
 // Dialable 127.0.0.1:PORT from http_listen (maps 0.0.0.0 / :: → 127.0.0.1).

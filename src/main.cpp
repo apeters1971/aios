@@ -20,9 +20,9 @@ boost::asio::io_context* g_ioc = nullptr;
 std::unique_ptr<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> g_work;
 
 void on_signal(int) {
+  // Only request stop; main tears down S3 (posix unmount/rstat flush needs HTTP)
+  // before stopping the io_context.
   g_stop.store(true);
-  g_work.reset();
-  if (g_ioc) g_ioc->stop();
 }
 }  // namespace
 
@@ -87,6 +87,9 @@ int main(int argc, char** argv) {
     while (!g_stop.load()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+    // stop() closes accept on ioc then unmounts (rstat flush needs loopback HTTP).
+    if (s3) s3->stop();
+    s3.reset();
     g_work.reset();
     ioc.stop();
     if (ioc_thread.joinable()) ioc_thread.join();
