@@ -19,7 +19,7 @@ struct FsEntry {
   std::string target_path;
   std::string aios_path;
   std::string storage_class;
-  std::string rack;  // effective failure domain
+  std::string rack{};  // effective failure domain
   int weight{1};
   LifecycleState state{LifecycleState::Up};  // effective (node × target)
   std::uint64_t bsize{0};

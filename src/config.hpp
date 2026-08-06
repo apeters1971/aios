@@ -11,10 +11,10 @@ namespace aios {
 struct LayoutRule {
   std::string prefix;
   std::string layout;  // required: "replica" | "ec"
-  std::optional<std::string> storage_class;
-  std::optional<int> ec_k;
-  std::optional<int> ec_m;
-  std::optional<std::string> ec_codec;
+  std::optional<std::string> storage_class{};
+  std::optional<int> ec_k{};
+  std::optional<int> ec_m{};
+  std::optional<std::string> ec_codec{};
 };
 
 // Background tip migration between storage classes (prefix match).
@@ -22,10 +22,10 @@ struct TransitionRule {
   std::string prefix;
   std::string from;  // source storage_class
   std::string to;    // destination storage_class
-  std::optional<std::string> layout;  // optional layout change on transition
-  std::optional<int> ec_k;
-  std::optional<int> ec_m;
-  std::optional<std::string> ec_codec;
+  std::optional<std::string> layout{};  // optional layout change on transition
+  std::optional<int> ec_k{};
+  std::optional<int> ec_m{};
+  std::optional<std::string> ec_codec{};
 };
 
 // Snapshot a POSIX volume or VBD, then pack+drain the immutable tree (see proto/backup.md).

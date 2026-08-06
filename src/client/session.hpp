@@ -15,7 +15,7 @@ struct SessionConfig {
   std::string endpoint{"127.0.0.1:7480"};
   std::string cluster_key;
   // Optional workload label sent as x-aios-app-label on every request.
-  std::string app_label;
+  std::string app_label{};
 };
 
 struct HttpResponse {

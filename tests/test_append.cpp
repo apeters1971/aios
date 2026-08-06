@@ -43,7 +43,8 @@ struct HttpFixture {
   }
 
   aios::SessionConfig cfg() const {
-    return aios::SessionConfig{host + ":" + port, fx.cfg.cluster_key};
+    return aios::SessionConfig{.endpoint = host + ":" + port,
+                               .cluster_key = fx.cfg.cluster_key};
   }
 };
 
