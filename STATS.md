@@ -10,17 +10,29 @@ billing meter (Cursor/Grok totals are not available in this environment).
 
 ## 1. Cursor chat (Aug 1–6)
 
-Calendar span **Sat 1 Aug 09:59 → Thu 6 Aug 12:08 (UTC+2)** (~122 h), across **6**
+Calendar span **Sat 1 Aug 09:59 → Thu 6 Aug ~13:30 (UTC+2)** (~123 h), across **6**
 active calendar days.
 
 | Metric | Value | Notes |
 |--------|------:|-------|
-| User turns | **~268** | Timestamped `<user_query>` events |
-| Tool calls | **~5,050** | Counted in transcript |
-| Active time (est.) | **~31–44 h** | Sum of gaps between user turns, capped at 45–90 min |
+| User turns | **~276** | Timestamped `<user_query>` events |
+| Tool calls | **~5,130** | Counted in transcript |
+| Active time (est.) | **~10–16 h** | Cursor-style “Worked for” agent runtime (see below) |
 
-This is **not** continuous coding time; long idle gaps between sessions are capped so
-overnight pauses are not counted as work.
+**How this was estimated.** Cursor’s per-turn **“Worked for …”** labels are *agent
+runtime*, not wall-clock gaps between your messages. Those labels are not stored in
+the JSONL transcript, so this is reconstructed from turn structure:
+
+- **~276** user→agent turns (median **4** tool calls/turn; mean ~19, skewed by heavy turns)
+- Heuristic agent time ≈ 15–30 s base + ~8–15 s per tool call, with a per-turn cap
+  (~10–15 min) for long builds → **~10–16 h** total
+- Cross-check: summing only inter-message gaps ≤15–20 min (rapid back-and-forth
+  sessions) gives **~9–10 h** of wall-clock interaction — a lower bound on the same
+  order
+
+The older **~31–44 h** figure was wrong for “Worked for”: it summed gaps between user
+turns capped at 45–90 minutes, which mostly counts *waiting / idle / reading*, not
+agent work.
 
 ---
 
@@ -42,11 +54,11 @@ Range: parent of first Aug 1 commit → `HEAD` at generation time.
 
 | Metric | Value |
 |--------|------:|
-| Commits | **59** (`f43b067` … `403cda0`) |
+| Commits | **61** (`f43b067` … `cddc29b`) |
 | Files changed | **~237** |
-| Insertions | **+51,471** |
-| Deletions | **−752** |
-| Net | **+50,719** |
+| Insertions | **+51,508** |
+| Deletions | **−753** |
+| Net | **+50,755** |
 
 ### Commit log (oldest → newest)
 
@@ -109,7 +121,9 @@ f28fd5b 2026-08-05 14:54:33 +0200 Add whole-bag ZSTD compression and AES-256-GCM
 d1513f3 2026-08-06 11:56:54 +0200 Build static libs with -fPIC for libXrdAios.so on Linux.
 3576728 2026-08-06 11:59:26 +0200 Add rack failure domain and rename gossip liveness to online/offline.
 267049b 2026-08-06 12:02:58 +0200 Silence GCC -Wmissing-field-initializers on partial aggregate inits.
-403cda0 2026-08-06 12:10:44 +0200 Add development statistics and August commit log snapshot.
+403cda0 2026-08-06 12:10:45 +0200 Add development statistics and August commit log snapshot.
+b9baf5e 2026-08-06 12:14:20 +0200 Trim STATS.md to chat summary and August commit log.
+cddc29b 2026-08-06 13:32:19 +0200 Fix S3Server shutdown hang and accept-loop use-after-free.
 ```
 
 Refresh the log with:
