@@ -54,6 +54,7 @@ nlohmann::json ClusterMap::to_json() const {
         {"mount", t.mount},
         {"storage_class", t.storage_class},
         {"weight", t.weight},
+        {"state", lifecycle_state_name(t.state)},
         {"bavail", t.bavail},
     });
   }
@@ -90,8 +91,10 @@ ClusterMap ClusterMap::from_json(const nlohmann::json& j) {
     t.mount = e.value("mount", "");
     t.storage_class = e.value("storage_class", "");
     t.weight = e.value("weight", 1);
+    t.state = lifecycle_state_from_string(e.value("state", "up"));
     t.bavail = e.value("bavail", static_cast<std::uint64_t>(0));
-    if (!t.node_id.empty() && !t.aios_path.empty() && !t.storage_class.empty()) {
+    if (!t.node_id.empty() && !t.aios_path.empty() && !t.storage_class.empty() &&
+        t.state != LifecycleState::Off) {
       m.targets.push_back(std::move(t));
     }
   }
@@ -121,6 +124,7 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
     if (!e.usable) continue;
     if (e.aios_path.empty() || e.node_id.empty()) continue;
     if (e.storage_class.empty()) continue;
+    if (e.state == LifecycleState::Off) continue;
     auto it = alive.find(e.node_id);
     if (it == alive.end()) continue;
     StorageTarget t;
@@ -131,6 +135,7 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
     t.mount = e.mount;
     t.storage_class = e.storage_class;
     t.weight = e.weight > 0 ? e.weight : 1;
+    t.state = e.state;
     t.bavail = e.bavail;
     map.targets.push_back(std::move(t));
   }
@@ -151,7 +156,7 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
   canon << "max_vnodes=" << map.placement.max_vnodes << '\n';
   for (const auto& t : map.targets) {
     canon << t.storage_class << '\t' << t.node_id << '\t' << t.addr << '\t' << t.aios_path
-          << '\t' << t.weight << '\n';
+          << '\t' << t.weight << '\t' << lifecycle_state_name(t.state) << '\n';
   }
   map.epoch = hash_canonical(canon.str());
   return map;

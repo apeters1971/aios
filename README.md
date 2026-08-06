@@ -302,19 +302,34 @@ Place a file named `.aios` in the **top level** of a mounted filesystem the daem
 | Field | Effect |
 |-------|--------|
 | `storage_class: nvme` | Placement pool / class-scoped consistent-hash ring (required) |
-| `weight: 2` | Optional vnode weight (default 1) |
+| `weight: 4` | Relative capacity for CH (default 1). Set proportional to device size (e.g. 4 TB → `4`, 16 TB → `16`); not auto-derived from free space |
+| `state: up` | Lifecycle: `up` \| `drain` \| `off` (default `up`) |
 | `targets: [data, scratch]` | `<mount>/data/aios/` and `<mount>/scratch/aios/` (omit → `<mount>/aios/`) |
+
+**Lifecycle** (planned ops; gossip Alive/Suspect/Dead stays liveness-only):
+
+| Effective state | In cluster map | Local store | In `place()` ring | Role |
+|-----------------|----------------|-------------|-------------------|------|
+| **up** | yes | yes | yes (weighted) | Normal I/O + new replicas |
+| **drain** | yes | yes | no | Serve existing data; repair evacuates away |
+| **off** | no | no | no | Out of service |
+
+Effective state is the worse of **node** (`node_state` in aiosd YAML / live admin) and **target** (`.aios` `state`): `off` > `drain` > `up`.
+
+Replace playbook: set target (or node) **drain** → wait/run repair until evacuated → **off** / unmount → replace disk → new `.aios` with `state: up` and capacity **weight** → scan → repair fills. Admin: `aios admin lifecycle show|node|target …`, Web UI **Lifecycle** tab, `GET/PUT /admin/api/lifecycle*`.
 
 The daemon creates each `aios/` directory if missing, then requires ownership to match the process **euid/egid**. Mismatches are logged and the target is **not** advertised.
 
 ```bash
 cat > /path/to/nvme-mount/.aios <<'EOF'
 storage_class: nvme
+weight: 4
+state: up
 targets: [data]
 EOF
 cat > /path/to/hdd-mount/.aios <<'EOF'
 storage_class: hdd
-weight: 1
+weight: 16
 EOF
 ```
 
@@ -324,7 +339,7 @@ EOF
 
 ### Consistent hashing
 
-Each storage class has its own **vnode ring**. Targets advertise a class and optional `weight` in `.aios`; the map expands each target to `clamp(weight × vnodes_per_target, min_vnodes, max_vnodes)` virtual nodes.
+Each storage class has its own **vnode ring**. Only **up** targets enter the ring. Targets advertise a class and optional capacity `weight` in `.aios`; the map expands each target to `clamp(weight × vnodes_per_target, min_vnodes, max_vnodes)` virtual nodes. **Drain** targets remain in the map (and can serve/evacuate data) but are excluded from new placement.
 
 ```text
 sha256(oid) → start on class ring → walk clockwise

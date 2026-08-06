@@ -134,3 +134,5 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # admin: true
 # admin_metrics_public: true   # GET /metrics without HMAC (restrict network access)
 # Web UI: http://HOST:7480/admin/  (login with cluster_key; assets in web/admin or AIOS_ADMIN_WEB)
+# Planned node lifecycle (worse of this and each .aios state; gossip Alive/Suspect/Dead separate):
+# node_state: up               # up | drain | off — live toggle via admin lifecycle API/CLI/UI

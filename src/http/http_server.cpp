@@ -1,5 +1,7 @@
 #include "http/http_server.hpp"
 
+#include "cluster/lifecycle.hpp"
+#include "fs/aios_scan.hpp"
 #include "http/http_auth.hpp"
 #include "metrics/app_label.hpp"
 #include "metrics/frontend_io.hpp"
@@ -609,6 +611,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"max_object_bytes", c.max_object_bytes},
       {"admin", cfg_.admin},
       {"admin_metrics_public", cfg_.admin_metrics_public},
+      {"node_state", cfg_.node_state},
       {"s3_listen", c.s3_listen},
       {"s3_volume", c.s3_volume},
       {"s3_access_key", c.s3_access_key},
@@ -642,14 +645,51 @@ nlohmann::json HttpServer::admin_status_json() const {
   };
 }
 
-HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
+nlohmann::json HttpServer::admin_lifecycle_json() const {
+  nlohmann::json nodes = nlohmann::json::array();
+  for (const auto& m : membership_.snapshot()) {
+    nlohmann::json n{
+        {"node_id", m.node_id},
+        {"addr", m.addr},
+        {"http_addr", m.http_addr},
+        {"member_state", member_state_name(m.state)},
+        {"self", m.node_id == cfg_.node_id},
+    };
+    if (m.node_id == cfg_.node_id) {
+      n["node_state"] = cfg_.node_state;
+    }
+    nodes.push_back(std::move(n));
+  }
+  nlohmann::json targets = nlohmann::json::array();
+  for (const auto& t : objects_.map().targets) {
+    targets.push_back({
+        {"node_id", t.node_id},
+        {"mount", t.mount},
+        {"aios_path", t.aios_path},
+        {"storage_class", t.storage_class},
+        {"weight", t.weight},
+        {"state", lifecycle_state_name(t.state)},
+        {"addr", t.addr},
+        {"self", t.node_id == cfg_.node_id},
+    });
+  }
+  return nlohmann::json{
+      {"node_id", cfg_.node_id},
+      {"node_state", cfg_.node_state},
+      {"map_epoch", objects_.map().epoch},
+      {"nodes", std::move(nodes)},
+      {"targets", std::move(targets)},
+  };
+}
+
+HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService& objects,
                        MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam,
                        std::shared_ptr<QuotaAdminStore> quota, std::shared_ptr<QosAdminStore> qos,
                        std::shared_ptr<BackupPolicyStore> backup_policies,
                        std::shared_ptr<PosixLayoutStore> posix_layout,
                        std::shared_ptr<VbdRegistryStore> vbd_registry)
     : ioc_(ioc),
-      cfg_(std::move(cfg)),
+      cfg_(cfg),
       objects_(objects),
       membership_(membership),
       s3_iam_(std::move(s3_iam)),
@@ -1356,6 +1396,132 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                     {"repaired", stats.repaired},
                     {"failed", stats.failed}},
                    keep_alive);
+        continue;
+      }
+      if (method == "GET" && path == "/admin/api/lifecycle") {
+        write_json(*sock, 200, "OK", admin_lifecycle_json(), keep_alive);
+        continue;
+      }
+      if (method == "PUT" && path == "/admin/api/lifecycle/node") {
+        try {
+          const std::string raw =
+              body.empty() ? "{}"
+                           : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+          auto j = nlohmann::json::parse(raw);
+          if (!j.contains("state") || !j["state"].is_string()) {
+            write_json(*sock, 400, "Bad Request", {{"error", "state required"}}, keep_alive);
+            continue;
+          }
+          std::string st = j["state"].get<std::string>();
+          for (char& c : st) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          if (!valid_lifecycle_state_string(st)) {
+            write_json(*sock, 400, "Bad Request",
+                       {{"error", "state must be up, drain, or off"}}, keep_alive);
+            continue;
+          }
+          cfg_.node_state = st;
+          if (on_lifecycle_changed_) on_lifecycle_changed_();
+          write_json(*sock, 200, "OK",
+                     {{"ok", true}, {"node_id", cfg_.node_id}, {"node_state", cfg_.node_state}},
+                     keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
+        continue;
+      }
+      if (method == "PUT" && path == "/admin/api/lifecycle/target") {
+        try {
+          const std::string raw =
+              body.empty() ? "{}"
+                           : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+          auto j = nlohmann::json::parse(raw);
+          std::optional<std::string> state;
+          std::optional<int> weight;
+          if (j.contains("state")) {
+            if (!j["state"].is_string()) {
+              write_json(*sock, 400, "Bad Request", {{"error", "state must be string"}},
+                         keep_alive);
+              continue;
+            }
+            state = j["state"].get<std::string>();
+          }
+          if (j.contains("weight")) {
+            if (!j["weight"].is_number_integer()) {
+              write_json(*sock, 400, "Bad Request", {{"error", "weight must be integer"}},
+                         keep_alive);
+              continue;
+            }
+            weight = j["weight"].get<int>();
+          }
+          if (!state && !weight) {
+            write_json(*sock, 400, "Bad Request", {{"error", "state or weight required"}},
+                       keep_alive);
+            continue;
+          }
+          std::string aios_path = j.value("aios_path", "");
+          std::string mount = j.value("mount", "");
+          const StorageTarget* match = nullptr;
+          for (const auto& t : objects_.map().targets) {
+            if (t.node_id != cfg_.node_id) continue;
+            if (!aios_path.empty() && t.aios_path == aios_path) {
+              match = &t;
+              break;
+            }
+            if (!mount.empty() && t.mount == mount) {
+              match = &t;
+              break;
+            }
+          }
+          if (!match) {
+            // Also allow rewriting by mount when target is off (not in map).
+            if (mount.empty() && aios_path.empty()) {
+              write_json(*sock, 400, "Bad Request",
+                         {{"error", "aios_path or mount required for a local target"}},
+                         keep_alive);
+              continue;
+            }
+          }
+          std::string marker;
+          if (match) {
+            marker = (fs::path(match->mount) / ".aios").string();
+          } else if (!mount.empty()) {
+            marker = (fs::path(mount) / ".aios").string();
+          } else {
+            // Derive mount from aios_path (.../target/aios -> walk up for .aios).
+            fs::path p(aios_path);
+            if (p.filename() == "aios") p = p.parent_path();
+            // Prefer mount root .aios: search upward for .aios
+            fs::path cur = p;
+            bool found = false;
+            for (int i = 0; i < 8 && !cur.empty() && cur != cur.root_path(); ++i) {
+              const fs::path cand = cur / ".aios";
+              std::error_code ec;
+              if (fs::is_regular_file(cand, ec)) {
+                marker = cand.string();
+                found = true;
+                break;
+              }
+              cur = cur.parent_path();
+            }
+            if (!found) {
+              write_json(*sock, 404, "Not Found",
+                         {{"error", "no local .aios found for aios_path"}}, keep_alive);
+              continue;
+            }
+          }
+          std::string err;
+          if (!update_aios_marker_file(marker, state, weight, err)) {
+            write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+            continue;
+          }
+          if (on_lifecycle_changed_) on_lifecycle_changed_();
+          nlohmann::json resp{{"ok", true}, {"marker", marker}};
+          if (state) resp["state"] = *state;
+          if (weight) resp["weight"] = *weight;
+          write_json(*sock, 200, "OK", resp, keep_alive);
+        } catch (...) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+        }
         continue;
       }
       if (method == "POST" && path == "/admin/api/settings") {

@@ -166,6 +166,8 @@ struct Config {
   bool admin{false};
   // When true (and admin), GET /metrics skips HMAC so Prometheus can scrape.
   bool admin_metrics_public{false};
+  // Operator lifecycle for this node (up | drain | off). Folded into local target states.
+  std::string node_state{"up"};
   // Whole-object PUT compression: "none" | "zstd" (range/append rejected on compressed tips).
   std::string compression{"none"};
   int compression_level{3};                 // zstd level 1..22

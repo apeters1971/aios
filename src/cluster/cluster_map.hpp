@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cluster/lifecycle.hpp"
 #include "fs/fs_table.hpp"
 #include "membership.hpp"
 
@@ -27,6 +28,7 @@ struct StorageTarget {
   std::string mount;
   std::string storage_class;
   int weight{1};
+  LifecycleState state{LifecycleState::Up};  // up or drain (off never appears)
   std::uint64_t bavail{0};
 };
 

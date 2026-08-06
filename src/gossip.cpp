@@ -1,5 +1,6 @@
 #include "gossip.hpp"
 
+#include "cluster/lifecycle.hpp"
 #include "fs/aios_scan.hpp"
 #include "net/client.hpp"
 #include "node_id.hpp"
@@ -125,6 +126,11 @@ void GossipEngine::start() {
     http_server_ = std::make_unique<HttpServer>(ioc_, cfg_, *object_service_, membership_,
                                                 s3_iam_, quota_, qos_, backup_policies_,
                                                 posix_layout_, vbd_registry_);
+    http_server_->set_on_lifecycle_changed([this] {
+      run_scan();
+      rebuild_cluster_map();
+      sync_local_stores();
+    });
     http_server_->start();
     if (cfg_.admin) {
       AIOS_LOG_INFO("admin API enabled on ", cfg_.http_listen,
@@ -247,7 +253,7 @@ void GossipEngine::run_scan() {
       AIOS_LOG_WARN("target unusable ", t.aios_path, ": ", t.error);
     }
   }
-  fs_table_.set_local(cfg_.node_id, targets);
+  fs_table_.set_local(cfg_.node_id, targets, lifecycle_state_from_string(cfg_.node_state));
   AIOS_LOG_INFO("fs scan: ", targets.size(), " targets, ", usable, " usable");
 }
 

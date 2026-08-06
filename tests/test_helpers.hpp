@@ -42,13 +42,14 @@ inline std::filesystem::path temp_root(const char* prefix) {
 }
 
 inline AiosTarget make_target(const std::string& path, const std::string& storage_class = "nvme",
-                              int weight = 1) {
+                              int weight = 1, LifecycleState state = LifecycleState::Up) {
   AiosTarget t;
   t.mount = path;
   t.target_path = path;
   t.aios_path = path;
   t.storage_class = storage_class;
   t.weight = weight;
+  t.state = state;
   t.usable = true;
   t.bavail = 1000;
   return t;

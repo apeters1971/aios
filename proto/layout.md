@@ -12,7 +12,8 @@ AIOS has no pools or placement groups. Durability, storage class, and data layou
 ## Placement
 
 ```
-target T  →  weight w (from .aios; default 1)
+target T  →  weight w (from .aios; default 1; capacity-proportional, operator-set)
+           →  only LifecycleState::Up enters the place() ring
            →  vnodes = clamp(w * vnodes_per_target, min_vnodes, max_vnodes)
 oid key    =  sha256(oid) → u64
 acting set =  clockwise on the class ring from oid key; unique physical targets,
@@ -27,14 +28,18 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
 
 - One vnode ring **per storage class**
 - `n` is replica count or `k+m`
-- If the class has fewer than `n` targets → empty acting set → `no_targets`
+- Map includes **up** and **drain** targets; **off** is omitted. `place()` uses **up** only.
+- Effective lifecycle = worse of node `node_state` and target `.aios` `state` (`off` > `drain` > `up`)
+- Drain: still serves existing data; repair **evacuates** tips that are no longer in the acting set
+- If the class has fewer than `n` **up** targets → empty acting set → `no_targets`
 - Adding/removing a target remaps roughly `O(1/N)` of objects (consistent hashing)
 
 ### Device declaration (`.aios`)
 
 ```yaml
 storage_class: nvme   # required; [a-z0-9_-]+
-weight: 2             # optional CH weight
+weight: 4             # relative capacity (e.g. TB units); feeds vnode count
+state: up             # up | drain | off (default up)
 targets: [data]       # optional; default = mount root
 ```
 

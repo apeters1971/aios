@@ -4,8 +4,8 @@
 
 namespace aios {
 
-void FsTable::set_local(const std::string& node_id,
-                        const std::vector<AiosTarget>& targets) {
+void FsTable::set_local(const std::string& node_id, const std::vector<AiosTarget>& targets,
+                        LifecycleState node_state) {
   std::lock_guard lock(mu_);
   local_id_ = node_id;
   // Drop previous local entries.
@@ -19,6 +19,8 @@ void FsTable::set_local(const std::string& node_id,
   const auto ts = now_ms();
   for (const auto& t : targets) {
     if (!t.usable) continue;
+    const LifecycleState eff = worse_lifecycle(node_state, t.state);
+    if (eff == LifecycleState::Off) continue;  // not advertised
     FsEntry e;
     e.node_id = node_id;
     e.mount = t.mount;
@@ -26,6 +28,7 @@ void FsTable::set_local(const std::string& node_id,
     e.aios_path = t.aios_path;
     e.storage_class = t.storage_class;
     e.weight = t.weight > 0 ? t.weight : 1;
+    e.state = eff;
     e.bsize = t.bsize;
     e.blocks = t.blocks;
     e.bfree = t.bfree;
@@ -69,6 +72,7 @@ nlohmann::json FsTable::to_json() const {
         {"aios_path", e.aios_path},
         {"storage_class", e.storage_class},
         {"weight", e.weight},
+        {"state", lifecycle_state_name(e.state)},
         {"bsize", e.bsize},
         {"blocks", e.blocks},
         {"bfree", e.bfree},
@@ -94,6 +98,7 @@ std::vector<FsEntry> FsTable::from_json(const nlohmann::json& j) {
     e.aios_path = x.value("aios_path", "");
     e.storage_class = x.value("storage_class", "");
     e.weight = x.value("weight", 1);
+    e.state = lifecycle_state_from_string(x.value("state", "up"));
     e.bsize = x.value("bsize", std::uint64_t{0});
     e.blocks = x.value("blocks", std::uint64_t{0});
     e.bfree = x.value("bfree", std::uint64_t{0});

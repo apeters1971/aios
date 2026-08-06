@@ -209,6 +209,7 @@
     if (activeTab === "quota") await refreshQuota();
     if (activeTab === "qos") await refreshQos();
     if (activeTab === "posix-layout") await refreshPosixLayout();
+    if (activeTab === "lifecycle") await refreshLifecycle();
     if (activeTab === "actions") await refreshArchiveBackup();
   }
 
@@ -374,6 +375,7 @@
     if (btn.dataset.tab === "quota") refreshQuota().catch(() => {});
     if (btn.dataset.tab === "qos") refreshQos().catch(() => {});
     if (btn.dataset.tab === "posix-layout") refreshPosixLayout().catch(() => {});
+    if (btn.dataset.tab === "lifecycle") refreshLifecycle().catch(() => {});
     if (btn.dataset.tab === "actions") refreshArchiveBackup().catch(() => {});
   });
 
@@ -410,6 +412,92 @@
     if (res.ok) renderPosixLayout(json);
     else renderPosixLayout({ posix_layout_rules: [] });
   }
+
+  function renderLifecycle(doc) {
+    const ns = document.getElementById("lifecycle-node-state");
+    if (ns && doc && doc.node_state) ns.value = doc.node_state;
+    const rows = ((doc && doc.targets) || [])
+      .map(
+        (t) =>
+          `<tr>
+            <td>${t.node_id || "—"}${t.self ? " *" : ""}</td>
+            <td>${t.mount || "—"}</td>
+            <td>${t.storage_class || "—"}</td>
+            <td>${t.weight ?? "—"}</td>
+            <td>${t.state || "—"}</td>
+            <td class="muted">${t.aios_path || ""}</td>
+          </tr>`
+      )
+      .join("");
+    document.getElementById("lifecycle-table").innerHTML =
+      `<table><thead><tr><th>Node</th><th>Mount</th><th>Class</th><th>Weight</th><th>State</th><th>Path</th></tr></thead><tbody>${
+        rows || "<tr><td colspan=6>No targets in map</td></tr>"
+      }</tbody></table>`;
+  }
+
+  async function refreshLifecycle() {
+    const { res, json } = await api("/admin/api/lifecycle");
+    if (res.status === 401) {
+      showLogin("Session expired — sign in again.");
+      return;
+    }
+    if (res.ok) renderLifecycle(json);
+    else renderLifecycle({ targets: [] });
+  }
+
+  document.getElementById("lifecycle-node-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("lifecycle-error");
+    const out = document.getElementById("lifecycle-result");
+    errEl.hidden = true;
+    out.classList.add("hidden");
+    const state = document.getElementById("lifecycle-node-state").value;
+    const { res, json } = await api("/admin/api/lifecycle/node", {
+      method: "PUT",
+      body: JSON.stringify({ state }),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Set node state failed";
+      return;
+    }
+    out.classList.remove("hidden");
+    out.textContent = JSON.stringify(json, null, 2);
+    await refreshLifecycle();
+  });
+
+  document.getElementById("lifecycle-target-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errEl = document.getElementById("lifecycle-error");
+    const out = document.getElementById("lifecycle-result");
+    errEl.hidden = true;
+    out.classList.add("hidden");
+    const key = document.getElementById("lifecycle-target-key").value.trim();
+    const state = document.getElementById("lifecycle-target-state").value;
+    const wraw = document.getElementById("lifecycle-target-weight").value.trim();
+    const body = {};
+    if (key.endsWith("/aios") || key.includes("/aios")) body.aios_path = key;
+    else body.mount = key;
+    if (state) body.state = state;
+    if (wraw) body.weight = parseInt(wraw, 10);
+    if (!body.state && body.weight == null) {
+      errEl.hidden = false;
+      errEl.textContent = "Set state and/or weight";
+      return;
+    }
+    const { res, json } = await api("/admin/api/lifecycle/target", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Set target failed";
+      return;
+    }
+    out.classList.remove("hidden");
+    out.textContent = JSON.stringify(json, null, 2);
+    await refreshLifecycle();
+  });
 
   document.getElementById("posix-layout-reload").addEventListener("click", () => {
     refreshPosixLayout().catch(() => {});

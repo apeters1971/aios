@@ -53,7 +53,7 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  admin [status|ops|config|cluster|metrics|console|archive|backup|vbd|posix-layout|s3-cred|quota|qos ...]\n"
+      << "  admin [status|ops|config|cluster|metrics|console|archive|backup|vbd|posix-layout|lifecycle|s3-cred|quota|qos ...]\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
@@ -62,6 +62,7 @@ void usage() {
       << "  admin backup show|run|snapshot|policy ...\n"
       << "  admin vbd list|delete|backup ...\n"
       << "  admin posix-layout show|set ...\n"
+      << "  admin lifecycle show|node|target ...\n"
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
       << "  admin qos show|set|project ...\n"
@@ -559,11 +560,12 @@ int cmd_admin_cluster(std::string host, std::string port, const std::string& key
 
 void admin_console_help() {
   std::cout << "commands: status | ops | config | cluster | metrics | archive | backup | "
-               "vbd | posix-layout | help | quit\n"
+               "vbd | posix-layout | lifecycle | help | quit\n"
             << "  archive [show|run|drain]\n"
             << "  backup [show|run]\n"
             << "  vbd [list|delete|backup ...]\n"
-            << "  posix-layout [show|set ...]\n";
+            << "  posix-layout [show|set ...]\n"
+            << "  lifecycle [show|node|target ...]\n";
 }
 
 HttpResp admin_exchange(std::string host, std::string port, const std::string& method,
@@ -866,6 +868,79 @@ int cmd_admin_vbd(std::string host, std::string port, const std::string& key,
     return 0;
   }
   std::cerr << "usage: admin vbd list|delete|backup ...\n";
+  return 2;
+}
+
+int cmd_admin_lifecycle(std::string host, std::string port, const std::string& key,
+                        const std::vector<std::string>& args) {
+  const std::string action = args.size() >= 2 ? args[1] : "show";
+  if (action == "show") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/lifecycle", key);
+    if (r.status != 200) {
+      std::cerr << "lifecycle show failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "node") {
+    if (args.size() < 3) {
+      std::cerr << "usage: admin lifecycle node up|drain|off\n";
+      return 2;
+    }
+    nlohmann::json body{{"state", args[2]}};
+    auto r = admin_exchange(std::move(host), std::move(port), "PUT",
+                            "/admin/api/lifecycle/node", body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "lifecycle node failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "target") {
+    // admin lifecycle target --mount PATH|--aios-path PATH [--state S] [--weight N]
+    std::string mount, aios_path, state;
+    std::optional<int> weight;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      if (args[i] == "--mount" && i + 1 < args.size()) {
+        mount = args[++i];
+      } else if ((args[i] == "--aios-path" || args[i] == "--aios_path") && i + 1 < args.size()) {
+        aios_path = args[++i];
+      } else if (args[i] == "--state" && i + 1 < args.size()) {
+        state = args[++i];
+      } else if (args[i] == "--weight" && i + 1 < args.size()) {
+        weight = std::stoi(args[++i]);
+      } else {
+        std::cerr << "usage: admin lifecycle target --mount PATH|--aios-path PATH "
+                     "[--state up|drain|off] [--weight N]\n";
+        return 2;
+      }
+    }
+    if (mount.empty() && aios_path.empty()) {
+      std::cerr << "usage: admin lifecycle target --mount PATH|--aios-path PATH "
+                   "[--state up|drain|off] [--weight N]\n";
+      return 2;
+    }
+    if (state.empty() && !weight) {
+      std::cerr << "lifecycle target requires --state and/or --weight\n";
+      return 2;
+    }
+    nlohmann::json body;
+    if (!mount.empty()) body["mount"] = mount;
+    if (!aios_path.empty()) body["aios_path"] = aios_path;
+    if (!state.empty()) body["state"] = state;
+    if (weight) body["weight"] = *weight;
+    auto r = admin_exchange(std::move(host), std::move(port), "PUT",
+                            "/admin/api/lifecycle/target", body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "lifecycle target failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  std::cerr << "usage: admin lifecycle show|node|target ...\n";
   return 2;
 }
 
@@ -1371,6 +1446,14 @@ int run_admin_console(std::string host, std::string port, const std::string& key
         while (iss >> tok) a.push_back(tok);
       }
       rc = cmd_admin_posix_layout(host, port, key, a);
+    } else if (line == "lifecycle" || line.rfind("lifecycle ", 0) == 0) {
+      std::vector<std::string> a{"lifecycle"};
+      if (line.size() > 9) {
+        std::istringstream iss(line.substr(10));
+        std::string tok;
+        while (iss >> tok) a.push_back(tok);
+      }
+      rc = cmd_admin_lifecycle(host, port, key, a);
     } else {
       std::cout << "unknown: " << line << "\n";
       admin_console_help();
@@ -1529,6 +1612,8 @@ int main(int argc, char** argv) {
       if (sub == "vbd") return cmd_admin_vbd(host, port, args.cluster_key, args.positional);
       if (sub == "posix-layout")
         return cmd_admin_posix_layout(host, port, args.cluster_key, args.positional);
+      if (sub == "lifecycle")
+        return cmd_admin_lifecycle(host, port, args.cluster_key, args.positional);
       if (sub == "s3-cred")
         return cmd_admin_s3_cred(host, port, args.cluster_key, args.positional);
       if (sub == "quota") return cmd_admin_quota(host, port, args.cluster_key, args.positional);

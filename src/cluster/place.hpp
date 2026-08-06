@@ -16,8 +16,8 @@ struct Placement {
 
 // Consistent-hash placement with virtual nodes on the class-scoped ring.
 // Walks the vnode ring clockwise from sha256(oid), preferring distinct
-// node_ids, then filling same-node mounts. Empty acting set if the class
-// has fewer than `n` targets (or n < 1).
+// node_ids, then filling same-node mounts. Only LifecycleState::Up targets
+// enter the ring. Empty acting set if the class has fewer than `n` up targets.
 Placement place(const std::string& oid, const ClusterMap& map, int n,
                 const std::string& storage_class);
 

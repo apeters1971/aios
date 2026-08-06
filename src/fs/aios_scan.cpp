@@ -92,6 +92,14 @@ bool parse_aios_marker(const std::string& yaml_text, const std::string& mount_ro
         return false;
       }
     }
+    if (root["state"]) {
+      const auto st = lower_copy(root["state"].as<std::string>());
+      if (!valid_lifecycle_state_string(st)) {
+        err = "state must be up, drain, or off";
+        return false;
+      }
+      out.state = lifecycle_state_from_string(st);
+    }
     if (!root["targets"]) {
       out.target_paths = {mount_root};
       return true;
@@ -126,13 +134,14 @@ bool parse_aios_marker(const std::string& yaml_text, const std::string& mount_ro
 }
 
 AiosTarget prepare_target(const std::string& mount, const std::string& target_path,
-                          const std::string& storage_class, int weight) {
+                          const std::string& storage_class, int weight, LifecycleState state) {
   AiosTarget t;
   t.mount = mount;
   t.target_path = target_path;
   t.aios_path = (fs::path(target_path) / "aios").string();
   t.storage_class = storage_class;
   t.weight = weight > 0 ? weight : 1;
+  t.state = state;
 
   std::error_code ec;
   if (!fs::exists(target_path, ec)) {
@@ -208,10 +217,56 @@ std::vector<AiosTarget> scan_aios_filesystems() {
       continue;
     }
     for (const auto& tp : parsed.target_paths) {
-      out.push_back(prepare_target(m.path, tp, parsed.storage_class, parsed.weight));
+      out.push_back(
+          prepare_target(m.path, tp, parsed.storage_class, parsed.weight, parsed.state));
     }
   }
   return out;
+}
+
+bool update_aios_marker_file(const std::string& marker_path,
+                             const std::optional<std::string>& state,
+                             const std::optional<int>& weight, std::string& err) {
+  err.clear();
+  if (!state && !weight) {
+    err = "state or weight required";
+    return false;
+  }
+  if (state && !valid_lifecycle_state_string(lower_copy(*state))) {
+    err = "state must be up, drain, or off";
+    return false;
+  }
+  if (weight && *weight < 1) {
+    err = "weight must be >= 1";
+    return false;
+  }
+  std::ifstream in(marker_path);
+  if (!in) {
+    err = "cannot read " + marker_path;
+    return false;
+  }
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  try {
+    YAML::Node root = YAML::Load(ss.str());
+    if (!root || !root.IsMap()) {
+      err = ".aios must be a YAML mapping";
+      return false;
+    }
+    if (state) root["state"] = lower_copy(*state);
+    if (weight) root["weight"] = *weight;
+    std::ofstream out(marker_path, std::ios::trunc);
+    if (!out) {
+      err = "cannot write " + marker_path;
+      return false;
+    }
+    out << root;
+    out << "\n";
+    return true;
+  } catch (const std::exception& e) {
+    err = e.what();
+    return false;
+  }
 }
 
 }  // namespace aios

@@ -12,6 +12,7 @@
 
 #include <boost/asio.hpp>
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -19,7 +20,8 @@ namespace aios {
 
 class HttpServer {
  public:
-  HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& objects,
+  // cfg is shared with GossipEngine so live admin toggles (node_state, etc.) apply.
+  HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService& objects,
              MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam = nullptr,
              std::shared_ptr<QuotaAdminStore> quota = nullptr,
              std::shared_ptr<QosAdminStore> qos = nullptr,
@@ -29,6 +31,11 @@ class HttpServer {
 
   void start();
 
+  // Optional: after lifecycle target rewrite, rescan local .aios markers.
+  void set_on_lifecycle_changed(std::function<void()> cb) {
+    on_lifecycle_changed_ = std::move(cb);
+  }
+
   std::uint64_t requests() const { return objects_.ops().total().http_requests.load(); }
 
  private:
@@ -36,9 +43,10 @@ class HttpServer {
   void handle_session(std::shared_ptr<boost::asio::ip::tcp::socket> sock);
   nlohmann::json admin_status_json() const;
   nlohmann::json admin_config_json() const;
+  nlohmann::json admin_lifecycle_json() const;
 
   boost::asio::io_context& ioc_;
-  Config cfg_;
+  Config& cfg_;
   ObjectService& objects_;
   MembershipTable& membership_;
   std::shared_ptr<S3IamStore> s3_iam_;
@@ -47,6 +55,7 @@ class HttpServer {
   std::shared_ptr<BackupPolicyStore> backup_policies_;
   std::shared_ptr<PosixLayoutStore> posix_layout_;
   std::shared_ptr<VbdRegistryStore> vbd_registry_;
+  std::function<void()> on_lifecycle_changed_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 

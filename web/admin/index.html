@@ -42,6 +42,7 @@
         <button type="button" data-tab="quota" class="tab">Quotas</button>
         <button type="button" data-tab="qos" class="tab">QoS</button>
         <button type="button" data-tab="posix-layout" class="tab">POSIX layout</button>
+        <button type="button" data-tab="lifecycle" class="tab">Lifecycle</button>
       </nav>
       <button type="button" id="logout-btn" class="btn ghost">Log out</button>
     </header>
@@ -234,6 +235,44 @@
         </div>
         <pre id="posix-layout-result" class="code-block small hidden"></pre>
         <p id="posix-layout-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-lifecycle" class="panel hidden">
+        <h2>Lifecycle</h2>
+        <p class="note">Planned ops while gossip-Alive: <code>up</code> (new placement), <code>drain</code> (serve existing; repair evacuates), <code>off</code> (out of map). Effective state is the worse of node and target. Set <code>weight</code> proportional to device capacity (e.g. TB).</p>
+        <h3>This node</h3>
+        <form id="lifecycle-node-form" class="s3-form">
+          <label class="field"><span>Node state</span>
+            <select id="lifecycle-node-state">
+              <option value="up">up</option>
+              <option value="drain">drain</option>
+              <option value="off">off</option>
+            </select>
+          </label>
+          <button type="submit" class="btn primary">Set node state</button>
+        </form>
+        <h3>Targets</h3>
+        <div id="lifecycle-table" class="table-wrap"></div>
+        <h3>Set target</h3>
+        <form id="lifecycle-target-form" class="s3-form">
+          <label class="field"><span>Mount or aios path</span>
+            <input id="lifecycle-target-key" spellcheck="false" required placeholder="/mnt/disk0 or .../aios" />
+          </label>
+          <label class="field"><span>State</span>
+            <select id="lifecycle-target-state">
+              <option value="">(unchanged)</option>
+              <option value="up">up</option>
+              <option value="drain">drain</option>
+              <option value="off">off</option>
+            </select>
+          </label>
+          <label class="field"><span>Weight</span>
+            <input id="lifecycle-target-weight" type="number" min="1" placeholder="optional" />
+          </label>
+          <button type="submit" class="btn primary">Apply</button>
+        </form>
+        <pre id="lifecycle-result" class="code-block small hidden"></pre>
+        <p id="lifecycle-error" class="error" hidden></p>
       </section>
     </main>
   </div>

@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <optional>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -46,9 +48,20 @@ int test_aios_scan() {
            "full marker ok");
     expect(m.storage_class == "hdd", "hdd class");
     expect(m.weight == 2, "weight 2");
+    expect(m.state == LifecycleState::Up, "default state up");
     expect(m.target_paths.size() == 2, "two targets");
     expect(m.target_paths[0] == "/mnt/data", "data path");
     expect(m.target_paths[1] == "/mnt/scratch", "scratch path");
+  }
+  {
+    expect(parse_aios_marker("storage_class: nvme\nstate: drain\nweight: 4\n", "/mnt", m, err),
+           "state drain ok");
+    expect(m.state == LifecycleState::Drain, "parsed drain");
+    expect(m.weight == 4, "weight 4");
+  }
+  {
+    expect(!parse_aios_marker("storage_class: nvme\nstate: broken\n", "/mnt", m, err),
+           "bad state rejected");
   }
   {
     expect(!parse_aios_marker("storage_class: nvme\ntargets:\n  - /elsewhere\n", "/mnt", m, err),
@@ -64,6 +77,25 @@ int test_aios_scan() {
     expect(t.storage_class == "nvme", "prepare class");
     expect(fs::is_directory(base / "data" / "aios"), "aios dir created");
     expect(t.bsize > 0, "statvfs bsize");
+  }
+  {
+    const auto marker = base / ".aios";
+    {
+      std::ofstream out(marker);
+      out << "storage_class: nvme\nweight: 1\n";
+    }
+    expect(update_aios_marker_file(marker.string(), std::string("drain"), 8, err),
+           "update marker");
+    expect(parse_aios_marker(
+               [&] {
+                 std::ifstream in(marker);
+                 return std::string(std::istreambuf_iterator<char>(in),
+                                    std::istreambuf_iterator<char>());
+               }(),
+               base.string(), m, err),
+           "reparse after update");
+    expect(m.state == LifecycleState::Drain, "updated state");
+    expect(m.weight == 8, "updated weight");
   }
 
   fs::remove_all(base);

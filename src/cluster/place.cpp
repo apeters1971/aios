@@ -1,5 +1,7 @@
 #include "cluster/place.hpp"
 
+#include "cluster/lifecycle.hpp"
+
 #include <openssl/evp.h>
 
 #include <algorithm>
@@ -65,7 +67,11 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
   p.storage_class = storage_class;
   if (map.targets.empty() || n < 1 || storage_class.empty()) return p;
 
-  const auto pool = map.targets_for_class(storage_class);
+  // New placement uses only up targets; drain stays on the map for reads/evacuate.
+  std::vector<StorageTarget> pool;
+  for (const auto& t : map.targets_for_class(storage_class)) {
+    if (t.state == LifecycleState::Up) pool.push_back(t);
+  }
   if (static_cast<std::size_t>(n) > pool.size()) return p;
 
   const auto ring = build_ring(pool, map.placement);

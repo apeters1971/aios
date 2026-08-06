@@ -1,5 +1,6 @@
 #include "object/repair.hpp"
 
+#include "cluster/lifecycle.hpp"
 #include "cluster/place.hpp"
 #include "ec/codec_factory.hpp"
 #include "ec/ec_attrs.hpp"
@@ -378,7 +379,92 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
           break;
         }
       }
-      if (!local_in_set) continue;
+
+      const StorageTarget* local_target = nullptr;
+      for (const auto& t : map.targets) {
+        if (t.node_id == cfg.node_id && t.aios_path == path) {
+          local_target = &t;
+          break;
+        }
+      }
+
+      // Drain evacuate: still hold tip but no longer in acting set — push out.
+      if (!local_in_set) {
+        if (!local_target || local_target->state != LifecycleState::Drain) continue;
+        std::string tip_err;
+        auto tip = local->stat(oid, tip_err);
+        if (!tip || tip->is_delete) continue;
+
+        std::vector<TargetObjState> states(p.acting_set.size());
+        std::vector<bool> has(p.acting_set.size(), false);
+        for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
+          states[i] =
+              target_object_state(cfg, advertise, map, stores, p.acting_set[i], oid);
+          has[i] = states[i].present;
+        }
+        const bool is_ec = attrs_are_ec(local_attrs);
+        bool any_fix = false;
+        std::vector<bool> needs_fix(p.acting_set.size(), false);
+        for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
+          if (!has[i]) {
+            needs_fix[i] = true;
+            any_fix = true;
+          }
+        }
+        if (!any_fix) continue;
+
+        ++stats.under_replicated;
+        if (!should_repair(cfg, p, has)) continue;
+
+        bool all_ok = true;
+        if (is_ec) {
+          // Push our shard to the acting-set slot matching ec_i when missing.
+          int shard_i = -1;
+          if (auto it = local_attrs.find(kEcAttrI); it != local_attrs.end()) {
+            try {
+              shard_i = std::stoi(it->second);
+            } catch (...) {
+              shard_i = -1;
+            }
+          }
+          if (shard_i >= 0 && static_cast<std::size_t>(shard_i) < p.acting_set.size() &&
+              needs_fix[static_cast<std::size_t>(shard_i)]) {
+            std::vector<std::uint8_t> body;
+            if (fetch_shard_body(cfg, advertise, map, stores, *local_target, oid, body) &&
+                push_ec_shard(cfg, advertise, map, stores,
+                              p.acting_set[static_cast<std::size_t>(shard_i)], oid,
+                              tip->seq, body, local_attrs)) {
+              AIOS_LOG_INFO("evacuated ec oid=", oid, " shard=", shard_i, " -> ",
+                            p.acting_set[static_cast<std::size_t>(shard_i)].node_id);
+            } else {
+              all_ok = false;
+              AIOS_LOG_WARN("evacuate ec failed oid=", oid, " shard=", shard_i);
+            }
+          } else {
+            // Not the missing shard index; leave for up-node EC repair.
+            continue;
+          }
+        } else {
+          for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
+            if (!needs_fix[i]) continue;
+            if (push_replica(cfg, advertise, map, stores, *local_target, p.acting_set[i],
+                             oid)) {
+              AIOS_LOG_INFO("evacuated oid=", oid, " -> ", p.acting_set[i].node_id, ":",
+                            p.acting_set[i].aios_path);
+            } else {
+              all_ok = false;
+              AIOS_LOG_WARN("evacuate failed oid=", oid, " -> ",
+                            p.acting_set[i].node_id);
+            }
+          }
+        }
+        if (all_ok) {
+          ++stats.repaired;
+        } else {
+          ++stats.failed;
+        }
+        continue;
+      }
 
       std::vector<TargetObjState> states(p.acting_set.size());
       std::vector<bool> has(p.acting_set.size(), false);

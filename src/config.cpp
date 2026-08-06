@@ -1,5 +1,6 @@
 #include "config.hpp"
 
+#include "cluster/lifecycle.hpp"
 #include "ec/codec_factory.hpp"
 #include "node_id.hpp"
 
@@ -393,6 +394,7 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["admin"]) cfg.admin = root["admin"].as<bool>();
     if (root["admin_metrics_public"])
       cfg.admin_metrics_public = root["admin_metrics_public"].as<bool>();
+    if (root["node_state"]) cfg.node_state = root["node_state"].as<std::string>();
     if (root["compression"]) cfg.compression = root["compression"].as<std::string>();
     if (root["compression_level"]) cfg.compression_level = root["compression_level"].as<int>();
     if (root["compression_min_bytes"])
@@ -731,6 +733,12 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
 }
 
 bool normalize_config(Config& cfg, std::string& err) {
+  cfg.node_state = lower_copy(cfg.node_state);
+  if (cfg.node_state.empty()) cfg.node_state = "up";
+  if (!valid_lifecycle_state_string(cfg.node_state)) {
+    err = "node_state must be up, drain, or off";
+    return false;
+  }
   if (cfg.durability.empty() || cfg.durability == "replica") {
     cfg.durability = "replica";
   } else if (cfg.durability != "ec") {

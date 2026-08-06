@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cluster/lifecycle.hpp"
 #include "fs/aios_scan.hpp"
 
 #include <cstdint>
@@ -19,6 +20,7 @@ struct FsEntry {
   std::string aios_path;
   std::string storage_class;
   int weight{1};
+  LifecycleState state{LifecycleState::Up};  // effective (node × target)
   std::uint64_t bsize{0};
   std::uint64_t blocks{0};
   std::uint64_t bfree{0};
@@ -32,7 +34,9 @@ struct FsEntry {
 class FsTable {
  public:
   // Replace all local-origin entries with scan results.
-  void set_local(const std::string& node_id, const std::vector<AiosTarget>& targets);
+  // node_state is folded into each entry's effective state; Off targets are omitted.
+  void set_local(const std::string& node_id, const std::vector<AiosTarget>& targets,
+                 LifecycleState node_state = LifecycleState::Up);
 
   void merge(const std::vector<FsEntry>& remote);
 

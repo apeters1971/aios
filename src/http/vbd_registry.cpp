@@ -3,7 +3,6 @@
 #include "util/log.hpp"
 
 #include <algorithm>
-#include <chrono>
 
 namespace aios {
 namespace {
@@ -44,12 +43,6 @@ bool put_cas(ObjectService& objects, const std::string& oid, const std::string& 
     return false;
   }
   return true;
-}
-
-std::int64_t now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
 }
 
 }  // namespace
