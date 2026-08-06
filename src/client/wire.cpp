@@ -11,11 +11,56 @@ std::string mode_name(sync_mode m) {
   return m == sync_mode::sync ? "sync" : "async";
 }
 
+nlohmann::json parse_json(const std::string& body) {
+  try {
+    return nlohmann::json::parse(body);
+  } catch (const nlohmann::json::exception& e) {
+    throw client_error("bad_request", std::string("malformed stl document: ") + e.what());
+  }
+}
+
+int envelope_version(const nlohmann::json& j) {
+  if (!j.is_object()) return 0;
+  auto it = j.find("aios_stl");
+  if (it == j.end() || !it->is_number_integer()) return 0;
+  return it->get<int>();
+}
+
+std::string envelope_type(const nlohmann::json& j) {
+  if (!j.is_object()) return {};
+  auto it = j.find("type");
+  if (it == j.end() || !it->is_string()) return {};
+  return it->get<std::string>();
+}
+
+std::uint64_t u64_field(const nlohmann::json& j, const char* key, std::uint64_t def) {
+  if (!j.is_object()) return def;
+  auto it = j.find(key);
+  if (it == j.end()) return def;
+  if (!it->is_number_unsigned()) {
+    throw client_error("bad_request", std::string("stl field not a u64: ") + key);
+  }
+  return it->get<std::uint64_t>();
+}
+
+const nlohmann::json& array_field(const nlohmann::json& j, const char* key) {
+  auto it = j.is_object() ? j.find(key) : j.end();
+  if (it == j.end() || !it->is_array()) {
+    throw client_error("bad_request", std::string("stl field not an array: ") + key);
+  }
+  return *it;
+}
+
+std::string string_element(const nlohmann::json& e, const char* what) {
+  if (!e.is_string()) throw client_error("bad_request", std::string("stl ") + what + " not a string");
+  return e.get<std::string>();
+}
+
 void check_envelope(const nlohmann::json& j, const char* expect_type) {
-  if (!j.is_object() || j.value("aios_stl", 0) != kStlVersion) {
+  if (envelope_version(j) != kStlVersion) {
     throw client_error("bad_request", "invalid aios_stl envelope");
   }
-  if (j.value("type", "") != expect_type) {
+  if (envelope_type(j) != expect_type) {
     throw client_error("bad_request", std::string("stl type mismatch, expected ") + expect_type);
   }
 }
@@ -66,50 +111,50 @@ nlohmann::json make_list_doc(const std::vector<std::string>& items, sync_mode mo
 }
 
 std::string parse_string_doc(const std::string& body) {
-  auto j = nlohmann::json::parse(body);
+  const auto j = parse_json(body);
   check_envelope(j, "string");
   return j.value("data", "");
 }
 
 std::map<std::string, std::string> parse_map_doc(const std::string& body) {
-  auto j = nlohmann::json::parse(body);
+  const auto j = parse_json(body);
   check_envelope(j, "map");
   std::map<std::string, std::string> out;
-  for (const auto& e : j.at("entries")) {
+  for (const auto& e : array_field(j, "entries")) {
     if (!e.is_array() || e.size() != 2) {
       throw client_error("bad_request", "bad map entry");
     }
-    out[e[0].get<std::string>()] = e[1].get<std::string>();
+    out[string_element(e[0], "map key")] = string_element(e[1], "map value");
   }
   return out;
 }
 
 std::unordered_map<std::string, std::string> parse_unordered_map_doc(const std::string& body) {
-  auto j = nlohmann::json::parse(body);
+  const auto j = parse_json(body);
   check_envelope(j, "unordered_map");
   std::unordered_map<std::string, std::string> out;
-  for (const auto& e : j.at("entries")) {
+  for (const auto& e : array_field(j, "entries")) {
     if (!e.is_array() || e.size() != 2) {
       throw client_error("bad_request", "bad unordered_map entry");
     }
-    out[e[0].get<std::string>()] = e[1].get<std::string>();
+    out[string_element(e[0], "unordered_map key")] = string_element(e[1], "unordered_map value");
   }
   return out;
 }
 
 std::set<std::string> parse_set_doc(const std::string& body) {
-  auto j = nlohmann::json::parse(body);
+  const auto j = parse_json(body);
   check_envelope(j, "set");
   std::set<std::string> out;
-  for (const auto& e : j.at("keys")) out.insert(e.get<std::string>());
+  for (const auto& e : array_field(j, "keys")) out.insert(string_element(e, "set key"));
   return out;
 }
 
 std::vector<std::string> parse_list_doc(const std::string& body, const char* expect_type) {
-  auto j = nlohmann::json::parse(body);
+  const auto j = parse_json(body);
   check_envelope(j, expect_type);
   std::vector<std::string> out;
-  for (const auto& e : j.at("items")) out.push_back(e.get<std::string>());
+  for (const auto& e : array_field(j, "items")) out.push_back(string_element(e, "list item"));
   return out;
 }
 

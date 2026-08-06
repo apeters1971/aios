@@ -121,6 +121,30 @@ bool push_replica(const Config& cfg, const std::string& advertise, const Cluster
 
   if (pv.seq == 0) pv.seq = 1;
 
+  // Tip advances are monotonic. If the destination already has a newer tip (e.g. a
+  // delete marker that tip stat() hides), reinstall under a fresh seq.
+  if (dst.node_id == cfg.node_id) {
+    if (auto* store = stores.get(dst.aios_path)) {
+      std::string terr;
+      std::uint64_t tip = 0;
+      if (store->tip_seq(oid, tip, terr) && tip >= pv.seq) {
+        pv.seq = tip + 1;
+        pv.fs_path.clear();
+      }
+    }
+  } else {
+    auto st = object_stat_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                 cfg.auth_skew_ms, map.epoch, dst.aios_path, oid);
+    // Remote stat hides delete markers; if the object "exists" with a higher tip, bump.
+    if (st.ok && st.body.contains("seq")) {
+      const auto tip = st.body.value("seq", static_cast<std::uint64_t>(0));
+      if (tip >= pv.seq) {
+        pv.seq = tip + 1;
+        pv.fs_path.clear();
+      }
+    }
+  }
+
   auto publish_dst = [&]() -> bool {
     if (dst.node_id == cfg.node_id) {
       auto* store = stores.get(dst.aios_path);
@@ -295,6 +319,12 @@ bool repair_ec_object(const Config& cfg, const std::string& advertise, const Clu
   }
   auto meta = parse_ec_attrs(tip_attrs);
   if (!meta) return false;
+  // Without a known full_crc, a mixed-generation decode cannot be validated before
+  // overwriting shards — refuse rather than risk permanent corruption.
+  if (!meta->full_crc_known) {
+    AIOS_LOG_WARN("ec repair aborted oid=", oid, ": missing aios.ec.full_crc");
+    return false;
+  }
 
   std::string err;
   auto codec = make_erasure_codec(meta->k, meta->m, meta->codec, err);
@@ -307,8 +337,12 @@ bool repair_ec_object(const Config& cfg, const std::string& advertise, const Clu
   // A shard's identity is the aios.ec.i attr it was stamped with, not its slot in
   // the acting set: place() reorders the set whenever the topology changes, so
   // decoding by position would feed the codec mismatched shards.
+  // Also skip targets known to need_fix (stale seq) so we do not mix generations.
   for (std::size_t ti = 0; ti < p.acting_set.size(); ++ti) {
     if (!has[ti]) continue;
+    if (ti < needs_fix.size() && needs_fix[ti]) continue;
+    const auto st = target_object_state(cfg, advertise, map, stores, p.acting_set[ti], oid);
+    if (auth_seq > 0 && st.seq > 0 && st.seq != auth_seq) continue;
     const auto shard_attrs = load_attrs_from_target(cfg, advertise, map, stores, p.acting_set[ti],
                                                     oid);
     const auto shard_meta = parse_ec_attrs(shard_attrs);
@@ -329,7 +363,7 @@ bool repair_ec_object(const Config& cfg, const std::string& advertise, const Clu
   }
   // Repair overwrites healthy shards with the re-encoded result, so a bad decode
   // here is unrecoverable. Verify before writing anything.
-  if (meta->full_crc_known && crc32c(full.data(), full.size()) != meta->full_crc) {
+  if (crc32c(full.data(), full.size()) != meta->full_crc) {
     AIOS_LOG_WARN("ec repair aborted oid=", oid, ": decoded object crc mismatch");
     return false;
   }

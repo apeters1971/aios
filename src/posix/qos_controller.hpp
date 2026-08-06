@@ -64,6 +64,7 @@ class QosController {
 
   bool ensure_loaded_locked(std::string& err);
   void configure_bucket(Bucket& b, std::optional<std::uint64_t> rate_per_sec, std::int64_t now);
+  static double clamped_cost(const Bucket& b, double cost);
   bool try_consume(Bucket& b, double cost, std::int64_t now);
   bool check_id(KeyBuckets& kb, const QosIdLimits& lim, std::uint64_t bytes, std::int64_t now,
                 bool consume);

@@ -75,21 +75,30 @@ TEST(Qos, Basic) {
     size_t wrote = 0;
     EXPECT_TRUE(aios_posix_write(fs, fino, 0, chunk.data(), chunk.size(), &wrote) == 0) << "write1";
     EXPECT_TRUE(aios_posix_write(fs, fino, chunk.size(), chunk.data(), chunk.size(), &wrote) == 0) << "write2";
-    // Burst equals rate (2); third immediate write should throttle.
-    EXPECT_TRUE(aios_posix_write(fs, fino, 2 * chunk.size(), chunk.data(), chunk.size(), &wrote) ==
-               -EAGAIN) << "iops EAGAIN";
+    // Burst is 2× rate (4). Four writes drain the bucket; the fifth throttles.
+    EXPECT_TRUE(aios_posix_write(fs, fino, 2 * chunk.size(), chunk.data(), chunk.size(), &wrote) == 0)
+        << "write3";
+    EXPECT_TRUE(aios_posix_write(fs, fino, 3 * chunk.size(), chunk.data(), chunk.size(), &wrote) == 0)
+        << "write4";
+    EXPECT_TRUE(aios_posix_write(fs, fino, 4 * chunk.size(), chunk.data(), chunk.size(), &wrote) ==
+                -EBUSY)
+        << "iops EBUSY";
 
     EXPECT_TRUE(qos_admin->set_volume_uid(1001, std::nullopt, std::nullopt, true, qerr)) << "clear iops";
     aios_posix_unmount(fs);
     fs = aios_posix_mount(&pcfg, &err);
-    EXPECT_TRUE(aios_posix_write(fs, fino, 2 * chunk.size(), chunk.data(), chunk.size(), &wrote) == 0) << "write after clear";
+    EXPECT_TRUE(aios_posix_write(fs, fino, 4 * chunk.size(), chunk.data(), chunk.size(), &wrote) == 0)
+        << "write after clear";
 
-    // Bandwidth limit: 20 bytes/s, burst 20 — 40-byte write denied.
+    // Bandwidth limit: 20 bytes/s, burst 40. A 40-byte write drains the bucket; the next is denied.
     EXPECT_TRUE(qos_admin->set_volume_uid(1001, std::nullopt, 20, false, qerr)) << "set bps=20";
     aios_posix_unmount(fs);
     fs = aios_posix_mount(&pcfg, &err);
     const std::string big(40, 'y');
-    EXPECT_TRUE(aios_posix_write(fs, fino, 0, big.data(), big.size(), &wrote) == -EAGAIN) << "bps EAGAIN";
+    EXPECT_TRUE(aios_posix_write(fs, fino, 0, big.data(), big.size(), &wrote) == 0) << "bps drain";
+    EXPECT_TRUE(aios_posix_write(fs, fino, 0, big.data(), big.size(), &wrote) == -EBUSY) << "bps EBUSY";
+    // Refill roughly one second of tokens, then a small write fits.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     const std::string small(10, 'z');
     EXPECT_TRUE(aios_posix_write(fs, fino, 0, small.data(), small.size(), &wrote) == 0) << "bps ok";
 

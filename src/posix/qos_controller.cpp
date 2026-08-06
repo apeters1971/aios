@@ -11,9 +11,13 @@ namespace posix {
 namespace {
 
 constexpr std::int64_t kCacheTtlMs = 5000;
+// Bucket depth in seconds of rate. Depth must exceed the rate, otherwise a single
+// I/O costing a full second of budget can never be admitted.
+constexpr double kBurstSeconds = 2.0;
 
+// Monotonic: a wall-clock step backwards must not stall refills.
 std::int64_t now_ms() {
-  using clock = std::chrono::system_clock;
+  using clock = std::chrono::steady_clock;
   return std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch())
       .count();
 }
@@ -128,8 +132,8 @@ void QosController::configure_bucket(Bucket& b, std::optional<std::uint64_t> rat
   const double rate = static_cast<double>(*rate_per_sec);
   if (!b.enabled || b.rate != rate) {
     b.rate = rate;
-    b.burst = rate;
-    b.tokens = rate;
+    b.burst = rate * kBurstSeconds;
+    b.tokens = b.burst;
     b.last_ms = now;
     b.enabled = true;
     return;
@@ -139,10 +143,17 @@ void QosController::configure_bucket(Bucket& b, std::optional<std::uint64_t> rat
   b.last_ms = now;
 }
 
+// An I/O larger than the bucket depth costs a full bucket rather than being
+// rejected forever: it waits for a full bucket, then drains it.
+double QosController::clamped_cost(const Bucket& b, double cost) {
+  return std::min(cost, b.burst);
+}
+
 bool QosController::try_consume(Bucket& b, double cost, std::int64_t /*now*/) {
   if (!b.enabled) return true;
-  if (b.tokens + 1e-9 < cost) return false;
-  b.tokens -= cost;
+  const double need = clamped_cost(b, cost);
+  if (b.tokens + 1e-9 < need) return false;
+  b.tokens -= need;
   return true;
 }
 
@@ -151,8 +162,11 @@ bool QosController::check_id(KeyBuckets& kb, const QosIdLimits& lim, std::uint64
   configure_bucket(kb.iops, lim.iops, now);
   configure_bucket(kb.bps, lim.bps, now);
   if (!consume) {
-    if (kb.iops.enabled && kb.iops.tokens + 1e-9 < 1.0) return false;
-    if (kb.bps.enabled && kb.bps.tokens + 1e-9 < static_cast<double>(bytes)) return false;
+    if (kb.iops.enabled && kb.iops.tokens + 1e-9 < clamped_cost(kb.iops, 1.0)) return false;
+    if (kb.bps.enabled &&
+        kb.bps.tokens + 1e-9 < clamped_cost(kb.bps, static_cast<double>(bytes))) {
+      return false;
+    }
     return true;
   }
   return try_consume(kb.iops, 1.0, now) && try_consume(kb.bps, static_cast<double>(bytes), now);

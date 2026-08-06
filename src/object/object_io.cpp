@@ -12,6 +12,32 @@
 
 namespace aios {
 
+namespace {
+
+std::unordered_map<std::string, std::string> attrs_from_target(const Config& cfg,
+                                                              const std::string& advertise,
+                                                              const ClusterMap& map,
+                                                              LocalStores& stores,
+                                                              const StorageTarget& t,
+                                                              const std::string& oid) {
+  std::unordered_map<std::string, std::string> a;
+  std::string err;
+  if (t.node_id == cfg.node_id) {
+    auto* store = stores.get(t.aios_path);
+    if (!store) return a;
+    return store->list_attrs(oid, err);
+  }
+  auto st = object_stat_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key, cfg.auth_skew_ms,
+                               map.epoch, t.aios_path, oid);
+  if (!st.ok || !st.body.contains("attrs") || !st.body["attrs"].is_object()) return a;
+  for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
+    if (it.value().is_string()) a[it.key()] = it.value().get<std::string>();
+  }
+  return a;
+}
+
+}  // namespace
+
 bool load_object_bytes(const Config& cfg, const std::string& advertise, const ClusterMap& map,
                        LocalStores& stores, Placement src_placement, const std::string& oid,
                        std::vector<std::uint8_t>& out,
@@ -57,25 +83,42 @@ bool load_object_bytes(const Config& cfg, const std::string& advertise, const Cl
     if (!codec) return false;
     std::vector<std::optional<std::vector<std::uint8_t>>> shards(static_cast<std::size_t>(n));
     int got = 0;
-    for (std::size_t i = 0; i < src_placement.acting_set.size() && i < shards.size(); ++i) {
-      const auto& t = src_placement.acting_set[i];
+    // Shard identity is aios.ec.i, not acting-set position (place() reorders on topology change).
+    for (std::size_t ti = 0; ti < src_placement.acting_set.size(); ++ti) {
+      const auto& t = src_placement.acting_set[ti];
+      const auto shard_attrs = attrs_from_target(cfg, advertise, map, stores, t, oid);
+      const auto shard_meta = parse_ec_attrs(shard_attrs);
+      const auto idx = (shard_meta && shard_meta->shard_i >= 0)
+                           ? static_cast<std::size_t>(shard_meta->shard_i)
+                           : ti;
+      if (idx >= shards.size() || shards[idx]) continue;
+
+      std::optional<std::vector<std::uint8_t>> body;
       if (t.node_id == cfg.node_id) {
         auto* store = stores.get(t.aios_path);
         if (!store) continue;
         auto s = store->get(oid, err);
         if (!s) continue;
-        shards[i] = std::move(*s);
-        ++got;
+        body = std::move(*s);
       } else {
         auto r = object_get_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key,
                                    cfg.auth_skew_ms, map.epoch, t.aios_path, oid);
         if (!r.ok || !r.data) continue;
-        shards[i] = std::move(*r.data);
-        ++got;
+        body = std::move(*r.data);
       }
+      shards[idx] = std::move(*body);
+      ++got;
     }
     if (got < meta->k) return false;
-    return codec->decode(shards, static_cast<std::size_t>(meta->full_size), out, err);
+    if (!codec->decode(shards, static_cast<std::size_t>(meta->full_size), out, err)) {
+      out.clear();
+      return false;
+    }
+    if (meta->full_crc_known && crc32c(out.data(), out.size()) != meta->full_crc) {
+      out.clear();
+      return false;
+    }
+    return true;
   }
 
   for (const auto& t : src_placement.acting_set) {
@@ -133,8 +176,8 @@ bool install_replica_version(const Config& cfg, const std::string& advertise,
       auto* s = stores.get(t.aios_path);
       if (s) s->publish_tip(oid, pv.seq, err);
     } else {
-      object_publish_tip_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key,
-                                cfg.auth_skew_ms, map.epoch, t.aios_path, oid, pv.seq);
+      object_publish_tip_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key, cfg.auth_skew_ms,
+                                map.epoch, t.aios_path, oid, pv.seq);
     }
   }
   return true;

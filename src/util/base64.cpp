@@ -52,6 +52,10 @@ bool base64_decode(const std::string& in, std::vector<std::uint8_t>& out, std::s
       err = "invalid base64";
       return false;
     }
+    if (c == -2 && d != -2) {
+      err = "invalid base64 padding";
+      return false;
+    }
     out.push_back(static_cast<std::uint8_t>((a << 2) | (b >> 4)));
     if (c >= 0) {
       out.push_back(static_cast<std::uint8_t>(((b & 15) << 4) | (c >> 2)));

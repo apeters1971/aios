@@ -52,11 +52,10 @@ class basic_list : public detail::StlBase {
     }
     if (!local_valid_) load();
     if (!impl_->pending.empty()) {
-      impl_->log.append_ops(impl_->pending, mode());
-      auto m = impl_->log.load_meta();
-      if (m.next_op > 1) impl_->applied_op = m.next_op - 1;
+      impl_->applied_op = impl_->log.append_ops(impl_->pending, mode());
       impl_->pending.clear();
     }
+    pull();
     clear_dirty();
     maybe_compact();
   }
@@ -113,11 +112,6 @@ class basic_list : public detail::StlBase {
     persist_op(changelog::Op::PopFront, {});
   }
 
-  T& operator[](std::size_t i) {
-    ensure_fresh_read();
-    if (mode() == sync_mode::async) mark_dirty();
-    return local_.at(i);
-  }
   const T& operator[](std::size_t i) const {
     ensure_fresh_read();
     return local_.at(i);
@@ -125,6 +119,12 @@ class basic_list : public detail::StlBase {
   T at(std::size_t i) const {
     ensure_fresh_read();
     return local_.at(i);
+  }
+
+  void set_at(std::size_t i, const T& v) {
+    ensure_fresh_read();
+    local_.at(i) = v;
+    persist_op(changelog::Op::SetAt, {std::to_string(i), stl_codec<T>::to_string(v)});
   }
 
   void insert(std::size_t index, const T& v) {
@@ -155,7 +155,7 @@ class basic_list : public detail::StlBase {
   };
 
   static std::size_t parse_index(const std::string& s) {
-    return static_cast<std::size_t>(std::stoull(s));
+    return static_cast<std::size_t>(stl_codec<std::uint64_t>::from_string(s));
   }
 
   static std::vector<std::string> to_wire(const std::vector<T>& in) {

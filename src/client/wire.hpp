@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <map>
 #include <set>
 #include <string>
@@ -31,6 +32,16 @@ std::vector<std::string> parse_list_doc(const std::string& body, const char* exp
 
 std::string mode_name(sync_mode m);
 void check_envelope(const nlohmann::json& j, const char* expect_type);
+
+// Defensive JSON accessors. The library's error contract is client_error with a
+// code() that callers switch on, while nlohmann reports a malformed document,
+// a missing key or a wrong element type through its own exception hierarchy.
+nlohmann::json parse_json(const std::string& body);
+int envelope_version(const nlohmann::json& j);
+std::string envelope_type(const nlohmann::json& j);
+std::uint64_t u64_field(const nlohmann::json& j, const char* key, std::uint64_t def);
+const nlohmann::json& array_field(const nlohmann::json& j, const char* key);
+std::string string_element(const nlohmann::json& e, const char* what);
 
 }  // namespace wire
 }  // namespace aios

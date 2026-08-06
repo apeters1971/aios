@@ -17,6 +17,12 @@ XrdAiosFile::~XrdAiosFile() { Close(); }
 int XrdAiosFile::Open(const char* path, int Oflag, mode_t Mode, XrdOucEnv& env) {
   if (!oss_ || !oss_->fs()) return -EIO;
   if (int rc = apply_caller(oss_->fs(), env)) return rc;
+  {
+    const auto cred = aios_posix_get_caller(oss_->fs());
+    uid_ = cred.uid;
+    gid_ = cred.gid;
+    caller_set_ = true;
+  }
 
   aios_posix_stat st{};
   int rc = lookup_path(oss_->fs(), path, &st);
@@ -65,10 +71,19 @@ int XrdAiosFile::Close(long long* retsz) {
   }
   open_ = false;
   ino_ = 0;
+  caller_set_ = false;
   return XrdOssOK;
 }
 
+int XrdAiosFile::restore_caller() const {
+  if (!open_ || !oss_ || !oss_->fs()) return -EBADF;
+  if (!caller_set_) return -EACCES;
+  aios_posix_set_caller(oss_->fs(), uid_, gid_);
+  return 0;
+}
+
 ssize_t XrdAiosFile::Read(void* buffer, off_t offset, size_t size) {
+  if (int rc = restore_caller()) return rc;
   if (!open_ || !oss_ || !oss_->fs()) return -EBADF;
   size_t got = 0;
   int rc = aios_posix_read(oss_->fs(), ino_, static_cast<uint64_t>(offset), buffer, size, &got);
@@ -77,6 +92,7 @@ ssize_t XrdAiosFile::Read(void* buffer, off_t offset, size_t size) {
 }
 
 ssize_t XrdAiosFile::Write(const void* buffer, off_t offset, size_t size) {
+  if (int rc = restore_caller()) return rc;
   if (!open_ || !oss_ || !oss_->fs()) return -EBADF;
   size_t wrote = 0;
   int rc =
@@ -86,6 +102,7 @@ ssize_t XrdAiosFile::Write(const void* buffer, off_t offset, size_t size) {
 }
 
 int XrdAiosFile::Fstat(struct stat* buf) {
+  if (int rc = restore_caller()) return rc;
   if (!open_ || !oss_ || !oss_->fs() || !buf) return -EBADF;
   aios_posix_stat st{};
   int rc = aios_posix_getattr(oss_->fs(), ino_, &st);
@@ -95,16 +112,19 @@ int XrdAiosFile::Fstat(struct stat* buf) {
 }
 
 int XrdAiosFile::Fsync() {
+  if (int rc = restore_caller()) return rc;
   if (!open_ || !oss_ || !oss_->fs()) return -EBADF;
   return aios_posix_fsync(oss_->fs(), ino_);
 }
 
 int XrdAiosFile::Ftruncate(unsigned long long flen) {
+  if (int rc = restore_caller()) return rc;
   if (!open_ || !oss_ || !oss_->fs()) return -EBADF;
   return aios_posix_truncate(oss_->fs(), ino_, flen);
 }
 
 int XrdAiosFile::Fchmod(mode_t mode) {
+  if (int rc = restore_caller()) return rc;
   if (!open_ || !oss_ || !oss_->fs()) return -EBADF;
   aios_posix_stat st{};
   st.mode = static_cast<uint32_t>(mode);

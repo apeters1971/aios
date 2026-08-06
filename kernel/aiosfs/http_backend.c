@@ -34,6 +34,7 @@
 #define AIOS_HTTP_MAX_XATTR_VALUE AIOS_KABI_XATTR_VALUE_MAX
 
 struct aios_iinfo {
+	u64 last_synced_size;
 	u64 cas;
 	u64 stripe_unit;
 	u32 stripe_width;
@@ -113,6 +114,8 @@ static bool json_get_u64(const char *json, const char *key, u64 *out)
 	char pat[64];
 	const char *p;
 	int n;
+	char num[32];
+	size_t i;
 
 	n = snprintf(pat, sizeof(pat), "\"%s\":", key);
 	if (n < 0 || n >= (int)sizeof(pat))
@@ -123,7 +126,15 @@ static bool json_get_u64(const char *json, const char *key, u64 *out)
 	p += n;
 	while (*p == ' ' || *p == '\t')
 		p++;
-	return kstrtou64(p, 10, out) == 0;
+	i = 0;
+	while (p[i] >= '0' && p[i] <= '9' && i < sizeof(num) - 1) {
+		num[i] = p[i];
+		i++;
+	}
+	if (i == 0)
+		return false;
+	num[i] = '\0';
+	return kstrtou64(num, 10, out) == 0;
 }
 
 static bool json_get_u32(const char *json, const char *key, u32 *out)
@@ -136,7 +147,147 @@ static bool json_get_u32(const char *json, const char *key, u32 *out)
 	return true;
 }
 
-/* Parse {"entries":{"a":1,"b":2}} — names are unescaped (posix names). */
+static int parse_u64_digits(const char *p, u64 *out, const char **end_out)
+{
+	char num[32];
+	size_t i = 0;
+
+	while (p[i] >= '0' && p[i] <= '9' && i < sizeof(num) - 1) {
+		num[i] = p[i];
+		i++;
+	}
+	if (i == 0)
+		return -EINVAL;
+	num[i] = '\0';
+	if (kstrtou64(num, 10, out))
+		return -EINVAL;
+	if (end_out)
+		*end_out = p + i;
+	return 0;
+}
+
+/* Parse {"entries":{"a":1,"b":2}} — names are JSON-escaped. */
+static int json_escape_append(char *dst, size_t cap, size_t *pos, const char *src)
+{
+	for (; *src; src++) {
+		const char *esc = NULL;
+		char hex[7];
+
+		switch (*src) {
+		case '"':
+			esc = "\\\"";
+			break;
+		case '\\':
+			esc = "\\\\";
+			break;
+		case '\b':
+			esc = "\\b";
+			break;
+		case '\f':
+			esc = "\\f";
+			break;
+		case '\n':
+			esc = "\\n";
+			break;
+		case '\r':
+			esc = "\\r";
+			break;
+		case '\t':
+			esc = "\\t";
+			break;
+		default:
+			if ((unsigned char)*src < 0x20) {
+				snprintf(hex, sizeof(hex), "\\u%04x", (unsigned char)*src);
+				esc = hex;
+			}
+			break;
+		}
+		if (esc) {
+			size_t elen = strlen(esc);
+
+			if (*pos + elen >= cap)
+				return -EOVERFLOW;
+			memcpy(dst + *pos, esc, elen);
+			*pos += elen;
+		} else {
+			if (*pos + 1 >= cap)
+				return -EOVERFLOW;
+			dst[(*pos)++] = *src;
+		}
+	}
+	return 0;
+}
+
+static int parse_json_quoted(const char **pp, const char *end, char *out, size_t out_cap)
+{
+	const char *p = *pp;
+	size_t o = 0;
+
+	if (p >= end || *p != '"')
+		return -EINVAL;
+	p++;
+	while (p < end && *p != '"') {
+		char c = *p++;
+
+		if (c != '\\') {
+			if (o + 1 >= out_cap)
+				return -ENAMETOOLONG;
+			out[o++] = c;
+			continue;
+		}
+		if (p >= end)
+			return -EINVAL;
+		c = *p++;
+		switch (c) {
+		case '"':
+		case '\\':
+		case '/':
+			break;
+		case 'b':
+			c = '\b';
+			break;
+		case 'f':
+			c = '\f';
+			break;
+		case 'n':
+			c = '\n';
+			break;
+		case 'r':
+			c = '\r';
+			break;
+		case 't':
+			c = '\t';
+			break;
+		case 'u': {
+			char hex[5];
+			unsigned int cp;
+			int j;
+
+			if (p + 4 > end)
+				return -EINVAL;
+			for (j = 0; j < 4; j++)
+				hex[j] = p[j];
+			hex[4] = '\0';
+			p += 4;
+			if (kstrtouint(hex, 16, &cp) || cp > 0x7f)
+				return -EINVAL;
+			c = (char)cp;
+			break;
+		}
+		default:
+			return -EINVAL;
+		}
+		if (o + 1 >= out_cap)
+			return -ENAMETOOLONG;
+		out[o++] = c;
+	}
+	if (p >= end || *p != '"')
+		return -EINVAL;
+	out[o] = '\0';
+	*pp = p + 1;
+	return 0;
+}
+
 static int parse_entries(const char *json, struct aios_dir_table *dt)
 {
 	const char *p = strstr(json, "\"entries\"");
@@ -151,9 +302,9 @@ static int parse_entries(const char *json, struct aios_dir_table *dt)
 	p++;
 	end = json + strlen(json);
 	while (p < end && *p) {
-		const char *q;
-		size_t nlen;
 		u64 ino;
+		const char *after;
+		int err;
 
 		while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == ','))
 			p++;
@@ -161,26 +312,20 @@ static int parse_entries(const char *json, struct aios_dir_table *dt)
 			break;
 		if (*p != '"')
 			return -EINVAL;
-		p++;
-		q = p;
-		while (q < end && *q && *q != '"')
-			q++;
-		if (q >= end || *q != '"')
-			return -EINVAL;
-		nlen = q - p;
-		if (nlen > AIOS_KABI_NAME_MAX)
-			return -ENAMETOOLONG;
 		if (dt->count >= AIOS_HTTP_MAX_DIR_ENTS)
 			return -ENOSPC;
-		memcpy(dt->ents[dt->count].name, p, nlen);
-		dt->ents[dt->count].name[nlen] = '\0';
-		p = q + 1;
+		err = parse_json_quoted(&p, end, dt->ents[dt->count].name,
+					sizeof(dt->ents[0].name));
+		if (err)
+			return err;
 		while (p < end && (*p == ' ' || *p == '\t' || *p == ':'))
 			p++;
-		if (kstrtou64(p, 10, &ino))
-			return -EINVAL;
+		err = parse_u64_digits(p, &ino, &after);
+		if (err)
+			return err;
 		dt->ents[dt->count].ino = ino;
 		dt->count++;
+		p = after;
 		while (p < end && *p && *p != ',' && *p != '}')
 			p++;
 	}
@@ -409,7 +554,7 @@ static int dir_plan_compact(struct aios_dir_table *dt, char **snap_out, char **m
 	u64 next = dt->next_op < 2 ? 2 : dt->next_op;
 	u64 snap_op = next - 1;
 
-	snap_cap = 32 + dt->count * (AIOS_KABI_NAME_MAX + 32);
+	snap_cap = 32 + dt->count * (AIOS_KABI_NAME_MAX * 6 + 32);
 	snap = kmalloc(snap_cap, GFP_KERNEL);
 	meta = kmalloc(512, GFP_KERNEL);
 	if (!snap || !meta) {
@@ -419,9 +564,21 @@ static int dir_plan_compact(struct aios_dir_table *dt, char **snap_out, char **m
 	}
 	pos = scnprintf(snap, snap_cap, "{\"entries\":{");
 	for (i = 0; i < dt->count; i++) {
-		pos += scnprintf(snap + pos, snap_cap - pos, "%s\"%s\":%llu",
-				 i ? "," : "", dt->ents[i].name,
+		char ename[AIOS_KABI_NAME_MAX * 6 + 8];
+		size_t epos = 0;
+		int err;
+
+		if (i)
+			pos += scnprintf(snap + pos, snap_cap - pos, ",");
+		pos += scnprintf(snap + pos, snap_cap - pos, "\"");
+		err = json_escape_append(ename, sizeof(ename), &epos, dt->ents[i].name);
+		if (err)
+			goto out_cap;
+		ename[epos] = '\0';
+		pos += scnprintf(snap + pos, snap_cap - pos, "%s\":%llu", ename,
 				 (unsigned long long)dt->ents[i].ino);
+		if (pos >= snap_cap)
+			goto out_cap;
 	}
 	scnprintf(snap + pos, snap_cap - pos, "}}");
 	scnprintf(meta, 512,
@@ -434,6 +591,11 @@ static int dir_plan_compact(struct aios_dir_table *dt, char **snap_out, char **m
 	*snap_out = snap;
 	*meta_out = meta;
 	return 0;
+
+out_cap:
+	kfree(snap);
+	kfree(meta);
+	return -EOVERFLOW;
 }
 
 static int dir_store_compact(struct aios_sb_info *info, struct aios_dir_table *dt)
@@ -739,6 +901,10 @@ static int base64_decode(const char *in, size_t in_len, u8 **out, size_t *out_le
 			kfree(buf);
 			return -EINVAL;
 		}
+		if (c == -2 && d != -2) {
+			kfree(buf);
+			return -EINVAL;
+		}
 		buf[o++] = (u8)((a << 2) | (b >> 4));
 		if (c >= 0)
 			buf[o++] = (u8)(((b & 15) << 4) | (c >> 2));
@@ -785,11 +951,10 @@ static int parse_xattrs_object(const char *obj, struct aios_xa_ent **ents_out, u
 	p = obj + 1;
 	end = obj + strlen(obj);
 	while (p < end && *p) {
-		const char *q;
-		size_t nlen, vlen;
-		char *b64 = NULL;
+		char b64_stack[AIOS_HTTP_MAX_XATTR_VALUE * 2 + 8];
 		u8 *raw = NULL;
 		size_t raw_len = 0;
+		size_t b64_len;
 		int err;
 
 		while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == ','))
@@ -800,46 +965,24 @@ static int parse_xattrs_object(const char *obj, struct aios_xa_ent **ents_out, u
 			free_xa_ents(ents, n);
 			return n >= AIOS_HTTP_MAX_XATTRS ? -ENOSPC : -EINVAL;
 		}
-		p++;
-		q = p;
-		while (q < end && *q && *q != '"')
-			q++;
-		if (q >= end || *q != '"') {
+		err = parse_json_quoted(&p, end, ents[n].name, sizeof(ents[n].name));
+		if (err) {
 			free_xa_ents(ents, n);
-			return -EINVAL;
+			return err;
 		}
-		nlen = q - p;
-		if (nlen == 0 || nlen > AIOS_KABI_NAME_MAX) {
-			free_xa_ents(ents, n);
-			return -EINVAL;
-		}
-		memcpy(ents[n].name, p, nlen);
-		ents[n].name[nlen] = '\0';
-		p = q + 1;
 		while (p < end && (*p == ' ' || *p == '\t' || *p == ':'))
 			p++;
 		if (p >= end || *p != '"') {
 			free_xa_ents(ents, n);
 			return -EINVAL;
 		}
-		p++;
-		q = p;
-		while (q < end && *q && *q != '"')
-			q++;
-		if (q >= end || *q != '"') {
+		err = parse_json_quoted(&p, end, b64_stack, sizeof(b64_stack));
+		if (err) {
 			free_xa_ents(ents, n);
-			return -EINVAL;
+			return err;
 		}
-		vlen = q - p;
-		b64 = kmalloc(vlen + 1, GFP_KERNEL);
-		if (!b64) {
-			free_xa_ents(ents, n);
-			return -ENOMEM;
-		}
-		memcpy(b64, p, vlen);
-		b64[vlen] = '\0';
-		err = base64_decode(b64, vlen, &raw, &raw_len);
-		kfree(b64);
+		b64_len = strlen(b64_stack);
+		err = base64_decode(b64_stack, b64_len, &raw, &raw_len);
 		if (err) {
 			free_xa_ents(ents, n);
 			return err;
@@ -847,7 +990,6 @@ static int parse_xattrs_object(const char *obj, struct aios_xa_ent **ents_out, u
 		ents[n].value = raw;
 		ents[n].value_len = raw_len;
 		n++;
-		p = q + 1;
 	}
 	*ents_out = ents;
 	*n_out = n;
@@ -862,22 +1004,33 @@ static int build_xattrs_object(struct aios_xa_ent *ents, unsigned int n, char **
 	unsigned int i;
 
 	for (i = 0; i < n; i++)
-		cap += strlen(ents[i].name) + ((ents[i].value_len + 2) / 3) * 4 + 8;
+		cap += (strlen(ents[i].name) * 6) + ((ents[i].value_len + 2) / 3) * 4 + 8;
 	s = kmalloc(cap + 16, GFP_KERNEL);
 	if (!s)
 		return -ENOMEM;
 	pos = scnprintf(s, cap + 16, "{");
 	for (i = 0; i < n; i++) {
+		char ename[AIOS_KABI_NAME_MAX * 6 + 8];
+		size_t epos = 0;
 		char *b64 = NULL;
 		size_t blen = 0;
-		int err = base64_encode(ents[i].value, ents[i].value_len, &b64, &blen);
+		int err;
 
+		if (i)
+			pos += scnprintf(s + pos, cap + 16 - pos, ",");
+		pos += scnprintf(s + pos, cap + 16 - pos, "\"");
+		err = json_escape_append(ename, sizeof(ename), &epos, ents[i].name);
 		if (err) {
 			kfree(s);
 			return err;
 		}
-		pos += scnprintf(s + pos, cap + 16 - pos, "%s\"%s\":\"%s\"", i ? "," : "",
-				 ents[i].name, b64);
+		ename[epos] = '\0';
+		err = base64_encode(ents[i].value, ents[i].value_len, &b64, &blen);
+		if (err) {
+			kfree(s);
+			return err;
+		}
+		pos += scnprintf(s + pos, cap + 16 - pos, "%s\":\"%s\"", ename, b64);
 		kfree(b64);
 	}
 	scnprintf(s + pos, cap + 16 - pos, "}");
@@ -997,6 +1150,8 @@ static void attach_iinfo(struct inode *inode, const struct aios_inode_meta *m)
 		ii->cas = m->cas;
 		ii->stripe_unit = m->stripe_unit;
 		ii->stripe_width = m->stripe_width;
+		if (!ii->last_synced_size)
+			ii->last_synced_size = m->size;
 	}
 }
 
@@ -1132,7 +1287,7 @@ static int ensure_root(struct aios_sb_info *info)
 	return err;
 }
 
-static int drop_nlink(struct aios_sb_info *info, u64 ino)
+static int aios_http_drop_link(struct aios_sb_info *info, u64 ino)
 {
 	struct aios_inode_meta m;
 	int err;
@@ -1365,7 +1520,8 @@ static int http_unlink(struct inode *dir, struct dentry *dentry)
 	err = dir_store_compact(info, &dt);
 	if (err)
 		goto out_dt;
-	drop_nlink(info, child);
+	drop_nlink(d_inode(dentry));
+	aios_http_drop_link(info, child);
 	d_drop(dentry);
 out_dt:
 	dir_table_free(&dt);
@@ -1460,6 +1616,8 @@ static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const cha
 				const char *new_name)
 {
 	struct aios_dir_table dt;
+	struct aios_inode_meta victim;
+	u64 victim_ino = 0;
 	int err;
 
 	err = dir_table_init(&dt, info->volume, parent);
@@ -1472,10 +1630,33 @@ static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const cha
 		err = -ENOENT;
 		goto out;
 	}
+	if (!dir_find(&dt, new_name, &victim_ino)) {
+		err = load_inode(info, victim_ino, &victim);
+		if (err)
+			goto out;
+		if (S_ISDIR(victim.mode)) {
+			struct aios_dir_table child_dt;
+
+			err = dir_table_init(&child_dt, info->volume, victim_ino);
+			if (err)
+				goto out;
+			err = dir_load(info, &child_dt);
+			if (!err && child_dt.count) {
+				dir_table_free(&child_dt);
+				err = -ENOTEMPTY;
+				goto out;
+			}
+			dir_table_free(&child_dt);
+		}
+	}
 	err = apply_dir_op(&dt, AIOS_HTTP_OP_RENAME, old_name, new_name);
 	if (err)
 		goto out;
 	err = dir_store_compact(info, &dt);
+	if (err)
+		goto out;
+	if (victim_ino)
+		aios_http_drop_link(info, victim_ino);
 out:
 	dir_table_free(&dt);
 	return err;
@@ -2028,7 +2209,6 @@ static int http_readdir(struct file *file, struct dir_context *ctx)
 
 		if (ctx->pos > pos)
 			continue;
-		ctx->pos = pos;
 		if (!load_inode(info, dt.ents[i].ino, &m)) {
 			if (S_ISDIR(m.mode))
 				type = DT_DIR;
@@ -2276,7 +2456,6 @@ static int aios_http_wb_collect(struct page *page, struct writeback_control *wbc
 	batch[n].len = 0;
 	batch[n].data = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!batch[n].data) {
-		end_page_writeback(page);
 		unlock_page(page);
 		return -ENOMEM;
 	}
@@ -2852,7 +3031,6 @@ static void http_put_super(struct super_block *sb)
 
 static const struct super_operations aios_http_super_ops = {
 	.statfs = http_statfs,
-	.drop_inode = generic_delete_inode,
 	.evict_inode = aios_evict_inode,
 	.write_inode = aios_write_inode,
 	.put_super = http_put_super,

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 #if defined(AIOS_HAVE_ISAL)
 #include <isa-l/erasure_code.h>
@@ -87,6 +88,10 @@ bool IsaLReedSolomonCodec::encode(std::span<const std::uint8_t> object,
   }
 
   if (shard_len == 0) return true;
+  if (shard_len > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    err = "shard length exceeds ISA-L int limit";
+    return false;
+  }
 
   std::vector<std::uint8_t> g_tbls(static_cast<std::size_t>(k_ * m_ * 32));
   // ISA-L takes non-const coeff pointers but does not modify them.
@@ -114,6 +119,7 @@ bool IsaLReedSolomonCodec::decode(
   int nerrs = 0;
   int frag_err_list[kMaxShards];
   std::size_t shard_len = 0;
+  bool have_len = false;
   int present = 0;
   for (int i = 0; i < total; ++i) {
     if (!shards_in[static_cast<std::size_t>(i)]) {
@@ -126,8 +132,10 @@ bool IsaLReedSolomonCodec::decode(
     }
     ++present;
     const auto& s = *shards_in[static_cast<std::size_t>(i)];
-    if (shard_len == 0) shard_len = s.size();
-    else if (s.size() != shard_len) {
+    if (!have_len) {
+      shard_len = s.size();
+      have_len = true;
+    } else if (s.size() != shard_len) {
       err = "shard length mismatch";
       return false;
     }
@@ -136,12 +144,22 @@ bool IsaLReedSolomonCodec::decode(
     err = "need at least k shards";
     return false;
   }
-  if (shard_len == 0 && full_size == 0) {
+  if (!have_len && full_size == 0) {
     object_out.clear();
     return true;
   }
-  if (shard_len == 0) {
+  if (!have_len) {
     err = "empty shards with nonzero full_size";
+    return false;
+  }
+  const std::size_t want =
+      (full_size + static_cast<std::size_t>(k_) - 1) / static_cast<std::size_t>(k_);
+  if (shard_len != want) {
+    err = "shard length does not match full_size";
+    return false;
+  }
+  if (shard_len > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    err = "shard length exceeds ISA-L int limit";
     return false;
   }
 

@@ -54,11 +54,10 @@ class basic_set : public detail::StlBase {
     }
     if (!local_valid_) load();
     if (!impl_->pending.empty()) {
-      impl_->log.append_ops(impl_->pending, mode());
-      auto m = impl_->log.load_meta();
-      if (m.next_op > 1) impl_->applied_op = m.next_op - 1;
+      impl_->applied_op = impl_->log.append_ops(impl_->pending, mode());
       impl_->pending.clear();
     }
+    pull();
     clear_dirty();
     maybe_compact();
   }

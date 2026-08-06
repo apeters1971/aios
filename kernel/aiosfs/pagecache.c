@@ -248,8 +248,10 @@ ssize_t aios_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		struct inode *inode = file_inode(iocb->ki_filp);
+		struct file *file = iocb->ki_filp;
 		loff_t size = i_size_read(inode);
 		size_t count = iov_iter_count(to);
+		loff_t end;
 		int err;
 
 		if (!count || iocb->ki_pos >= size)
@@ -260,9 +262,13 @@ ssize_t aios_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		if (!count)
 			return 0;
 
+		end = iocb->ki_pos + count - 1;
+		err = filemap_write_and_wait_range(inode->i_mapping, iocb->ki_pos, end);
+		if (err)
+			return err;
 		err = invalidate_inode_pages2_range(inode->i_mapping,
 						   iocb->ki_pos >> PAGE_SHIFT,
-						   (iocb->ki_pos + count - 1) >> PAGE_SHIFT);
+						   end >> PAGE_SHIFT);
 		if (err)
 			return err;
 		return aios_direct_IO(iocb, to, false);
@@ -293,13 +299,21 @@ ssize_t aios_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			} else {
 				loff_t endbyte = iocb->ki_pos + count - 1;
 
-				err = invalidate_inode_pages2_range(inode->i_mapping,
-								    iocb->ki_pos >> PAGE_SHIFT,
-								    endbyte >> PAGE_SHIFT);
+				err = filemap_write_and_wait_range(inode->i_mapping,
+								   iocb->ki_pos, endbyte);
+				if (!err)
+					err = invalidate_inode_pages2_range(inode->i_mapping,
+									    iocb->ki_pos >> PAGE_SHIFT,
+									    endbyte >> PAGE_SHIFT);
 				if (err)
 					ret = err;
 				else
 					ret = aios_direct_IO(iocb, from, true);
+				if (ret > 0)
+					invalidate_inode_pages2_range(inode->i_mapping,
+								      iocb->ki_pos >> PAGE_SHIFT,
+								      (iocb->ki_pos + ret - 1) >>
+									      PAGE_SHIFT);
 			}
 		}
 		inode_unlock(inode);
@@ -340,12 +354,28 @@ long aios_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 
 int aios_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
+	struct aios_inode_aux *aux = inode->i_private;
 	loff_t size;
+	int err;
 
 	if (!S_ISREG(inode->i_mode))
 		return 0;
 	size = i_size_read(inode);
-	return aios_io_set_size(inode, size);
+	if (!aux) {
+		aux = kzalloc(sizeof(*aux), GFP_KERNEL);
+		if (!aux)
+			return -ENOMEM;
+		aux->last_synced_size = (u64)size;
+		inode->i_private = aux;
+	}
+	if (aux->last_synced_size == (u64)size)
+		return 0;
+	if ((u64)size < aux->last_synced_size)
+		return 0;
+	err = aios_io_set_size(inode, size);
+	if (!err)
+		aux->last_synced_size = (u64)size;
+	return err;
 }
 
 void aios_evict_inode(struct inode *inode)

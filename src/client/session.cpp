@@ -1,6 +1,7 @@
 #include "client/session.hpp"
 
 #include "http/http_auth.hpp"
+#include "util/auth.hpp"
 #include "util/log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -9,6 +10,11 @@
 
 #include <cctype>
 #include <sstream>
+
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/time.h>
+#endif
 
 namespace aios {
 namespace {
@@ -120,14 +126,24 @@ std::string Session::stl_oid(const std::string& type, const std::string& name) {
   return "stl/" + type + "/" + name;
 }
 
+void Session::validate_header_value(const std::string& value, const char* what) {
+  for (char c : value) {
+    if (c == '\r' || c == '\n' || c == '\0') {
+      throw client_error("bad_request", std::string("invalid characters in ") + what);
+    }
+  }
+}
+
 void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
-                       const std::string& method, const std::string& target) const {
+                       const std::string& method, const std::string& target,
+                       const std::string& body) const {
   const std::string date = std::to_string(now_ms());
   headers["x-aios-date"] = date;
-  headers["x-aios-content-sha256"] = "UNSIGNED-PAYLOAD";
+  const std::string payload_hash = sha256_hex(body);
+  headers["x-aios-content-sha256"] = payload_hash;
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
   const auto canon =
-      http_canonical(method, target, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
+      http_canonical(method, target, date, signed_headers, headers, payload_hash);
   const auto sig = http_sign(cfg_.cluster_key, canon);
   headers["authorization"] = "AIOS-HMAC-SHA256 Credential=stl, SignedHeaders=" +
                              signed_headers + ", Signature=" + sig;
@@ -136,6 +152,15 @@ void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
 HttpResponse Session::request(const std::string& method, const std::string& target,
                               std::unordered_map<std::string, std::string> headers,
                               const std::string& body, int max_redirects) {
+  if (body.size() > kMaxBodyBytes) {
+    throw client_error("payload_too_large", "request body exceeds 16 MiB");
+  }
+  for (const auto& [k, v] : headers) {
+    validate_header_value(k, "header name");
+    validate_header_value(v, "header value");
+  }
+  if (!cfg_.app_label.empty()) validate_header_value(cfg_.app_label, "app label");
+
   std::string host = host_;
   std::string port = port_;
   std::string path = target;
@@ -146,7 +171,7 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     headers.erase("x-aios-date");
     headers["content-length"] = std::to_string(body.size());
     if (!cfg_.app_label.empty()) headers["x-aios-app-label"] = cfg_.app_label;
-    add_auth(headers, method, path);
+    add_auth(headers, method, path, body);
 
     boost::asio::io_context ioc;
     boost::system::error_code ec;
@@ -157,6 +182,17 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     tcp::socket sock(ioc);
     boost::asio::connect(sock, endpoints, ec);
     if (ec) throw client_error("http", "connect: " + ec.message());
+
+#ifndef _WIN32
+    if (cfg_.socket_timeout_ms > 0) {
+      struct timeval tv {};
+      tv.tv_sec = cfg_.socket_timeout_ms / 1000;
+      tv.tv_usec = (cfg_.socket_timeout_ms % 1000) * 1000;
+      const int fd = sock.native_handle();
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+#endif
 
     std::ostringstream req;
     req << method << ' ' << path << " HTTP/1.1\r\n";
@@ -184,6 +220,7 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     }
     std::string line;
     std::size_t content_length = 0;
+    bool have_content_length = false;
     while (std::getline(is, line)) {
       if (!line.empty() && line.back() == '\r') line.pop_back();
       if (line.empty()) break;
@@ -195,9 +232,20 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
       for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
       resp.headers[name] = value;
       if (name == "content-length") {
+        have_content_length = true;
+        if (value.empty() || value.front() == '-') {
+          throw client_error("http", "invalid Content-Length");
+        }
         try {
-          content_length = static_cast<std::size_t>(std::stoull(value));
+          const auto n = std::stoull(value);
+          if (n > kMaxBodyBytes) {
+            throw client_error("payload_too_large", "response body exceeds 16 MiB");
+          }
+          content_length = static_cast<std::size_t>(n);
+        } catch (const client_error&) {
+          throw;
         } catch (...) {
+          throw client_error("http", "invalid Content-Length");
         }
       }
     }
@@ -210,6 +258,10 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
       if (ec) break;
     }
     if (content_length > 0 && resp.body.size() > content_length) resp.body.resize(content_length);
+    if (have_content_length && method != "HEAD" && resp.status != 204 &&
+        resp.body.size() != content_length) {
+      throw client_error("http", "short response body");
+    }
 
     if (resp.status == 307 || resp.status == 301 || resp.status == 302) {
       const auto loc = header_get(resp.headers, "location");
@@ -305,11 +357,16 @@ std::uint64_t Session::put_bytes(const std::string& oid, const std::string& body
   std::unordered_map<std::string, std::string> headers;
   headers["content-type"] = "application/octet-stream";
   for (const auto& [k, v] : attrs) {
+    validate_header_value(k, "attribute name");
+    validate_header_value(v, "attribute value");
     headers["x-aios-attr-" + k] = v;
   }
   apply_put_layout_headers(headers, layout);
   const std::uint64_t new_cas = apply_posix_cas_headers(*this, oid, expected_cas, headers);
-  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  if (lock_token) {
+    validate_header_value(*lock_token, "lock token");
+    headers["x-aios-lock-token"] = *lock_token;
+  }
   const auto path = "/o/" + url_encode_oid(oid);
   auto resp = request("PUT", path, headers, body);
   if (resp.status != 204 && resp.status != 200 && resp.status != 201) {
@@ -329,7 +386,10 @@ void Session::put_range(const std::string& oid, std::uint64_t offset, const std:
   headers["content-type"] = "application/octet-stream";
   headers["content-range"] =
       "bytes " + std::to_string(offset) + "-" + std::to_string(end) + "/*";
-  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  if (lock_token) {
+    validate_header_value(*lock_token, "lock token");
+    headers["x-aios-lock-token"] = *lock_token;
+  }
   const auto path = "/o/" + url_encode_oid(oid);
   auto resp = request("PUT", path, headers, data);
   if (resp.status != 204 && resp.status != 200 && resp.status != 201) {
@@ -340,7 +400,10 @@ void Session::put_range(const std::string& oid, std::uint64_t offset, const std:
 void Session::delete_object(const std::string& oid,
                             const std::optional<std::string>& lock_token) {
   std::unordered_map<std::string, std::string> headers;
-  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  if (lock_token) {
+    validate_header_value(*lock_token, "lock token");
+    headers["x-aios-lock-token"] = *lock_token;
+  }
   const auto path = "/o/" + url_encode_oid(oid);
   auto resp = request("DELETE", path, headers);
   if (resp.status == 404) return;
@@ -387,7 +450,10 @@ std::uint64_t Session::put_object(const std::string& oid, const std::string& bod
   headers["x-aios-attr-aios.stl.type"] = stl_type;
   headers["x-aios-attr-aios.stl.v"] = std::to_string(stl_v);
   headers["x-aios-attr-aios.stl.cas"] = std::to_string(new_cas);
-  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  if (lock_token) {
+    validate_header_value(*lock_token, "lock token");
+    headers["x-aios-lock-token"] = *lock_token;
+  }
 
   if (expected_cas == 0) {
     // Create if absent, or first write when cas attr missing.
@@ -420,7 +486,10 @@ AppendResult Session::append(const std::string& oid, const std::string& data,
   }
   std::unordered_map<std::string, std::string> headers;
   headers["content-type"] = "application/octet-stream";
-  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  if (lock_token) {
+    validate_header_value(*lock_token, "lock token");
+    headers["x-aios-lock-token"] = *lock_token;
+  }
   const auto path = "/o/" + url_encode_oid(oid) + "/append";
   auto resp = request("POST", path, headers, data);
   if (resp.status != 200) throw_http(resp, "append");
@@ -439,7 +508,7 @@ AppendResult Session::append(const std::string& oid, const std::string& data,
   }
 }
 
-std::string Session::lock_acquire(const std::string& oid, int ttl_ms) {
+LockResult Session::lock_acquire(const std::string& oid, int ttl_ms) {
   std::unordered_map<std::string, std::string> headers;
   headers["x-aios-lock-ttl-ms"] = std::to_string(ttl_ms);
   const auto path = "/o/" + url_encode_oid(oid) + "/lock";
@@ -447,15 +516,21 @@ std::string Session::lock_acquire(const std::string& oid, int ttl_ms) {
   if (resp.status != 201) throw_http(resp, "lock_acquire");
   try {
     auto j = nlohmann::json::parse(resp.body);
-    return j.at("token").get<std::string>();
+    LockResult out;
+    out.token = j.at("token").get<std::string>();
+    out.expires_ms = j.value("expires_ms", static_cast<std::int64_t>(0));
+    return out;
   } catch (...) {
     throw client_error("http", "bad lock response");
   }
 }
 
-bool Session::lock_try_acquire(const std::string& oid, std::string& token_out, int ttl_ms) {
+bool Session::lock_try_acquire(const std::string& oid, std::string& token_out, int ttl_ms,
+                               std::int64_t* expires_ms_out) {
   try {
-    token_out = lock_acquire(oid, ttl_ms);
+    const auto lr = lock_acquire(oid, ttl_ms);
+    token_out = lr.token;
+    if (expires_ms_out) *expires_ms_out = lr.expires_ms;
     return true;
   } catch (const client_error& e) {
     if (e.code() == "lock_held") return false;
@@ -463,13 +538,23 @@ bool Session::lock_try_acquire(const std::string& oid, std::string& token_out, i
   }
 }
 
-void Session::lock_renew(const std::string& oid, const std::string& token, int ttl_ms) {
+void Session::lock_renew(const std::string& oid, const std::string& token, int ttl_ms,
+                         std::int64_t* expires_ms_out) {
   std::unordered_map<std::string, std::string> headers;
   headers["x-aios-lock-ttl-ms"] = std::to_string(ttl_ms);
+  validate_header_value(token, "lock token");
   headers["x-aios-lock-token"] = token;
   const auto path = "/o/" + url_encode_oid(oid) + "/lock/renew";
   auto resp = request("POST", path, headers);
   if (resp.status != 200) throw_http(resp, "lock_renew");
+  if (expires_ms_out) {
+    try {
+      auto j = nlohmann::json::parse(resp.body);
+      *expires_ms_out = j.value("expires_ms", static_cast<std::int64_t>(0));
+    } catch (...) {
+      *expires_ms_out = 0;
+    }
+  }
 }
 
 void Session::lock_release(const std::string& oid, const std::string& token) {
@@ -507,10 +592,15 @@ void Session::txn_prepare_put(const std::string& txn_id, const std::string& oid,
   std::unordered_map<std::string, std::string> headers;
   headers["content-type"] = "application/octet-stream";
   for (const auto& [k, v] : attrs) {
+    validate_header_value(k, "attribute name");
+    validate_header_value(v, "attribute value");
     headers["x-aios-attr-" + k] = v;
   }
   apply_posix_cas_headers(*this, oid, expected_cas, headers);
-  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  if (lock_token) {
+    validate_header_value(*lock_token, "lock token");
+    headers["x-aios-lock-token"] = *lock_token;
+  }
   const auto path = "/txn/" + url_encode_oid(txn_id) + "/o/" + url_encode_oid(oid);
   auto resp = request("PUT", path, headers, body);
   if (resp.status != 200 && resp.status != 201 && resp.status != 204) {
@@ -524,7 +614,10 @@ void Session::txn_prepare_delete(const std::string& txn_id, const std::string& o
     throw client_error("bad_request", "txn_prepare_delete args");
   }
   std::unordered_map<std::string, std::string> headers;
-  if (lock_token) headers["x-aios-lock-token"] = *lock_token;
+  if (lock_token) {
+    validate_header_value(*lock_token, "lock token");
+    headers["x-aios-lock-token"] = *lock_token;
+  }
   const auto path = "/txn/" + url_encode_oid(txn_id) + "/o/" + url_encode_oid(oid);
   auto resp = request("DELETE", path, headers);
   if (resp.status != 200 && resp.status != 201 && resp.status != 204) {

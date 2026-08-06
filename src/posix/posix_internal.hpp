@@ -10,8 +10,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -135,15 +137,18 @@ struct FsState {
   uint32_t default_uid{0};
   uint32_t default_gid{0};
   std::string frontend_label{"fs"};  // s3 | fs | custom (for IO monitoring)
+  std::mutex mu;                     // guards super, inode_cache, flock_tokens, rstat_dirty
   SuperMeta super;
-  std::mutex mu;
   std::unordered_map<uint64_t, InodeMeta> inode_cache;
   std::unordered_map<uint64_t, std::string> flock_tokens;  // ino → lock token
   std::unordered_set<uint64_t> rstat_dirty;
   int rstat_interval_ms{60000};
   std::atomic<bool> rstat_stop{false};
   std::thread rstat_thread;
-  std::vector<PosixLayoutRule> layout_rules;
+  // Layout rules are replaced wholesale on refresh; readers take a snapshot of the
+  // shared_ptr so an in-flight lookup keeps the version it started with.
+  std::mutex layout_mu;
+  std::shared_ptr<const std::vector<PosixLayoutRule>> layout_rules;
   std::chrono::steady_clock::time_point layout_rules_loaded{};
   std::unique_ptr<QuotaLedger> quota;
   std::unique_ptr<QosController> qos;
@@ -164,10 +169,22 @@ struct FsState {
 int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_name,
                      uint64_t new_parent, const std::string& new_name);
 
+// Same-directory rename/replace via /txn (compact rewrite under locks).
+int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
+                    const std::string& new_name);
+
 InodeMeta load_inode(FsState& st, uint64_t ino);
+
+// Restates this operation's own mutation against a record freshly loaded from the
+// server. Required for any store_inode that read-modify-writes an existing inode:
+// without it a CAS conflict can only be answered by failing, since re-sending the
+// caller's stale copy would discard the other writer's fields.
+using InodeReapply = std::function<void(InodeMeta&)>;
+
 // path_for_layout: use when the dentry is not linked yet (create/mkdir).
 void store_inode(FsState& st, InodeMeta& m,
-                 const std::optional<std::string>& path_for_layout = std::nullopt);
+                 const std::optional<std::string>& path_for_layout = std::nullopt,
+                 const InodeReapply& reapply = nullptr);
 uint64_t alloc_ino(FsState& st);
 void ensure_super(FsState& st);
 void ensure_root(FsState& st);

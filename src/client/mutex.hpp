@@ -2,6 +2,8 @@
 
 #include "client/session.hpp"
 
+#include <chrono>
+#include <optional>
 #include <string>
 
 namespace aios {
@@ -16,21 +18,25 @@ class mutex {
   mutex(const mutex&) = delete;
   mutex& operator=(const mutex&) = delete;
 
-  void lock();
+  // Blocks until acquired or timeout_ms elapses (defaults to ttl_ms_).
+  void lock(std::optional<int> timeout_ms = std::nullopt);
   bool try_lock();
-  void unlock();
+  void unlock() noexcept;
   void renew();
-  bool owns_lock() const { return !token_.empty(); }
+  bool owns_lock() const;
 
   const std::string& name() const { return name_; }
   const std::string& oid() const { return oid_; }
 
  private:
+  void maybe_renew();
+
   Session* session_;
   std::string name_;
   std::string oid_;
   int ttl_ms_;
   std::string token_;
+  std::int64_t expires_ms_{0};
 };
 
 }  // namespace aios

@@ -2,11 +2,39 @@
 
 #include "client/wire.hpp"
 
+#include <algorithm>
 #include <nlohmann/json.hpp>
 
 namespace aios {
 namespace changelog {
 namespace {
+
+struct LogLockGuard {
+  Session* session{nullptr};
+  std::string oid;
+  std::string token;
+
+  LogLockGuard(Session& s, const std::string& oid_in) : session(&s), oid(oid_in) {
+    token = s.lock_acquire(oid_in).token;
+  }
+
+  ~LogLockGuard() {
+    if (session && !token.empty()) {
+      try {
+        session->lock_release(oid, token);
+      } catch (...) {
+      }
+    }
+  }
+
+  LogLockGuard(const LogLockGuard&) = delete;
+  LogLockGuard& operator=(const LogLockGuard&) = delete;
+};
+
+bool valid_op(std::uint32_t op_u) {
+  return op_u >= static_cast<std::uint32_t>(Op::Put) &&
+         op_u <= static_cast<std::uint32_t>(Op::Compact);
+}
 
 void append_u32(std::string& out, std::uint32_t v) {
   out.push_back(static_cast<char>(v & 0xff));
@@ -66,7 +94,7 @@ nlohmann::json make_meta_json(const Meta& m, sync_mode mode, const std::string& 
 }
 
 Meta parse_meta_json(const std::string& body, const char* expect_type) {
-  auto j = nlohmann::json::parse(body);
+  auto j = wire::parse_json(body);
   if (!j.is_object() || j.value("aios_stl", 0) != kMetaVersion) {
     throw client_error("bad_request", "invalid aios_stl meta (want v2)");
   }
@@ -111,6 +139,9 @@ std::size_t decode_records(const std::string& buf, std::vector<Record>& out) {
       throw client_error("bad_request", "changelog magic mismatch");
     }
     if (!read_u32(buf, i, header_len)) return start;
+    if (header_len != 16) {
+      throw client_error("bad_request", "changelog header_len must be 16");
+    }
     if (i + header_len > buf.size()) return start;
     std::size_t h = i;
     Record rec;
@@ -118,6 +149,12 @@ std::size_t decode_records(const std::string& buf, std::vector<Record>& out) {
     std::uint32_t payload_len = 0;
     if (!read_u64(buf, h, rec.op_id) || !read_u32(buf, h, op_u) || !read_u32(buf, h, payload_len)) {
       throw client_error("bad_request", "changelog header truncated");
+    }
+    if (rec.op_id == 0) {
+      throw client_error("bad_request", "changelog invalid op_id");
+    }
+    if (!valid_op(op_u)) {
+      throw client_error("bad_request", "changelog invalid op");
     }
     i += header_len;
     if (i + payload_len > buf.size()) return start;
@@ -157,9 +194,9 @@ Log::Log(Session& session, std::string type, std::string name)
       log_oid_(changelog::log_oid(type_, name_)),
       snap_oid_(changelog::snap_oid(type_, name_)) {}
 
-void Log::cas_put_meta(Meta& m, sync_mode mode) {
+void Log::cas_put_meta(Meta& m, sync_mode mode, const std::optional<std::string>& lock_token) {
   const auto body = make_meta_json(m, mode, snap_oid_).dump();
-  m.cas = session_->put_object(meta_oid_, body, type_, m.cas, std::nullopt, kMetaVersion);
+  m.cas = session_->put_object(meta_oid_, body, type_, m.cas, lock_token, kMetaVersion);
   m.exists = true;
 }
 
@@ -194,7 +231,7 @@ Meta Log::open(sync_mode mode) {
     m.type = type_;
     return m;
   }
-  auto j = nlohmann::json::parse(snap.body);
+  auto j = wire::parse_json(snap.body);
   const int ver = j.value("aios_stl", 0);
   if (ver == 1) {
     migrate_v1(snap.body, snap.cas, mode);
@@ -213,7 +250,7 @@ Meta Log::load_meta() {
   Meta m;
   m.type = type_;
   if (!snap.exists) return m;
-  auto j = nlohmann::json::parse(snap.body);
+  auto j = wire::parse_json(snap.body);
   if (j.value("aios_stl", 0) == 1) {
     throw client_error("stl_v1", "v1 tip; call open()");
   }
@@ -255,9 +292,18 @@ Meta Log::pull(std::uint64_t* applied_op,
   auto ranged = session_->get_range(log_oid_, 0, log_size - 1);
   if (!ranged.exists) return m;
   std::vector<Record> recs;
-  decode_records(ranged.body, recs);
+  const std::size_t consumed = decode_records(ranged.body, recs);
+  if (consumed != ranged.body.size()) {
+    throw client_error("bad_request", "incomplete changelog record");
+  }
+  std::sort(recs.begin(), recs.end(),
+            [](const Record& a, const Record& b) { return a.op_id < b.op_id; });
   for (const auto& r : recs) {
     if (r.op_id <= *applied_op) continue;
+    if (r.op_id == 0 || r.op_id >= m.next_op) {
+      throw client_error("bad_request", "changelog invalid op_id");
+    }
+    if (r.op_id != *applied_op + 1) break;
     if (r.op == Op::Compact) {
       *applied_op = r.op_id;
       continue;
@@ -311,8 +357,8 @@ std::uint64_t Log::append_op(Op op, std::vector<std::string> args, sync_mode mod
   throw client_error("conflict", "changelog append_op exhausted retries");
 }
 
-void Log::append_ops(std::vector<Record> records, sync_mode mode) {
-  if (records.empty()) return;
+std::uint64_t Log::append_ops(std::vector<Record> records, sync_mode mode) {
+  if (records.empty()) return 0;
   for (int attempt = 0; attempt < 16; ++attempt) {
     Meta m = open(mode);
     ensure_meta(m, mode);
@@ -337,23 +383,26 @@ void Log::append_ops(std::vector<Record> records, sync_mode mode) {
       if (cur.next_op < next) cur.next_op = next;
       try {
         cas_put_meta(cur, mode);
-        return;
+        return next - 1;
       } catch (const client_error& e) {
         if (e.code() == "conflict") continue;
         throw;
       }
     }
-    return;
+    return next - 1;
   }
   throw client_error("conflict", "changelog append_ops exhausted retries");
 }
 
 void Log::compact(const std::string& snapshot_json, sync_mode mode, std::uint64_t applied_op) {
+  LogLockGuard log_lock(*session_, log_oid_);
+  const std::optional<std::string> lock_token = log_lock.token;
+
   Meta m = open(mode);
   ensure_meta(m, mode);
 
   auto snap_head = session_->head_object(snap_oid_);
-  session_->put_object(snap_oid_, snapshot_json, type_, snap_head.cas, std::nullopt, 1);
+  session_->put_object(snap_oid_, snapshot_json, type_, snap_head.cas, lock_token, 1);
 
   const std::uint64_t fence_id = m.next_op;
   const std::uint64_t snap_op = applied_op > 0 ? applied_op : (fence_id > 0 ? fence_id - 1 : 0);
@@ -362,16 +411,16 @@ void Log::compact(const std::string& snapshot_json, sync_mode mode, std::uint64_
   reserved.next_op = fence_id + 1;
   reserved.snapshot_op = snap_op;
   reserved.log_bytes = 0;
-  cas_put_meta(reserved, mode);
+  cas_put_meta(reserved, mode, lock_token);
 
   auto log_head = session_->head_object(log_oid_);
-  session_->put_object(log_oid_, "", type_ + ".log", log_head.cas, std::nullopt, kMetaVersion);
+  session_->put_object(log_oid_, "", type_ + ".log", log_head.cas, lock_token, kMetaVersion);
 
   Meta cur = load_meta();
   cur.log_bytes = 0;
   cur.snapshot_op = snap_op;
   if (cur.next_op < fence_id + 1) cur.next_op = fence_id + 1;
-  cas_put_meta(cur, mode);
+  cas_put_meta(cur, mode, lock_token);
 }
 
 }  // namespace changelog

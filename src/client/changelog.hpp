@@ -76,7 +76,8 @@ class Log {
             const std::function<void(const Record&)>& apply);
 
   std::uint64_t append_op(Op op, std::vector<std::string> args, sync_mode mode);
-  void append_ops(std::vector<Record> records, sync_mode mode);
+  // Returns highest op_id written (0 if records empty).
+  std::uint64_t append_ops(std::vector<Record> records, sync_mode mode);
 
   void compact(const std::string& snapshot_json, sync_mode mode, std::uint64_t applied_op);
 
@@ -84,7 +85,8 @@ class Log {
 
  private:
   void ensure_meta(Meta& m, sync_mode mode);
-  void cas_put_meta(Meta& m, sync_mode mode);
+  void cas_put_meta(Meta& m, sync_mode mode,
+                    const std::optional<std::string>& lock_token = std::nullopt);
   void migrate_v1(const std::string& v1_body, std::uint64_t cas, sync_mode mode);
 
   Session* session_;

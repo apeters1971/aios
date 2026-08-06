@@ -16,6 +16,13 @@ struct SessionConfig {
   std::string cluster_key;
   // Optional workload label sent as x-aios-app-label on every request.
   std::string app_label{};
+  // Per-socket read/write deadline (SO_RCVTIMEO / SO_SNDTIMEO).
+  int socket_timeout_ms{30000};
+};
+
+struct LockResult {
+  std::string token;
+  std::int64_t expires_ms{0};
 };
 
 struct HttpResponse {
@@ -104,10 +111,12 @@ class Session {
                       const std::optional<std::string>& lock_token = std::nullopt);
 
   // Lock API on arbitrary oid.
-  std::string lock_acquire(const std::string& oid, int ttl_ms = 30000);
-  void lock_renew(const std::string& oid, const std::string& token, int ttl_ms = 30000);
+  LockResult lock_acquire(const std::string& oid, int ttl_ms = 30000);
+  void lock_renew(const std::string& oid, const std::string& token, int ttl_ms = 30000,
+                  std::int64_t* expires_ms_out = nullptr);
   void lock_release(const std::string& oid, const std::string& token);
-  bool lock_try_acquire(const std::string& oid, std::string& token_out, int ttl_ms = 30000);
+  bool lock_try_acquire(const std::string& oid, std::string& token_out, int ttl_ms = 30000,
+                        std::int64_t* expires_ms_out = nullptr);
 
   // Cross-object transactions (HTTP /txn). Prepare uses aios.posix.cas like put_bytes
   // when expected_cas is set. Pass lock_token when the oid is locked by this client.
@@ -128,7 +137,8 @@ class Session {
  private:
   void parse_endpoint();
   void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
-                const std::string& target) const;
+                const std::string& target, const std::string& body) const;
+  static void validate_header_value(const std::string& value, const char* what);
   static ObjectSnapshot parse_object_meta(const HttpResponse& resp, bool with_body);
 
   SessionConfig cfg_;

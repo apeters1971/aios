@@ -161,28 +161,35 @@ static ssize_t aios_dev_read(struct file *file, char __user *buf, size_t count,
 {
 	struct aios_conn *conn = file->private_data;
 	struct aios_request *req = NULL;
+	DEFINE_WAIT(wait);
 	size_t need;
-	int err;
 
 	if (!conn)
 		return -ENOTCONN;
 
-	err = wait_event_interruptible(conn->read_wait, ({
-		bool ready = false;
+	for (;;) {
+		prepare_to_wait(&conn->read_wait, &wait, TASK_INTERRUPTIBLE);
 		mutex_lock(&conn->lock);
 		if (!list_empty(&conn->pending)) {
 			req = list_first_entry(&conn->pending, struct aios_request, list);
 			list_del_init(&req->list);
 			list_add_tail(&req->list, &conn->waiting);
-			ready = true;
+			mutex_unlock(&conn->lock);
+			finish_wait(&conn->read_wait, &wait);
+			break;
+		}
+		if (!conn->daemon_open) {
+			mutex_unlock(&conn->lock);
+			finish_wait(&conn->read_wait, &wait);
+			return -ENODEV;
 		}
 		mutex_unlock(&conn->lock);
-		ready || !conn->daemon_open;
-	}));
-	if (err)
-		return err;
-	if (!req)
-		return -ENODEV;
+		if (signal_pending(current)) {
+			finish_wait(&conn->read_wait, &wait);
+			return -ERESTARTSYS;
+		}
+		schedule();
+	}
 
 	need = sizeof(req->hdr) + req->hdr.payload_len;
 	if (count < need) {

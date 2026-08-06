@@ -43,6 +43,7 @@ bool XorParityCodec::decode(
   int present = 0;
   int missing = -1;
   std::size_t shard_len = 0;
+  bool have_len = false;
   for (int i = 0; i < k_ + 1; ++i) {
     if (!shards_in[static_cast<std::size_t>(i)]) {
       if (missing >= 0) {
@@ -54,8 +55,10 @@ bool XorParityCodec::decode(
     }
     ++present;
     const auto& s = *shards_in[static_cast<std::size_t>(i)];
-    if (shard_len == 0) shard_len = s.size();
-    else if (s.size() != shard_len) {
+    if (!have_len) {
+      shard_len = s.size();
+      have_len = true;
+    } else if (s.size() != shard_len) {
       err = "shard length mismatch";
       return false;
     }
@@ -64,12 +67,18 @@ bool XorParityCodec::decode(
     err = "need at least k shards";
     return false;
   }
-  if (shard_len == 0 && full_size == 0) {
+  if (!have_len && full_size == 0) {
     object_out.clear();
     return true;
   }
-  if (shard_len == 0) {
+  if (!have_len) {
     err = "empty shards with nonzero full_size";
+    return false;
+  }
+  const std::size_t want =
+      (full_size + static_cast<std::size_t>(k_) - 1) / static_cast<std::size_t>(k_);
+  if (shard_len != want) {
+    err = "shard length does not match full_size";
     return false;
   }
 

@@ -13,7 +13,18 @@ void aios_stat_to_inode(struct inode *inode, const struct aios_kabi_stat *st)
 	set_nlink(inode, st->nlink ? st->nlink : 1);
 	i_uid_write(inode, st->uid);
 	i_gid_write(inode, st->gid);
-	inode->i_size = st->size;
+	if (S_ISREG(st->mode)) {
+		struct address_space *mapping = inode->i_mapping;
+
+		if (mapping && (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY) ||
+				mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK))) {
+			/* Keep in-core size while dirty/writeback pages are outstanding. */
+		} else if (st->size != (u64)i_size_read(inode)) {
+			i_size_write(inode, st->size);
+		}
+	} else {
+		inode->i_size = st->size;
+	}
 	inode->i_atime.tv_sec = st->atime_ns / 1000000000ull;
 	inode->i_atime.tv_nsec = st->atime_ns % 1000000000ull;
 	inode->i_mtime.tv_sec = st->mtime_ns / 1000000000ull;
@@ -183,8 +194,10 @@ static int aios_unlink(struct inode *dir, struct dentry *dentry)
 
 	err = aios_upcall(info->conn, AIOS_OP_UNLINK, info->mount_id, &in, sizeof(in),
 			  NULL, NULL);
-	if (!err)
+	if (!err) {
+		drop_nlink(d_inode(dentry));
 		d_drop(dentry);
+	}
 	return err;
 }
 
@@ -218,6 +231,10 @@ static int aios_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
 		.old_parent = old_dir->i_ino,
 		.new_parent = new_dir->i_ino,
 	};
+	struct inode *old_inode = d_inode(old_dentry);
+	struct inode *new_inode = d_inode(new_dentry);
+	bool is_dir = old_inode && S_ISDIR(old_inode->i_mode);
+	int err;
 
 	if (flags)
 		return -EINVAL;
@@ -229,8 +246,22 @@ static int aios_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
 	memcpy(in.new_name, new_dentry->d_name.name, new_dentry->d_name.len);
 	in.new_name[new_dentry->d_name.len] = '\0';
 
-	return aios_upcall(info->conn, AIOS_OP_RENAME, info->mount_id, &in, sizeof(in),
+	err = aios_upcall(info->conn, AIOS_OP_RENAME, info->mount_id, &in, sizeof(in),
 			   NULL, NULL);
+	if (err)
+		return err;
+
+	if (new_inode) {
+		if (S_ISDIR(new_inode->i_mode))
+			clear_nlink(new_inode);
+		else
+			drop_nlink(new_inode);
+	}
+	if (is_dir) {
+		drop_nlink(old_dir);
+		inc_nlink(new_dir);
+	}
+	return 0;
 }
 
 static int aios_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
@@ -371,18 +402,29 @@ static int aios_readdir(struct file *file, struct dir_context *ctx)
 		return -EIO;
 	}
 	ents = (struct aios_kabi_dirent *)(hdr + 1);
-	for (i = 0; i < hdr->count; ++i) {
-		unsigned char type = DT_UNKNOWN;
+	{
+		loff_t start = in.offset;
 
-		if (S_ISDIR(ents[i].mode))
-			type = DT_DIR;
-		else if (S_ISREG(ents[i].mode))
-			type = DT_REG;
-		if (!dir_emit(ctx, ents[i].name, strnlen(ents[i].name, AIOS_KABI_NAME_MAX),
-			      ents[i].ino, type))
-			break;
+		for (i = 0; i < hdr->count; ++i) {
+			unsigned char type = DT_UNKNOWN;
+
+			if (S_ISDIR(ents[i].mode))
+				type = DT_DIR;
+			else if (S_ISREG(ents[i].mode))
+				type = DT_REG;
+			if (!dir_emit(ctx, ents[i].name, strnlen(ents[i].name, AIOS_KABI_NAME_MAX),
+				      ents[i].ino, type))
+				break;
+			ctx->pos = start + (loff_t)i + 1;
+		}
+		if (i == hdr->count) {
+			if (hdr->count > 0 && hdr->next_offset <= (u64)start) {
+				kfree(out);
+				return -EIO;
+			}
+			ctx->pos = hdr->next_offset;
+		}
 	}
-	ctx->pos = hdr->next_offset;
 	kfree(out);
 	return 0;
 }

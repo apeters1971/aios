@@ -68,11 +68,15 @@ bool prepare_put_payload(const Config& cfg, OpsRegistry& ops, const std::uint8_t
   return true;
 }
 
-bool decompress_api_result(ApiResult& r, std::string& err) {
+bool decompress_api_result(ApiResult& r, std::string& err, std::uint64_t max_object_bytes) {
   if (!attrs_are_compressed(r.attrs)) return true;
   auto logical = compression_full_size(r.attrs);
   if (!logical) {
     err = "compressed object missing aios.compression.full_size";
+    return false;
+  }
+  if (*logical > max_object_bytes) {
+    err = "compressed object full_size exceeds max_object_bytes";
     return false;
   }
   if (!r.data) {
@@ -1800,7 +1804,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     rec.info->mtime_ms = info->mtime_ms;
     rec.info->ctime_ms = info->ctime_ms;
     rec.attrs = attrs;
-    if (!decompress_api_result(rec, err)) return fail("store_error", err);
+    if (!decompress_api_result(rec, err, cfg_.max_object_bytes)) return fail("store_error", err);
     if (!offset.has_value()) {
       note_get(rec);
       return rec;
@@ -1847,7 +1851,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
       }
       return fail("not_found", err);
     }
-    if (!decompress_api_result(r, err)) return fail("store_error", err);
+    if (!decompress_api_result(r, err, cfg_.max_object_bytes)) return fail("store_error", err);
     if (!offset.has_value()) {
       note_get(r);
       return r;

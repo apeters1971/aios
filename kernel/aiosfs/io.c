@@ -33,7 +33,7 @@ static int upcall_io_read(struct inode *inode, loff_t pos, void *buf, size_t len
 		return -EIO;
 	}
 	hdr = out;
-	if (hdr->size > rep_len - sizeof(*hdr)) {
+	if (hdr->size > len || hdr->size > rep_len - sizeof(*hdr)) {
 		kfree(out);
 		return -EIO;
 	}

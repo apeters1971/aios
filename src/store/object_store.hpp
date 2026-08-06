@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -213,6 +214,10 @@ class ObjectStore {
   // Tip delete-marker version (published).
   bool del(const std::string& oid, std::string& err);
 
+  // Current tip sequence, including delete markers (0 if none). Unlike tip stat(),
+  // this does not filter is_delete — repair needs it to allocate a newer seq.
+  bool tip_seq(const std::string& oid, std::uint64_t& out_seq, std::string& err);
+
   bool set_attr(const std::string& oid, const std::string& key, const std::string& value,
                 std::string& err);
   std::optional<std::string> get_attr(const std::string& oid, const std::string& key,
@@ -241,6 +246,7 @@ class ObjectStore {
     std::uint32_t id{0};
     std::string dir;
     sqlite3* db{nullptr};
+    mutable std::recursive_mutex mu;
   };
 
   Shard* shard_for(const std::string& oid);
@@ -283,7 +289,10 @@ class ObjectStore {
   bool load_version_locked(Shard& s, const std::string& oid, std::uint64_t seq, ObjectInfo& out,
                            std::string& err);
   bool delete_version_row_locked(Shard& s, const std::string& oid, std::uint64_t seq,
-                                 std::string& err);
+                                 std::vector<std::string>& fs_unlink_out, std::string& err);
+  bool rewrite_version_attrs_locked(Shard& s, const std::string& oid, std::uint64_t seq,
+                                    const std::unordered_map<std::string, std::string>& attrs,
+                                    std::string& err);
 
   std::string root_;
   ObjectStoreOptions opts_;

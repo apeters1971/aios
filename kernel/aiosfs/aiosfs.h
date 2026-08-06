@@ -29,6 +29,13 @@ enum aios_backend {
 
 struct aios_conn;
 
+struct aios_inode_aux {
+	u64 last_synced_size;
+	u64 cas;
+	u64 stripe_unit;
+	u32 stripe_width;
+};
+
 struct aios_sb_info {
 	enum aios_backend backend;
 	struct aios_conn *conn;

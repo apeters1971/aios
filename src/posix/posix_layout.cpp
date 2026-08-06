@@ -34,9 +34,9 @@ std::string normalize_fs_path(std::string path) {
   return out;
 }
 
-const PosixLayoutRule* match_posix_layout_rule(const std::vector<PosixLayoutRule>& rules,
-                                               const std::string& volume,
-                                               const std::string& path) {
+std::optional<PosixLayoutRule> match_posix_layout_rule(
+    const std::vector<PosixLayoutRule>& rules, const std::string& volume,
+    const std::string& path) {
   const std::string p = normalize_fs_path(path);
   const PosixLayoutRule* best = nullptr;
   std::size_t best_len = 0;
@@ -50,10 +50,11 @@ const PosixLayoutRule* match_posix_layout_rule(const std::vector<PosixLayoutRule
       }
     }
   }
-  return best;
+  if (!best) return std::nullopt;
+  return *best;
 }
 
-std::string layout_domain_key(const PosixLayoutRule* rule) {
+std::string layout_domain_key(const std::optional<PosixLayoutRule>& rule) {
   if (!rule) return {};
   auto enc = [](const PosixLayoutSpec& s) {
     return (s.layout.empty() ? "-" : s.layout) + "|" +
@@ -96,15 +97,21 @@ std::string path_of_ino(FsState& st, uint64_t ino) {
   return path;
 }
 
-void refresh_layout_rules(FsState& st) {
+std::shared_ptr<const std::vector<PosixLayoutRule>> refresh_layout_rules(FsState& st) {
   const auto now = std::chrono::steady_clock::now();
-  if (st.layout_rules_loaded.time_since_epoch().count() != 0 &&
-      now - st.layout_rules_loaded < kLayoutRefresh) {
-    return;
+  {
+    std::lock_guard lock(st.layout_mu);
+    if (st.layout_rules_loaded.time_since_epoch().count() != 0 &&
+        now - st.layout_rules_loaded < kLayoutRefresh) {
+      return st.layout_rules ? st.layout_rules
+                             : std::make_shared<const std::vector<PosixLayoutRule>>();
+    }
+    // Claim the refresh so concurrent callers keep serving the current version.
+    st.layout_rules_loaded = now;
   }
+  auto fresh = std::make_shared<std::vector<PosixLayoutRule>>();
   try {
     auto snap = st.session.get_object("posix/layout_rules");
-    st.layout_rules.clear();
     if (snap.exists && !snap.body.empty()) {
       auto j = nlohmann::json::parse(snap.body);
       if (j.contains("rules") && j["rules"].is_array()) {
@@ -130,24 +137,30 @@ void refresh_layout_rules(FsState& st) {
           };
           if (jr.contains("meta")) parse_spec(jr["meta"], r.meta);
           if (jr.contains("data")) parse_spec(jr["data"], r.data);
-          st.layout_rules.push_back(std::move(r));
+          fresh->push_back(std::move(r));
         }
       }
     }
   } catch (...) {
+    // Keep serving the previous version rather than dropping every rule.
+    std::lock_guard lock(st.layout_mu);
+    if (st.layout_rules) return st.layout_rules;
   }
-  st.layout_rules_loaded = now;
+  std::shared_ptr<const std::vector<PosixLayoutRule>> published = std::move(fresh);
+  std::lock_guard lock(st.layout_mu);
+  st.layout_rules = published;
+  return published;
 }
 
 PutLayout meta_layout_for_path(FsState& st, const std::string& path) {
-  refresh_layout_rules(st);
-  const auto* r = match_posix_layout_rule(st.layout_rules, st.volume, path);
+  auto rules = refresh_layout_rules(st);
+  const auto r = match_posix_layout_rule(*rules, st.volume, path);
   return r ? put_layout_from_spec(r->meta) : PutLayout{};
 }
 
 PutLayout data_layout_for_path(FsState& st, const std::string& path) {
-  refresh_layout_rules(st);
-  const auto* r = match_posix_layout_rule(st.layout_rules, st.volume, path);
+  auto rules = refresh_layout_rules(st);
+  const auto r = match_posix_layout_rule(*rules, st.volume, path);
   return r ? put_layout_from_spec(r->data) : PutLayout{};
 }
 
@@ -160,9 +173,9 @@ PutLayout data_layout_for_ino(FsState& st, uint64_t ino) {
 }
 
 bool layout_domains_differ(FsState& st, const std::string& path_a, const std::string& path_b) {
-  refresh_layout_rules(st);
-  const auto* ra = match_posix_layout_rule(st.layout_rules, st.volume, path_a);
-  const auto* rb = match_posix_layout_rule(st.layout_rules, st.volume, path_b);
+  auto rules = refresh_layout_rules(st);
+  const auto ra = match_posix_layout_rule(*rules, st.volume, path_a);
+  const auto rb = match_posix_layout_rule(*rules, st.volume, path_b);
   return layout_domain_key(ra) != layout_domain_key(rb);
 }
 

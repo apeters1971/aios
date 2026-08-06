@@ -89,7 +89,9 @@ nlohmann::json usage_map_to_json(const std::unordered_map<std::uint32_t, std::in
 }
 
 bool put_cas(Session& session, const std::string& oid, const std::string& body,
-             std::uint64_t expected_cas, std::uint64_t& new_cas_out, std::string& err) {
+             std::uint64_t expected_cas, std::uint64_t& new_cas_out, std::string& err,
+             bool& conflict_out) {
+  conflict_out = false;
   try {
     const std::uint64_t new_cas = expected_cas + 1;
     std::unordered_map<std::string, std::string> attrs{{"aios.posix.cas", std::to_string(new_cas)}};
@@ -102,6 +104,7 @@ bool put_cas(Session& session, const std::string& oid, const std::string& body,
         expect = 0;
       } else {
         err = "cas mismatch";
+        conflict_out = true;
         return false;
       }
     }
@@ -110,6 +113,7 @@ bool put_cas(Session& session, const std::string& oid, const std::string& body,
     return true;
   } catch (const client_error& e) {
     err = e.code() + ": " + e.what();
+    conflict_out = e.code() == "conflict";
     return false;
   } catch (const std::exception& e) {
     err = e.what();
@@ -229,14 +233,14 @@ bool QuotaLedger::ensure_loaded_locked(std::string& err) {
   try {
     auto lim_snap = session_.get_object(quota_limits_oid(volume_));
     if (lim_snap.exists) {
-      limits_ = parse_quota_limits(lim_snap.body, lim_snap.cas);
+      limits_ = parse_quota_limits(lim_snap.body, cas_from_attrs(lim_snap.attrs));
     } else {
       limits_ = QuotaLimits{};
     }
     auto use_snap = session_.get_object(quota_usage_oid(volume_));
     if (use_snap.exists) {
       // Keep pending; refresh base usage.
-      usage_ = parse_quota_usage(use_snap.body, use_snap.cas);
+      usage_ = parse_quota_usage(use_snap.body, cas_from_attrs(use_snap.attrs));
     } else if (!loaded_) {
       usage_ = QuotaUsage{};
     }
@@ -449,7 +453,7 @@ bool QuotaLedger::flush_locked(std::string& err) {
     try {
       auto use_snap = session_.get_object(quota_usage_oid(volume_));
       if (use_snap.exists) {
-        usage_ = parse_quota_usage(use_snap.body, use_snap.cas);
+        usage_ = parse_quota_usage(use_snap.body, cas_from_attrs(use_snap.attrs));
       } else {
         usage_.cas = 0;
       }
@@ -465,13 +469,13 @@ bool QuotaLedger::flush_locked(std::string& err) {
     next.epoch = usage_.epoch;
 
     std::uint64_t new_cas = 0;
+    bool conflict = false;
     if (!put_cas(session_, quota_usage_oid(volume_), serialize_quota_usage(next), usage_.cas,
-                 new_cas, err)) {
-      if (err.find("conflict") != std::string::npos || err.find("cas") != std::string::npos ||
-          err.find("precondition") != std::string::npos) {
-        continue;
-      }
+                 new_cas, err, conflict)) {
+      if (conflict) continue;
       AIOS_LOG_WARN("quota flush failed: ", err);
+      // Back off: without this a failing flush is retried on every write.
+      last_flush_ms_ = now_ms();
       return false;
     }
     usage_ = next;
@@ -484,6 +488,7 @@ bool QuotaLedger::flush_locked(std::string& err) {
     return true;
   }
   err = "quota flush cas retry exhausted";
+  last_flush_ms_ = now_ms();
   return false;
 }
 
@@ -561,13 +566,13 @@ bool QuotaLedger::save_limits(const QuotaLimits& lim, std::string& err) {
   for (int attempt = 0; attempt < 8; ++attempt) {
     try {
       auto snap = session_.get_object(quota_limits_oid(volume_));
-      std::uint64_t cas = snap.exists ? snap.cas : 0;
+      std::uint64_t cas = snap.exists ? cas_from_attrs(snap.attrs) : 0;
       if (snap.exists) limits_ = parse_quota_limits(snap.body, cas);
       std::uint64_t new_cas = 0;
+      bool conflict = false;
       if (!put_cas(session_, quota_limits_oid(volume_), serialize_quota_limits(lim), cas, new_cas,
-                   err)) {
-        if (err.find("conflict") != std::string::npos || err.find("cas") != std::string::npos)
-          continue;
+                   err, conflict)) {
+        if (conflict) continue;
         return false;
       }
       limits_ = lim;
@@ -590,13 +595,13 @@ bool QuotaLedger::replace_usage(QuotaUsage u, std::string& err) {
   for (int attempt = 0; attempt < 8; ++attempt) {
     try {
       auto snap = session_.get_object(quota_usage_oid(volume_));
-      std::uint64_t cas = snap.exists ? snap.cas : 0;
+      std::uint64_t cas = snap.exists ? cas_from_attrs(snap.attrs) : 0;
       u.epoch = (snap.exists ? parse_quota_usage(snap.body, cas).epoch : 0) + 1;
       std::uint64_t new_cas = 0;
+      bool conflict = false;
       if (!put_cas(session_, quota_usage_oid(volume_), serialize_quota_usage(u), cas, new_cas,
-                   err)) {
-        if (err.find("conflict") != std::string::npos || err.find("cas") != std::string::npos)
-          continue;
+                   err, conflict)) {
+        if (conflict) continue;
         return false;
       }
       usage_ = u;

@@ -184,7 +184,6 @@ int aios_show_options(struct seq_file *m, struct dentry *root)
 
 const struct super_operations aios_super_ops = {
 	.statfs = aios_statfs,
-	.drop_inode = generic_delete_inode,
 	.evict_inode = aios_evict_inode,
 	.write_inode = aios_write_inode,
 	.put_super = aios_put_super,

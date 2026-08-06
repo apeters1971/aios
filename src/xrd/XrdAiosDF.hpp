@@ -27,9 +27,14 @@ public:
   int Fchmod(mode_t mode) override;
 
 private:
+  int restore_caller() const;
+
   XrdAiosOss* oss_{nullptr};
   uint64_t ino_{0};
+  uint32_t uid_{0};
+  uint32_t gid_{0};
   bool open_{false};
+  bool caller_set_{false};
 };
 
 class XrdAiosDir : public XrdOssDF {
