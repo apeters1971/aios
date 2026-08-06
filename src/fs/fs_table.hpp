@@ -19,6 +19,7 @@ struct FsEntry {
   std::string target_path;
   std::string aios_path;
   std::string storage_class;
+  std::string rack;  // effective failure domain
   int weight{1};
   LifecycleState state{LifecycleState::Up};  // effective (node × target)
   std::uint64_t bsize{0};
@@ -35,8 +36,10 @@ class FsTable {
  public:
   // Replace all local-origin entries with scan results.
   // node_state is folded into each entry's effective state; Off targets are omitted.
+  // node_rack is the node default (empty → node_id); .aios rack_explicit overrides.
   void set_local(const std::string& node_id, const std::vector<AiosTarget>& targets,
-                 LifecycleState node_state = LifecycleState::Up);
+                 LifecycleState node_state = LifecycleState::Up,
+                 const std::string& node_rack = {});
 
   void merge(const std::vector<FsEntry>& remote);
 

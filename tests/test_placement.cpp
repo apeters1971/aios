@@ -13,6 +13,60 @@ int test_placement() {
   int& failures = aios::test::failures();
   failures = 0;
 
+  // Prefer distinct racks before same-rack nodes.
+  {
+    auto root = temp_root("place-rack");
+    std::filesystem::create_directories(root / "a1" / "aios");
+    std::filesystem::create_directories(root / "a2" / "aios");
+    std::filesystem::create_directories(root / "b1" / "aios");
+    const std::string a1 = (root / "a1" / "aios").string();
+    const std::string a2 = (root / "a2" / "aios").string();
+    const std::string b1 = (root / "b1" / "aios").string();
+    MembershipTable membership;
+    membership.set_local("node-a", "127.0.0.1:7400", {}, "rack-1");
+    membership.mark_alive("node-b", "127.0.0.1:7401", 1000, {}, "rack-1");
+    membership.mark_alive("node-c", "127.0.0.1:7402", 1000, {}, "rack-2");
+    FsTable fs;
+    std::vector<AiosTarget> local_a{
+        make_target(a1, "nvme", 1, LifecycleState::Up, "rack-1"),
+        make_target(a2, "nvme", 1, LifecycleState::Up, "rack-1"),
+    };
+    fs.set_local("node-a", local_a, LifecycleState::Up, "rack-1");
+    std::vector<FsEntry> remote{
+        {.node_id = "node-b",
+         .mount = "/b",
+         .target_path = "/b",
+         .aios_path = "/b/aios",
+         .storage_class = "nvme",
+         .rack = "rack-1",
+         .weight = 1,
+         .usable = true,
+         .updated_ms = 1000},
+        {.node_id = "node-c",
+         .mount = "/c",
+         .target_path = "/c",
+         .aios_path = "/c/aios",
+         .storage_class = "nvme",
+         .rack = "rack-2",
+         .weight = 1,
+         .usable = true,
+         .updated_ms = 1000},
+    };
+    (void)b1;
+    fs.merge(remote);
+    PlacementConfig pc;
+    pc.vnodes_per_target = 32;
+    pc.min_vnodes = 8;
+    pc.max_vnodes = 256;
+    auto map = ClusterMap::build(membership, fs, 2, pc);
+    expect(map.targets.size() == 4, "four targets across racks");
+    auto p = place("rack-oid-0", map, 2, "nvme");
+    expect(p.acting_set.size() == 2, "acting set size 2");
+    expect(p.acting_set[0].rack != p.acting_set[1].rack, "distinct racks preferred");
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+  }
+
   // Drain targets stay in the map but are excluded from place().
   {
     auto root = temp_root("place-drain");

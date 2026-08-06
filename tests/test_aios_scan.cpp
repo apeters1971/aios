@@ -73,6 +73,10 @@ int test_aios_scan() {
     expect(m.weight == 4, "weight 4");
   }
   {
+    expect(parse_aios_marker("storage_class: nvme\nrack: row-a\n", "/mnt", m, err), "rack ok");
+    expect(m.rack_specified && m.rack == "row-a", "parsed rack");
+  }
+  {
     expect(!parse_aios_marker("storage_class: nvme\nstate: broken\n", "/mnt", m, err),
            "bad state rejected");
   }

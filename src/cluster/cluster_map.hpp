@@ -27,6 +27,7 @@ struct StorageTarget {
   std::string aios_path;  // absolute .../aios path on that node
   std::string mount;
   std::string storage_class;
+  std::string rack;  // failure domain (prefer distinct racks in place())
   int weight{1};
   LifecycleState state{LifecycleState::Up};  // up or drain (off never appears)
   std::uint64_t bavail{0};
@@ -49,7 +50,7 @@ struct ClusterMap {
   nlohmann::json to_json() const;
   static ClusterMap from_json(const nlohmann::json& j);
 
-  // Build from current membership + fs_table. Only Alive members and usable
+  // Build from current membership + fs_table. Only Online members and usable
   // FsEntry rows with a non-empty storage_class are included.
   static ClusterMap build(const MembershipTable& membership, const FsTable& fs_table,
                           int replica_count, const PlacementConfig& placement = {});

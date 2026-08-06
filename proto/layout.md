@@ -17,7 +17,7 @@ target T  →  weight w (from .aios; default 1; capacity-proportional, operator-
            →  vnodes = clamp(w * vnodes_per_target, min_vnodes, max_vnodes)
 oid key    =  sha256(oid) → u64
 acting set =  clockwise on the class ring from oid key; unique physical targets,
-              prefer distinct node_id (then fill same-node mounts)
+              prefer distinct rack, then node_id, then same-node mounts
 primary    =  acting_set[0]
 ```
 
@@ -29,6 +29,7 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
 - One vnode ring **per storage class**
 - `n` is replica count or `k+m`
 - Map includes **up** and **drain** targets; **off** is omitted. `place()` uses **up** only.
+- Failure domains: **rack → node → mount**. Node `rack:` (YAML) defaults each target; `.aios` `rack:` overwrites. Empty node rack → `node_id`.
 - Effective lifecycle = worse of node `node_state` and target `.aios` `state` (`off` > `drain` > `up`)
 - Drain: still serves existing data; repair **evacuates** tips that are no longer in the acting set
 - If the class has fewer than `n` **up** targets → empty acting set → `no_targets`
@@ -40,12 +41,14 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
 storage_class: nvme   # required; [a-z0-9_-]+
 weight: 4             # optional; TiB units. Omit → total FS size (statvfs)
 state: up             # up | drain | off (default up)
+rack: row-a           # optional; overwrites node rack for this FS
 targets: [data]       # optional; default = mount root
 ```
 
 Daemon knobs (YAML / live admin):
 
 ```yaml
+rack: row-a                            # node default failure domain (else node_id)
 weight_autotune: false                 # true → weight from free space (TiB)
 weight_autotune_threshold_pct: 20      # relative hysteresis
 weight_autotune_min_delta: 1           # absolute floor on |Δweight|
@@ -54,6 +57,7 @@ weight_autotune_min_delta: 1           # absolute floor on |Δweight|
 Autotune updates advertised weight only when
 `|Δ| ≥ max(min_delta, ceil(current × threshold_pct / 100))`.
 
+Gossip liveness (separate from lifecycle): **online** / **suspect** / **offline** (legacy `alive`/`dead` still accepted on parse).
 ## Layout descriptor (version attrs)
 
 | Attr | Meaning |

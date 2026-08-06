@@ -215,7 +215,7 @@ KEY=550e8400-e29b-41d4-a716-446655440000
   --status-file /tmp/aios-b.json
 ```
 
-Within a few seconds both status files should list `a` and `b` as `alive`. A daemon with a different `--cluster-key` will not join.
+Within a few seconds both status files should list `a` and `b` as `online`. A daemon with a different `--cluster-key` will not join.
 
 **Client** (against A’s HTTP port; follows redirects to the primary):
 
@@ -304,9 +304,10 @@ Place a file named `.aios` in the **top level** of a mounted filesystem the daem
 | `storage_class: nvme` | Placement pool / class-scoped consistent-hash ring (required) |
 | `weight: 4` | Relative CH capacity in TiB units. **Omit** to use total filesystem size (`statvfs` → nearest TiB, min 1). With `weight_autotune`, free space drives weight instead (thresholded) |
 | `state: up` | Lifecycle: `up` \| `drain` \| `off` (default `up`) |
+| `rack: row-a` | Optional failure domain; overwrites node `rack:` / `node_id` for this FS |
 | `targets: [data, scratch]` | `<mount>/data/aios/` and `<mount>/scratch/aios/` (omit → `<mount>/aios/`) |
 
-**Lifecycle** (planned ops; gossip Alive/Suspect/Dead stays liveness-only):
+**Lifecycle** (planned ops; gossip **online/suspect/offline** stays liveness-only):
 
 | Effective state | In cluster map | Local store | In `place()` ring | Role |
 |-----------------|----------------|-------------|-------------------|------|
@@ -345,11 +346,11 @@ Each storage class has its own **vnode ring**. Only **up** targets enter the rin
 
 ```text
 sha256(oid) → start on class ring → walk clockwise
-  → prefer distinct node_id, then fill same-node mounts
+  → prefer distinct rack, then node_id, then same-node mounts
   → acting_set[0] is primary
 ```
 
-API: `place(oid, map, n, storage_class)`. If the class has fewer than `n` targets, placement fails with `no_targets` (no silent under-protection). Adding or removing a target remaps roughly **`1/N`** of objects—not a full reshuffle.
+API: `place(oid, map, n, storage_class)`. Node default rack is aiosd `rack:` (else `node_id`); `.aios` `rack:` overwrites per FS. If the class has fewer than `n` **up** targets, placement fails with `no_targets`. Adding or removing a target remaps roughly **`1/N`** of objects—not a full reshuffle.
 
 ### Storage classes
 

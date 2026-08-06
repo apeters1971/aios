@@ -35,6 +35,16 @@ int test_cluster_map() {
     expect(std::string(dec.begin(), dec.end()) == raw, "base64 roundtrip");
   }
 
+  {
+    expect(member_state_from_string("online") == MemberState::Online, "online");
+    expect(member_state_from_string("alive") == MemberState::Online, "legacy alive");
+    expect(member_state_from_string("suspect") == MemberState::Suspect, "suspect");
+    expect(member_state_from_string("offline") == MemberState::Offline, "offline");
+    expect(member_state_from_string("dead") == MemberState::Offline, "legacy dead");
+    expect(std::string(member_state_name(MemberState::Online)) == "online", "name online");
+    expect(std::string(member_state_name(MemberState::Offline)) == "offline", "name offline");
+  }
+
   MembershipTable membership;
   membership.set_local("node-a", "127.0.0.1:7400");
   membership.mark_alive("node-b", "127.0.0.1:7401", 1000);
@@ -100,9 +110,9 @@ int test_cluster_map() {
   // Age node-b past dead_after → excluded from map.
   membership.age(1000 + 20000, 5000, 15000);
   auto map_dead = ClusterMap::build(membership, fs, 3, pc);
-  expect(map_dead.targets.size() == 2, "dead node targets excluded");
+  expect(map_dead.targets.size() == 2, "offline node targets excluded");
 
-  // Rebuild fresh map with both alive for place tests.
+  // Rebuild fresh map with both online for place tests.
   membership.mark_alive("node-b", "127.0.0.1:7401", 50000);
   map = ClusterMap::build(membership, fs, 3, pc);
 

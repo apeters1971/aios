@@ -612,6 +612,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"admin", cfg_.admin},
       {"admin_metrics_public", cfg_.admin_metrics_public},
       {"node_state", cfg_.node_state},
+      {"rack", cfg_.rack.empty() ? cfg_.node_id : cfg_.rack},
       {"weight_autotune", cfg_.weight_autotune},
       {"weight_autotune_threshold_pct", cfg_.weight_autotune_threshold_pct},
       {"weight_autotune_min_delta", cfg_.weight_autotune_min_delta},
@@ -629,7 +630,7 @@ nlohmann::json HttpServer::admin_status_json() const {
   const auto members = membership_.snapshot();
   std::size_t alive = 0;
   for (const auto& m : members) {
-    if (m.state == MemberState::Alive) ++alive;
+    if (m.state == MemberState::Online) ++alive;
   }
   return nlohmann::json{
       {"node_id", cfg_.node_id},
@@ -655,11 +656,13 @@ nlohmann::json HttpServer::admin_lifecycle_json() const {
         {"node_id", m.node_id},
         {"addr", m.addr},
         {"http_addr", m.http_addr},
+        {"rack", m.rack},
         {"member_state", member_state_name(m.state)},
         {"self", m.node_id == cfg_.node_id},
     };
     if (m.node_id == cfg_.node_id) {
       n["node_state"] = cfg_.node_state;
+      if (!cfg_.rack.empty()) n["rack"] = cfg_.rack;
     }
     nodes.push_back(std::move(n));
   }
@@ -670,6 +673,7 @@ nlohmann::json HttpServer::admin_lifecycle_json() const {
         {"mount", t.mount},
         {"aios_path", t.aios_path},
         {"storage_class", t.storage_class},
+        {"rack", t.rack},
         {"weight", t.weight},
         {"state", lifecycle_state_name(t.state)},
         {"addr", t.addr},
@@ -679,6 +683,7 @@ nlohmann::json HttpServer::admin_lifecycle_json() const {
   return nlohmann::json{
       {"node_id", cfg_.node_id},
       {"node_state", cfg_.node_state},
+      {"rack", cfg_.rack.empty() ? cfg_.node_id : cfg_.rack},
       {"weight_autotune", cfg_.weight_autotune},
       {"weight_autotune_threshold_pct", cfg_.weight_autotune_threshold_pct},
       {"weight_autotune_min_delta", cfg_.weight_autotune_min_delta},
@@ -941,7 +946,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         nlohmann::json peers = nlohmann::json::array();
         std::unordered_set<std::string> seen;
         for (const auto& m : membership_.snapshot()) {
-          if (m.state != MemberState::Alive) continue;
+          if (m.state != MemberState::Online) continue;
           if (m.http_addr.empty()) continue;
           if (!seen.insert(m.http_addr).second) continue;
           peers.push_back({{"node_id", m.node_id},

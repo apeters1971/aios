@@ -87,7 +87,7 @@ Short-lived TCP sessions:
 
 ## Cluster map
 
-Built locally from Alive members × usable `fs_table` entries. `epoch` is a content hash of the sorted target list and `replica_count`.
+Built locally from Online members × usable `fs_table` entries. `epoch` is a content hash of the sorted target list and `replica_count`.
 
 ```json
 {
@@ -204,12 +204,13 @@ On `epoch_mismatch`, clients should refresh the cluster map and retry. On `not_p
 {
   "node_id": "node-a",
   "addr": "192.168.1.10:7400",
-  "state": "alive",
+  "rack": "row-a",
+  "state": "online",
   "last_seen_ms": 1710000000000
 }
 ```
 
-`state` is one of `alive`, `suspect`, `dead`.
+`state` is one of `online`, `suspect`, `offline` (legacy `alive`/`dead` accepted on parse).
 
 ## FS table entry
 

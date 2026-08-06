@@ -395,6 +395,7 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["admin_metrics_public"])
       cfg.admin_metrics_public = root["admin_metrics_public"].as<bool>();
     if (root["node_state"]) cfg.node_state = root["node_state"].as<std::string>();
+    if (root["rack"]) cfg.rack = root["rack"].as<std::string>();
     if (root["weight_autotune"]) cfg.weight_autotune = root["weight_autotune"].as<bool>();
     if (root["weight_autotune_threshold_pct"])
       cfg.weight_autotune_threshold_pct = root["weight_autotune_threshold_pct"].as<int>();

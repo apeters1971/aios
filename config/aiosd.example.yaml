@@ -1,5 +1,6 @@
 # AIOS daemon example configuration
 node_id: "node-a"          # stable string; default = hostname
+# rack: "row-a"            # failure domain for placement (default = node_id); .aios rack: overwrites
 listen: "0.0.0.0:7400"
 # Shared cluster secret (UUID recommended). Required.
 cluster_key: "550e8400-e29b-41d4-a716-446655440000"
@@ -134,7 +135,7 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # admin: true
 # admin_metrics_public: true   # GET /metrics without HMAC (restrict network access)
 # Web UI: http://HOST:7480/admin/  (login with cluster_key; assets in web/admin or AIOS_ADMIN_WEB)
-# Planned node lifecycle (worse of this and each .aios state; gossip Alive/Suspect/Dead separate):
+# Planned node lifecycle (worse of this and each .aios state; gossip online/suspect/offline separate):
 # node_state: up               # up | drain | off — live toggle via admin lifecycle API/CLI/UI
 # Weight: omit in .aios → total FS capacity (TiB). Autotune uses free space with hysteresis:
 # weight_autotune: false

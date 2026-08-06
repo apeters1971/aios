@@ -61,7 +61,7 @@
     const cards = [
       ["Node", status.node_id || "—"],
       ["Map epoch", status.map_epoch],
-      ["Members alive", status.members_alive],
+      ["Members online", status.members_alive],
       ["HTTP requests", ops.http_requests],
       ["Puts", ops.put],
       ["Gets", ops.get],
@@ -431,6 +431,7 @@
         (t) =>
           `<tr>
             <td>${t.node_id || "—"}${t.self ? " *" : ""}</td>
+            <td>${t.rack || "—"}</td>
             <td>${t.mount || "—"}</td>
             <td>${t.storage_class || "—"}</td>
             <td>${t.weight ?? "—"}</td>
@@ -440,8 +441,8 @@
       )
       .join("");
     document.getElementById("lifecycle-table").innerHTML =
-      `<table><thead><tr><th>Node</th><th>Mount</th><th>Class</th><th>Weight</th><th>State</th><th>Path</th></tr></thead><tbody>${
-        rows || "<tr><td colspan=6>No targets in map</td></tr>"
+      `<table><thead><tr><th>Node</th><th>Rack</th><th>Mount</th><th>Class</th><th>Weight</th><th>State</th><th>Path</th></tr></thead><tbody>${
+        rows || "<tr><td colspan=7>No targets in map</td></tr>"
       }</tbody></table>`;
   }
 

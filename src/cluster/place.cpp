@@ -86,25 +86,33 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
   const std::size_t want = static_cast<std::size_t>(n);
   std::unordered_set<std::string> used_keys;
   std::unordered_set<std::string> used_nodes;
+  std::unordered_set<std::string> used_racks;
 
-  auto try_add = [&](std::size_t ti, bool require_new_node) -> bool {
+  enum class DomainPref { NewRack, NewNode, Any };
+  auto try_add = [&](std::size_t ti, DomainPref pref) -> bool {
     const auto& t = pool[ti];
     if (used_keys.count(target_key(t))) return false;
-    if (require_new_node && used_nodes.count(t.node_id)) return false;
+    const std::string rack = t.rack.empty() ? t.node_id : t.rack;
+    if (pref == DomainPref::NewRack && used_racks.count(rack)) return false;
+    if (pref == DomainPref::NewNode && used_nodes.count(t.node_id)) return false;
     p.acting_set.push_back(t);
     used_keys.insert(target_key(t));
     used_nodes.insert(t.node_id);
+    used_racks.insert(rack);
     return true;
   };
 
-  // Pass 1: distinct nodes, walking the vnode ring clockwise.
-  for (std::size_t i = 0; i < ring.size() && p.acting_set.size() < want; ++i) {
-    try_add(ring[(start + i) % ring.size()].target_index, /*require_new_node=*/true);
-  }
-  // Pass 2: fill remaining with any unused targets in the pool.
-  for (std::size_t i = 0; i < ring.size() && p.acting_set.size() < want; ++i) {
-    try_add(ring[(start + i) % ring.size()].target_index, /*require_new_node=*/false);
-  }
+  auto walk = [&](DomainPref pref) {
+    for (std::size_t i = 0; i < ring.size() && p.acting_set.size() < want; ++i) {
+      try_add(ring[(start + i) % ring.size()].target_index, pref);
+    }
+  };
+  // Pass 1: distinct racks.
+  walk(DomainPref::NewRack);
+  // Pass 2: distinct nodes (may share a rack).
+  walk(DomainPref::NewNode);
+  // Pass 3: any remaining unused mounts.
+  walk(DomainPref::Any);
   return p;
 }
 

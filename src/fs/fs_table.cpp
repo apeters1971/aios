@@ -5,7 +5,7 @@
 namespace aios {
 
 void FsTable::set_local(const std::string& node_id, const std::vector<AiosTarget>& targets,
-                        LifecycleState node_state) {
+                        LifecycleState node_state, const std::string& node_rack) {
   std::lock_guard lock(mu_);
   local_id_ = node_id;
   // Drop previous local entries.
@@ -16,6 +16,7 @@ void FsTable::set_local(const std::string& node_id, const std::vector<AiosTarget
       ++it;
     }
   }
+  const std::string default_rack = node_rack.empty() ? node_id : node_rack;
   const auto ts = now_ms();
   for (const auto& t : targets) {
     if (!t.usable) continue;
@@ -27,6 +28,7 @@ void FsTable::set_local(const std::string& node_id, const std::vector<AiosTarget
     e.target_path = t.target_path;
     e.aios_path = t.aios_path;
     e.storage_class = t.storage_class;
+    e.rack = (t.rack_explicit && !t.rack.empty()) ? t.rack : default_rack;
     e.weight = t.weight > 0 ? t.weight : 1;
     e.state = eff;
     e.bsize = t.bsize;
@@ -50,6 +52,7 @@ void FsTable::merge(const std::vector<FsEntry>& remote) {
     auto it = entries_.find(k);
     if (it == entries_.end() || r.updated_ms >= it->second.updated_ms) {
       entries_[k] = r;
+      if (entries_[k].rack.empty()) entries_[k].rack = r.node_id;
     }
   }
 }
@@ -71,6 +74,7 @@ nlohmann::json FsTable::to_json() const {
         {"target_path", e.target_path},
         {"aios_path", e.aios_path},
         {"storage_class", e.storage_class},
+        {"rack", e.rack},
         {"weight", e.weight},
         {"state", lifecycle_state_name(e.state)},
         {"bsize", e.bsize},
@@ -97,6 +101,8 @@ std::vector<FsEntry> FsTable::from_json(const nlohmann::json& j) {
     e.target_path = x.value("target_path", "");
     e.aios_path = x.value("aios_path", "");
     e.storage_class = x.value("storage_class", "");
+    e.rack = x.value("rack", "");
+    if (e.rack.empty() && !e.node_id.empty()) e.rack = e.node_id;
     e.weight = x.value("weight", 1);
     e.state = lifecycle_state_from_string(x.value("state", "up"));
     e.bsize = x.value("bsize", std::uint64_t{0});

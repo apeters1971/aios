@@ -102,6 +102,14 @@ bool parse_aios_marker(const std::string& yaml_text, const std::string& mount_ro
       }
       out.state = lifecycle_state_from_string(st);
     }
+    if (root["rack"]) {
+      out.rack = root["rack"].as<std::string>();
+      if (out.rack.empty()) {
+        err = "rack must be non-empty when set";
+        return false;
+      }
+      out.rack_specified = true;
+    }
     if (!root["targets"]) {
       out.target_paths = {mount_root};
       return true;
@@ -146,6 +154,7 @@ AiosTarget prepare_target(const std::string& mount, const std::string& target_pa
   t.weight_explicit = weight.has_value();
   t.weight = (weight && *weight > 0) ? *weight : 1;
   t.state = state;
+  // rack filled by caller from marker when specified
 
   std::error_code ec;
   if (!fs::exists(target_path, ec)) {
@@ -228,7 +237,12 @@ std::vector<AiosTarget> scan_aios_filesystems() {
     for (const auto& tp : parsed.target_paths) {
       std::optional<int> w;
       if (parsed.weight_specified) w = parsed.weight;
-      out.push_back(prepare_target(m.path, tp, parsed.storage_class, w, parsed.state));
+      auto t = prepare_target(m.path, tp, parsed.storage_class, w, parsed.state);
+      if (parsed.rack_specified) {
+        t.rack = parsed.rack;
+        t.rack_explicit = true;
+      }
+      out.push_back(std::move(t));
     }
   }
   return out;

@@ -168,6 +168,10 @@ struct Config {
   bool admin_metrics_public{false};
   // Operator lifecycle for this node (up | drain | off). Folded into local target states.
   std::string node_state{"up"};
+  // Failure domain for placement (prefer distinct racks). Empty → use node_id.
+  // Per-target .aios rack: overwrites this for that filesystem.
+  std::string rack;
+
   // When true, advertise placement weights from free space (TiB), with hysteresis.
   // When false: explicit .aios weight, or total capacity (TiB) if weight omitted.
   bool weight_autotune{false};

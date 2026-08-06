@@ -16,6 +16,8 @@ struct AiosTarget {
   std::string storage_class;
   int weight{1};
   bool weight_explicit{false};  // true if .aios set weight:
+  std::string rack;             // from .aios when rack_explicit
+  bool rack_explicit{false};
   LifecycleState state{LifecycleState::Up};
   bool usable{false};
   std::string error;
@@ -33,6 +35,8 @@ struct AiosMarker {
   std::string storage_class;
   int weight{1};
   bool weight_specified{false};
+  std::string rack;
+  bool rack_specified{false};
   LifecycleState state{LifecycleState::Up};
   std::vector<std::string> target_paths;  // absolute paths under mount
 };

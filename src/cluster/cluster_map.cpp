@@ -53,6 +53,7 @@ nlohmann::json ClusterMap::to_json() const {
         {"aios_path", t.aios_path},
         {"mount", t.mount},
         {"storage_class", t.storage_class},
+        {"rack", t.rack},
         {"weight", t.weight},
         {"state", lifecycle_state_name(t.state)},
         {"bavail", t.bavail},
@@ -90,6 +91,8 @@ ClusterMap ClusterMap::from_json(const nlohmann::json& j) {
     t.aios_path = e.value("aios_path", "");
     t.mount = e.value("mount", "");
     t.storage_class = e.value("storage_class", "");
+    t.rack = e.value("rack", "");
+    if (t.rack.empty() && !t.node_id.empty()) t.rack = t.node_id;
     t.weight = e.value("weight", 1);
     t.state = lifecycle_state_from_string(e.value("state", "up"));
     t.bavail = e.value("bavail", static_cast<std::uint64_t>(0));
@@ -114,7 +117,7 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
 
   std::unordered_map<std::string, Member> alive;
   for (const auto& m : membership.snapshot()) {
-    if (m.state != MemberState::Alive) continue;
+    if (m.state != MemberState::Online) continue;
     if (m.node_id.empty() || m.node_id.rfind("seed:", 0) == 0) continue;
     if (m.addr.empty()) continue;
     alive[m.node_id] = m;
@@ -134,6 +137,7 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
     t.aios_path = e.aios_path;
     t.mount = e.mount;
     t.storage_class = e.storage_class;
+    t.rack = e.rack.empty() ? e.node_id : e.rack;
     t.weight = e.weight > 0 ? e.weight : 1;
     t.state = e.state;
     t.bavail = e.bavail;
@@ -155,8 +159,8 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
   canon << "min_vnodes=" << map.placement.min_vnodes << '\n';
   canon << "max_vnodes=" << map.placement.max_vnodes << '\n';
   for (const auto& t : map.targets) {
-    canon << t.storage_class << '\t' << t.node_id << '\t' << t.addr << '\t' << t.aios_path
-          << '\t' << t.weight << '\t' << lifecycle_state_name(t.state) << '\n';
+    canon << t.storage_class << '\t' << t.node_id << '\t' << t.rack << '\t' << t.addr << '\t'
+          << t.aios_path << '\t' << t.weight << '\t' << lifecycle_state_name(t.state) << '\n';
   }
   map.epoch = hash_canonical(canon.str());
   return map;

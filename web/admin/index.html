@@ -239,7 +239,7 @@
 
       <section id="tab-lifecycle" class="panel hidden">
         <h2>Lifecycle</h2>
-        <p class="note">Planned ops while gossip-Alive: <code>up</code> / <code>drain</code> / <code>off</code>. Weight is TiB units: omit in <code>.aios</code> to use total capacity; with autotune, weight tracks free space but only moves when |Δ| ≥ max(min-delta, ceil(cur×threshold%)).</p>
+        <p class="note">Operator lifecycle <code>up</code>/<code>drain</code>/<code>off</code> is separate from gossip <code>online</code>/<code>suspect</code>/<code>offline</code>. Placement prefers distinct <code>rack</code> (node YAML default, optional <code>.aios</code> override), then node, then mount. Weight: omit in <code>.aios</code> → total capacity; autotune uses free space with hysteresis.</p>
         <h3>This node</h3>
         <form id="lifecycle-node-form" class="s3-form">
           <label class="field"><span>Node state</span>

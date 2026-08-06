@@ -9,14 +9,15 @@ namespace aios {
 
 void MembershipTable::set_local(const std::string& node_id,
                                 const std::string& advertise_addr,
-                                const std::string& http_addr) {
+                                const std::string& http_addr, const std::string& rack) {
   std::lock_guard lock(mu_);
   local_id_ = node_id;
   Member m;
   m.node_id = node_id;
   m.addr = advertise_addr;
   m.http_addr = http_addr;
-  m.state = MemberState::Alive;
+  m.rack = rack.empty() ? node_id : rack;
+  m.state = MemberState::Online;
   m.last_seen_ms = now_ms();
   members_[node_id] = std::move(m);
 }
@@ -38,7 +39,8 @@ void MembershipTable::add_seed(const std::string& addr) {
 }
 
 void MembershipTable::mark_alive(const std::string& node_id, const std::string& addr,
-                                 std::int64_t now, const std::string& http_addr) {
+                                 std::int64_t now, const std::string& http_addr,
+                                 const std::string& rack) {
   std::lock_guard lock(mu_);
   // Drop provisional seed entries that match this addr.
   for (auto it = members_.begin(); it != members_.end();) {
@@ -53,7 +55,9 @@ void MembershipTable::mark_alive(const std::string& node_id, const std::string& 
   m.node_id = node_id;
   if (!addr.empty()) m.addr = addr;
   if (!http_addr.empty()) m.http_addr = http_addr;
-  m.state = MemberState::Alive;
+  if (!rack.empty()) m.rack = rack;
+  else if (m.rack.empty()) m.rack = node_id;
+  m.state = MemberState::Online;
   m.last_seen_ms = now;
 }
 
@@ -66,14 +70,17 @@ void MembershipTable::merge(const std::vector<Member>& remote, std::int64_t now)
     auto it = members_.find(r.node_id);
     if (it == members_.end()) {
       members_[r.node_id] = r;
+      if (members_[r.node_id].rack.empty()) members_[r.node_id].rack = r.node_id;
       continue;
     }
     if (r.last_seen_ms >= it->second.last_seen_ms) {
       auto keep_addr = it->second.addr;
       auto keep_http = it->second.http_addr;
+      auto keep_rack = it->second.rack;
       it->second = r;
       if (it->second.addr.empty()) it->second.addr = keep_addr;
       if (it->second.http_addr.empty()) it->second.http_addr = keep_http;
+      if (it->second.rack.empty()) it->second.rack = keep_rack.empty() ? r.node_id : keep_rack;
     }
   }
 }
@@ -83,7 +90,7 @@ void MembershipTable::age(std::int64_t now, int suspect_after_ms,
   std::lock_guard lock(mu_);
   for (auto& [id, m] : members_) {
     if (id == local_id_) {
-      m.state = MemberState::Alive;
+      m.state = MemberState::Online;
       m.last_seen_ms = now;
       continue;
     }
@@ -91,7 +98,7 @@ void MembershipTable::age(std::int64_t now, int suspect_after_ms,
     if (m.last_seen_ms == 0) continue;
     const auto age_ms = now - m.last_seen_ms;
     if (age_ms >= dead_after_ms) {
-      m.state = MemberState::Dead;
+      m.state = MemberState::Offline;
     } else if (age_ms >= suspect_after_ms) {
       m.state = MemberState::Suspect;
     }
@@ -111,7 +118,7 @@ std::vector<Member> MembershipTable::snapshot() const {
 
 std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
   std::lock_guard lock(mu_);
-  std::vector<Member> alive;
+  std::vector<Member> online;
   std::vector<Member> suspect;
   std::vector<Member> seeds;
   for (const auto& [id, m] : members_) {
@@ -121,7 +128,7 @@ std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
       seeds.push_back(m);
       continue;
     }
-    if (m.state == MemberState::Alive) alive.push_back(m);
+    if (m.state == MemberState::Online) online.push_back(m);
     else if (m.state == MemberState::Suspect) suspect.push_back(m);
   }
 
@@ -129,7 +136,7 @@ std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
   auto shuffle = [&](std::vector<Member>& v) {
     std::shuffle(v.begin(), v.end(), rng);
   };
-  shuffle(alive);
+  shuffle(online);
   shuffle(suspect);
   shuffle(seeds);
 
@@ -137,7 +144,7 @@ std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
   if (!suspect.empty() && k > 0) {
     out.push_back(suspect.front());
   }
-  for (const auto& m : alive) {
+  for (const auto& m : online) {
     if (out.size() >= k) break;
     out.push_back(m);
   }
@@ -169,6 +176,7 @@ nlohmann::json MembershipTable::to_json() const {
         {"node_id", m.node_id},
         {"addr", m.addr},
         {"http_addr", m.http_addr},
+        {"rack", m.rack},
         {"state", member_state_name(m.state)},
         {"last_seen_ms", m.last_seen_ms},
     });
@@ -185,7 +193,9 @@ std::vector<Member> MembershipTable::from_json(const nlohmann::json& j) {
     m.node_id = e.value("node_id", "");
     m.addr = e.value("addr", "");
     m.http_addr = e.value("http_addr", "");
-    m.state = member_state_from_string(e.value("state", "alive"));
+    m.rack = e.value("rack", "");
+    if (m.rack.empty() && !m.node_id.empty()) m.rack = m.node_id;
+    m.state = member_state_from_string(e.value("state", "online"));
     m.last_seen_ms = e.value("last_seen_ms", std::int64_t{0});
     if (!m.node_id.empty()) out.push_back(std::move(m));
   }

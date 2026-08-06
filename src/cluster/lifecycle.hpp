@@ -5,7 +5,8 @@
 
 namespace aios {
 
-// Operator lifecycle for nodes and filesystem targets (independent of gossip Alive/Suspect/Dead).
+// Operator lifecycle for nodes and filesystem targets (independent of gossip
+// Online/Suspect/Offline).
 enum class LifecycleState { Up, Drain, Off };
 
 inline const char* lifecycle_state_name(LifecycleState s) {

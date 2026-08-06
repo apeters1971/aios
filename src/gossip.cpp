@@ -81,7 +81,7 @@ void GossipEngine::sync_local_stores() {
 void GossipEngine::start() {
   const auto adv = advertise_addr();
   const auto http_adv = derive_http_addr(adv, cfg_.http_listen);
-  membership_.set_local(cfg_.node_id, adv, http_adv);
+  membership_.set_local(cfg_.node_id, adv, http_adv, cfg_.rack);
   for (const auto& p : cfg_.peers) {
     membership_.add_seed(p);
   }
@@ -287,7 +287,8 @@ void GossipEngine::run_scan() {
       AIOS_LOG_WARN("target unusable ", t.aios_path, ": ", t.error);
     }
   }
-  fs_table_.set_local(cfg_.node_id, targets, lifecycle_state_from_string(cfg_.node_state));
+  fs_table_.set_local(cfg_.node_id, targets, lifecycle_state_from_string(cfg_.node_state),
+                      cfg_.rack);
   AIOS_LOG_INFO("fs scan: ", targets.size(), " targets, ", usable, " usable",
                 cfg_.weight_autotune ? " (weight autotune on)" : "");
 }
@@ -397,7 +398,7 @@ void GossipEngine::write_status() {
   const auto members = membership_.snapshot();
   std::size_t alive = 0;
   for (const auto& m : members) {
-    if (m.state == MemberState::Alive) ++alive;
+    if (m.state == MemberState::Online) ++alive;
   }
   AIOS_LOG_INFO("status members=", members.size(), " alive=", alive,
                 " fs_entries=", fs_table_.snapshot().size(),
