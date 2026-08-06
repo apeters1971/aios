@@ -30,14 +30,23 @@ struct aios_http_client *aios_http_client_create(const char *endpoint, const cha
 	c = kzalloc(sizeof(*c), gfp);
 	if (!c)
 		return ERR_PTR(-ENOMEM);
+	/* Before any error path: aios_http_client_destroy takes this. */
+	mutex_init(&c->mu);
+
+	c->reqbuf = kmalloc(AIOS_HTTP_MAX_HDR, gfp);
+	c->hdrbuf = kmalloc(AIOS_HTTP_MAX_HDR, gfp);
+	if (!c->reqbuf || !c->hdrbuf) {
+		aios_http_client_destroy(c);
+		return ERR_PTR(-ENOMEM);
+	}
 
 	colon = strrchr(endpoint, ':');
 	if (!colon || colon == endpoint || !*(colon + 1)) {
-		kfree(c);
+		aios_http_client_destroy(c);
 		return ERR_PTR(-EINVAL);
 	}
 	if ((size_t)(colon - endpoint) >= sizeof(c->host)) {
-		kfree(c);
+		aios_http_client_destroy(c);
 		return ERR_PTR(-EINVAL);
 	}
 	memcpy(c->host, endpoint, colon - endpoint);
@@ -50,7 +59,6 @@ struct aios_http_client *aios_http_client_create(const char *endpoint, const cha
 	c->sock = NULL;
 	atomic64_set(&c->timeouts, 0);
 	atomic64_set(&c->reconnects, 0);
-	mutex_init(&c->mu);
 	return c;
 }
 EXPORT_SYMBOL_GPL(aios_http_client_create);
@@ -63,6 +71,8 @@ void aios_http_client_destroy(struct aios_http_client *c)
 	aios_http_client_close_sock(c);
 	mutex_unlock(&c->mu);
 	memzero_explicit(c->cluster_key, sizeof(c->cluster_key));
+	kfree(c->reqbuf);
+	kfree(c->hdrbuf);
 	kfree(c);
 }
 EXPORT_SYMBOL_GPL(aios_http_client_destroy);
@@ -249,7 +259,6 @@ int aios_http_request(struct aios_http_client *c, const char *method, const char
 {
 	char cur_path[1024];
 	char location[1024];
-	char hdrs[AIOS_HTTP_MAX_HDR];
 	int hop;
 	int err = 0;
 
@@ -265,7 +274,7 @@ int aios_http_request(struct aios_http_client *c, const char *method, const char
 			aios_http_buf_free(resp_body);
 		err = aios_http_tcp_request(c, method, cur_path, extra_hdrs, body, body_len,
 					    &status, location, sizeof(location), resp_body,
-					    hdrs, sizeof(hdrs));
+					    NULL, 0);
 		if (err)
 			break;
 		*status_out = status;
@@ -298,6 +307,8 @@ static int request_with_hdrs(struct aios_http_client *c, const char *method, con
 	int hop;
 	int err = 0;
 
+	if (!c)
+		return -EINVAL;
 	strscpy(cur_path, path, sizeof(cur_path));
 	mutex_lock(&c->mu);
 	for (hop = 0; hop <= AIOS_HTTP_MAX_REDIRECTS; hop++) {
@@ -332,51 +343,67 @@ int aios_http_get(struct aios_http_client *c, const char *oid, struct aios_http_
 		  u64 *cas_out)
 {
 	char path[1100];
-	char hdrs[AIOS_HTTP_MAX_HDR];
+	char *hdrs;
 	int status = 0;
 	int err;
 
-	if (!body)
+	if (!c || !body)
 		return -EINVAL;
 	err = aios_http_oid_path(oid, path, sizeof(path));
 	if (err)
 		return err;
-	err = request_with_hdrs(c, "GET", path, NULL, NULL, 0, &status, body, hdrs, sizeof(hdrs));
+	/* AIOS_HTTP_MAX_HDR is the size of an entire kernel stack; never automatic. */
+	hdrs = kmalloc(AIOS_HTTP_MAX_HDR, c->gfp);
+	if (!hdrs)
+		return -ENOMEM;
+	err = request_with_hdrs(c, "GET", path, NULL, NULL, 0, &status, body, hdrs,
+				AIOS_HTTP_MAX_HDR);
 	if (err)
-		return err;
+		goto out;
 	if (status == 404) {
 		aios_http_buf_free(body);
-		return -ENOENT;
+		err = -ENOENT;
+		goto out;
 	}
 	err = aios_http_map_status(status);
 	if (err)
-		return err;
+		goto out;
 	if (cas_out)
 		*cas_out = aios_http_attr_u64(hdrs, "aios.posix.cas");
-	return 0;
+out:
+	kfree(hdrs);
+	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_get);
 
 int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u64 *cas_out)
 {
 	char path[1100];
-	char hdrs[AIOS_HTTP_MAX_HDR];
+	char *hdrs;
 	char sz[32];
 	int status = 0;
 	int err;
 
+	if (!c)
+		return -EINVAL;
 	err = aios_http_oid_path(oid, path, sizeof(path));
 	if (err)
 		return err;
+	/* AIOS_HTTP_MAX_HDR is the size of an entire kernel stack; never automatic. */
+	hdrs = kmalloc(AIOS_HTTP_MAX_HDR, c->gfp);
+	if (!hdrs)
+		return -ENOMEM;
 	err = request_with_hdrs(c, "HEAD", path, NULL, NULL, 0, &status, NULL, hdrs,
-				sizeof(hdrs));
+				AIOS_HTTP_MAX_HDR);
 	if (err)
-		return err;
-	if (status == 404)
-		return -ENOENT;
+		goto out;
+	if (status == 404) {
+		err = -ENOENT;
+		goto out;
+	}
 	err = aios_http_map_status(status);
 	if (err)
-		return err;
+		goto out;
 	if (size_out) {
 		*size_out = 0;
 		if (!aios_http_header_get(hdrs, "x-aios-size", sz, sizeof(sz)))
@@ -386,7 +413,9 @@ int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u
 	}
 	if (cas_out)
 		*cas_out = aios_http_attr_u64(hdrs, "aios.posix.cas");
-	return 0;
+out:
+	kfree(hdrs);
+	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_head);
 
@@ -423,10 +452,10 @@ int aios_http_put(struct aios_http_client *c, const char *oid, const void *body,
 {
 	char path[1100];
 	char cas_hdrs[512];
-	char combined[768];
-	char hdrs[AIOS_HTTP_MAX_HDR];
+	char all[1024];
 	int status = 0;
 	int err;
+	int n;
 	u64 new_cas = 0;
 
 	err = aios_http_oid_path(oid, path, sizeof(path));
@@ -441,19 +470,14 @@ int aios_http_put(struct aios_http_client *c, const char *oid, const void *body,
 			return err;
 	}
 
-	if (extra_hdrs && extra_hdrs[0])
-		snprintf(combined, sizeof(combined), "%s%s", cas_hdrs, extra_hdrs);
-	else
-		strscpy(combined, cas_hdrs, sizeof(combined));
+	n = snprintf(all, sizeof(all),
+		     "Content-Type: application/octet-stream\r\n"
+		     "%s%s",
+		     cas_hdrs, extra_hdrs ? extra_hdrs : "");
+	if (n < 0 || n >= (int)sizeof(all))
+		return -EOVERFLOW;
 
-	{
-		char ctype[64] = "Content-Type: application/octet-stream\r\n";
-		char all[832];
-
-		snprintf(all, sizeof(all), "%s%s", ctype, combined);
-		err = request_with_hdrs(c, "PUT", path, all, body, len, &status, NULL, hdrs,
-					sizeof(hdrs));
-	}
+	err = request_with_hdrs(c, "PUT", path, all, body, len, &status, NULL, NULL, 0);
 	if (err)
 		return err;
 	err = aios_http_map_status(status);
@@ -470,11 +494,10 @@ int aios_http_put_range(struct aios_http_client *c, const char *oid, u64 offset,
 {
 	char path[1100];
 	char cas_hdrs[512];
-	char range_hdr[96];
-	char combined[768];
-	char hdrs[AIOS_HTTP_MAX_HDR];
+	char all[1024];
 	int status = 0;
 	int err;
+	int n;
 	u64 new_cas = 0;
 	u64 end;
 
@@ -498,18 +521,15 @@ int aios_http_put_range(struct aios_http_client *c, const char *oid, u64 offset,
 			return err;
 	}
 
-	snprintf(range_hdr, sizeof(range_hdr), "Content-Range: bytes %llu-%llu/*\r\n",
-		 (unsigned long long)offset, (unsigned long long)end);
-	snprintf(combined, sizeof(combined), "%s%s", cas_hdrs, range_hdr);
+	n = snprintf(all, sizeof(all),
+		     "Content-Type: application/octet-stream\r\n"
+		     "%s"
+		     "Content-Range: bytes %llu-%llu/*\r\n",
+		     cas_hdrs, (unsigned long long)offset, (unsigned long long)end);
+	if (n < 0 || n >= (int)sizeof(all))
+		return -EOVERFLOW;
 
-	{
-		char ctype[64] = "Content-Type: application/octet-stream\r\n";
-		char all[832];
-
-		snprintf(all, sizeof(all), "%s%s", ctype, combined);
-		err = request_with_hdrs(c, "PUT", path, all, data, len, &status, NULL, hdrs,
-					sizeof(hdrs));
-	}
+	err = request_with_hdrs(c, "PUT", path, all, data, len, &status, NULL, NULL, 0);
 	if (err)
 		return err;
 	err = aios_http_map_status(status);

@@ -28,6 +28,13 @@ struct aios_http_client {
 	atomic64_t timeouts;
 	atomic64_t reconnects;
 	struct mutex mu; /* serialize TCP transactions on this client */
+	/* Request/response header scratch, both AIOS_HTTP_MAX_HDR, owned by mu.
+	 * A header buffer is the size of a whole kernel stack, so it can be neither
+	 * automatic nor per-request: keeping them here also spares the I/O path two
+	 * trips through the allocator per request. Exactly AIOS_HTTP_MAX_HDR so each
+	 * lands on a kmalloc bucket boundary rather than rounding up to the next. */
+	char *reqbuf;
+	char *hdrbuf;
 };
 
 struct aios_http_pool {

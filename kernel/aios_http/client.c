@@ -296,8 +296,9 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 			    bool force_new)
 {
 	struct socket *sock;
-	char *req = NULL;
-	char *hdrbuf = NULL;
+	/* Owned by c->mu, which every caller of this function holds. */
+	char *req = c->reqbuf;
+	char *hdrbuf = c->hdrbuf;
 	char auth[512];
 	size_t have = 0;
 	unsigned long content_length = 0;
@@ -320,14 +321,12 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 
 	if (body_len > AIOS_HTTP_MAX_BODY)
 		return -EFBIG;
+	if (!req || !hdrbuf)
+		return -ENOMEM;
 
 	err = aios_http_build_auth(c, method, path, auth, sizeof(auth));
 	if (err)
 		return err;
-
-	req = kmalloc(AIOS_HTTP_MAX_HDR + 512, GFP_KERNEL);
-	if (!req)
-		return -ENOMEM;
 
 	{
 		char app_line[96] = "";
@@ -335,7 +334,7 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 		if (c->app_label[0])
 			snprintf(app_line, sizeof(app_line), "x-aios-app-label: %s\r\n",
 				 c->app_label);
-		n = snprintf(req, AIOS_HTTP_MAX_HDR + 512,
+		n = snprintf(req, AIOS_HTTP_MAX_HDR,
 			     "%s %s HTTP/1.1\r\n"
 			     "Host: %s\r\n"
 			     "Connection: keep-alive\r\n"
@@ -345,7 +344,7 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 			     method, path, c->endpoint, body_len, auth, app_line,
 			     extra_hdrs ? extra_hdrs : "");
 	}
-	if (n < 0 || n >= AIOS_HTTP_MAX_HDR + 512) {
+	if (n < 0 || n >= (int)AIOS_HTTP_MAX_HDR) {
 		err = -EOVERFLOW;
 		goto out;
 	}
@@ -364,11 +363,6 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 			goto fail_sock;
 	}
 
-	hdrbuf = kmalloc(AIOS_HTTP_MAX_HDR, GFP_KERNEL);
-	if (!hdrbuf) {
-		err = -ENOMEM;
-		goto fail_sock;
-	}
 	err = sock_recv_until(c, sock, hdrbuf, AIOS_HTTP_MAX_HDR, "\r\n\r\n", &have);
 	if (err)
 		goto fail_sock;
@@ -452,8 +446,6 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 fail_sock:
 	aios_http_client_close_sock(c);
 out:
-	kfree(req);
-	kfree(hdrbuf);
 	return err;
 }
 
