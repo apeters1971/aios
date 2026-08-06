@@ -3,8 +3,8 @@
 Snapshot generated **2026-08-06** from git history and the Cursor agent transcript
 [`4ae526f1-a71a-4795-b75c-1e40ff32bf86`](https://cursor.com).
 
-Sources of uncertainty are called out inline. Token usage is **not** from a
-billing meter (Cursor/Grok totals are not available in this environment).
+Sources of uncertainty are called out inline. Token totals below come from the
+Cursor usage dashboard (`tokens.png`); dollar figures are approximate.
 
 ---
 
@@ -36,15 +36,22 @@ agent work.
 
 ---
 
-## 2. Grok 4.5 tokens
+## 2. Tokens and cost
 
-| Scope | Exact billed tokens | Rough lower bound (message text only) |
-|-------|---------------------|----------------------------------------|
-| Whole chat (Aug 1–6) | **Unknown** | ~**60–65k** (chars ÷ 3.5) |
+Cursor usage dashboard (model `cursor-grok-4.5-high-fast`), cumulative over the
+billing window that covers this chat:
 
-Message-text estimates **exclude** tool results, file contents, and multi-turn
-context reuse, so real Grok/Cursor billed tokens are likely **several times higher**.
-Authoritative source: Cursor **Settings → Usage / Billing**.
+![Token usage Jul 31 – Aug 6 (Cursor dashboard)](tokens.png)
+
+| Metric | Value | Notes |
+|--------|------:|-------|
+| Cumulative tokens (dashboard) | **~310M** | End of Aug 6 (“Today” on the plot); ~0 → ~310M from Jul 31 |
+| API-equivalent cost (est.) | **~$1,800** | Rough list/API pricing for the same token volume |
+| Actual Cursor cost (est.) | **~$100** | About **50%** of one monthly **Cursor Ultra** subscription used for this work |
+
+The API figure is a counterfactual (“if this volume were billed at public API rates”).
+Real spend here is the Ultra plan share above, not ~$1,800 in out-of-pocket API
+charges.
 
 ---
 
