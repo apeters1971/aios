@@ -646,7 +646,8 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& 
                        MembershipTable& membership, std::shared_ptr<S3IamStore> s3_iam,
                        std::shared_ptr<QuotaAdminStore> quota, std::shared_ptr<QosAdminStore> qos,
                        std::shared_ptr<BackupPolicyStore> backup_policies,
-                       std::shared_ptr<PosixLayoutStore> posix_layout)
+                       std::shared_ptr<PosixLayoutStore> posix_layout,
+                       std::shared_ptr<VbdRegistryStore> vbd_registry)
     : ioc_(ioc),
       cfg_(std::move(cfg)),
       objects_(objects),
@@ -656,6 +657,7 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config cfg, ObjectService& 
       qos_(std::move(qos)),
       backup_policies_(std::move(backup_policies)),
       posix_layout_(std::move(posix_layout)),
+      vbd_registry_(std::move(vbd_registry)),
       acceptor_(ioc) {
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
@@ -1103,6 +1105,90 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         } catch (...) {
           write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
         }
+        continue;
+      }
+      if (method == "GET" && path == "/admin/api/vbd") {
+        if (!vbd_registry_) {
+          write_json(*sock, 503, "Unavailable", {{"error", "vbd registry disabled"}}, keep_alive);
+          continue;
+        }
+        auto body = vbd_registry_->list_json();
+        body["mapped"] = vbd_devices_json();
+        write_json(*sock, 200, "OK", body, keep_alive);
+        continue;
+      }
+      if (path.rfind("/admin/api/vbd/", 0) == 0) {
+        if (!vbd_registry_) {
+          write_json(*sock, 503, "Unavailable", {{"error", "vbd registry disabled"}}, keep_alive);
+          continue;
+        }
+        const std::string rest = path.substr(std::string("/admin/api/vbd/").size());
+        const auto slash = rest.find('/');
+        if (slash == std::string::npos || slash == 0 || slash + 1 >= rest.size()) {
+          write_json(*sock, 400, "Bad Request", {{"error", "expected /admin/api/vbd/{pool}/{name}"}},
+                     keep_alive);
+          continue;
+        }
+        std::string pool = url_decode(rest.substr(0, slash));
+        std::string name_and = rest.substr(slash + 1);
+        bool is_backup = false;
+        std::string name;
+        if (name_and.size() > 7 && name_and.compare(name_and.size() - 7, 7, "/backup") == 0) {
+          is_backup = true;
+          name = url_decode(name_and.substr(0, name_and.size() - 7));
+        } else {
+          name = url_decode(name_and);
+        }
+        if (pool.empty() || name.empty() || pool.find('/') != std::string::npos ||
+            name.find('/') != std::string::npos) {
+          write_json(*sock, 400, "Bad Request", {{"error", "invalid pool/name"}}, keep_alive);
+          continue;
+        }
+        if (method == "DELETE" && !is_backup) {
+          std::string err;
+          if (!vbd_registry_->delete_volume(pool, name, err)) {
+            const int st = (err == "not found") ? 404 : 400;
+            write_json(*sock, st, st == 404 ? "Not Found" : "Bad Request", {{"error", err}},
+                       keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK", {{"ok", true}, {"pool", pool}, {"name", name}},
+                     keep_alive);
+          continue;
+        }
+        if (method == "POST" && is_backup) {
+          std::string dest;
+          try {
+            const std::string raw =
+                body.empty()
+                    ? "{}"
+                    : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+            auto j = nlohmann::json::parse(raw);
+            dest = j.value("dest", "");
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+            continue;
+          }
+          if (dest.empty()) {
+            dest = name + ".snap-" + std::to_string(now_ms());
+          }
+          std::string err;
+          std::size_t copied = 0;
+          if (!backup_snapshot_vbd(objects_, pool, name, dest, err, &copied)) {
+            write_json(*sock, 400, "Bad Request", {{"error", err}}, keep_alive);
+            continue;
+          }
+          write_json(*sock, 200, "OK",
+                     {{"ok", true},
+                      {"pool", pool},
+                      {"name", name},
+                      {"dest", dest},
+                      {"oids_copied", copied}},
+                     keep_alive);
+          continue;
+        }
+        write_json(*sock, 405, "Method Not Allowed", {{"error", "method not allowed"}},
+                   keep_alive);
         continue;
       }
       if (method == "GET" && (path == "/admin/backup" || path == "/admin/api/backup")) {

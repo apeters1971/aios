@@ -53,13 +53,14 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  admin [status|ops|config|cluster|metrics|console|archive|backup|posix-layout|s3-cred|quota|qos ...]\n"
+      << "  admin [status|ops|config|cluster|metrics|console|archive|backup|vbd|posix-layout|s3-cred|quota|qos ...]\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
       << "  admin status|ops|config|cluster|metrics   one-shot\n"
       << "  admin archive show|run|drain|recall OID\n"
       << "  admin backup show|run|snapshot|policy ...\n"
+      << "  admin vbd list|delete|backup ...\n"
       << "  admin posix-layout show|set ...\n"
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
@@ -558,9 +559,10 @@ int cmd_admin_cluster(std::string host, std::string port, const std::string& key
 
 void admin_console_help() {
   std::cout << "commands: status | ops | config | cluster | metrics | archive | backup | "
-               "posix-layout | help | quit\n"
+               "vbd | posix-layout | help | quit\n"
             << "  archive [show|run|drain]\n"
             << "  backup [show|run]\n"
+            << "  vbd [list|delete|backup ...]\n"
             << "  posix-layout [show|set ...]\n";
 }
 
@@ -791,6 +793,79 @@ int cmd_admin_backup(std::string host, std::string port, const std::string& key,
     return 2;
   }
   std::cerr << "usage: admin backup show|run|snapshot|policy ...\n";
+  return 2;
+}
+
+int cmd_admin_vbd(std::string host, std::string port, const std::string& key,
+                  const std::vector<std::string>& args) {
+  const std::string action = args.size() >= 2 ? args[1] : "list";
+  if (action == "list" || action == "show") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/vbd", key);
+    if (r.status != 200) {
+      std::cerr << "vbd list failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "delete" || action == "rm") {
+    std::string pool, name;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      if (i + 1 >= args.size()) {
+        std::cerr << "missing value for " << args[i] << "\n";
+        return 2;
+      }
+      if (args[i] == "--pool") pool = args[++i];
+      else if (args[i] == "--name") name = args[++i];
+      else {
+        std::cerr << "unknown flag: " << args[i] << "\n";
+        return 2;
+      }
+    }
+    if (pool.empty() || name.empty()) {
+      std::cerr << "usage: admin vbd delete --pool POOL --name NAME\n";
+      return 2;
+    }
+    auto r = admin_exchange(std::move(host), std::move(port), "DELETE",
+                            "/admin/api/vbd/" + pool + "/" + name, "", key);
+    if (r.status != 200) {
+      std::cerr << "vbd delete failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  if (action == "backup") {
+    std::string pool, name, dest;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      if (i + 1 >= args.size()) {
+        std::cerr << "missing value for " << args[i] << "\n";
+        return 2;
+      }
+      if (args[i] == "--pool") pool = args[++i];
+      else if (args[i] == "--name") name = args[++i];
+      else if (args[i] == "--dest") dest = args[++i];
+      else {
+        std::cerr << "unknown flag: " << args[i] << "\n";
+        return 2;
+      }
+    }
+    if (pool.empty() || name.empty()) {
+      std::cerr << "usage: admin vbd backup --pool POOL --name NAME [--dest DEST]\n";
+      return 2;
+    }
+    nlohmann::json body = nlohmann::json::object();
+    if (!dest.empty()) body["dest"] = dest;
+    auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                            "/admin/api/vbd/" + pool + "/" + name + "/backup", body.dump(), key);
+    if (r.status != 200) {
+      std::cerr << "vbd backup failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << nlohmann::json::parse(r.body).dump(2) << "\n";
+    return 0;
+  }
+  std::cerr << "usage: admin vbd list|delete|backup ...\n";
   return 2;
 }
 
@@ -1280,6 +1355,14 @@ int run_admin_console(std::string host, std::string port, const std::string& key
         while (iss >> tok) a.push_back(tok);
       }
       rc = cmd_admin_backup(host, port, key, a);
+    } else if (line == "vbd" || line.rfind("vbd ", 0) == 0) {
+      std::vector<std::string> a{"vbd"};
+      if (line.size() > 3) {
+        std::istringstream iss(line.substr(4));
+        std::string tok;
+        while (iss >> tok) a.push_back(tok);
+      }
+      rc = cmd_admin_vbd(host, port, key, a);
     } else if (line == "posix-layout" || line.rfind("posix-layout ", 0) == 0) {
       std::vector<std::string> a{"posix-layout"};
       if (line.size() > 12) {
@@ -1443,6 +1526,7 @@ int main(int argc, char** argv) {
         return cmd_admin_archive(host, port, args.cluster_key, args.positional);
       if (sub == "backup")
         return cmd_admin_backup(host, port, args.cluster_key, args.positional);
+      if (sub == "vbd") return cmd_admin_vbd(host, port, args.cluster_key, args.positional);
       if (sub == "posix-layout")
         return cmd_admin_posix_layout(host, port, args.cluster_key, args.positional);
       if (sub == "s3-cred")

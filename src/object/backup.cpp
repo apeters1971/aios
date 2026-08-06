@@ -1,6 +1,7 @@
 #include "object/backup.hpp"
 
 #include "http/backup_policy.hpp"
+#include "http/vbd_registry.hpp"
 #include "object/archive_bag.hpp"
 #include "object/archive_pack.hpp"
 #include "object/archive_tape.hpp"
@@ -568,6 +569,21 @@ bool backup_snapshot_vbd(ObjectService& svc, const std::string& pool, const std:
     if (!put.ok) {
       err = put.error.empty() ? put.code : put.error;
       return false;
+    }
+  }
+  {
+    VbdRegistryStore reg(svc.config(), svc);
+    VbdVolume v;
+    v.pool = pool;
+    v.name = dest_name;
+    v.size = size;
+    v.obj_order = obj_order;
+    v.sealed = true;
+    v.snapshot_of = pool + "/" + name;
+    v.created_ms = hj.value("created_ms", static_cast<std::int64_t>(0));
+    std::string rerr;
+    if (!reg.upsert(std::move(v), rerr)) {
+      AIOS_LOG_WARN("vbd registry upsert for snapshot ", pool, "/", dest_name, ": ", rerr);
     }
   }
   if (oids_copied) *oids_copied = copied + 1;

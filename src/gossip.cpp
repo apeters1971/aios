@@ -120,10 +120,11 @@ void GossipEngine::start() {
       backup_policies_ = std::make_shared<BackupPolicyStore>(cfg_, *object_service_);
       posix_layout_ = std::make_shared<PosixLayoutStore>(cfg_, *object_service_);
       posix_layout_->seed_from_config_if_empty();
+      vbd_registry_ = std::make_shared<VbdRegistryStore>(cfg_, *object_service_);
     }
     http_server_ = std::make_unique<HttpServer>(ioc_, cfg_, *object_service_, membership_,
                                                 s3_iam_, quota_, qos_, backup_policies_,
-                                                posix_layout_);
+                                                posix_layout_, vbd_registry_);
     http_server_->start();
     if (cfg_.admin) {
       AIOS_LOG_INFO("admin API enabled on ", cfg_.http_listen,

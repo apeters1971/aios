@@ -6,6 +6,7 @@
 #include "http/qos_admin.hpp"
 #include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
+#include "http/vbd_registry.hpp"
 #include "membership.hpp"
 #include "object/object_service.hpp"
 
@@ -23,7 +24,8 @@ class HttpServer {
              std::shared_ptr<QuotaAdminStore> quota = nullptr,
              std::shared_ptr<QosAdminStore> qos = nullptr,
              std::shared_ptr<BackupPolicyStore> backup_policies = nullptr,
-             std::shared_ptr<PosixLayoutStore> posix_layout = nullptr);
+             std::shared_ptr<PosixLayoutStore> posix_layout = nullptr,
+             std::shared_ptr<VbdRegistryStore> vbd_registry = nullptr);
 
   void start();
 
@@ -44,6 +46,7 @@ class HttpServer {
   std::shared_ptr<QosAdminStore> qos_;
   std::shared_ptr<BackupPolicyStore> backup_policies_;
   std::shared_ptr<PosixLayoutStore> posix_layout_;
+  std::shared_ptr<VbdRegistryStore> vbd_registry_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 

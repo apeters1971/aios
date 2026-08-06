@@ -1,7 +1,10 @@
+#include "client/session.hpp"
+#include "client/vbd_registry_client.hpp"
 #include "kernel/aiosvd_uapi.h"
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -22,12 +25,16 @@ void usage(const char* argv0) {
       << "  " << argv0 << " unmap DEV_ID\n"
       << "  " << argv0 << " info DEV_ID\n"
       << "  " << argv0 << " list\n"
-      << "  " << argv0 << " resize DEV_ID --size BYTES\n"
-      << "  " << argv0 << " clone SRC_DEV_ID --pool POOL --name NAME\n"
-      << "  " << argv0 << " rename DEV_ID --pool POOL --name NAME\n"
+      << "  " << argv0
+      << " resize DEV_ID --endpoint HOST:PORT --key KEY --size BYTES\n"
+      << "  " << argv0
+      << " clone SRC_DEV_ID --endpoint HOST:PORT --key KEY --pool POOL --name NAME\n"
+      << "  " << argv0
+      << " rename DEV_ID --endpoint HOST:PORT --key KEY --pool POOL --name NAME\n"
       << "\n"
       << "Maps an AIOS volume device (aiosvd) — block device backed by object stripes\n"
       << "vd/{pool}/{name}/data.*. Creates /dev/aiosvdN.\n"
+      << "create/clone/rename/resize register the volume in cluster object vd/registry.\n"
       << "clone creates a lightweight COW child header referencing the parent volume.\n";
 }
 
@@ -72,6 +79,27 @@ void print_info(const aiosvd_info_arg& info) {
             << "  timeouts=" << info.timeouts << "\n"
             << "  reconnects=" << info.reconnects << "\n"
             << "  cache_hits=" << info.cache_hits << "\n";
+}
+
+aios::Session make_session(const std::string& endpoint, const std::string& key) {
+  aios::SessionConfig sc;
+  sc.endpoint = endpoint;
+  sc.cluster_key = key;
+  sc.app_label = "vbd";
+  return aios::Session(std::move(sc));
+}
+
+int register_fail(const std::string& what, const std::string& err) {
+  std::cerr << "ERROR: volume " << what
+            << " but failed to update vd/registry: " << err << "\n"
+            << "The volume exists on the cluster but is not registered.\n";
+  return 1;
+}
+
+bool ioctl_info(int fd, int32_t dev_id, aiosvd_info_arg& info) {
+  info = {};
+  info.dev_id = dev_id;
+  return ioctl(fd, AIOSVD_IOCTL_INFO, &info) == 0;
 }
 
 int cmd_map(int argc, char** argv) {
@@ -138,6 +166,20 @@ int cmd_map(int argc, char** argv) {
   std::cout << "/dev/" << AIOSVD_DISK_PREFIX << arg.dev_id << "  pool=" << arg.pool
             << " name=" << arg.name << " size=" << arg.size << " obj_order=" << arg.obj_order
             << "\n";
+
+  if (create) {
+    aios::VbdVolume v;
+    v.pool = arg.pool;
+    v.name = arg.name;
+    v.size = arg.size;
+    v.obj_order = arg.obj_order ? arg.obj_order : AIOSVD_DEFAULT_OBJ_ORDER;
+    v.sealed = false;
+    std::string err;
+    auto sess = make_session(endpoint, key);
+    if (!aios::vbd_registry_upsert(sess, v, err)) {
+      return register_fail("created", err);
+    }
+  }
   return 0;
 }
 
@@ -196,39 +238,67 @@ int cmd_list(int argc, char** /*argv*/) {
 }
 
 int cmd_resize(int argc, char** argv) {
-  if (argc < 1) throw std::runtime_error("resize DEV_ID --size BYTES");
+  if (argc < 1) throw std::runtime_error("resize DEV_ID --endpoint E --key K --size BYTES");
   aiosvd_resize_arg r{};
   r.dev_id = std::stoi(argv[0]);
   uint64_t size = 0;
+  std::string endpoint, key;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    if (a == "--size") {
-      if (i + 1 >= argc) throw std::runtime_error("missing value for --size");
-      size = parse_size(argv[++i]);
-    } else {
-      throw std::runtime_error("unknown arg: " + a);
-    }
+    auto need = [&](const char* opt) -> const char* {
+      if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + opt);
+      return argv[++i];
+    };
+    if (a == "--size") size = parse_size(need("--size"));
+    else if (a == "--endpoint") endpoint = need("--endpoint");
+    else if (a == "--key") key = need("--key");
+    else throw std::runtime_error("unknown arg: " + a);
   }
   if (!size) throw std::runtime_error("--size is required");
+  if (endpoint.empty() || key.empty())
+    throw std::runtime_error("--endpoint and --key are required to update vd/registry");
   r.new_size = size;
 
   int fd = open_ctl();
   if (fd < 0) return 1;
+  aiosvd_info_arg before{};
+  if (!ioctl_info(fd, r.dev_id, before)) {
+    std::cerr << "info: " << std::strerror(errno) << "\n";
+    close(fd);
+    return 1;
+  }
   if (ioctl(fd, AIOSVD_IOCTL_RESIZE, &r) < 0) {
     std::cerr << "resize: " << std::strerror(errno) << "\n";
     close(fd);
     return 1;
   }
+  aiosvd_info_arg after{};
+  ioctl_info(fd, r.dev_id, after);
   close(fd);
   std::cout << "/dev/" << AIOSVD_DISK_PREFIX << r.dev_id << " size=" << r.new_size << "\n";
+
+  aios::VbdVolume v;
+  v.pool = after.pool[0] ? after.pool : before.pool;
+  v.name = after.name[0] ? after.name : before.name;
+  v.size = r.new_size;
+  v.obj_order = after.obj_order ? after.obj_order : before.obj_order;
+  v.sealed = false;
+  if (before.parent_pool[0]) {
+    v.parent_pool = before.parent_pool;
+    v.parent_name = before.parent_name;
+  }
+  std::string err;
+  auto sess = make_session(endpoint, key);
+  if (!aios::vbd_registry_upsert(sess, v, err)) return register_fail("resized", err);
   return 0;
 }
 
 int cmd_clone(int argc, char** argv) {
-  if (argc < 1) throw std::runtime_error("clone SRC_DEV_ID --pool POOL --name NAME");
+  if (argc < 1)
+    throw std::runtime_error("clone SRC_DEV_ID --endpoint E --key K --pool POOL --name NAME");
   aiosvd_clone_arg c{};
   c.src_dev_id = std::stoi(argv[0]);
-  std::string pool, name;
+  std::string pool, name, endpoint, key;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto need = [&](const char* opt) -> const char* {
@@ -237,30 +307,55 @@ int cmd_clone(int argc, char** argv) {
     };
     if (a == "--pool") pool = need("--pool");
     else if (a == "--name") name = need("--name");
+    else if (a == "--endpoint") endpoint = need("--endpoint");
+    else if (a == "--key") key = need("--key");
     else throw std::runtime_error("unknown arg: " + a);
   }
   if (pool.empty() || name.empty()) throw std::runtime_error("--pool and --name are required");
+  if (endpoint.empty() || key.empty())
+    throw std::runtime_error("--endpoint and --key are required to update vd/registry");
   std::snprintf(c.pool, sizeof(c.pool), "%s", pool.c_str());
   std::snprintf(c.name, sizeof(c.name), "%s", name.c_str());
 
   int fd = open_ctl();
   if (fd < 0) return 1;
+  aiosvd_info_arg parent{};
+  if (!ioctl_info(fd, c.src_dev_id, parent)) {
+    std::cerr << "info: " << std::strerror(errno) << "\n";
+    close(fd);
+    return 1;
+  }
   if (ioctl(fd, AIOSVD_IOCTL_CLONE, &c) < 0) {
     std::cerr << "clone: " << std::strerror(errno) << "\n";
     close(fd);
     return 1;
   }
+  aiosvd_info_arg child{};
+  ioctl_info(fd, c.dest_dev_id, child);
   close(fd);
   std::cout << "/dev/" << AIOSVD_DISK_PREFIX << c.dest_dev_id << "  pool=" << c.pool
             << " name=" << c.name << " (clone of " << c.src_dev_id << ")\n";
+
+  aios::VbdVolume v;
+  v.pool = c.pool;
+  v.name = c.name;
+  v.size = child.size ? child.size : parent.size;
+  v.obj_order = child.obj_order ? child.obj_order : parent.obj_order;
+  v.sealed = false;
+  v.parent_pool = parent.pool;
+  v.parent_name = parent.name;
+  std::string err;
+  auto sess = make_session(endpoint, key);
+  if (!aios::vbd_registry_upsert(sess, v, err)) return register_fail("cloned", err);
   return 0;
 }
 
 int cmd_rename(int argc, char** argv) {
-  if (argc < 1) throw std::runtime_error("rename DEV_ID --pool POOL --name NAME");
+  if (argc < 1)
+    throw std::runtime_error("rename DEV_ID --endpoint E --key K --pool POOL --name NAME");
   aiosvd_rename_arg r{};
   r.dev_id = std::stoi(argv[0]);
-  std::string pool, name;
+  std::string pool, name, endpoint, key;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto need = [&](const char* opt) -> const char* {
@@ -269,22 +364,53 @@ int cmd_rename(int argc, char** argv) {
     };
     if (a == "--pool") pool = need("--pool");
     else if (a == "--name") name = need("--name");
+    else if (a == "--endpoint") endpoint = need("--endpoint");
+    else if (a == "--key") key = need("--key");
     else throw std::runtime_error("unknown arg: " + a);
   }
   if (pool.empty() || name.empty()) throw std::runtime_error("--pool and --name are required");
+  if (endpoint.empty() || key.empty())
+    throw std::runtime_error("--endpoint and --key are required to update vd/registry");
   std::snprintf(r.pool, sizeof(r.pool), "%s", pool.c_str());
   std::snprintf(r.name, sizeof(r.name), "%s", name.c_str());
 
   int fd = open_ctl();
   if (fd < 0) return 1;
+  aiosvd_info_arg before{};
+  if (!ioctl_info(fd, r.dev_id, before)) {
+    std::cerr << "info: " << std::strerror(errno) << "\n";
+    close(fd);
+    return 1;
+  }
   if (ioctl(fd, AIOSVD_IOCTL_RENAME, &r) < 0) {
     std::cerr << "rename: " << std::strerror(errno) << "\n";
     close(fd);
     return 1;
   }
+  aiosvd_info_arg after{};
+  ioctl_info(fd, r.dev_id, after);
   close(fd);
   std::cout << "/dev/" << AIOSVD_DISK_PREFIX << r.dev_id << " renamed to " << r.pool << "/"
             << r.name << "\n";
+
+  aios::VbdVolume v;
+  v.pool = r.pool;
+  v.name = r.name;
+  v.size = after.size ? after.size : before.size;
+  v.obj_order = after.obj_order ? after.obj_order : before.obj_order;
+  v.sealed = false;
+  if (after.parent_pool[0]) {
+    v.parent_pool = after.parent_pool;
+    v.parent_name = after.parent_name;
+  } else if (before.parent_pool[0]) {
+    v.parent_pool = before.parent_pool;
+    v.parent_name = before.parent_name;
+  }
+  std::string err;
+  auto sess = make_session(endpoint, key);
+  if (!aios::vbd_registry_rename(sess, before.pool, before.name, v, err)) {
+    return register_fail("renamed", err);
+  }
   return 0;
 }
 

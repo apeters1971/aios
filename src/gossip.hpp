@@ -7,6 +7,7 @@
 #include "http/http_server.hpp"
 #include "http/posix_layout_store.hpp"
 #include "http/qos_admin.hpp"
+#include "http/vbd_registry.hpp"
 #include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
 #include "membership.hpp"
@@ -36,6 +37,7 @@ class GossipEngine {
   std::shared_ptr<QosAdminStore> qos() const { return qos_; }
   std::shared_ptr<BackupPolicyStore> backup_policies() const { return backup_policies_; }
   std::shared_ptr<PosixLayoutStore> posix_layout() const { return posix_layout_; }
+  std::shared_ptr<VbdRegistryStore> vbd_registry() const { return vbd_registry_; }
 
  private:
   void on_gossip_timer(const boost::system::error_code& ec);
@@ -66,6 +68,7 @@ class GossipEngine {
   std::shared_ptr<QosAdminStore> qos_;
   std::shared_ptr<BackupPolicyStore> backup_policies_;
   std::shared_ptr<PosixLayoutStore> posix_layout_;
+  std::shared_ptr<VbdRegistryStore> vbd_registry_;
   std::unique_ptr<TcpServer> server_;
   std::unique_ptr<HttpServer> http_server_;
   boost::asio::steady_timer gossip_timer_;

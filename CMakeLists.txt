@@ -167,6 +167,7 @@ add_library(aios_core STATIC
   src/http/qos_admin.cpp
   src/http/backup_policy.cpp
   src/http/posix_layout_store.cpp
+  src/http/vbd_registry.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
   src/metrics/qos_rates.cpp
@@ -212,6 +213,7 @@ add_library(aios_client STATIC
   src/client/changelog.cpp
   src/client/string.cpp
   src/client/mutex.cpp
+  src/client/vbd_registry_client.cpp
 )
 target_include_directories(aios_client PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -421,7 +423,11 @@ endif()
 
 # Userspace control for aiosvd.ko (AIOS Volume Device).
 add_executable(aios-vd tools/aios_vd.cpp)
-target_include_directories(aios-vd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(aios-vd PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(aios-vd PRIVATE aios_client)
 install(TARGETS aios-vd RUNTIME DESTINATION bin)
 install(FILES kernel/aiosvd_uapi.h DESTINATION include/aios)
 
