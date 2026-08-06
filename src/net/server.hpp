@@ -45,6 +45,7 @@ class TcpServer {
             const std::string& listen_port, RpcHandlers handlers);
 
   void start();
+  void close();
 
  private:
   void do_accept();

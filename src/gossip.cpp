@@ -195,6 +195,21 @@ void GossipEngine::start() {
                 " replica_count=", cfg_.replica_count);
 }
 
+void GossipEngine::stop() {
+  gossip_timer_.cancel();
+  scan_timer_.cancel();
+  status_timer_.cancel();
+  repair_timer_.cancel();
+  transition_timer_.cancel();
+  archive_timer_.cancel();
+  backup_timer_.cancel();
+  if (server_) server_->close();
+  if (http_server_) http_server_->close_sessions();
+  // Join HTTP workers while sockets are closed (unblocks keep-alive reads).
+  http_server_.reset();
+  server_.reset();
+}
+
 Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
                                           const std::string& peer_listen,
                                           const Frame& req) {

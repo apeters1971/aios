@@ -14,7 +14,9 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace aios {
 
@@ -31,6 +33,8 @@ class HttpServer {
   ~HttpServer();
 
   void start();
+  // Close acceptor + active sockets so keep-alive worker threads can exit.
+  void close_sessions();
 
   // Optional: after lifecycle target rewrite, rescan local .aios markers.
   void set_on_lifecycle_changed(std::function<void()> cb) {
@@ -60,6 +64,8 @@ class HttpServer {
   boost::asio::ip::tcp::acceptor acceptor_;
   // Blocking read/write session loop must not run on ioc_ (would stall accepts).
   boost::asio::thread_pool workers_{4};
+  std::mutex sessions_mu_;
+  std::unordered_set<std::shared_ptr<boost::asio::ip::tcp::socket>> sessions_;
 };
 
 }  // namespace aios

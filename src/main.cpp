@@ -67,37 +67,42 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    MembershipTable membership;
-    FsTable fs_table;
-    GossipEngine engine(ioc, cfg, membership, fs_table);
-    // Bind listen sockets before ioc.run() so a bind failure can throw cleanly
-    // without racing acceptor teardown against the io_context thread.
-    engine.start();
+    std::thread ioc_thread;
+    {
+      MembershipTable membership;
+      FsTable fs_table;
+      GossipEngine engine(ioc, cfg, membership, fs_table);
+      // Bind listen sockets before ioc.run() so a bind failure can throw cleanly
+      // without racing acceptor teardown against the io_context thread.
+      engine.start();
 
-    // Run the io_context before S3 starts: posix mount needs loopback HTTP.
-    std::thread ioc_thread([&] { ioc.run(); });
+      // Run the io_context before S3 starts: posix mount needs loopback HTTP.
+      ioc_thread = std::thread([&] { ioc.run(); });
 
-    std::unique_ptr<S3Server> s3;
-    if (!cfg.s3_listen.empty()) {
-      auto endpoint = s3_loopback_http_endpoint(cfg.http_listen);
-      if (endpoint.empty()) {
-        throw std::runtime_error("cannot derive loopback HTTP endpoint for S3 posix mount");
+      std::unique_ptr<S3Server> s3;
+      if (!cfg.s3_listen.empty()) {
+        auto endpoint = s3_loopback_http_endpoint(cfg.http_listen);
+        if (endpoint.empty()) {
+          throw std::runtime_error("cannot derive loopback HTTP endpoint for S3 posix mount");
+        }
+        s3 = std::make_unique<S3Server>(ioc, cfg, endpoint, engine.s3_iam(),
+                                        make_cuobject_endpoint(cfg));
+        s3->start();
       }
-      s3 = std::make_unique<S3Server>(ioc, cfg, endpoint, engine.s3_iam(),
-                                      make_cuobject_endpoint(cfg));
-      s3->start();
-    }
 
-    AIOS_LOG_INFO("aiosd running");
-    while (!g_stop.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      AIOS_LOG_INFO("aiosd running");
+      while (!g_stop.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+      // stop() closes accept on ioc then unmounts (rstat flush needs loopback HTTP).
+      if (s3) s3->stop();
+      s3.reset();
+      // Close acceptors + HTTP keep-alive sockets before stopping ioc/joining workers.
+      engine.stop();
+      g_work.reset();
+      ioc.stop();
+      if (ioc_thread.joinable()) ioc_thread.join();
     }
-    // stop() closes accept on ioc then unmounts (rstat flush needs loopback HTTP).
-    if (s3) s3->stop();
-    s3.reset();
-    g_work.reset();
-    ioc.stop();
-    if (ioc_thread.joinable()) ioc_thread.join();
     AIOS_LOG_INFO("aiosd stopped");
   } catch (const std::exception& e) {
     AIOS_LOG_ERROR("fatal: ", e.what());

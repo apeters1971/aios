@@ -29,6 +29,8 @@ class GossipEngine {
                FsTable& fs_table);
 
   void start();
+  // Stop acceptors / HTTP workers (call before io_context::stop).
+  void stop();
 
   const ClusterMap& cluster_map() const { return cluster_map_; }
   LocalStores& local_stores() { return local_stores_; }
