@@ -715,12 +715,30 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService&
     throw std::runtime_error("invalid http_listen: " + cfg_.http_listen);
   }
   tcp::resolver resolver(ioc_);
-  const auto endpoints = resolver.resolve(host, port);
+  boost::system::error_code ec;
+  const auto endpoints = resolver.resolve(host, port, ec);
+  if (ec || endpoints.empty()) {
+    throw std::runtime_error("resolve http_listen " + cfg_.http_listen + ": " +
+                             (ec ? ec.message() : "no endpoints"));
+  }
   const tcp::endpoint ep = *endpoints.begin();
-  acceptor_.open(ep.protocol());
-  acceptor_.set_option(tcp::acceptor::reuse_address(true));
-  acceptor_.bind(ep);
-  acceptor_.listen();
+  acceptor_.open(ep.protocol(), ec);
+  if (ec) throw std::runtime_error("open http listen socket: " + ec.message());
+  acceptor_.set_option(tcp::acceptor::reuse_address(true), ec);
+  if (ec) throw std::runtime_error("set http reuse_address: " + ec.message());
+  acceptor_.bind(ep, ec);
+  if (ec) {
+    boost::system::error_code ignored;
+    acceptor_.close(ignored);
+    throw std::runtime_error("bind http_listen " + cfg_.http_listen + ": " +
+                             ec.message());
+  }
+  acceptor_.listen(tcp::socket::max_listen_connections, ec);
+  if (ec) {
+    boost::system::error_code ignored;
+    acceptor_.close(ignored);
+    throw std::runtime_error("http listen: " + ec.message());
+  }
   AIOS_LOG_INFO("http listening on ", ep.address().to_string(), ":", ep.port());
 }
 

@@ -79,12 +79,31 @@ TcpServer::TcpServer(boost::asio::io_context& ioc, const std::string& listen_hos
       acceptor_(ioc),
       handlers_(std::move(handlers)) {
   tcp::resolver resolver(ioc_);
-  const auto endpoints = resolver.resolve(listen_host, listen_port);
+  boost::system::error_code ec;
+  const auto endpoints = resolver.resolve(listen_host, listen_port, ec);
+  if (ec || endpoints.empty()) {
+    throw std::runtime_error("resolve " + listen_host + ":" + listen_port + ": " +
+                             (ec ? ec.message() : "no endpoints"));
+  }
   const tcp::endpoint ep = *endpoints.begin();
-  acceptor_.open(ep.protocol());
-  acceptor_.set_option(tcp::acceptor::reuse_address(true));
-  acceptor_.bind(ep);
-  acceptor_.listen();
+  acceptor_.open(ep.protocol(), ec);
+  if (ec) throw std::runtime_error("open listen socket: " + ec.message());
+  acceptor_.set_option(tcp::acceptor::reuse_address(true), ec);
+  if (ec) throw std::runtime_error("set reuse_address: " + ec.message());
+  acceptor_.bind(ep, ec);
+  if (ec) {
+    const std::string msg =
+        "bind " + listen_host + ":" + listen_port + ": " + ec.message();
+    boost::system::error_code ignored;
+    acceptor_.close(ignored);
+    throw std::runtime_error(msg);
+  }
+  acceptor_.listen(tcp::socket::max_listen_connections, ec);
+  if (ec) {
+    boost::system::error_code ignored;
+    acceptor_.close(ignored);
+    throw std::runtime_error("listen: " + ec.message());
+  }
   AIOS_LOG_INFO("listening on ", ep.address().to_string(), ":", ep.port());
 }
 

@@ -67,13 +67,15 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
-    // Run the io_context before S3 starts: posix mount needs loopback HTTP.
-    std::thread ioc_thread([&] { ioc.run(); });
-
     MembershipTable membership;
     FsTable fs_table;
     GossipEngine engine(ioc, cfg, membership, fs_table);
+    // Bind listen sockets before ioc.run() so a bind failure can throw cleanly
+    // without racing acceptor teardown against the io_context thread.
     engine.start();
+
+    // Run the io_context before S3 starts: posix mount needs loopback HTTP.
+    std::thread ioc_thread([&] { ioc.run(); });
 
     std::unique_ptr<S3Server> s3;
     if (!cfg.s3_listen.empty()) {
@@ -99,6 +101,11 @@ int main(int argc, char** argv) {
     AIOS_LOG_INFO("aiosd stopped");
   } catch (const std::exception& e) {
     AIOS_LOG_ERROR("fatal: ", e.what());
+    g_work.reset();
+    if (g_ioc) g_ioc->stop();
+    return 1;
+  } catch (...) {
+    AIOS_LOG_ERROR("fatal: unknown exception");
     g_work.reset();
     if (g_ioc) g_ioc->stop();
     return 1;

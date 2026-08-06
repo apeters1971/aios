@@ -9,6 +9,7 @@
 
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <cctype>
 #include <cerrno>
@@ -166,11 +167,13 @@ AiosTarget prepare_target(const std::string& mount, const std::string& target_pa
     return t;
   }
 
+  bool created = false;
   if (!fs::exists(t.aios_path, ec)) {
     if (!fs::create_directory(t.aios_path, ec)) {
       t.error = "mkdir aios failed: " + ec.message();
       return t;
     }
+    created = true;
     AIOS_LOG_INFO("created ", t.aios_path);
   }
   if (!fs::is_directory(t.aios_path, ec)) {
@@ -185,13 +188,21 @@ AiosTarget prepare_target(const std::string& mount, const std::string& target_pa
   }
   const uid_t uid = effective_uid();
   const gid_t gid = effective_gid();
+  // macOS /tmp (and setgid parents) often create dirs as group wheel (0) while
+  // egid is staff. Fix ownership when we created the dir, or when we already own
+  // the uid and can chown the group.
   if (st.st_uid != uid || st.st_gid != gid) {
-    std::ostringstream oss;
-    oss << "uid/gid mismatch on " << t.aios_path << ": dir=" << st.st_uid << "/"
-        << st.st_gid << " euid/egid=" << uid << "/" << gid;
-    t.error = oss.str();
-    AIOS_LOG_ERROR(t.error);
-    return t;
+    if ((created || st.st_uid == uid) && ::chown(t.aios_path.c_str(), uid, gid) == 0 &&
+        ::stat(t.aios_path.c_str(), &st) == 0 && st.st_uid == uid && st.st_gid == gid) {
+      AIOS_LOG_INFO("chown ", t.aios_path, " -> ", uid, "/", gid);
+    } else {
+      std::ostringstream oss;
+      oss << "uid/gid mismatch on " << t.aios_path << ": dir=" << st.st_uid << "/"
+          << st.st_gid << " euid/egid=" << uid << "/" << gid;
+      t.error = oss.str();
+      AIOS_LOG_ERROR(t.error);
+      return t;
+    }
   }
 
   struct statvfs vfs {};
