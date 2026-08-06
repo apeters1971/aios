@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aios {
@@ -18,6 +19,11 @@ struct SessionConfig {
   std::string app_label{};
   // Per-socket read/write deadline (SO_RCVTIMEO / SO_SNDTIMEO).
   int socket_timeout_ms{30000};
+  // Extra host:port values absolute 307/301/302 Location targets may use.
+  // The configured endpoint is always allowed. Relative Locations stay on the
+  // current hop host. When an absolute redirect is not yet allowlisted, Session
+  // once refreshes peers from GET /admin/cluster on the bootstrap endpoint.
+  std::vector<std::string> redirect_peers{};
 };
 
 struct LockResult {
@@ -141,9 +147,19 @@ class Session {
   static void validate_header_value(const std::string& value, const char* what);
   static ObjectSnapshot parse_object_meta(const HttpResponse& resp, bool with_body);
 
+  static std::string normalize_host_port(std::string host, std::string port);
+  void allow_redirect_peer(const std::string& http_addr);
+  bool redirect_allowed(const std::string& host, const std::string& port) const;
+  void refresh_redirect_allowlist();
+  // One-shot GET to the bootstrap endpoint; does not follow redirects.
+  HttpResponse bootstrap_get(const std::string& path);
+
   SessionConfig cfg_;
   std::string host_;
   std::string port_;
+  std::unordered_set<std::string> redirect_allow_;
+  bool redirect_refreshed_{false};
+  bool refreshing_allowlist_{false};
 };
 
 }  // namespace aios

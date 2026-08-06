@@ -30,62 +30,56 @@ struct StubServer {
   std::atomic<bool> ready{false};
   std::string last_request;
 
-  explicit StubServer(std::function<std::string(const std::string&)> handler)
+  explicit StubServer(std::function<std::string(const std::string&)> handler, int accepts = 1)
       : acc(ioc, tcp::endpoint(tcp::v4(), 0)) {
     port = std::to_string(acc.local_endpoint().port());
-    th = std::thread([this, handler = std::move(handler)] {
+    th = std::thread([this, handler = std::move(handler), accepts] {
       ready.store(true);
-      boost::system::error_code ec;
-      tcp::socket sock(ioc);
-      acc.accept(sock, ec);
-      if (ec) return;
+      for (int i = 0; i < accepts; ++i) {
+        boost::system::error_code ec;
+        tcp::socket sock(ioc);
+        acc.accept(sock, ec);
+        if (ec) return;
 
-      boost::asio::streambuf buf;
-      boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
-      std::istream is(&buf);
-      std::string req((std::istreambuf_iterator<char>(is)), {});
-      // Drain a small declared body if present in the already-buffered data.
-      last_request = req;
-      const auto cl_pos = req.find("Content-Length:");
-      if (cl_pos == std::string::npos) {
-        const auto cl2 = req.find("content-length:");
-        if (cl2 != std::string::npos) {
-          // handled below via case-insensitive search in handler path
-        }
-      }
-      std::size_t content_length = 0;
-      {
-        auto lower = req;
-        for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        const auto p = lower.find("content-length:");
-        if (p != std::string::npos) {
-          const auto end = lower.find("\r\n", p);
-          const auto line = req.substr(p, end - p);
-          const auto colon = line.find(':');
-          if (colon != std::string::npos) {
-            try {
-              content_length = static_cast<std::size_t>(std::stoull(line.substr(colon + 1)));
-            } catch (...) {
+        boost::asio::streambuf buf;
+        boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
+        std::istream is(&buf);
+        std::string req((std::istreambuf_iterator<char>(is)), {});
+        last_request = req;
+        std::size_t content_length = 0;
+        {
+          auto lower = req;
+          for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          const auto p = lower.find("content-length:");
+          if (p != std::string::npos) {
+            const auto end = lower.find("\r\n", p);
+            const auto line = req.substr(p, end - p);
+            const auto colon = line.find(':');
+            if (colon != std::string::npos) {
+              try {
+                content_length = static_cast<std::size_t>(std::stoull(line.substr(colon + 1)));
+              } catch (...) {
+              }
             }
           }
         }
-      }
-      const auto hdr_end = req.find("\r\n\r\n");
-      std::string body;
-      if (hdr_end != std::string::npos) {
-        body = req.substr(hdr_end + 4);
-        while (body.size() < content_length) {
-          char tmp[1024];
-          const auto n = sock.read_some(boost::asio::buffer(tmp), ec);
-          if (n == 0 || ec) break;
-          body.append(tmp, tmp + n);
+        const auto hdr_end = req.find("\r\n\r\n");
+        std::string body;
+        if (hdr_end != std::string::npos) {
+          body = req.substr(hdr_end + 4);
+          while (body.size() < content_length) {
+            char tmp[1024];
+            const auto n = sock.read_some(boost::asio::buffer(tmp), ec);
+            if (n == 0 || ec) break;
+            body.append(tmp, tmp + n);
+          }
+          last_request = req.substr(0, hdr_end + 4) + body;
         }
-        last_request = req.substr(0, hdr_end + 4) + body;
-      }
 
-      const std::string resp = handler(last_request);
-      boost::asio::write(sock, boost::asio::buffer(resp), ec);
-      sock.close(ec);
+        const std::string resp = handler(last_request);
+        boost::asio::write(sock, boost::asio::buffer(resp), ec);
+        sock.close(ec);
+      }
     });
     while (!ready.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
@@ -222,4 +216,104 @@ TEST(SessionWireC8, RequestBodyIsContentSha256Hashed) {
   const auto expect = sha256_hex(body);
   EXPECT_NE(stub.last_request.find(expect), std::string::npos)
       << "request missing x-aios-content-sha256=" << expect;
+}
+
+TEST(SessionWireC8, AbsoluteRedirectToUnknownHostIsRejected) {
+  using namespace aios;
+  // Second accept serves the one-shot /admin/cluster refresh (empty peers).
+  StubServer stub(
+      [](const std::string& req) {
+        if (req.find("GET /admin/cluster ") != std::string::npos) {
+          return http_response(200, R"({"admin_peers":[]})");
+        }
+        return http_response(307, R"({"code":"not_primary"})",
+                             {{"Location", "http://evil.example:9/o/stolen"}});
+      },
+      /*accepts=*/2);
+
+  SessionConfig cfg;
+  cfg.endpoint = "127.0.0.1:" + stub.port;
+  cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+  cfg.socket_timeout_ms = 2000;
+  Session s(cfg);
+
+  try {
+    s.request("PUT", "/o/x", {}, "payload");
+    FAIL() << "expected redirect target rejection";
+  } catch (const client_error& e) {
+    EXPECT_EQ(e.code(), "http");
+    EXPECT_NE(std::string(e.what()).find("redirect target not in cluster"), std::string::npos);
+  }
+}
+
+TEST(SessionWireC8, AbsoluteRedirectToAllowlistedPeerIsFollowed) {
+  using namespace aios;
+  StubServer peer([](const std::string&) { return http_response(200, "primary-ok"); });
+  const std::string peer_hp = "127.0.0.1:" + peer.port;
+  StubServer stub([&](const std::string&) {
+    return http_response(307, R"({"code":"not_primary"})",
+                         {{"Location", "http://" + peer_hp + "/o/x"}});
+  });
+
+  SessionConfig cfg;
+  cfg.endpoint = "127.0.0.1:" + stub.port;
+  cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+  cfg.socket_timeout_ms = 2000;
+  cfg.redirect_peers = {peer_hp};
+  Session s(cfg);
+
+  auto resp = s.request("PUT", "/o/x", {}, "payload");
+  EXPECT_EQ(resp.status, 200);
+  EXPECT_EQ(resp.body, "primary-ok");
+}
+
+TEST(SessionWireC8, RelativeRedirectIsFollowed) {
+  using namespace aios;
+  StubServer stub(
+      [](const std::string& req) {
+        if (req.find("GET /o/alias ") != std::string::npos) {
+          return http_response(307, "", {{"Location", "/o/target"}});
+        }
+        return http_response(200, "target-body");
+      },
+      /*accepts=*/2);
+
+  SessionConfig cfg;
+  cfg.endpoint = "127.0.0.1:" + stub.port;
+  cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+  cfg.socket_timeout_ms = 2000;
+  Session s(cfg);
+
+  auto resp = s.request("GET", "/o/alias");
+  EXPECT_EQ(resp.status, 200);
+  EXPECT_EQ(resp.body, "target-body");
+}
+
+TEST(SessionWireC8, AbsoluteRedirectAllowedAfterClusterRefresh) {
+  using namespace aios;
+  StubServer peer([](const std::string&) { return http_response(200, "via-refresh"); });
+  const std::string peer_hp = "127.0.0.1:" + peer.port;
+
+  StubServer stub(
+      [&](const std::string& req) {
+        if (req.find("GET /admin/cluster ") != std::string::npos) {
+          const std::string body =
+              std::string(R"({"node_id":"n0","admin_peers":[{"http_addr":")") + peer_hp +
+              R"("}]})";
+          return http_response(200, body);
+        }
+        return http_response(307, R"({"code":"not_primary"})",
+                             {{"Location", "http://" + peer_hp + "/o/x"}});
+      },
+      /*accepts=*/2);
+
+  SessionConfig cfg;
+  cfg.endpoint = "127.0.0.1:" + stub.port;
+  cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+  cfg.socket_timeout_ms = 2000;
+  Session s(cfg);
+
+  auto resp = s.request("PUT", "/o/x", {}, "payload");
+  EXPECT_EQ(resp.status, 200);
+  EXPECT_EQ(resp.body, "via-refresh");
 }

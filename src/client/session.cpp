@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <sstream>
+#include <utility>
 
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -43,6 +44,11 @@ bool parse_location(const std::string& loc, std::string& host, std::string& port
     return true;
   }
   return false;
+}
+
+std::string ascii_lower(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
 }
 
 void throw_http(const HttpResponse& resp, const std::string& what) {
@@ -94,6 +100,8 @@ std::uint64_t apply_posix_cas_headers(Session& session, const std::string& oid,
 Session::Session(SessionConfig cfg) : cfg_(std::move(cfg)) {
   if (cfg_.cluster_key.empty()) throw client_error("bad_request", "cluster_key required");
   parse_endpoint();
+  allow_redirect_peer(host_ + ":" + port_);
+  for (const auto& p : cfg_.redirect_peers) allow_redirect_peer(p);
 }
 
 void Session::parse_endpoint() {
@@ -103,6 +111,136 @@ void Session::parse_endpoint() {
   }
   host_ = cfg_.endpoint.substr(0, colon);
   port_ = cfg_.endpoint.substr(colon + 1);
+}
+
+std::string Session::normalize_host_port(std::string host, std::string port) {
+  host = ascii_lower(std::move(host));
+  // Strip IPv6 brackets if present: [::1]:7480 → host=[::1] already split by rfind(':')
+  // for non-bracket forms; keep host as-is after lowercasing.
+  if (port.empty()) port = "80";
+  return host + ":" + port;
+}
+
+void Session::allow_redirect_peer(const std::string& http_addr) {
+  if (http_addr.empty()) return;
+  auto colon = http_addr.rfind(':');
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= http_addr.size()) {
+    // host only → default HTTP port
+    redirect_allow_.insert(normalize_host_port(http_addr, "80"));
+    return;
+  }
+  redirect_allow_.insert(
+      normalize_host_port(http_addr.substr(0, colon), http_addr.substr(colon + 1)));
+}
+
+bool Session::redirect_allowed(const std::string& host, const std::string& port) const {
+  return redirect_allow_.count(normalize_host_port(host, port)) > 0;
+}
+
+HttpResponse Session::bootstrap_get(const std::string& path) {
+  std::unordered_map<std::string, std::string> headers;
+  headers["content-length"] = "0";
+  add_auth(headers, "GET", path, {});
+
+  boost::asio::io_context ioc;
+  boost::system::error_code ec;
+  tcp::resolver resolver(ioc);
+  auto endpoints = resolver.resolve(host_, port_, ec);
+  if (ec) throw client_error("http", "resolve: " + ec.message());
+
+  tcp::socket sock(ioc);
+  boost::asio::connect(sock, endpoints, ec);
+  if (ec) throw client_error("http", "connect: " + ec.message());
+
+#ifndef _WIN32
+  if (cfg_.socket_timeout_ms > 0) {
+    struct timeval tv {};
+    tv.tv_sec = cfg_.socket_timeout_ms / 1000;
+    tv.tv_usec = (cfg_.socket_timeout_ms % 1000) * 1000;
+    const int fd = sock.native_handle();
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
+#endif
+
+  std::ostringstream req;
+  req << "GET " << path << " HTTP/1.1\r\n";
+  req << "Host: " << host_ << ':' << port_ << "\r\n";
+  req << "Connection: close\r\n";
+  for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
+  req << "\r\n";
+  boost::asio::write(sock, boost::asio::buffer(req.str()), ec);
+  if (ec) throw client_error("http", "write: " + ec.message());
+
+  boost::asio::streambuf buf;
+  boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
+  if (ec) throw client_error("http", "read headers: " + ec.message());
+
+  std::istream is(&buf);
+  std::string status_line;
+  std::getline(is, status_line);
+  HttpResponse resp;
+  {
+    std::istringstream ss(status_line);
+    std::string ver, reason;
+    ss >> ver >> resp.status;
+  }
+  std::string line;
+  std::size_t content_length = 0;
+  while (std::getline(is, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) break;
+    auto colon = line.find(':');
+    if (colon == std::string::npos) continue;
+    auto name = line.substr(0, colon);
+    auto value = line.substr(colon + 1);
+    while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    resp.headers[name] = value;
+    if (name == "content-length") {
+      try {
+        content_length = static_cast<std::size_t>(std::stoull(value));
+      } catch (...) {
+        content_length = 0;
+      }
+      if (content_length > kMaxBodyBytes) {
+        throw client_error("payload_too_large", "response body exceeds 16 MiB");
+      }
+    }
+  }
+  std::string already(std::istreambuf_iterator<char>(is), {});
+  resp.body = std::move(already);
+  while (resp.body.size() < content_length) {
+    char tmp[4096];
+    const auto n = sock.read_some(boost::asio::buffer(tmp), ec);
+    if (n > 0) resp.body.append(tmp, tmp + n);
+    if (ec) break;
+  }
+  if (content_length > 0 && resp.body.size() > content_length) resp.body.resize(content_length);
+  return resp;
+}
+
+void Session::refresh_redirect_allowlist() {
+  if (redirect_refreshed_ || refreshing_allowlist_) return;
+  redirect_refreshed_ = true;
+  refreshing_allowlist_ = true;
+  struct Clear {
+    bool& f;
+    ~Clear() { f = false; }
+  } clear{refreshing_allowlist_};
+
+  try {
+    auto resp = bootstrap_get("/admin/cluster");
+    if (resp.status != 200 || resp.body.empty()) return;
+    const auto j = nlohmann::json::parse(resp.body);
+    if (!j.contains("admin_peers") || !j["admin_peers"].is_array()) return;
+    for (const auto& peer : j["admin_peers"]) {
+      if (!peer.is_object()) continue;
+      allow_redirect_peer(peer.value("http_addr", ""));
+    }
+  } catch (...) {
+    // Keep the bootstrap allowlist; absolute redirects to unknown hosts stay rejected.
+  }
 }
 
 std::string Session::url_encode_oid(const std::string& oid) {
@@ -265,11 +403,25 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
 
     if (resp.status == 307 || resp.status == 301 || resp.status == 302) {
       const auto loc = header_get(resp.headers, "location");
+      std::string new_host = host;
+      std::string new_port = port;
       std::string new_path;
-      if (!parse_location(loc, host, port, new_path)) {
+      if (!parse_location(loc, new_host, new_port, new_path)) {
         throw client_error("http", "bad redirect Location");
       }
-      path = new_path;
+      // Absolute Locations may point anywhere; only follow cluster HTTP peers.
+      // Relative Locations keep the current hop host (already connected/trusted path).
+      if (loc.rfind("http://", 0) == 0) {
+        if (!redirect_allowed(new_host, new_port)) {
+          refresh_redirect_allowlist();
+          if (!redirect_allowed(new_host, new_port)) {
+            throw client_error("http", "redirect target not in cluster");
+          }
+        }
+      }
+      host = std::move(new_host);
+      port = std::move(new_port);
+      path = std::move(new_path);
       continue;
     }
     return resp;
