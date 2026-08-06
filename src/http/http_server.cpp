@@ -744,13 +744,22 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService&
   AIOS_LOG_INFO("http listening on ", ep.address().to_string(), ":", ep.port());
 }
 
+HttpServer::~HttpServer() {
+  boost::system::error_code ec;
+  acceptor_.close(ec);
+  workers_.stop();
+  workers_.join();
+}
+
 void HttpServer::start() { do_accept(); }
 
 void HttpServer::do_accept() {
   auto sock = std::make_shared<tcp::socket>(ioc_);
   acceptor_.async_accept(*sock, [this, sock](boost::system::error_code ec) {
     if (!ec) {
-      boost::asio::post(ioc_, [this, sock] { handle_session(sock); });
+      // Session I/O is synchronous; run off ioc_ so parallel browser connections
+      // (HTML + CSS + JS) are not stalled by keep-alive reads.
+      boost::asio::post(workers_, [this, sock] { handle_session(sock); });
     } else {
       AIOS_LOG_WARN("http accept: ", ec.message());
     }

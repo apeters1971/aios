@@ -28,6 +28,7 @@ class HttpServer {
              std::shared_ptr<BackupPolicyStore> backup_policies = nullptr,
              std::shared_ptr<PosixLayoutStore> posix_layout = nullptr,
              std::shared_ptr<VbdRegistryStore> vbd_registry = nullptr);
+  ~HttpServer();
 
   void start();
 
@@ -57,6 +58,8 @@ class HttpServer {
   std::shared_ptr<VbdRegistryStore> vbd_registry_;
   std::function<void()> on_lifecycle_changed_;
   boost::asio::ip::tcp::acceptor acceptor_;
+  // Blocking read/write session loop must not run on ioc_ (would stall accepts).
+  boost::asio::thread_pool workers_{4};
 };
 
 }  // namespace aios
