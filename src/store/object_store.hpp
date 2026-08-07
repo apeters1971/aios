@@ -20,6 +20,8 @@ struct ObjectStoreOptions {
   int max_versions{16};
   // If true, FS COW requires reflink/clone; if false, allow full-copy fallback.
   bool clone_required{true};
+  // When false, skip body/dir fsync and use SQLite synchronous=OFF (dev/bench only).
+  bool data_fsync{true};
 };
 
 struct ObjectInfo {
@@ -255,7 +257,7 @@ class ObjectStore {
   bool write_layout(std::string& err) const;
 
   static bool exec_db(sqlite3* db, const char* sql, std::string& err);
-  static bool ensure_schema(sqlite3* db, std::string& err);
+  static bool ensure_schema(sqlite3* db, std::string& err, bool data_fsync = true);
   static bool migrate_legacy_if_needed(sqlite3* db, const std::string& shard_dir,
                                        std::string& err);
   bool use_inline(std::size_t len) const;

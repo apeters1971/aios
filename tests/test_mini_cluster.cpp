@@ -84,6 +84,9 @@ struct MiniNode {
 
   void stop() {
     if (!running) return;
+    // Drop pooled outbound keep-alives so peer session workers can exit.
+    aios::object_rpc_pool_clear();
+    if (server) server->close();
     work.reset();
     ioc.stop();
     if (thr.joinable()) thr.join();

@@ -31,11 +31,15 @@ struct ObjectRpcResult {
   nlohmann::json body = nlohmann::json::object();
 };
 
-// Short-lived session on a private io_context: Hello → request → ObjectReply.
+// Object RPC over a pooled keep-alive TCP session (Hello once, then request/reply).
+// Connections are reused across calls to the same peer; I/O errors discard the socket.
 ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& local_node_id,
                            const std::string& local_listen, const std::string& cluster_key,
                            int auth_skew_ms, MsgType req_type, nlohmann::json req_body,
                            std::vector<std::uint8_t> raw = {});
+
+// Drop idle pooled sockets (call before tearing down peer TcpServers / in tests).
+void object_rpc_pool_clear();
 
 ObjectRpcResult object_put_range_remote(
     const std::string& peer_addr, const std::string& local_node_id,

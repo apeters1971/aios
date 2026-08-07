@@ -170,7 +170,7 @@ bool ObjectStore::exec_db(sqlite3* db, const char* sql, std::string& err) {
   return true;
 }
 
-bool ObjectStore::ensure_schema(sqlite3* db, std::string& err) {
+bool ObjectStore::ensure_schema(sqlite3* db, std::string& err, bool data_fsync) {
   const char* ddl = R"SQL(
 CREATE TABLE IF NOT EXISTS object_tips (
   oid TEXT PRIMARY KEY,
@@ -202,7 +202,8 @@ CREATE INDEX IF NOT EXISTS idx_object_versions_fs_path ON object_versions(fs_pat
 )SQL";
   if (!exec_db(db, "PRAGMA foreign_keys = ON;", err)) return false;
   if (!exec_db(db, "PRAGMA journal_mode = WAL;", err)) return false;
-  if (!exec_db(db, "PRAGMA synchronous = NORMAL;", err)) return false;
+  if (!exec_db(db, data_fsync ? "PRAGMA synchronous = NORMAL;" : "PRAGMA synchronous = OFF;", err))
+    return false;
   if (!exec_db(db, ddl, err)) return false;
   // Older versioned DBs may lack redirect_oid (duplicate column errors ignored).
   sqlite3_exec(db, "ALTER TABLE object_versions ADD COLUMN redirect_oid TEXT;", nullptr,
@@ -482,7 +483,7 @@ bool ObjectStore::open_shard(std::uint32_t id, std::string& err) {
     if (shard->db) sqlite3_close(shard->db);
     return false;
   }
-  if (!ensure_schema(shard->db, err)) {
+  if (!ensure_schema(shard->db, err, opts_.data_fsync)) {
     sqlite3_close(shard->db);
     return false;
   }
@@ -560,7 +561,7 @@ bool ObjectStore::write_fs_object(Shard& shard, const std::string& relpath,
     }
     done += static_cast<std::size_t>(n);
   }
-  if (::fsync(fd) != 0) {
+  if (opts_.data_fsync && ::fsync(fd) != 0) {
     err = std::string("fsync data: ") + std::strerror(errno);
     ::close(fd);
     fs::remove(tmp_path, ec);
@@ -577,14 +578,16 @@ bool ObjectStore::write_fs_object(Shard& shard, const std::string& relpath,
     fs::remove(tmp_path, ec);
     return false;
   }
-  int dir_fd = ::open(final_path.parent_path().c_str(), O_RDONLY);
-  if (dir_fd >= 0) {
-    if (::fsync(dir_fd) != 0) {
-      err = std::string("fsync dir: ") + std::strerror(errno);
+  if (opts_.data_fsync) {
+    int dir_fd = ::open(final_path.parent_path().c_str(), O_RDONLY);
+    if (dir_fd >= 0) {
+      if (::fsync(dir_fd) != 0) {
+        err = std::string("fsync dir: ") + std::strerror(errno);
+        ::close(dir_fd);
+        return false;
+      }
       ::close(dir_fd);
-      return false;
     }
-    ::close(dir_fd);
   }
   return true;
 }
@@ -643,7 +646,7 @@ bool ObjectStore::pwrite_fs(Shard& shard, const std::string& relpath, std::uint6
     }
     done += static_cast<std::size_t>(n);
   }
-  if (::fsync(fd) != 0) {
+  if (opts_.data_fsync && ::fsync(fd) != 0) {
     err = std::string("fsync: ") + std::strerror(errno);
     ::close(fd);
     return false;
@@ -1188,7 +1191,7 @@ bool ObjectStore::place_staging_as_version(const std::string& oid, std::uint64_t
     }
     fs::remove(staging_abs_path, ec);
   }
-  {
+  if (opts_.data_fsync) {
     FILE* f = std::fopen(final_path.c_str(), "rb");
     if (f) {
       fflush(f);

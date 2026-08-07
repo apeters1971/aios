@@ -68,8 +68,10 @@ void usage() {
       << "  --cluster-key KEY      required shared secret\n"
       << "  --mode object|stl      object = raw PUT/GET (default); stl = aios_client types\n"
       << "  --threads N            worker threads (default: hardware concurrency)\n"
-      << "  --ops N                operations per size per phase (default 200)\n"
-      << "  --warmup N             discarded ops per size per phase (default 10)\n"
+      << "  --ops N                operations per size per phase (default 200;\n"
+      << "                         object mode auto-scales: ÷4 at ≥4MiB, ÷16 at ≥16MiB)\n"
+      << "  --warmup N             discarded ops per size per phase (default 10;\n"
+      << "                         same size scaling as --ops in object mode)\n"
       << "  --sizes LIST           object mode: 1k,4k,… (default 1k..16M)\n"
       << "                        stl mode: string bytes or entry counts (default 16,64,256,1k,4k)\n"
       << "  --ops-mix LIST         create,update,read (default all three)\n"
@@ -540,9 +542,7 @@ class HttpSession {
     std::ostringstream req;
     req << method << ' ' << target << " HTTP/1.1\r\n";
     req << "Host: " << host_ << ':' << port_ << "\r\n";
-    // Close after each response so a stalled peer cannot pin bench threads on a
-    // keep-alive socket waiting for headers that will never arrive.
-    req << "Connection: close\r\n";
+    req << "Connection: keep-alive\r\n";
     for (const auto& [k, v] : headers) {
       req << k << ": " << v << "\r\n";
     }
@@ -557,6 +557,7 @@ class HttpSession {
     if (ec) {
       resp.status = -1;
       resp.error = "write: " + ec.message();
+      close();
       return resp;
     }
 
@@ -565,6 +566,7 @@ class HttpSession {
     if (ec && ec != asio::error::eof) {
       resp.status = -1;
       resp.error = "read headers: " + ec.message();
+      close();
       return resp;
     }
 
@@ -616,14 +618,13 @@ class HttpSession {
       if (ec) {
         resp.status = -1;
         resp.error = "read body: " + ec.message();
+        close();
         return resp;
       }
       need -= n;
     }
 
-    // We always send Connection: close; drop the socket so the next op reconnects.
-    close();
-    (void)close_conn;
+    if (close_conn || ec == asio::error::eof) close();
     return resp;
   }
 
@@ -1025,11 +1026,22 @@ PhaseStats run_stl_phase(const BenchArgs& a, const std::string& type, aios::sync
   return st;
 }
 
+// Large objects dominate wall time; keep total transferred bytes roughly flat.
+std::size_t scaled_ops(std::size_t base, std::size_t size_bytes) {
+  std::size_t div = 1;
+  if (size_bytes >= 16ull * 1024 * 1024) {
+    div = 16;
+  } else if (size_bytes >= 4ull * 1024 * 1024) {
+    div = 4;
+  }
+  return std::max<std::size_t>(1, base / div);
+}
+
 int run_object_bench(const BenchArgs& args, const std::string& host, const std::string& port) {
   if (!args.json) {
     std::cout << "aios-bench mode=object endpoint=" << args.endpoint
               << " threads=" << args.threads << " ops=" << args.ops << " warmup=" << args.warmup
-              << "\n";
+              << " (ops÷4 at ≥4MiB, ÷16 at ≥16MiB)\n";
     std::cout << std::left << std::setw(8) << "size" << std::setw(8) << "op" << std::right
               << std::setw(8) << "ok" << std::setw(6) << "err" << std::setw(10) << "iops"
               << std::setw(10) << "MiB/s" << std::setw(10) << "p50_ms" << std::setw(10) << "p95_ms"
@@ -1041,39 +1053,41 @@ int run_object_bench(const BenchArgs& args, const std::string& host, const std::
   results.reserve(args.sizes.size() * 3);
 
   for (std::size_t size : args.sizes) {
-    if (args.warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
-      run_phase(args, host, port, OpKind::Put, size, args.warmup, false);
+    const std::size_t ops = scaled_ops(args.ops, size);
+    const std::size_t warmup = args.warmup > 0 ? scaled_ops(args.warmup, size) : 0;
+    if (warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
+      run_phase(args, host, port, OpKind::Put, size, warmup, false);
       if (args.do_update) {
-        run_phase(args, host, port, OpKind::Update, size, args.warmup, false);
+        run_phase(args, host, port, OpKind::Update, size, warmup, false);
       }
       if (args.do_read) {
-        run_phase(args, host, port, OpKind::Read, size, args.warmup, false);
+        run_phase(args, host, port, OpKind::Read, size, warmup, false);
       }
-      run_phase(args, host, port, OpKind::Delete, size, args.warmup, false);
+      run_phase(args, host, port, OpKind::Delete, size, warmup, false);
     }
 
     if (args.do_create) {
-      auto st = run_phase(args, host, port, OpKind::Create, size, args.ops, true);
+      auto st = run_phase(args, host, port, OpKind::Create, size, ops, true);
       if (!args.json) print_human(st);
       results.push_back(std::move(st));
     } else if (args.do_update || args.do_read) {
-      run_phase(args, host, port, OpKind::Put, size, args.ops, false);
+      run_phase(args, host, port, OpKind::Put, size, ops, false);
     }
 
     if (args.do_update) {
-      auto st = run_phase(args, host, port, OpKind::Update, size, args.ops, true);
+      auto st = run_phase(args, host, port, OpKind::Update, size, ops, true);
       if (!args.json) print_human(st);
       results.push_back(std::move(st));
     }
 
     if (args.do_read) {
-      auto st = run_phase(args, host, port, OpKind::Read, size, args.ops, true);
+      auto st = run_phase(args, host, port, OpKind::Read, size, ops, true);
       if (!args.json) print_human(st);
       results.push_back(std::move(st));
     }
 
     if (args.cleanup) {
-      run_phase(args, host, port, OpKind::Delete, size, args.ops, false);
+      run_phase(args, host, port, OpKind::Delete, size, ops, false);
     }
   }
 

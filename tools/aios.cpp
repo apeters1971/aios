@@ -47,6 +47,7 @@ struct Args {
   std::vector<std::string> positional;
   std::string out_file;
   std::string prefix;
+  bool testbed_no_fsync{false};
 };
 
 void usage() {
@@ -61,12 +62,13 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
-      << "  testbed                 spawn a 4-node local cluster under /var/tmp/aios-testbed\n"
+      << "  testbed [--no-fsync]    spawn a 4-node local cluster under /var/tmp/aios-testbed\n"
       << "  admin [status|ops|config|cluster|metrics|console|archive|backup|vbd|posix-layout|lifecycle|s3-cred|quota|qos ...]\n"
       << "\n"
       << "testbed creates /var/tmp/aios-testbed/{00,01,02,03}, starts aiosd on each\n"
       << "(gossip 7400–7403, HTTP 7480–7483; node 00 has --admin), and waits until\n"
       << "Ctrl+C. Default --cluster-key if omitted: testbed.\n"
+      << "--no-fsync (with testbed) disables body fsync on all nodes for faster local bench.\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
@@ -126,6 +128,10 @@ bool parse_args(int argc, char** argv, Args& a) {
       const char* v = need("--prefix");
       if (!v) return false;
       a.prefix = v;
+      continue;
+    }
+    if (arg == "--no-fsync") {
+      a.testbed_no_fsync = true;
       continue;
     }
     if (a.cmd.empty()) {
@@ -1627,7 +1633,7 @@ bool http_ready(const std::string& host, const std::string& port, const std::str
   return r.status == 200 || r.status == 401 || r.status == 403;
 }
 
-int cmd_testbed(const std::string& cluster_key, const char* argv0) {
+int cmd_testbed(const std::string& cluster_key, const char* argv0, bool no_fsync) {
   const fs::path root(kTestbedRoot);
   std::string err;
   if (!prepare_testbed_root(root, err)) {
@@ -1681,6 +1687,7 @@ int cmd_testbed(const std::string& cluster_key, const char* argv0) {
       args.push_back("--peer");
       args.push_back(peer0);
     }
+    if (no_fsync) args.push_back("--no-fsync");
 
     const pid_t pid = spawn_aiosd(aiosd, args, node / "aiosd.log");
     if (pid < 0) {
@@ -1712,6 +1719,7 @@ int cmd_testbed(const std::string& cluster_key, const char* argv0) {
 
   std::cout << "\ntestbed root:  " << root << "\n"
             << "cluster_key:   " << cluster_key << "\n"
+            << "data_fsync:    " << (no_fsync ? "off (--no-fsync)" : "on") << "\n"
             << "admin UI:      http://127.0.0.1:" << kTestbedHttpBase << "/admin/\n"
             << "client example:\n"
             << "  aios --endpoint 127.0.0.1:" << kTestbedHttpBase << " --cluster-key " << cluster_key
@@ -1771,7 +1779,7 @@ int main(int argc, char** argv) {
 
   try {
     if (args.cmd == "testbed") {
-      return cmd_testbed(args.cluster_key, argv[0]);
+      return cmd_testbed(args.cluster_key, argv[0], args.testbed_no_fsync);
     }
   } catch (const std::exception& e) {
     std::cerr << e.what() << "\n";

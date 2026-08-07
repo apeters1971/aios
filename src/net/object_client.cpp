@@ -11,86 +11,17 @@
 
 #include <algorithm>
 #include <fstream>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace aios {
+namespace {
 
-ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& local_node_id,
-                           const std::string& local_listen, const std::string& cluster_key,
-                           int auth_skew_ms, MsgType req_type, nlohmann::json req_body,
-                           std::vector<std::uint8_t> raw) {
+ObjectRpcResult parse_object_reply(Frame& reply) {
   ObjectRpcResult result;
-  std::string host, port;
-  if (!split_host_port(peer_addr, host, port)) {
-    result.error = "bad peer addr: " + peer_addr;
-    result.code = "bad_addr";
-    return result;
-  }
-
-  boost::asio::io_context ioc;
-  boost::system::error_code ec;
-  tcp::resolver resolver(ioc);
-  auto endpoints = resolver.resolve(host, port, ec);
-  if (ec) {
-    result.error = "resolve " + peer_addr + ": " + ec.message();
-    result.code = "resolve";
-    return result;
-  }
-
-  tcp::socket sock(ioc);
-  boost::asio::connect(sock, endpoints, ec);
-  if (ec) {
-    result.error = "connect " + peer_addr + ": " + ec.message();
-    result.code = "connect";
-    return result;
-  }
-
-  std::string err;
-  Frame hello;
-  hello.type = MsgType::Hello;
-  hello.body = {{"node_id", local_node_id}, {"listen", local_listen}};
-  auth_sign(hello.body, MsgType::Hello, cluster_key);
-  if (!write_frame(sock, hello, err, ec)) {
-    result.error = "hello write: " + err;
-    result.code = "io";
-    return result;
-  }
-
-  Frame hello_reply;
-  if (!read_frame(sock, hello_reply, err, ec) || hello_reply.type != MsgType::Hello) {
-    result.error = "hello read: " + err;
-    result.code = "io";
-    return result;
-  }
-  if (!auth_verify(hello_reply.body, MsgType::Hello, cluster_key, auth_skew_ms, err)) {
-    result.error = "hello auth: " + err;
-    result.code = "auth";
-    return result;
-  }
-
-  Frame req;
-  req.type = req_type;
-  req.body = std::move(req_body);
-  req.raw = std::move(raw);
-  if (!req.raw.empty()) req.flags |= kFlagRawBody;
-  auth_sign(req.body, req_type, cluster_key);
-  if (!write_frame(sock, req, err, ec)) {
-    result.error = "request write: " + err;
-    result.code = "io";
-    return result;
-  }
-
-  Frame reply;
-  if (!read_frame(sock, reply, err, ec) || reply.type != MsgType::ObjectReply) {
-    result.error = "reply read: " + err;
-    result.code = "io";
-    return result;
-  }
-  if (!auth_verify(reply.body, MsgType::ObjectReply, cluster_key, auth_skew_ms, err)) {
-    result.error = "reply auth: " + err;
-    result.code = "auth";
-    return result;
-  }
-
   result.body = reply.body;
   result.raw = std::move(reply.raw);
   result.ok = reply.body.value("ok", false);
@@ -137,6 +68,205 @@ ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& loca
     }
     result.list.next_cursor = reply.body.value("next_cursor", "");
   }
+  return result;
+}
+
+class ObjectRpcConn {
+ public:
+  bool open(const std::string& peer_addr, const std::string& local_node_id,
+            const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+            std::string& err) {
+    close();
+    std::string host, port;
+    if (!split_host_port(peer_addr, host, port)) {
+      err = "bad peer addr: " + peer_addr;
+      return false;
+    }
+    boost::system::error_code ec;
+    tcp::resolver resolver(ioc_);
+    auto endpoints = resolver.resolve(host, port, ec);
+    if (ec) {
+      err = "resolve " + peer_addr + ": " + ec.message();
+      return false;
+    }
+    boost::asio::connect(sock_, endpoints, ec);
+    if (ec) {
+      err = "connect " + peer_addr + ": " + ec.message();
+      close();
+      return false;
+    }
+    Frame hello;
+    hello.type = MsgType::Hello;
+    hello.body = {{"node_id", local_node_id}, {"listen", local_listen}};
+    auth_sign(hello.body, MsgType::Hello, cluster_key);
+    if (!write_frame(sock_, hello, err, ec)) {
+      err = "hello write: " + err;
+      close();
+      return false;
+    }
+    Frame hello_reply;
+    if (!read_frame(sock_, hello_reply, err, ec) || hello_reply.type != MsgType::Hello) {
+      err = "hello read: " + err;
+      close();
+      return false;
+    }
+    if (!auth_verify(hello_reply.body, MsgType::Hello, cluster_key, auth_skew_ms, err)) {
+      err = "hello auth: " + err;
+      close();
+      return false;
+    }
+    open_ = true;
+    return true;
+  }
+
+  ObjectRpcResult exchange(MsgType req_type, nlohmann::json req_body,
+                          std::vector<std::uint8_t> raw, const std::string& cluster_key,
+                          int auth_skew_ms) {
+    ObjectRpcResult result;
+    if (!open_ || !sock_.is_open()) {
+      result.error = "not connected";
+      result.code = "io";
+      return result;
+    }
+    std::string err;
+    boost::system::error_code ec;
+    Frame req;
+    req.type = req_type;
+    req.body = std::move(req_body);
+    req.raw = std::move(raw);
+    if (!req.raw.empty()) req.flags |= kFlagRawBody;
+    auth_sign(req.body, req_type, cluster_key);
+    if (!write_frame(sock_, req, err, ec)) {
+      result.error = "request write: " + err;
+      result.code = "io";
+      close();
+      return result;
+    }
+    Frame reply;
+    if (!read_frame(sock_, reply, err, ec) || reply.type != MsgType::ObjectReply) {
+      result.error = "reply read: " + err;
+      result.code = "io";
+      close();
+      return result;
+    }
+    if (!auth_verify(reply.body, MsgType::ObjectReply, cluster_key, auth_skew_ms, err)) {
+      result.error = "reply auth: " + err;
+      result.code = "auth";
+      close();
+      return result;
+    }
+    return parse_object_reply(reply);
+  }
+
+  tcp::socket& socket() { return sock_; }
+  bool is_open() const { return open_ && sock_.is_open(); }
+
+  void close() {
+    open_ = false;
+    boost::system::error_code ec;
+    sock_.shutdown(tcp::socket::shutdown_both, ec);
+    sock_.close(ec);
+  }
+
+  ~ObjectRpcConn() { close(); }
+
+ private:
+  boost::asio::io_context ioc_;
+  tcp::socket sock_{ioc_};
+  bool open_{false};
+};
+
+class ObjectRpcPool {
+ public:
+  static ObjectRpcPool& instance() {
+    static ObjectRpcPool pool;
+    return pool;
+  }
+
+  std::unique_ptr<ObjectRpcConn> acquire(const std::string& peer_addr,
+                                         const std::string& local_node_id,
+                                         const std::string& local_listen,
+                                         const std::string& cluster_key, int auth_skew_ms,
+                                         std::string& err) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = idle_.find(peer_addr);
+      if (it != idle_.end()) {
+        while (!it->second.empty()) {
+          auto conn = std::move(it->second.back());
+          it->second.pop_back();
+          if (conn && conn->is_open()) return conn;
+        }
+      }
+    }
+    auto conn = std::make_unique<ObjectRpcConn>();
+    if (!conn->open(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms, err)) {
+      return nullptr;
+    }
+    return conn;
+  }
+
+  void release(const std::string& peer_addr, std::unique_ptr<ObjectRpcConn> conn, bool reusable) {
+    if (!conn) return;
+    if (!reusable || !conn->is_open()) {
+      conn->close();
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    auto& bucket = idle_[peer_addr];
+    if (bucket.size() >= kMaxIdlePerPeer) {
+      conn->close();
+      return;
+    }
+    bucket.push_back(std::move(conn));
+  }
+
+  void clear() {
+    std::unordered_map<std::string, std::vector<std::unique_ptr<ObjectRpcConn>>> idle;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      idle.swap(idle_);
+    }
+    for (auto& [_, bucket] : idle) {
+      for (auto& conn : bucket) {
+        if (conn) conn->close();
+      }
+    }
+  }
+
+ private:
+  static constexpr std::size_t kMaxIdlePerPeer = 8;
+  std::mutex mu_;
+  std::unordered_map<std::string, std::vector<std::unique_ptr<ObjectRpcConn>>> idle_;
+};
+
+bool rpc_transport_failed(const ObjectRpcResult& r) {
+  return r.code == "io" || r.code == "connect" || r.code == "resolve" || r.code == "auth";
+}
+
+}  // namespace
+
+void object_rpc_pool_clear() { ObjectRpcPool::instance().clear(); }
+
+ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& local_node_id,
+                           const std::string& local_listen, const std::string& cluster_key,
+                           int auth_skew_ms, MsgType req_type, nlohmann::json req_body,
+                           std::vector<std::uint8_t> raw) {
+  ObjectRpcResult result;
+  std::string err;
+  auto conn = ObjectRpcPool::instance().acquire(peer_addr, local_node_id, local_listen,
+                                                cluster_key, auth_skew_ms, err);
+  if (!conn) {
+    result.error = err;
+    result.code = err.rfind("resolve", 0) == 0   ? "resolve"
+                  : err.rfind("connect", 0) == 0 ? "connect"
+                  : err.rfind("bad peer", 0) == 0 ? "bad_addr"
+                                                  : "io";
+    return result;
+  }
+  result = conn->exchange(req_type, std::move(req_body), std::move(raw), cluster_key,
+                          auth_skew_ms);
+  ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
   return result;
 }
 
@@ -363,49 +493,12 @@ ObjectRpcResult object_install_file_remote(
     const std::unordered_map<std::string, std::string>& attrs,
     const std::string& abs_body_path) {
   ObjectRpcResult result;
-  std::string host, port;
-  if (!split_host_port(peer_addr, host, port)) {
-    result.error = "bad peer addr: " + peer_addr;
-    result.code = "bad_addr";
-    return result;
-  }
-
-  boost::asio::io_context ioc;
-  boost::system::error_code ec;
-  tcp::resolver resolver(ioc);
-  auto endpoints = resolver.resolve(host, port, ec);
-  if (ec) {
-    result.error = "resolve: " + ec.message();
-    result.code = "resolve";
-    return result;
-  }
-  tcp::socket sock(ioc);
-  boost::asio::connect(sock, endpoints, ec);
-  if (ec) {
-    result.error = "connect: " + ec.message();
-    result.code = "connect";
-    return result;
-  }
-
   std::string err;
-  Frame hello;
-  hello.type = MsgType::Hello;
-  hello.body = {{"node_id", local_node_id}, {"listen", local_listen}, {"http_addr", ""}};
-  auth_sign(hello.body, MsgType::Hello, cluster_key);
-  if (!write_frame(sock, hello, err, ec)) {
-    result.error = "hello write: " + err;
+  auto conn = ObjectRpcPool::instance().acquire(peer_addr, local_node_id, local_listen,
+                                                cluster_key, auth_skew_ms, err);
+  if (!conn) {
+    result.error = err;
     result.code = "io";
-    return result;
-  }
-  Frame hello_reply;
-  if (!read_frame(sock, hello_reply, err, ec) || hello_reply.type != MsgType::Hello) {
-    result.error = "hello read: " + err;
-    result.code = "io";
-    return result;
-  }
-  if (!auth_verify(hello_reply.body, MsgType::Hello, cluster_key, auth_skew_ms, err)) {
-    result.error = "hello auth: " + err;
-    result.code = "auth";
     return result;
   }
 
@@ -426,15 +519,19 @@ ObjectRpcResult object_install_file_remote(
       {"role", "replica"},
   };
   if (!v.redirect_oid.empty()) begin["redirect"] = v.redirect_oid;
-  result = rpc_one(sock, MsgType::ObjectStageBegin, std::move(begin), {}, cluster_key,
+  result = rpc_one(conn->socket(), MsgType::ObjectStageBegin, std::move(begin), {}, cluster_key,
                    auth_skew_ms);
-  if (!result.ok) return result;
+  if (!result.ok) {
+    ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
+    return result;
+  }
 
   std::ifstream in(abs_body_path, std::ios::binary);
   if (!in) {
     result.ok = false;
     result.error = "cannot open " + abs_body_path;
     result.code = "io";
+    ObjectRpcPool::instance().release(peer_addr, std::move(conn), false);
     return result;
   }
   std::vector<std::uint8_t> buf(kStageChunkSize);
@@ -452,9 +549,13 @@ ObjectRpcResult object_install_file_remote(
         {"role", "replica"},
     };
     std::vector<std::uint8_t> raw(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(n));
-    result = rpc_one(sock, MsgType::ObjectStageData, std::move(chunk), std::move(raw),
+    result = rpc_one(conn->socket(), MsgType::ObjectStageData, std::move(chunk), std::move(raw),
                      cluster_key, auth_skew_ms);
-    if (!result.ok) return result;
+    if (!result.ok) {
+      ObjectRpcPool::instance().release(peer_addr, std::move(conn),
+                                        !rpc_transport_failed(result));
+      return result;
+    }
     offset += n;
   }
 
@@ -473,8 +574,10 @@ ObjectRpcResult object_install_file_remote(
       {"role", "replica"},
   };
   if (!v.redirect_oid.empty()) commit["redirect"] = v.redirect_oid;
-  return rpc_one(sock, MsgType::ObjectStageCommit, std::move(commit), {}, cluster_key,
-                 auth_skew_ms);
+  result = rpc_one(conn->socket(), MsgType::ObjectStageCommit, std::move(commit), {},
+                   cluster_key, auth_skew_ms);
+  ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
+  return result;
 }
 
 namespace {

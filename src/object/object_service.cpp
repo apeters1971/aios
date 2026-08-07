@@ -15,12 +15,15 @@
 #include <utility>
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <random>
 #include <span>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
+#include <vector>
 
 namespace aios {
 namespace {
@@ -337,76 +340,105 @@ int ObjectService::replicate_install(
       (data == nullptr || len > 4u * 1024u * 1024u || v.size > 4u * 1024u * 1024u);
 
   UnlockForRpc unlock(mu_);
-  int ok = 0;
+  if (placement.acting_set.size() <= 1) return 0;
+
+  std::atomic<int> ok{0};
+  std::vector<std::thread> workers;
+  workers.reserve(placement.acting_set.size() - 1);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
-    const auto& t = placement.acting_set[i];
-    if (t.node_id == cfg_.node_id) {
-      std::string err;
-      bool done = false;
-      if (file_stream) {
-        done = local_install_file(t.aios_path, v, abs_body_path, attrs, err);
-      } else {
-        done = local_install(t.aios_path, v, data, len, attrs, err);
+    workers.emplace_back([&, i] {
+      const auto& t = placement.acting_set[i];
+      if (t.node_id == cfg_.node_id) {
+        std::string err;
+        bool done = false;
+        if (file_stream) {
+          done = local_install_file(t.aios_path, v, abs_body_path, attrs, err);
+        } else {
+          done = local_install(t.aios_path, v, data, len, attrs, err);
+        }
+        if (done) {
+          ok.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          AIOS_LOG_WARN("local replica install failed ", t.aios_path, " oid=", v.oid, ": ",
+                        err);
+        }
+        return;
       }
-      if (done) ++ok;
-      else
-        AIOS_LOG_WARN("local replica install failed ", t.aios_path, " oid=", v.oid, ": ",
-                      err);
-      continue;
-    }
-    ObjectRpcResult r;
-    if (file_stream) {
-      r = object_install_file_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                     cfg_.auth_skew_ms, placement.epoch, t.aios_path, v,
-                                     attrs, abs_body_path);
-    } else {
-      r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                cfg_.auth_skew_ms, placement.epoch, t.aios_path, v, data,
-                                len, attrs);
-    }
-    if (r.ok) ++ok;
-    else
-      AIOS_LOG_WARN("remote replica install failed ", t.addr, ": ", r.error);
+      ObjectRpcResult r;
+      if (file_stream) {
+        r = object_install_file_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                       cfg_.auth_skew_ms, placement.epoch, t.aios_path, v,
+                                       attrs, abs_body_path);
+      } else {
+        r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                  cfg_.auth_skew_ms, placement.epoch, t.aios_path, v, data,
+                                  len, attrs);
+      }
+      if (r.ok) {
+        ok.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        AIOS_LOG_WARN("remote replica install failed ", t.addr, ": ", r.error);
+      }
+    });
   }
-  return ok;
+  for (auto& w : workers) w.join();
+  return ok.load();
 }
 
 int ObjectService::replicate_publish(const Placement& placement, const std::string& oid,
                                      std::uint64_t seq) {
   UnlockForRpc unlock(mu_);
-  int ok = 0;
+  if (placement.acting_set.size() <= 1) return 0;
+
+  std::atomic<int> ok{0};
+  std::vector<std::thread> workers;
+  workers.reserve(placement.acting_set.size() - 1);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
-    const auto& t = placement.acting_set[i];
-    if (t.node_id == cfg_.node_id) {
-      std::string err;
-      if (local_publish(t.aios_path, oid, seq, err)) ++ok;
-      else
-        AIOS_LOG_WARN("local replica publish failed ", t.aios_path, ": ", err);
-      continue;
-    }
-    auto r = object_publish_tip_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                       cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid,
-                                       seq);
-    if (r.ok) ++ok;
-    else
-      AIOS_LOG_WARN("remote replica publish failed ", t.addr, ": ", r.error);
+    workers.emplace_back([&, i] {
+      const auto& t = placement.acting_set[i];
+      if (t.node_id == cfg_.node_id) {
+        std::string err;
+        if (local_publish(t.aios_path, oid, seq, err)) {
+          ok.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          AIOS_LOG_WARN("local replica publish failed ", t.aios_path, ": ", err);
+        }
+        return;
+      }
+      auto r = object_publish_tip_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                         cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid,
+                                         seq);
+      if (r.ok) {
+        ok.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        AIOS_LOG_WARN("remote replica publish failed ", t.addr, ": ", r.error);
+      }
+    });
   }
-  return ok;
+  for (auto& w : workers) w.join();
+  return ok.load();
 }
 
 void ObjectService::replicate_abort(const Placement& placement, const std::string& oid,
                                     std::uint64_t seq) {
   UnlockForRpc unlock(mu_);
+  if (placement.acting_set.size() <= 1) return;
+
+  std::vector<std::thread> workers;
+  workers.reserve(placement.acting_set.size() - 1);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
-    const auto& t = placement.acting_set[i];
-    if (t.node_id == cfg_.node_id) {
-      std::string err;
-      local_abort(t.aios_path, oid, seq, err);
-      continue;
-    }
-    object_abort_version_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid, seq);
+    workers.emplace_back([&, i] {
+      const auto& t = placement.acting_set[i];
+      if (t.node_id == cfg_.node_id) {
+        std::string err;
+        local_abort(t.aios_path, oid, seq, err);
+        return;
+      }
+      object_abort_version_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                  cfg_.auth_skew_ms, placement.epoch, t.aios_path, oid, seq);
+    });
   }
+  for (auto& w : workers) w.join();
 }
 
 ApiResult ObjectService::install_prepared(

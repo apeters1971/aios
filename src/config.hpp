@@ -164,8 +164,11 @@ struct Config {
   std::string s3_access_key{"aios"};
   // cuObjServer RDMA listen (IP:port). Empty disables S3 GPUDirect offload.
   std::string cuobject_listen;
-  // Body durability for ranged FS puts: none | data | full (informational; store fsyncs).
+  // Body durability hint: none | data | full. "none" also clears data_fsync.
   std::string http_body_sync{"data"};
+  // When false, object store skips body/dir fsync (and SQLite synchronous=OFF).
+  // For local testbed / bench only — not for production durability.
+  bool data_fsync{true};
   // Retain newest N object versions per oid (default 16).
   int max_versions{16};
   // If true, FS COW requires reflink/clonefile; if false, allow full-copy fallback.

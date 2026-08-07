@@ -402,6 +402,7 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["cuobject_listen"]) cfg.cuobject_listen = root["cuobject_listen"].as<std::string>();
     if (root["http_body_sync"])
       cfg.http_body_sync = root["http_body_sync"].as<std::string>();
+    if (root["data_fsync"]) cfg.data_fsync = root["data_fsync"].as<bool>();
     if (root["max_versions"]) cfg.max_versions = root["max_versions"].as<int>();
     if (root["clone_required"]) cfg.clone_required = root["clone_required"].as<bool>();
     if (root["max_object_bytes"])
@@ -739,6 +740,11 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       cfg.admin_metrics_public = true;
       continue;
     }
+    if (arg == "--no-fsync") {
+      cfg.data_fsync = false;
+      cfg.http_body_sync = "none";
+      continue;
+    }
     if (arg == "--compression") {
       const char* v = need("--compression");
       if (!v) return false;
@@ -772,6 +778,14 @@ bool normalize_config(Config& cfg, std::string& err) {
     err = "node_state must be up, drain, or off";
     return false;
   }
+  cfg.http_body_sync = lower_copy(cfg.http_body_sync);
+  if (cfg.http_body_sync.empty()) cfg.http_body_sync = "data";
+  if (cfg.http_body_sync != "none" && cfg.http_body_sync != "data" &&
+      cfg.http_body_sync != "full") {
+    err = "http_body_sync must be none, data, or full";
+    return false;
+  }
+  if (cfg.http_body_sync == "none") cfg.data_fsync = false;
   if (cfg.weight_autotune_threshold_pct < 0 || cfg.weight_autotune_threshold_pct > 100) {
     err = "weight_autotune_threshold_pct must be 0..100";
     return false;

@@ -4,6 +4,7 @@
 #include "cluster/weight.hpp"
 #include "fs/aios_scan.hpp"
 #include "net/client.hpp"
+#include "net/object_client.hpp"
 #include "node_id.hpp"
 #include "object/archive_pack.hpp"
 #include "object/archive_tape.hpp"
@@ -115,6 +116,7 @@ void GossipEngine::sync_local_stores() {
   opts.shard_count = 16;
   opts.max_versions = cfg_.max_versions;
   opts.clone_required = cfg_.clone_required;
+  opts.data_fsync = cfg_.data_fsync;
   local_stores_.sync_paths(paths, opts);
 }
 
@@ -254,6 +256,8 @@ void GossipEngine::stop() {
   transition_timer_.cancel();
   archive_timer_.cancel();
   backup_timer_.cancel();
+  // Idle object-RPC keep-alives pin TcpServer session workers in read_frame.
+  object_rpc_pool_clear();
   if (server_) server_->close();
   if (http_server_) http_server_->close_sessions();
   // Join HTTP workers while sockets are closed (unblocks keep-alive reads).

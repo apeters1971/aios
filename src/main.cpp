@@ -61,6 +61,7 @@ int main(int argc, char** argv) {
         << "             [--replica-count N] [--write-quorum N]\n"
         << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
         << "             [--s3-listen HOST:PORT] [--s3-volume NAME] [--s3-access-key ID]\n"
+        << "             [--no-fsync]\n"
         << "\n"
         << "Standalone AIOS daemon: gossip membership, .aios discovery,\n"
         << "server-side primary replication, HTTP object API, and optional S3 API.\n"
@@ -71,7 +72,8 @@ int main(int argc, char** argv) {
         << "--scan-root/--scan-prefix PATH looks for PATH/.aios in addition to\n"
         << "mount roots (repeatable; also config scan_roots).\n"
         << "--admin enables /admin/* and /metrics on http_listen.\n"
-        << "--admin-metrics-public allows unauthenticated GET /metrics (scrape).\n";
+        << "--admin-metrics-public allows unauthenticated GET /metrics (scrape).\n"
+        << "--no-fsync skips body/dir fsync (dev/bench only; not durable).\n";
     return 0;
   }
 
@@ -81,6 +83,11 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
+
+    if (!cfg.data_fsync) {
+      AIOS_LOG_WARN("data_fsync disabled (--no-fsync / http_body_sync=none); "
+                    "object data is not crash-durable");
+    }
 
     {
       MembershipTable membership;

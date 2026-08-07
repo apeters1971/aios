@@ -694,6 +694,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"backup_interval_ms", c.backup_interval_ms},
       {"backup_batch_oids", c.backup_batch_oids},
       {"http_body_sync", c.http_body_sync},
+      {"data_fsync", c.data_fsync},
       {"max_versions", c.max_versions},
       {"clone_required", c.clone_required},
       {"max_object_bytes", c.max_object_bytes},
