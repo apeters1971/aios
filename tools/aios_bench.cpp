@@ -527,7 +527,9 @@ class HttpSession {
     std::ostringstream req;
     req << method << ' ' << target << " HTTP/1.1\r\n";
     req << "Host: " << host_ << ':' << port_ << "\r\n";
-    req << "Connection: keep-alive\r\n";
+    // Close after each response so a stalled peer cannot pin bench threads on a
+    // keep-alive socket waiting for headers that will never arrive.
+    req << "Connection: close\r\n";
     for (const auto& [k, v] : headers) {
       req << k << ": " << v << "\r\n";
     }
@@ -606,7 +608,9 @@ class HttpSession {
       need -= n;
     }
 
-    if (close_conn) close();
+    // We always send Connection: close; drop the socket so the next op reconnects.
+    close();
+    (void)close_conn;
     return resp;
   }
 

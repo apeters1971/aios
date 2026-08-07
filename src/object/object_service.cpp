@@ -480,7 +480,9 @@ ApiResult ObjectService::commit_prepared(
 }
 
 Frame ObjectService::handle(const Frame& req) {
-  std::lock_guard lock(mu_);
+  // Intentionally no outer mu_ lock: handlers that call api_*/replicate_* rely on
+  // UnlockForRpc to release the mutex across peer RPC. An outer lock_guard would
+  // keep the mutex held and reintroduce multi-node PUT/publish deadlocks under load.
   switch (req.type) {
     case MsgType::ObjectPut:
       return handle_put(req.body);
@@ -592,6 +594,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
 
   // Replica install of a prepared version (seq present).
   if (role == "replica" && body.contains("seq")) {
+    std::lock_guard lock(mu_);
     if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
     }
@@ -620,6 +623,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
 
   if (role == "replica") {
     // Legacy full put (publish immediately) — kept for repair tooling.
+    std::lock_guard lock(mu_);
     if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
       return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
     }
@@ -637,6 +641,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
   }
 
   // Full primary PUT with layout (replica or EC). Redirects keep the legacy path.
+  // api_put locks mu_ itself (and UnlockForRpc must not see an outer hold).
   if (!is_delete && !is_redirect) {
     const LayoutRequest layout_req = layout_request_from_json(body);
     const bool do_publish = body.value("publish", true);
@@ -672,6 +677,7 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
     apply_layout_attrs(attrs, layout);
   }
 
+  std::lock_guard lock(mu_);
   const std::string sc_for_primary = storage_class_for_attrs(attrs, cfg_.default_storage_class);
   const auto placement = place(oid, map_, sc_for_primary);
   if (placement.acting_set.empty()) {
@@ -775,6 +781,7 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
+  std::lock_guard lock(mu_);
   if (!map_.targets.empty() && !in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
   }
@@ -836,6 +843,7 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
+  std::lock_guard lock(mu_);
   const auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) {
     return reply_err(map_.epoch, "no_targets", "no storage targets");
@@ -915,6 +923,7 @@ Frame ObjectService::handle_stat(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
+  std::lock_guard lock(mu_);
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::optional<std::uint64_t> seq;
@@ -950,11 +959,13 @@ Frame ObjectService::handle_publish_tip(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty() || seq == 0) {
     return reply_err(map_.epoch, "bad_request", "oid, aios_path, seq required");
   }
+  // api_publish_version locks and UnlockForRpc across replica publish — no outer hold.
   if (role == "primary") {
     auto r = api_publish_version(oid, seq);
     if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
     return reply_ok(map_.epoch);
   }
+  std::lock_guard lock(mu_);
   if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set");
   }
@@ -980,6 +991,7 @@ Frame ObjectService::handle_abort_version(const nlohmann::json& body) {
     if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
     return reply_ok(map_.epoch);
   }
+  std::lock_guard lock(mu_);
   if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
     return reply_err(map_.epoch, "not_replica", "not in acting set");
   }
@@ -998,6 +1010,7 @@ Frame ObjectService::handle_list_versions(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
+  std::lock_guard lock(mu_);
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
@@ -1026,6 +1039,7 @@ Frame ObjectService::handle_purge_versions(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
+  std::lock_guard lock(mu_);
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string err;
@@ -2133,6 +2147,7 @@ Frame ObjectService::handle_stage_begin(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty() || seq == 0) {
     return reply_err(map_.epoch, "bad_request", "oid/aios_path/seq required");
   }
+  std::lock_guard lock(mu_);
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string path, err;
@@ -2155,6 +2170,7 @@ Frame ObjectService::handle_stage_data(const Frame& req) {
   if (oid.empty() || aios_path.empty() || seq == 0) {
     return reply_err(map_.epoch, "bad_request", "oid/aios_path/seq required");
   }
+  std::lock_guard lock(mu_);
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
   std::string path, err;
@@ -2175,6 +2191,7 @@ Frame ObjectService::handle_stage_commit(const nlohmann::json& body) {
   if (oid.empty() || aios_path.empty()) {
     return reply_err(map_.epoch, "bad_request", "oid/aios_path required");
   }
+  std::lock_guard lock(mu_);
   auto* store = stores_.get(aios_path);
   if (!store) return reply_err(map_.epoch, "store_error", "no local store");
 

@@ -63,7 +63,8 @@ class TcpServer {
   RpcHandlers handlers_;
   // Sessions read and write synchronously and stay open for keep-alive, so they
   // must not run on ioc_: one idle peer would stall accepts, gossip and every timer.
-  boost::asio::thread_pool workers_{8};
+  // Sized for concurrent replica install/publish under multi-threaded clients.
+  boost::asio::thread_pool workers_{32};
   std::atomic<bool> workers_drained_{false};
   std::mutex sessions_mu_;
   std::unordered_set<std::shared_ptr<tcp::socket>> sessions_;
