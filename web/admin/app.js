@@ -56,6 +56,25 @@
     return String(n);
   }
 
+  function emptyRow(cols, msg) {
+    return `<tr class="empty-row"><td colspan="${cols}" class="empty">${msg}</td></tr>`;
+  }
+
+  function badge(text, kind) {
+    const k = kind ? ` ${kind}` : "";
+    return `<span class="badge${k}">${text}</span>`;
+  }
+
+  function stateBadge(state) {
+    if (!state || state === "—") return "—";
+    const s = String(state).toLowerCase();
+    let kind = "";
+    if (s === "up" || s === "online" || s === "ok") kind = "up";
+    else if (s === "drain" || s === "suspect" || s === "warn") kind = "drain";
+    else if (s === "off" || s === "offline" || s === "error") kind = "off";
+    return badge(s, kind);
+  }
+
   function renderCards(status) {
     const ops = status.ops || {};
     const cards = [
@@ -74,7 +93,7 @@
           `<div class="card"><span class="label">${label}</span><div class="value">${fmt(value)}</div></div>`
       )
       .join("");
-    nodeLabel.textContent = status.node_id ? `· ${status.node_id}` : "";
+    nodeLabel.textContent = status.node_id || "";
   }
 
   function renderOps(opsPayload) {
@@ -134,11 +153,11 @@
       .join("");
     document.getElementById("io-frontends").innerHTML =
       `<table><thead><tr><th>Frontend</th><th>Read ops</th><th>Write ops</th><th>Read bytes</th><th>Write bytes</th><th>Source</th></tr></thead><tbody>${
-        frows || "<tr><td colspan=6>No frontend IO yet</td></tr>"
+        frows || emptyRow(6, "No frontend IO yet")
       }</tbody></table>` +
       (vbd.length
-        ? `<table style="margin-top:1rem"><thead><tr><th>Device</th><th>Volume</th><th>Read ops</th><th>Write ops</th><th>Read bytes</th><th>Write bytes</th></tr></thead><tbody>${vrows}</tbody></table>`
-        : `<p class="muted" style="margin-top:0.75rem">No aiosvd devices on this node (module not loaded or none mapped).</p>`);
+        ? `<table><thead><tr><th>Device</th><th>Volume</th><th>Read ops</th><th>Write ops</th><th>Read bytes</th><th>Write bytes</th></tr></thead><tbody>${vrows}</tbody></table>`
+        : `<p class="empty">No aiosvd devices on this node (module not loaded or none mapped).</p>`);
   }
 
   function renderCluster(cluster) {
@@ -146,12 +165,14 @@
     const rows = peers
       .map(
         (p) =>
-          `<tr><td>${p.node_id || ""}${p.self ? " (self)" : ""}</td><td>${p.addr || ""}</td><td>${p.http_addr || ""}</td></tr>`
+          `<tr><td>${p.node_id || ""}${p.self ? badge("self", "self") : ""}</td><td>${
+            p.addr || ""
+          }</td><td>${p.http_addr || ""}</td></tr>`
       )
       .join("");
     document.getElementById("cluster-table").innerHTML =
       `<table><thead><tr><th>Node</th><th>Gossip</th><th>HTTP</th></tr></thead><tbody>${
-        rows || "<tr><td colspan=3>No peers with http_addr</td></tr>"
+        rows || emptyRow(3, "No peers with http_addr")
       }</tbody></table>`;
   }
 
@@ -169,7 +190,7 @@
       .join("");
     document.getElementById("s3-table").innerHTML =
       `<table><thead><tr><th>Access key</th><th>UID</th><th>GID</th><th>Buckets</th><th></th></tr></thead><tbody>${
-        rows || "<tr><td colspan=5>No credentials (or S3 disabled on this node)</td></tr>"
+        rows || emptyRow(5, "No credentials (or S3 disabled on this node)")
       }</tbody></table>`;
   }
 
@@ -232,7 +253,7 @@
       .join("");
     document.getElementById("quota-vol-table").innerHTML =
       `<table><thead><tr><th>UID</th><th>Used</th><th>Limit</th></tr></thead><tbody>${
-        urows || "<tr><td colspan=3>No uid quotas</td></tr>"
+        urows || emptyRow(3, "No uid quotas")
       }</tbody></table>` +
       (() => {
         const grows = ((q && q.volume_gids) || [])
@@ -243,8 +264,8 @@
               }</td></tr>`
           )
           .join("");
-        return `<table style="margin-top:1rem"><thead><tr><th>GID</th><th>Used</th><th>Limit</th></tr></thead><tbody>${
-          grows || "<tr><td colspan=3>No gid quotas</td></tr>"
+        return `<table><thead><tr><th>GID</th><th>Used</th><th>Limit</th></tr></thead><tbody>${
+          grows || emptyRow(3, "No gid quotas")
         }</tbody></table>`;
       })();
     const prows = ((q && q.projects) || [])
@@ -258,7 +279,7 @@
       .join("");
     document.getElementById("quota-proj-table").innerHTML =
       `<table><thead><tr><th>ID</th><th>Name</th><th>Root ino</th><th>Used</th><th>Limit</th><th></th></tr></thead><tbody>${
-        prows || "<tr><td colspan=6>No projects</td></tr>"
+        prows || emptyRow(6, "No projects")
       }</tbody></table>`;
   }
 
@@ -336,10 +357,10 @@
       .join("");
     document.getElementById("qos-vol-table").innerHTML =
       `<table><thead><tr><th>UID</th><th>IOPS</th><th>BPS</th></tr></thead><tbody>${
-        urows || "<tr><td colspan=3>No uid QoS</td></tr>"
+        urows || emptyRow(3, "No uid QoS")
       }</tbody></table>` +
-      `<table style="margin-top:1rem"><thead><tr><th>GID</th><th>IOPS</th><th>BPS</th></tr></thead><tbody>${
-        grows || "<tr><td colspan=3>No gid QoS</td></tr>"
+      `<table><thead><tr><th>GID</th><th>IOPS</th><th>BPS</th></tr></thead><tbody>${
+        grows || emptyRow(3, "No gid QoS")
       }</tbody></table>`;
     const prows = ((q && q.projects) || [])
       .map((p) => {
@@ -353,7 +374,7 @@
       .join("");
     document.getElementById("qos-proj-table").innerHTML =
       `<table><thead><tr><th>ID</th><th>IOPS</th><th>BPS</th><th>Per-uid</th></tr></thead><tbody>${
-        prows || "<tr><td colspan=4>No project QoS</td></tr>"
+        prows || emptyRow(4, "No project QoS")
       }</tbody></table>`;
   }
 
@@ -394,7 +415,7 @@
       .join("");
     document.getElementById("posix-layout-table").innerHTML =
       `<table><thead><tr><th>Path</th><th>Volume</th><th>Meta</th><th>Data</th></tr></thead><tbody>${
-        rows || "<tr><td colspan=4>No rules (cluster defaults)</td></tr>"
+        rows || emptyRow(4, "No rules (cluster defaults)")
       }</tbody></table>`;
     document.getElementById("posix-layout-json").value = JSON.stringify(
       { posix_layout_rules: rules },
@@ -430,19 +451,19 @@
       .map(
         (t) =>
           `<tr>
-            <td>${t.node_id || "—"}${t.self ? " *" : ""}</td>
+            <td>${t.node_id || "—"}${t.self ? badge("self", "self") : ""}</td>
             <td>${t.rack || "—"}</td>
             <td>${t.mount || "—"}</td>
             <td>${t.storage_class || "—"}</td>
             <td>${t.weight ?? "—"}</td>
-            <td>${t.state || "—"}</td>
+            <td>${stateBadge(t.state)}</td>
             <td class="muted">${t.aios_path || ""}</td>
           </tr>`
       )
       .join("");
     document.getElementById("lifecycle-table").innerHTML =
       `<table><thead><tr><th>Node</th><th>Rack</th><th>Mount</th><th>Class</th><th>Weight</th><th>State</th><th>Path</th></tr></thead><tbody>${
-        rows || "<tr><td colspan=7>No targets in map</td></tr>"
+        rows || emptyRow(7, "No targets in map")
       }</tbody></table>`;
   }
 
@@ -805,7 +826,7 @@
     if (!wrap) return;
     const list = policies || [];
     if (!list.length) {
-      wrap.innerHTML = "<p class=\"muted\">No live policies.</p>";
+      wrap.innerHTML = "<p class=\"empty\">No live policies.</p>";
       return;
     }
     let html =

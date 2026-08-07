@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>AIOS Admin</title>
   <link rel="icon" type="image/png" href="/admin/aios-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/admin/style.css" />
 </head>
 <body>
@@ -33,23 +36,26 @@
           <span id="node-label" class="muted"></span>
         </div>
       </div>
-      <nav class="tabs" id="tabs">
-        <button type="button" data-tab="overview" class="tab active">Overview</button>
-        <button type="button" data-tab="cluster" class="tab">Cluster</button>
-        <button type="button" data-tab="config" class="tab">Config</button>
-        <button type="button" data-tab="actions" class="tab">Actions</button>
-        <button type="button" data-tab="s3" class="tab">S3 credentials</button>
-        <button type="button" data-tab="quota" class="tab">Quotas</button>
-        <button type="button" data-tab="qos" class="tab">QoS</button>
-        <button type="button" data-tab="posix-layout" class="tab">POSIX layout</button>
-        <button type="button" data-tab="lifecycle" class="tab">Lifecycle</button>
-      </nav>
+      <div class="tabs-scroll">
+        <nav class="tabs" id="tabs">
+          <button type="button" data-tab="overview" class="tab active">Overview</button>
+          <button type="button" data-tab="cluster" class="tab">Cluster</button>
+          <button type="button" data-tab="config" class="tab">Config</button>
+          <button type="button" data-tab="actions" class="tab">Actions</button>
+          <button type="button" data-tab="s3" class="tab">S3</button>
+          <button type="button" data-tab="quota" class="tab">Quotas</button>
+          <button type="button" data-tab="qos" class="tab">QoS</button>
+          <button type="button" data-tab="posix-layout" class="tab">POSIX</button>
+          <button type="button" data-tab="lifecycle" class="tab">Lifecycle</button>
+        </nav>
+      </div>
       <button type="button" id="logout-btn" class="btn ghost">Log out</button>
     </header>
 
     <main class="main">
       <section id="tab-overview" class="panel">
         <h2>Overview</h2>
+        <p class="note section-head">Live node status, compression, frontend IO, and object counters.</p>
         <div id="overview-cards" class="cards"></div>
         <h3>Compression</h3>
         <p class="note muted">Whole-object ZSTD puts: overall ratio is logical÷stored bytes (higher means more savings).</p>
@@ -63,6 +69,7 @@
 
       <section id="tab-cluster" class="panel hidden">
         <h2>Cluster</h2>
+        <p class="note section-head">Online members advertising an HTTP address.</p>
         <div id="cluster-table" class="table-wrap"></div>
       </section>
 
