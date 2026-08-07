@@ -7,7 +7,15 @@
   const actionError = document.getElementById("action-error");
 
   let refreshTimer = null;
+  let chartTimer = null;
   let activeTab = "overview";
+
+  const CHART_WINDOW = 60; // samples (~60s at 1 Hz)
+  const chartState = {
+    last: null, // { t, readOps, writeOps, readBytes, writeBytes }
+    iops: [], // { t, read, write }
+    bytes: [],
+  };
 
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -24,6 +32,10 @@
   function showLogin(err) {
     clearInterval(refreshTimer);
     refreshTimer = null;
+    stopChartSampler();
+    chartState.last = null;
+    chartState.iops = [];
+    chartState.bytes = [];
     appView.classList.add("hidden");
     loginView.classList.remove("hidden");
     if (err) {
@@ -38,6 +50,7 @@
     loginView.classList.add("hidden");
     appView.classList.remove("hidden");
     if (!refreshTimer) refreshTimer = setInterval(() => refresh().catch(() => {}), 5000);
+    startChartSampler();
   }
 
   function setTab(name) {
@@ -48,12 +61,186 @@
     document.querySelectorAll(".panel").forEach((p) => {
       p.classList.toggle("hidden", p.id !== `tab-${name}`);
     });
+    if (name === "overview" && !appView.classList.contains("hidden")) {
+      startChartSampler();
+      drawIoCharts();
+    } else if (name !== "overview") {
+      stopChartSampler();
+    }
   }
 
   function fmt(n) {
     if (n === undefined || n === null) return "—";
     if (typeof n === "number") return n.toLocaleString();
     return String(n);
+  }
+
+  function fmtRateUnit(n, unit) {
+    if (n == null || Number.isNaN(n)) return "—";
+    const abs = Math.abs(n);
+    if (unit === "B/s") {
+      if (abs >= 1e9) return (n / 1e9).toFixed(2) + " GB/s";
+      if (abs >= 1e6) return (n / 1e6).toFixed(2) + " MB/s";
+      if (abs >= 1e3) return (n / 1e3).toFixed(1) + " KB/s";
+      return n.toFixed(0) + " B/s";
+    }
+    if (abs >= 1e6) return (n / 1e6).toFixed(2) + "M " + unit;
+    if (abs >= 1e3) return (n / 1e3).toFixed(1) + "K " + unit;
+    return n.toFixed(1) + " " + unit;
+  }
+
+  function sumFrontendCounters(logical) {
+    const fe = logical || {};
+    let readOps = 0, writeOps = 0, readBytes = 0, writeBytes = 0;
+    for (const k of ["s3", "fs", "vbd"]) {
+      const c = fe[k] || {};
+      readOps += Number(c.read_ops) || 0;
+      writeOps += Number(c.write_ops) || 0;
+      readBytes += Number(c.read_bytes) || 0;
+      writeBytes += Number(c.write_bytes) || 0;
+    }
+    return { readOps, writeOps, readBytes, writeBytes };
+  }
+
+  function pushSample(series, point) {
+    series.push(point);
+    while (series.length > CHART_WINDOW) series.shift();
+  }
+
+  function sampleIoCharts(opsPayload) {
+    const logical =
+      (opsPayload && opsPayload.io_frontends && opsPayload.io_frontends.logical) || {};
+    const cur = sumFrontendCounters(logical);
+    const t = Date.now();
+    if (chartState.last) {
+      const dt = Math.max(0.001, (t - chartState.last.t) / 1000);
+      const dReadOps = Math.max(0, cur.readOps - chartState.last.readOps);
+      const dWriteOps = Math.max(0, cur.writeOps - chartState.last.writeOps);
+      const dReadBytes = Math.max(0, cur.readBytes - chartState.last.readBytes);
+      const dWriteBytes = Math.max(0, cur.writeBytes - chartState.last.writeBytes);
+      pushSample(chartState.iops, { t, read: dReadOps / dt, write: dWriteOps / dt });
+      pushSample(chartState.bytes, { t, read: dReadBytes / dt, write: dWriteBytes / dt });
+    }
+    chartState.last = { t, ...cur };
+    if (activeTab === "overview") drawIoCharts();
+  }
+
+  function drawLineChart(canvas, series, colors) {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || 640;
+    const cssH = canvas.clientHeight || 180;
+    if (canvas.width !== Math.floor(cssW * dpr) || canvas.height !== Math.floor(cssH * dpr)) {
+      canvas.width = Math.floor(cssW * dpr);
+      canvas.height = Math.floor(cssH * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const pad = { l: 44, r: 8, t: 8, b: 18 };
+    const w = cssW - pad.l - pad.r;
+    const h = cssH - pad.t - pad.b;
+
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--surface-2").trim() || "#f3eee7";
+    ctx.fillRect(pad.l, pad.t, w, h);
+
+    let maxY = 0;
+    for (const p of series) {
+      maxY = Math.max(maxY, p.read || 0, p.write || 0);
+    }
+    if (maxY <= 0) maxY = 1;
+
+    const ink = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() || "#6b635a";
+    ctx.strokeStyle = "rgba(28,25,22,0.08)";
+    ctx.lineWidth = 1;
+    ctx.font = "11px Sora, sans-serif";
+    ctx.fillStyle = ink;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i <= 4; ++i) {
+      const y = pad.t + (h * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(pad.l, y);
+      ctx.lineTo(pad.l + w, y);
+      ctx.stroke();
+      const val = maxY * (1 - i / 4);
+      ctx.fillText(val >= 1000 ? (val / 1000).toFixed(1) + "k" : val.toFixed(val >= 10 ? 0 : 1), pad.l - 6, y);
+    }
+
+    function pathFor(key, color) {
+      if (!series.length) return;
+      ctx.beginPath();
+      series.forEach((p, i) => {
+        const x = pad.l + (series.length === 1 ? w / 2 : (w * i) / (series.length - 1));
+        const y = pad.t + h - (Math.min(p[key] || 0, maxY) / maxY) * h;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.stroke();
+    }
+
+    pathFor("read", colors.read);
+    pathFor("write", colors.write);
+
+    if (!series.length) {
+      ctx.fillStyle = ink;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("Collecting samples…", pad.l + w / 2, pad.t + h / 2);
+    }
+  }
+
+  function drawIoCharts() {
+    const read = getComputedStyle(document.documentElement).getPropertyValue("--ok").trim() || "#2f6b4f";
+    const write = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#b87333";
+    const colors = { read, write };
+    drawLineChart(document.getElementById("chart-iops"), chartState.iops, colors);
+    drawLineChart(document.getElementById("chart-bytes"), chartState.bytes, colors);
+    const iLast = chartState.iops[chartState.iops.length - 1];
+    const bLast = chartState.bytes[chartState.bytes.length - 1];
+    const iEl = document.getElementById("chart-iops-now");
+    const bEl = document.getElementById("chart-bytes-now");
+    if (iEl) {
+      iEl.textContent = iLast
+        ? `now  read ${fmtRateUnit(iLast.read, "ops/s")} · write ${fmtRateUnit(iLast.write, "ops/s")}`
+        : "now  —";
+    }
+    if (bEl) {
+      bEl.textContent = bLast
+        ? `now  read ${fmtRateUnit(bLast.read, "B/s")} · write ${fmtRateUnit(bLast.write, "B/s")}`
+        : "now  —";
+    }
+  }
+
+  async function pollIoCharts() {
+    if (activeTab !== "overview") return;
+    try {
+      const { res, json } = await api("/admin/api/ops");
+      if (res.status === 401) {
+        showLogin("Session expired — sign in again.");
+        return;
+      }
+      if (res.ok) sampleIoCharts(json);
+    } catch (_) {
+      /* keep last series */
+    }
+  }
+
+  function startChartSampler() {
+    if (chartTimer) return;
+    chartTimer = setInterval(() => pollIoCharts().catch(() => {}), 1000);
+    pollIoCharts().catch(() => {});
+  }
+
+  function stopChartSampler() {
+    if (chartTimer) {
+      clearInterval(chartTimer);
+      chartTimer = null;
+    }
   }
 
   function emptyRow(cols, msg) {
@@ -75,11 +262,16 @@
     return badge(s, kind);
   }
 
+  let lastMapEpoch = null;
+
   function renderCards(status) {
     const ops = status.ops || {};
+    lastMapEpoch = status.map_epoch;
+    const epochEl = document.getElementById("map-epoch-value");
+    if (epochEl) epochEl.textContent = fmt(lastMapEpoch);
+
     const cards = [
       ["Node", status.node_id || "—"],
-      ["Map epoch", status.map_epoch],
       ["Members online", status.members_alive],
       ["HTTP requests", ops.http_requests],
       ["Puts", ops.put],
@@ -87,12 +279,16 @@
       ["Deletes", ops.del],
       ["Errors", ops.errors],
     ];
-    document.getElementById("overview-cards").innerHTML = cards
-      .map(
-        ([label, value]) =>
-          `<div class="card"><span class="label">${label}</span><div class="value">${fmt(value)}</div></div>`
-      )
-      .join("");
+    const cardsHtml =
+      `<div class="card"><span class="label">Map epoch</span>` +
+      `<button type="button" class="btn card-action" id="show-map-epoch">Show</button></div>` +
+      cards
+        .map(
+          ([label, value]) =>
+            `<div class="card"><span class="label">${label}</span><div class="value">${fmt(value)}</div></div>`
+        )
+        .join("");
+    document.getElementById("overview-cards").innerHTML = cardsHtml;
     nodeLabel.textContent = status.node_id || "";
   }
 
@@ -158,6 +354,7 @@
       (vbd.length
         ? `<table><thead><tr><th>Device</th><th>Volume</th><th>Read ops</th><th>Write ops</th><th>Read bytes</th><th>Write bytes</th></tr></thead><tbody>${vrows}</tbody></table>`
         : `<p class="empty">No aiosvd devices on this node (module not loaded or none mapped).</p>`);
+    sampleIoCharts(opsPayload);
   }
 
   function renderCluster(cluster) {
@@ -1039,6 +1236,19 @@
       actionError.hidden = false;
       actionError.textContent = (json && json.error) || "Snapshot failed";
     }
+  });
+
+  window.addEventListener("resize", () => {
+    if (activeTab === "overview") drawIoCharts();
+  });
+
+  document.getElementById("overview-cards").addEventListener("click", (e) => {
+    const btn = e.target.closest("#show-map-epoch");
+    if (!btn) return;
+    const dialog = document.getElementById("map-epoch-dialog");
+    const valueEl = document.getElementById("map-epoch-value");
+    if (valueEl) valueEl.textContent = fmt(lastMapEpoch);
+    if (dialog && typeof dialog.showModal === "function") dialog.showModal();
   });
 
   setTab("overview");

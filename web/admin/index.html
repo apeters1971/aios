@@ -57,6 +57,32 @@
         <h2>Overview</h2>
         <p class="note section-head">Live node status, compression, frontend IO, and object counters.</p>
         <div id="overview-cards" class="cards"></div>
+        <h3>Frontend IO (live)</h3>
+        <p class="note muted">Rates from logical s3 + fs + vbd counters (read and write). Window ~60s.</p>
+        <div class="chart-grid">
+          <div class="chart-card">
+            <div class="chart-head">
+              <strong>IOPS</strong>
+              <span class="chart-legend">
+                <span class="swatch read"></span> read
+                <span class="swatch write"></span> write
+              </span>
+            </div>
+            <canvas id="chart-iops" width="640" height="220" aria-label="Frontend IOPS"></canvas>
+            <div id="chart-iops-now" class="chart-now muted"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-head">
+              <strong>Throughput</strong>
+              <span class="chart-legend">
+                <span class="swatch read"></span> read
+                <span class="swatch write"></span> write
+              </span>
+            </div>
+            <canvas id="chart-bytes" width="640" height="220" aria-label="Frontend bytes per second"></canvas>
+            <div id="chart-bytes-now" class="chart-now muted"></div>
+          </div>
+        </div>
         <h3>Compression</h3>
         <p class="note muted">Whole-object ZSTD puts: overall ratio is logical÷stored bytes (higher means more savings).</p>
         <div id="compression-stats" class="table-wrap"></div>
@@ -297,6 +323,15 @@
       </section>
     </main>
   </div>
+
+  <dialog id="map-epoch-dialog" class="modal">
+    <form method="dialog" class="modal-panel">
+      <h3>Map epoch</h3>
+      <p class="muted modal-note">Cluster map generation (u64). Useful when debugging placement or membership churn.</p>
+      <p id="map-epoch-value" class="mono-value">—</p>
+      <button type="submit" class="btn primary">Close</button>
+    </form>
+  </dialog>
 
   <script src="/admin/app.js"></script>
 </body>
