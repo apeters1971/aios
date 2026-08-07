@@ -39,6 +39,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 #include <vector>
 
 #ifndef AIOS_ADMIN_WEB_DEFAULT
@@ -963,30 +964,48 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     std::string upload_path;
     std::uint32_t upload_crc = 0;
     if (content_length > 0 && content_length > kMemThreshold) {
-      upload_path =
-          (fs::temp_directory_path() / ("aios-upload-" + std::to_string(aios::now_ms())))
-              .string();
-      std::ofstream out(upload_path, std::ios::binary | std::ios::trunc);
-      if (!out) {
+      // Unique per request — now_ms alone collided under concurrent large PUTs and
+      // produced install crc32c mismatch / torn bodies on replicas.
+      std::string tmpl =
+          (fs::temp_directory_path() / "aios-upload-XXXXXX").string();
+      std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
+      tmpl_buf.push_back('\0');
+      const int tmp_fd = ::mkstemp(tmpl_buf.data());
+      if (tmp_fd < 0) {
         write_json(*sock, 500, "Error", {{"error", "cannot create upload temp"}}, false);
         return;
       }
+      upload_path.assign(tmpl_buf.data());
       std::vector<std::uint8_t> buf(256 * 1024);
       std::size_t left = content_length;
       upload_crc = 0;
       std::uint32_t crc = 0;
+      bool write_ok = true;
       while (left > 0) {
         const auto n = std::min(left, buf.size());
         if (!sock_read_exact(*sock, buf.data(), n, ec)) {
-          out.close();
-          fs::remove(upload_path);
-          return;
+          write_ok = false;
+          break;
         }
-        out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(n));
+        std::size_t off = 0;
+        while (off < n) {
+          const auto w = ::write(tmp_fd, buf.data() + off, n - off);
+          if (w < 0) {
+            write_ok = false;
+            break;
+          }
+          off += static_cast<std::size_t>(w);
+        }
+        if (!write_ok) break;
         crc = crc32c_update(crc, buf.data(), n);
         left -= n;
       }
-      out.close();
+      ::close(tmp_fd);
+      if (!write_ok || left != 0) {
+        fs::remove(upload_path);
+        upload_path.clear();
+        return;
+      }
       upload_crc = crc;
     } else if (content_length > 0) {
       body.resize(content_length);

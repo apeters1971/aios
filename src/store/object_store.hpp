@@ -297,6 +297,8 @@ class ObjectStore {
   std::string root_;
   ObjectStoreOptions opts_;
   std::vector<std::unique_ptr<Shard>> shards_;
+  // Guards lazy open_shard; shard ops themselves use Shard::mu.
+  mutable std::mutex open_mu_;
 };
 
 }  // namespace aios

@@ -2,6 +2,8 @@
 #include "http/http_auth.hpp"
 #include "util/log.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <boost/asio.hpp>
 
 #include <algorithm>
@@ -19,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace asio = boost::asio;
@@ -336,16 +339,45 @@ struct HttpResp {
   int status{-1};
   std::string body;
   std::string error;
+  std::string location;
 };
+
+bool parse_http_location(const std::string& loc, std::string& host, std::string& port,
+                         std::string& path) {
+  if (loc.rfind("http://", 0) == 0) {
+    auto rest = loc.substr(7);
+    auto slash = rest.find('/');
+    auto hp = slash == std::string::npos ? rest : rest.substr(0, slash);
+    path = slash == std::string::npos ? std::string("/") : rest.substr(slash);
+    auto colon = hp.rfind(':');
+    if (colon == std::string::npos) {
+      host = hp;
+      port = "80";
+    } else {
+      host = hp.substr(0, colon);
+      port = hp.substr(colon + 1);
+    }
+    return true;
+  }
+  if (!loc.empty() && loc.front() == '/') {
+    path = loc;
+    return true;
+  }
+  return false;
+}
 
 class HttpSession {
  public:
   HttpSession(std::string host, std::string port, std::string cluster_key)
       : host_(std::move(host)),
         port_(std::move(port)),
+        bootstrap_host_(host_),
+        bootstrap_port_(port_),
         cluster_key_(std::move(cluster_key)),
         resolver_(ioc_),
-        sock_(ioc_) {}
+        sock_(ioc_) {
+    allow_peer(host_ + ":" + port_);
+  }
 
   bool ensure_connected(std::string& err) {
     if (sock_.is_open()) return true;
@@ -373,23 +405,102 @@ class HttpSession {
   HttpResp request(const std::string& method, const std::string& target,
                    const std::uint8_t* body, std::size_t body_len,
                    const std::unordered_map<std::string, std::string>& extra_headers) {
+    std::string path = target;
     HttpResp resp;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-      std::string err;
-      if (!ensure_connected(err)) {
-        resp.error = err;
-        resp.status = -1;
+    for (int hop = 0; hop <= 5; ++hop) {
+      for (int attempt = 0; attempt < 2; ++attempt) {
+        std::string err;
+        if (!ensure_connected(err)) {
+          resp.error = err;
+          resp.status = -1;
+          close();
+          continue;
+        }
+        resp = do_request(method, path, body, body_len, extra_headers);
+        if (resp.status >= 0) break;
         close();
-        continue;
       }
-      resp = do_request(method, target, body, body_len, extra_headers);
-      if (resp.status >= 0) return resp;
-      close();
+      if (resp.status < 0) return resp;
+      if (resp.status != 307 && resp.status != 301 && resp.status != 302) return resp;
+
+      std::string new_host = host_;
+      std::string new_port = port_;
+      std::string new_path;
+      if (!parse_http_location(resp.location, new_host, new_port, new_path)) {
+        resp.error = "bad redirect Location";
+        return resp;
+      }
+      if (resp.location.rfind("http://", 0) == 0) {
+        if (!redirect_allowed(new_host, new_port)) {
+          refresh_redirect_allowlist();
+          if (!redirect_allowed(new_host, new_port)) {
+            resp.error = "redirect target not in cluster";
+            return resp;
+          }
+        }
+      }
+      // Primary redirects move keep-alive to the new peer for subsequent oids.
+      if (new_host != host_ || new_port != port_) {
+        close();
+        host_ = std::move(new_host);
+        port_ = std::move(new_port);
+      }
+      path = std::move(new_path);
     }
+    resp.error = "too many redirects";
+    resp.status = -1;
     return resp;
   }
 
  private:
+  static std::string norm_peer(std::string host, std::string port) {
+    for (char& c : host) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (port.empty()) port = "80";
+    return host + ":" + port;
+  }
+
+  void allow_peer(const std::string& http_addr) {
+    if (http_addr.empty()) return;
+    auto colon = http_addr.rfind(':');
+    if (colon == std::string::npos) {
+      redirect_allow_.insert(norm_peer(http_addr, "80"));
+      return;
+    }
+    redirect_allow_.insert(
+        norm_peer(http_addr.substr(0, colon), http_addr.substr(colon + 1)));
+  }
+
+  bool redirect_allowed(const std::string& host, const std::string& port) const {
+    return redirect_allow_.count(norm_peer(host, port)) > 0;
+  }
+
+  void refresh_redirect_allowlist() {
+    if (redirect_refreshed_) return;
+    redirect_refreshed_ = true;
+    // /admin/cluster is only on the admin node; always probe the bootstrap endpoint.
+    auto saved_host = host_;
+    auto saved_port = port_;
+    close();
+    host_ = bootstrap_host_;
+    port_ = bootstrap_port_;
+    std::string err;
+    HttpResp probe;
+    if (ensure_connected(err)) {
+      probe = do_request("GET", "/admin/cluster", nullptr, 0, {});
+    }
+    host_ = std::move(saved_host);
+    port_ = std::move(saved_port);
+    close();
+    if (probe.status != 200) return;
+    try {
+      auto j = nlohmann::json::parse(probe.body);
+      for (const auto& peer : j.value("admin_peers", nlohmann::json::array())) {
+        allow_peer(peer.value("http_addr", ""));
+      }
+    } catch (...) {
+    }
+  }
+
   void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
                 const std::string& target) {
     const std::string date = std::to_string(aios::now_ms());
@@ -408,6 +519,8 @@ class HttpSession {
                       const std::unordered_map<std::string, std::string>& extra_headers) {
     HttpResp resp;
     std::unordered_map<std::string, std::string> headers = extra_headers;
+    headers.erase("authorization");
+    headers.erase("x-aios-date");
     headers["content-length"] = std::to_string(body_len);
     add_auth(headers, method, target);
 
@@ -470,6 +583,8 @@ class HttpSession {
       } else if (name == "connection") {
         for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         if (value == "close") close_conn = true;
+      } else if (name == "location") {
+        resp.location = value;
       }
     }
 
@@ -497,10 +612,14 @@ class HttpSession {
 
   std::string host_;
   std::string port_;
+  std::string bootstrap_host_;
+  std::string bootstrap_port_;
   std::string cluster_key_;
   asio::io_context ioc_;
   tcp::resolver resolver_;
   tcp::socket sock_;
+  std::unordered_set<std::string> redirect_allow_;
+  bool redirect_refreshed_{false};
 };
 
 enum class OpKind { Create, Update, Put, Read, Delete };

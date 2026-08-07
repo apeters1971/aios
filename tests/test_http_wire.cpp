@@ -370,3 +370,49 @@ TEST(HttpWire, Basic) {
   ioc.stop();
   th.join();
   }
+
+// Bodies > 256 KiB land in a temp file. Naming by now_ms alone collided under
+// concurrent PUTs and tore bodies (install crc32c mismatch on replicas).
+TEST(HttpWire, ConcurrentLargePutsUseUniqueTemps) {
+  using namespace aios;
+  using aios::test::DualStoreFixture;
+  DualStoreFixture fx("aios-http-large-put");  // 2 local replicas; CRC checked on install
+  const int port_num = 19000 + static_cast<int>(::getpid() % 1000);
+  const std::string port = std::to_string(port_num);
+  fx.cfg.http_listen = "127.0.0.1:" + port;
+
+  boost::asio::io_context ioc;
+  HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
+  http.start();
+  std::thread th([&] { ioc.run(); });
+
+  const std::string host = "127.0.0.1";
+  const std::string key = fx.cfg.cluster_key;
+  constexpr std::size_t kBody = 300u * 1024u;
+  constexpr int kN = 8;
+
+  std::vector<std::string> bodies(kN);
+  std::vector<int> statuses(kN, -1);
+  std::vector<std::string> put_bodies(kN);
+  std::vector<std::thread> workers;
+  for (int i = 0; i < kN; ++i) {
+    bodies[i].assign(kBody, static_cast<char>('A' + i));
+    workers.emplace_back([&, i] {
+      auto r = http_request(host, port, "PUT", "/o/large-" + std::to_string(i), {}, bodies[i],
+                            key);
+      statuses[i] = r.status;
+      put_bodies[i] = r.body;
+    });
+  }
+  for (auto& w : workers) w.join();
+
+  for (int i = 0; i < kN; ++i) {
+    EXPECT_EQ(statuses[i], 204) << "PUT large-" << i << " body=" << put_bodies[i];
+    auto g = http_request(host, port, "GET", "/o/large-" + std::to_string(i), {}, "", key);
+    EXPECT_EQ(g.status, 200) << "GET large-" << i;
+    EXPECT_EQ(g.body, bodies[i]) << "body large-" << i;
+  }
+
+  ioc.stop();
+  th.join();
+}

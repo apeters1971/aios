@@ -461,6 +461,7 @@ bool ObjectStore::load_or_init_layout(ObjectStoreOptions requested, std::string&
 }
 
 bool ObjectStore::open_shard(std::uint32_t id, std::string& err) {
+  std::lock_guard<std::mutex> lock(open_mu_);
   auto& slot = shards_[id];
   if (slot && slot->db) return true;
 
@@ -474,6 +475,8 @@ bool ObjectStore::open_shard(std::uint32_t id, std::string& err) {
   fs::create_directories(fs::path(shard->dir) / "tmp", ec);
 
   const auto db_path = (fs::path(shard->dir) / "meta.sqlite").string();
+  // Concurrent openers of the same path race without open_mu_ (SQLITE busy /
+  // "shard open failed" under parallel large PUTs after UnlockForRpc).
   if (sqlite3_open(db_path.c_str(), &shard->db) != SQLITE_OK) {
     err = shard->db ? sqlite3_errmsg(shard->db) : "sqlite3_open failed";
     if (shard->db) sqlite3_close(shard->db);
