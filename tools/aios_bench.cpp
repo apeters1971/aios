@@ -6,11 +6,15 @@
 
 #include <boost/asio.hpp>
 
+#include <sys/socket.h>
+#include <sys/time.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -393,6 +397,15 @@ class HttpSession {
       close();
       return false;
     }
+    // Prefer blocking + SO_*TIMEO so a wedged peer cannot stall forever. Asio may
+    // leave the socket non-blocking after some reactor paths; force blocking first.
+    sock_.non_blocking(false, ec);
+    const int fd = static_cast<int>(sock_.native_handle());
+    timeval tv{};
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     return true;
   }
 
@@ -1020,7 +1033,8 @@ int run_object_bench(const BenchArgs& args, const std::string& host, const std::
     std::cout << std::left << std::setw(8) << "size" << std::setw(8) << "op" << std::right
               << std::setw(8) << "ok" << std::setw(6) << "err" << std::setw(10) << "iops"
               << std::setw(10) << "MiB/s" << std::setw(10) << "p50_ms" << std::setw(10) << "p95_ms"
-              << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms" << "\n";
+              << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms" << "\n"
+              << std::flush;
   }
 
   std::vector<PhaseStats> results;
@@ -1167,15 +1181,44 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  // Probe connectivity (404 on missing oid is fine).
+  // Probe connectivity (404 on missing oid is fine). Print first so a wedged
+  // cluster cannot look like a no-op hang with zero output. Also wall-clock
+  // the probe: socket timeouts alone are not always honored by Asio sync I/O.
+  if (!args.json) {
+    std::cerr << "aios-bench probing " << args.endpoint << " …\n" << std::flush;
+  }
   {
-    HttpSession probe(host, port, args.cluster_key);
-    auto r = probe.request("GET", "/o/" + url_encode_oid(args.prefix + "/probe"), nullptr, 0, {});
+    HttpResp r;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    std::thread th([&] {
+      HttpSession probe(host, port, args.cluster_key);
+      auto local = probe.request("GET", "/o/" + url_encode_oid(args.prefix + "/probe"), nullptr, 0,
+                                 {});
+      probe.close();
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        r = std::move(local);
+        done = true;
+      }
+      cv.notify_one();
+    });
+    {
+      std::unique_lock<std::mutex> lk(mu);
+      if (!cv.wait_for(lk, std::chrono::seconds(30), [&] { return done; })) {
+        std::cerr << "cannot reach " << args.endpoint
+                  << ": probe timed out (cluster may be wedged; restart testbed)\n";
+        th.detach();
+        return 1;
+      }
+    }
+    th.join();
     if (r.status < 0) {
-      std::cerr << "cannot reach " << args.endpoint << ": " << r.error << "\n";
+      std::cerr << "cannot reach " << args.endpoint << ": "
+                << (r.error.empty() ? "timeout or I/O error" : r.error) << "\n";
       return 1;
     }
-    probe.close();
   }
 
   if (args.mode == "stl") return run_stl_bench(args);
