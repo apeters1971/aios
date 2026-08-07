@@ -6,12 +6,19 @@
 
 #include <boost/asio.hpp>
 
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +27,7 @@
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -53,7 +61,12 @@ void usage() {
       << "  stat OID\n"
       << "  list [--prefix P]\n"
       << "  map\n"
+      << "  testbed                 spawn a 4-node local cluster under /var/tmp/aios-testbed\n"
       << "  admin [status|ops|config|cluster|metrics|console|archive|backup|vbd|posix-layout|lifecycle|s3-cred|quota|qos ...]\n"
+      << "\n"
+      << "testbed creates /var/tmp/aios-testbed/{00,01,02,03}, starts aiosd on each\n"
+      << "(gossip 7400–7403, HTTP 7480–7483; node 00 has --admin), and waits until\n"
+      << "Ctrl+C. Default --cluster-key if omitted: 550e8400-e29b-41d4-a716-446655440000.\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
@@ -121,12 +134,15 @@ bool parse_args(int argc, char** argv, Args& a) {
     }
     a.positional.push_back(arg);
   }
-  if (a.cluster_key.empty()) {
-    std::cerr << "--cluster-key is required\n";
-    return false;
-  }
   if (a.cmd.empty()) {
     std::cerr << "command required\n";
+    return false;
+  }
+  if (a.cmd == "testbed" && a.cluster_key.empty()) {
+    a.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+  }
+  if (a.cluster_key.empty()) {
+    std::cerr << "--cluster-key is required\n";
     return false;
   }
   return true;
@@ -1530,6 +1546,232 @@ int run_admin_console(std::string host, std::string port, const std::string& key
   return 0;
 }
 
+constexpr const char* kTestbedRoot = "/var/tmp/aios-testbed";
+constexpr int kTestbedNodes = 4;
+constexpr int kTestbedGossipBase = 7400;
+constexpr int kTestbedHttpBase = 7480;
+
+std::atomic<bool> g_testbed_stop{false};
+
+void on_testbed_signal(int) { g_testbed_stop.store(true); }
+
+fs::path resolve_aiosd(const char* argv0) {
+  if (const char* env = std::getenv("AIOS_AIOSD"); env && *env) {
+    return fs::path(env);
+  }
+  fs::path self(argv0 ? argv0 : "aios");
+  std::error_code ec;
+  if (!self.is_absolute()) {
+    const auto cand = fs::current_path(ec) / self;
+    if (!ec) self = cand;
+  }
+  self = fs::weakly_canonical(self, ec);
+  if (!ec) {
+    const auto sibling = self.parent_path() / "aiosd";
+    if (fs::exists(sibling)) return sibling;
+  }
+  return fs::path("aiosd");  // PATH lookup via execvp fallback
+}
+
+bool prepare_testbed_root(const fs::path& root, std::string& err) {
+  std::error_code ec;
+  fs::create_directories(root, ec);
+  if (ec) {
+    err = "mkdir " + root.string() + ": " + ec.message();
+    return false;
+  }
+  for (int i = 0; i < kTestbedNodes; ++i) {
+    char id[8];
+    std::snprintf(id, sizeof(id), "%02d", i);
+    const fs::path node = root / id;
+    fs::create_directories(node, ec);
+    if (ec) {
+      err = "mkdir " + node.string() + ": " + ec.message();
+      return false;
+    }
+    const fs::path aios_dir = node / "aios";
+    fs::create_directories(aios_dir, ec);
+    if (ec) {
+      err = "mkdir " + aios_dir.string() + ": " + ec.message();
+      return false;
+    }
+    const fs::path marker = node / ".aios";
+    {
+      std::ofstream out(marker);
+      if (!out) {
+        err = "cannot write " + marker.string();
+        return false;
+      }
+      out << "storage_class: nvme\nweight: 4\nstate: up\n";
+    }
+  }
+  return true;
+}
+
+pid_t spawn_aiosd(const fs::path& aiosd, const std::vector<std::string>& args,
+                  const fs::path& log_path) {
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    const int fd = ::open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+      dup2(fd, STDOUT_FILENO);
+      dup2(fd, STDERR_FILENO);
+      if (fd > STDERR_FILENO) close(fd);
+    }
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 2);
+    argv.push_back(const_cast<char*>(aiosd.c_str()));
+    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    if (aiosd.is_absolute() || aiosd.string().find('/') != std::string::npos) {
+      execv(aiosd.c_str(), argv.data());
+    } else {
+      execvp(aiosd.c_str(), argv.data());
+    }
+    std::fprintf(stderr, "exec aiosd failed: %s\n", std::strerror(errno));
+    _exit(127);
+  }
+  return pid;
+}
+
+bool http_ready(const std::string& host, const std::string& port, const std::string& key) {
+  auto r = http_exchange(host, port, "GET", "/admin/status", {}, {}, nullptr, key, 0);
+  return r.status == 200 || r.status == 401 || r.status == 403;
+}
+
+int cmd_testbed(const std::string& cluster_key, const char* argv0) {
+  const fs::path root(kTestbedRoot);
+  std::string err;
+  if (!prepare_testbed_root(root, err)) {
+    std::cerr << err << "\n";
+    return 1;
+  }
+
+  const fs::path aiosd = resolve_aiosd(argv0);
+  if (aiosd != "aiosd" && !fs::exists(aiosd)) {
+    std::cerr << "aiosd not found at " << aiosd
+              << " (set AIOS_AIOSD or run from the build directory)\n";
+    return 1;
+  }
+
+  std::vector<pid_t> pids;
+  pids.reserve(kTestbedNodes);
+
+  struct sigaction sa {};
+  sa.sa_handler = on_testbed_signal;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGTERM, &sa, nullptr);
+
+  const std::string peer0 = "127.0.0.1:" + std::to_string(kTestbedGossipBase);
+
+  for (int i = 0; i < kTestbedNodes; ++i) {
+    char id[8];
+    std::snprintf(id, sizeof(id), "%02d", i);
+    const fs::path node = root / id;
+    const int gossip = kTestbedGossipBase + i;
+    const int http = kTestbedHttpBase + i;
+
+    std::vector<std::string> args = {
+        "--cluster-key",
+        cluster_key,
+        "--node-id",
+        id,
+        "--listen",
+        "127.0.0.1:" + std::to_string(gossip),
+        "--http-listen",
+        "127.0.0.1:" + std::to_string(http),
+        "--scan-root",
+        node.string(),
+        "--status-file",
+        (node / "status.json").string(),
+    };
+    if (i == 0) {
+      args.push_back("--admin");
+    } else {
+      args.push_back("--peer");
+      args.push_back(peer0);
+    }
+
+    const pid_t pid = spawn_aiosd(aiosd, args, node / "aiosd.log");
+    if (pid < 0) {
+      std::cerr << "fork failed for node " << id << ": " << std::strerror(errno) << "\n";
+      g_testbed_stop.store(true);
+      break;
+    }
+    pids.push_back(pid);
+    std::cout << "started node " << id << " pid=" << pid << " gossip=127.0.0.1:" << gossip
+              << " http=127.0.0.1:" << http << (i == 0 ? " admin=yes" : "") << "\n";
+
+    if (i == 0) {
+      // Wait for bootstrap HTTP before peers join.
+      bool ready = false;
+      for (int t = 0; t < 50 && !g_testbed_stop.load(); ++t) {
+        if (http_ready("127.0.0.1", std::to_string(http), cluster_key)) {
+          ready = true;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      if (!ready && !g_testbed_stop.load()) {
+        std::cerr << "warning: node 00 HTTP not ready yet; continuing\n";
+      }
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+  }
+
+  std::cout << "\ntestbed root:  " << root << "\n"
+            << "cluster_key:   " << cluster_key << "\n"
+            << "admin UI:      http://127.0.0.1:" << kTestbedHttpBase << "/admin/\n"
+            << "client example:\n"
+            << "  aios --endpoint 127.0.0.1:" << kTestbedHttpBase << " --cluster-key " << cluster_key
+            << " put demo/hello ./file\n"
+            << "Press Ctrl+C to stop all nodes.\n";
+
+  while (!g_testbed_stop.load()) {
+    int status = 0;
+    const pid_t dead = waitpid(-1, &status, WNOHANG);
+    if (dead > 0) {
+      std::cerr << "aiosd pid " << dead << " exited";
+      if (WIFEXITED(status)) std::cerr << " code=" << WEXITSTATUS(status);
+      else if (WIFSIGNALED(status)) std::cerr << " signal=" << WTERMSIG(status);
+      std::cerr << "\n";
+      g_testbed_stop.store(true);
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+
+  for (pid_t pid : pids) {
+    if (pid > 0) kill(pid, SIGTERM);
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline) {
+    int status = 0;
+    if (waitpid(-1, &status, WNOHANG) <= 0) {
+      bool any = false;
+      for (pid_t pid : pids) {
+        if (pid > 0 && kill(pid, 0) == 0) {
+          any = true;
+          break;
+        }
+      }
+      if (!any) break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  for (pid_t pid : pids) {
+    if (pid > 0 && kill(pid, 0) == 0) kill(pid, SIGKILL);
+  }
+  while (waitpid(-1, nullptr, WNOHANG) > 0) {
+  }
+  std::cout << "testbed stopped\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1539,6 +1781,16 @@ int main(int argc, char** argv) {
     return 2;
   }
   g_app_label = args.app_label;
+
+  try {
+    if (args.cmd == "testbed") {
+      return cmd_testbed(args.cluster_key, argv[0]);
+    }
+  } catch (const std::exception& e) {
+    std::cerr << e.what() << "\n";
+    return 1;
+  }
+
   std::string host, port;
   try {
     parse_endpoint(args.endpoint, host, port);
