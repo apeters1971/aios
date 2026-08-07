@@ -244,19 +244,7 @@ void Session::refresh_redirect_allowlist() {
 }
 
 std::string Session::url_encode_oid(const std::string& oid) {
-  // Encode '/' as %2F so /o/{oid}/lock|watch stays unambiguous.
-  static const char* hex = "0123456789ABCDEF";
-  std::string out;
-  for (unsigned char c : oid) {
-    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      out.push_back(static_cast<char>(c));
-    } else {
-      out.push_back('%');
-      out.push_back(hex[c >> 4]);
-      out.push_back(hex[c & 0xf]);
-    }
-  }
-  return out;
+  return http_url_encode_oid(oid);
 }
 
 std::string Session::stl_oid(const std::string& type, const std::string& name) {

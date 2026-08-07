@@ -188,15 +188,19 @@ void GossipEngine::start() {
   }
 
 
-  boost::asio::post(ioc_, [this] {
+  boost::asio::post(gossip_workers_, [this] {
     for (const auto& p : cfg_.peers) {
-      auto r = gossip_with_peer(ioc_, p, cfg_.node_id, advertise_addr(),
-                                cfg_.cluster_key, cfg_.auth_skew_ms, membership_,
-                                fs_table_, derive_http_addr(advertise_addr(), cfg_.http_listen));
+      if (stopped_.load()) return;
+      auto r = gossip_with_peer(p, cfg_.node_id, advertise_addr(), cfg_.cluster_key,
+                                cfg_.auth_skew_ms, membership_, fs_table_,
+                                derive_http_addr(advertise_addr(), cfg_.http_listen));
       if (r.ok) {
         AIOS_LOG_INFO("seed gossip ok with ", p, " as ", r.peer_node_id);
-        rebuild_cluster_map();
-        write_status();
+        boost::asio::post(ioc_, [this] {
+          if (stopped_.load()) return;
+          rebuild_cluster_map();
+          write_status();
+        });
       } else {
         AIOS_LOG_WARN("seed gossip failed ", p, ": ", r.error);
       }
@@ -242,6 +246,7 @@ void GossipEngine::start() {
 }
 
 void GossipEngine::stop() {
+  stopped_.store(true);
   gossip_timer_.cancel();
   scan_timer_.cancel();
   status_timer_.cancel();
@@ -254,6 +259,11 @@ void GossipEngine::stop() {
   // Join HTTP workers while sockets are closed (unblocks keep-alive reads).
   // HttpServer owns its worker pool, so its destructor joins them here safely.
   http_server_.reset();
+  // Drain outbound gossip before TcpServer/ObjectService teardown.
+  if (!gossip_workers_joined_.exchange(true)) {
+    gossip_workers_.stop();
+    gossip_workers_.join();
+  }
   // TcpServer sessions run on the shared io_context, which the caller stops and
   // joins after this returns. Destroying it here would free handlers_ underneath
   // an in-flight session, so only close it and let ~GossipEngine reclaim it.
@@ -286,27 +296,40 @@ Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
 }
 
 void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
-  if (ec) return;
+  if (ec || stopped_.load()) return;
   const auto now = now_ms();
   membership_.age(now, cfg_.suspect_after_ms, cfg_.dead_after_ms);
 
   auto peers = membership_.peers_for_gossip(3);
-  for (const auto& p : peers) {
-    auto r = gossip_with_peer(ioc_, p.addr, cfg_.node_id, advertise_addr(),
-                              cfg_.cluster_key, cfg_.auth_skew_ms, membership_,
-                              fs_table_,
-                              derive_http_addr(advertise_addr(), cfg_.http_listen));
-    if (r.ok) {
-      AIOS_LOG_DEBUG("gossip ok ", p.addr, " -> ", r.peer_node_id);
-    } else {
-      AIOS_LOG_DEBUG("gossip fail ", p.addr, ": ", r.error);
-    }
-  }
-  rebuild_cluster_map();
-  if (object_service_) object_service_->ops().note_gossip_round();
+  const auto node_id = cfg_.node_id;
+  const auto adv = advertise_addr();
+  const auto key = cfg_.cluster_key;
+  const auto skew = cfg_.auth_skew_ms;
+  const auto http_adv = derive_http_addr(adv, cfg_.http_listen);
+  const auto interval = cfg_.gossip_interval_ms;
 
-  gossip_timer_.expires_after(std::chrono::milliseconds(cfg_.gossip_interval_ms));
-  gossip_timer_.async_wait([this](auto e) { on_gossip_timer(e); });
+  // Blocking peer round-trips must not run on ioc_: that stalls async_accept and
+  // deadlocks multi-node PUTs that need inbound object RPC while gossip is in flight.
+  boost::asio::post(gossip_workers_, [this, peers, node_id, adv, key, skew, http_adv,
+                                      interval] {
+    for (const auto& p : peers) {
+      if (stopped_.load()) return;
+      auto r = gossip_with_peer(p.addr, node_id, adv, key, skew, membership_, fs_table_,
+                                http_adv);
+      if (r.ok) {
+        AIOS_LOG_DEBUG("gossip ok ", p.addr, " -> ", r.peer_node_id);
+      } else {
+        AIOS_LOG_DEBUG("gossip fail ", p.addr, ": ", r.error);
+      }
+    }
+    boost::asio::post(ioc_, [this, interval] {
+      if (stopped_.load()) return;
+      rebuild_cluster_map();
+      if (object_service_) object_service_->ops().note_gossip_round();
+      gossip_timer_.expires_after(std::chrono::milliseconds(interval));
+      gossip_timer_.async_wait([this](auto e) { on_gossip_timer(e); });
+    });
+  });
 }
 
 void GossipEngine::apply_target_weights(std::vector<AiosTarget>& targets) {

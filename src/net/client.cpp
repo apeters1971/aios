@@ -8,8 +8,7 @@
 
 namespace aios {
 
-GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
-                                      const std::string& peer_addr,
+GossipExchangeResult gossip_with_peer(const std::string& peer_addr,
                                       const std::string& local_node_id,
                                       const std::string& local_listen,
                                       const std::string& cluster_key, int auth_skew_ms,
@@ -22,6 +21,8 @@ GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
     return result;
   }
 
+  // Private context: never block the daemon's shared accept/timer io_context.
+  boost::asio::io_context ioc;
   boost::system::error_code ec;
   tcp::resolver resolver(ioc);
   auto endpoints = resolver.resolve(host, port, ec);

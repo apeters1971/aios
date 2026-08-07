@@ -18,8 +18,9 @@ struct GossipExchangeResult {
 };
 
 // Connect → Hello → Gossip → close. Merges response into tables.
-GossipExchangeResult gossip_with_peer(boost::asio::io_context& ioc,
-                                      const std::string& peer_addr,
+// Uses a private io_context so callers must not run this on the daemon accept
+// loop thread (it blocks for the round-trip).
+GossipExchangeResult gossip_with_peer(const std::string& peer_addr,
                                       const std::string& local_node_id,
                                       const std::string& local_listen,
                                       const std::string& cluster_key, int auth_skew_ms,

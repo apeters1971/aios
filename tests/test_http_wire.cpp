@@ -354,6 +354,19 @@ TEST(HttpWire, Basic) {
     EXPECT_TRUE(r.status == 412) << "If-None-Match * 412";
   }
 
+  // Slash in oid must be %2F-encoded; raw slash is parsed as a subpath (404).
+  {
+    const std::string enc = "/o/" + http_url_encode_oid("demo/hello");
+    EXPECT_TRUE(enc == "/o/demo%2Fhello") << "encode oid for path";
+    auto put = http_request(host, port, "PUT", enc, {}, "slash-oid", key);
+    EXPECT_TRUE(put.status == 204) << "PUT encoded slash oid 204";
+    auto get = http_request(host, port, "GET", enc, {}, "", key);
+    EXPECT_TRUE(get.status == 200) << "GET encoded slash oid 200";
+    EXPECT_TRUE(get.body == "slash-oid") << "GET encoded slash oid body";
+    auto raw = http_request(host, port, "PUT", "/o/demo/hello", {}, "raw", key);
+    EXPECT_TRUE(raw.status == 404) << "raw slash oid is not a put path";
+  }
+
   ioc.stop();
   th.join();
   }

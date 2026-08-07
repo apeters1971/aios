@@ -32,4 +32,8 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
 std::string header_get(const std::unordered_map<std::string, std::string>& headers,
                        const std::string& name);
 
+// Percent-encode an object id for /o/{oid}[/sub]. Encodes '/' as %2F so lock,
+// versions, append, and watch subpaths stay unambiguous.
+std::string http_url_encode_oid(const std::string& oid);
+
 }  // namespace aios

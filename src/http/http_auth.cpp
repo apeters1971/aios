@@ -164,4 +164,20 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
   return r;
 }
 
+std::string http_url_encode_oid(const std::string& oid) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(oid.size() * 3);
+  for (unsigned char c : oid) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(hex[c >> 4]);
+      out.push_back(hex[c & 0xf]);
+    }
+  }
+  return out;
+}
+
 }  // namespace aios

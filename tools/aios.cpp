@@ -155,20 +155,7 @@ void parse_endpoint(const std::string& ep, std::string& host, std::string& port)
   port = ep.substr(colon + 1);
 }
 
-std::string url_encode_oid(const std::string& oid) {
-  static const char* hex = "0123456789ABCDEF";
-  std::string out;
-  for (unsigned char c : oid) {
-    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
-      out.push_back(static_cast<char>(c));
-    } else {
-      out.push_back('%');
-      out.push_back(hex[c >> 4]);
-      out.push_back(hex[c & 0xf]);
-    }
-  }
-  return out;
-}
+std::string url_encode_oid(const std::string& oid) { return aios::http_url_encode_oid(oid); }
 
 void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
               const std::string& target, const std::string& cluster_key) {

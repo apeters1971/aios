@@ -310,6 +310,20 @@ bool ObjectService::local_abort(const std::string& aios_path, const std::string&
   return store->abort_version(oid, seq, err);
 }
 
+namespace {
+
+// Caller must hold mu_. Release across peer RPC so inbound gossip can update the
+// map (otherwise multi-node PUTs deadlock with the gossip accept path).
+struct UnlockForRpc {
+  std::recursive_mutex& m;
+  explicit UnlockForRpc(std::recursive_mutex& mu) : m(mu) { m.unlock(); }
+  ~UnlockForRpc() { m.lock(); }
+  UnlockForRpc(const UnlockForRpc&) = delete;
+  UnlockForRpc& operator=(const UnlockForRpc&) = delete;
+};
+
+}  // namespace
+
 int ObjectService::replicate_install(
     const Placement& placement, const PreparedVersion& v, const std::uint8_t* data,
     std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
@@ -322,6 +336,7 @@ int ObjectService::replicate_install(
       use_file && (abs_body_path.empty() == false) &&
       (data == nullptr || len > 4u * 1024u * 1024u || v.size > 4u * 1024u * 1024u);
 
+  UnlockForRpc unlock(mu_);
   int ok = 0;
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     const auto& t = placement.acting_set[i];
@@ -358,6 +373,7 @@ int ObjectService::replicate_install(
 
 int ObjectService::replicate_publish(const Placement& placement, const std::string& oid,
                                      std::uint64_t seq) {
+  UnlockForRpc unlock(mu_);
   int ok = 0;
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     const auto& t = placement.acting_set[i];
@@ -380,6 +396,7 @@ int ObjectService::replicate_publish(const Placement& placement, const std::stri
 
 void ObjectService::replicate_abort(const Placement& placement, const std::string& oid,
                                     std::uint64_t seq) {
+  UnlockForRpc unlock(mu_);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     const auto& t = placement.acting_set[i];
     if (t.node_id == cfg_.node_id) {

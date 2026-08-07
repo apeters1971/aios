@@ -17,6 +17,7 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -87,6 +88,10 @@ class GossipEngine {
   boost::asio::steady_timer transition_timer_;
   boost::asio::steady_timer archive_timer_;
   boost::asio::steady_timer backup_timer_;
+  // Outbound gossip is blocking; keep it off ioc_ so async_accept keeps running.
+  boost::asio::thread_pool gossip_workers_{2};
+  std::atomic<bool> stopped_{false};
+  std::atomic<bool> gossip_workers_joined_{false};
 };
 
 }  // namespace aios

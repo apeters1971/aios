@@ -78,3 +78,12 @@ TEST(HttpAuth, Basic) {
   }
 
   }
+
+// CLI/Session historically diverged: leaving '/' raw made PUT /o/demo/hello look
+// like oid "demo" + unknown sub "hello" → 404. Shared encoder must escape it.
+TEST(HttpAuth, UrlEncodeOidEscapesSlash) {
+  using namespace aios;
+  EXPECT_EQ(http_url_encode_oid("demo/hello"), "demo%2Fhello");
+  EXPECT_EQ(http_url_encode_oid("plain"), "plain");
+  EXPECT_EQ(http_url_encode_oid("a b"), "a%20b");
+}
