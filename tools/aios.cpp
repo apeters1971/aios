@@ -66,7 +66,7 @@ void usage() {
       << "\n"
       << "testbed creates /var/tmp/aios-testbed/{00,01,02,03}, starts aiosd on each\n"
       << "(gossip 7400–7403, HTTP 7480–7483; node 00 has --admin), and waits until\n"
-      << "Ctrl+C. Default --cluster-key if omitted: 550e8400-e29b-41d4-a716-446655440000.\n"
+      << "Ctrl+C. Default --cluster-key if omitted: testbed.\n"
       << "\n"
       << "Admin commands require the target node to run with admin: true / --admin.\n"
       << "  admin                 interactive console (default)\n"
@@ -139,7 +139,7 @@ bool parse_args(int argc, char** argv, Args& a) {
     return false;
   }
   if (a.cmd == "testbed" && a.cluster_key.empty()) {
-    a.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+    a.cluster_key = "testbed";
   }
   if (a.cluster_key.empty()) {
     std::cerr << "--cluster-key is required\n";
