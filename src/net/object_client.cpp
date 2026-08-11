@@ -892,4 +892,146 @@ ObjectRpcResult object_get_file_remote(
   return r;
 }
 
+struct RemoteStageSession::Impl {
+  std::unique_ptr<ObjectRpcConn> conn;
+  std::string local_node_id;
+  std::string local_listen;
+};
+
+RemoteStageSession::RemoteStageSession() : impl_(std::make_unique<Impl>()) {}
+RemoteStageSession::~RemoteStageSession() { abort(); }
+RemoteStageSession::RemoteStageSession(RemoteStageSession&&) noexcept = default;
+RemoteStageSession& RemoteStageSession::operator=(RemoteStageSession&&) noexcept = default;
+
+bool RemoteStageSession::begin(const std::string& peer_addr, const std::string& local_node_id,
+                               const std::string& local_listen, const std::string& cluster_key,
+                               int auth_skew_ms, std::uint64_t epoch,
+                               const std::string& aios_path, const PreparedVersion& v) {
+  abort();
+  peer_addr_ = peer_addr;
+  aios_path_ = aios_path;
+  cluster_key_ = cluster_key;
+  auth_skew_ms_ = auth_skew_ms;
+  epoch_ = epoch;
+  meta_ = v;
+  meta_.fs_path = v.fs_path;
+  impl_->local_node_id = local_node_id;
+  impl_->local_listen = local_listen;
+  std::string err;
+  impl_->conn = ObjectRpcPool::instance().acquire(peer_addr, local_node_id, local_listen,
+                                                  cluster_key, auth_skew_ms, err);
+  if (!impl_->conn) {
+    ok_ = false;
+    error_ = err;
+    return false;
+  }
+  nlohmann::json begin = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", v.oid},
+      {"seq", v.seq},
+      {"base_seq", v.prev_tip},
+      {"size", v.size},
+      {"crc32c", v.crc32c},
+      {"inline_body", false},
+      {"fs_path", v.fs_path},
+      {"is_delete", v.is_delete},
+      {"role", "replica"},
+  };
+  if (!v.redirect_oid.empty()) begin["redirect"] = v.redirect_oid;
+  auto r = rpc_one(impl_->conn->socket(), MsgType::ObjectStageBegin, std::move(begin), {},
+                   cluster_key, auth_skew_ms);
+  if (!r.ok) {
+    ObjectRpcPool::instance().release(peer_addr, std::move(impl_->conn),
+                                      !rpc_transport_failed(r));
+    ok_ = false;
+    error_ = r.error.empty() ? r.code : r.error;
+    return false;
+  }
+  ok_ = true;
+  error_.clear();
+  return true;
+}
+
+bool RemoteStageSession::data(std::uint64_t offset, const std::uint8_t* p, std::size_t n) {
+  if (!ok_ || !impl_ || !impl_->conn) {
+    ok_ = false;
+    if (error_.empty()) error_ = "stage session not open";
+    return false;
+  }
+  nlohmann::json chunk = {
+      {"epoch", epoch_},
+      {"aios_path", aios_path_},
+      {"oid", meta_.oid},
+      {"seq", meta_.seq},
+      {"offset", offset},
+      {"role", "replica"},
+  };
+  auto r = rpc_one_ext(impl_->conn->socket(), MsgType::ObjectStageData, std::move(chunk), p, n,
+                       cluster_key_, auth_skew_ms_);
+  if (!r.ok) {
+    ObjectRpcPool::instance().release(peer_addr_, std::move(impl_->conn),
+                                      !rpc_transport_failed(r));
+    ok_ = false;
+    error_ = r.error.empty() ? r.code : r.error;
+    return false;
+  }
+  return true;
+}
+
+bool RemoteStageSession::commit(const PreparedVersion& v,
+                                const std::unordered_map<std::string, std::string>& attrs) {
+  if (!ok_ || !impl_ || !impl_->conn) {
+    ok_ = false;
+    if (error_.empty()) error_ = "stage session not open";
+    return false;
+  }
+  nlohmann::json attrs_j = nlohmann::json::object();
+  for (const auto& [k, val] : attrs) attrs_j[k] = val;
+  nlohmann::json commit = {
+      {"epoch", epoch_},
+      {"aios_path", aios_path_},
+      {"oid", v.oid},
+      {"seq", v.seq},
+      {"base_seq", v.prev_tip},
+      {"size", v.size},
+      {"crc32c", v.crc32c},
+      {"inline_body", false},
+      {"fs_path", v.fs_path},
+      {"is_delete", v.is_delete},
+      {"attrs", attrs_j},
+      {"role", "replica"},
+  };
+  if (!v.redirect_oid.empty()) commit["redirect"] = v.redirect_oid;
+  auto r = rpc_one(impl_->conn->socket(), MsgType::ObjectStageCommit, std::move(commit), {},
+                   cluster_key_, auth_skew_ms_);
+  ObjectRpcPool::instance().release(peer_addr_, std::move(impl_->conn),
+                                    !rpc_transport_failed(r));
+  if (!r.ok) {
+    ok_ = false;
+    error_ = r.error.empty() ? r.code : r.error;
+    return false;
+  }
+  ok_ = true;
+  error_.clear();
+  return true;
+}
+
+void RemoteStageSession::abort() {
+  if (!impl_ || !impl_->conn) return;
+  if (!meta_.oid.empty() && meta_.seq > 0) {
+    nlohmann::json body = {
+        {"epoch", epoch_},
+        {"aios_path", aios_path_},
+        {"oid", meta_.oid},
+        {"seq", meta_.seq},
+        {"role", "replica"},
+    };
+    (void)rpc_one(impl_->conn->socket(), MsgType::ObjectAbortVersion, std::move(body), {},
+                  cluster_key_, auth_skew_ms_);
+  }
+  ObjectRpcPool::instance().release(peer_addr_, std::move(impl_->conn), false);
+  ok_ = false;
+}
+
 }  // namespace aios

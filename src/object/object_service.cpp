@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -1439,6 +1440,449 @@ ApiResult ObjectService::api_begin_put_staging(const std::string& oid,
   r.ok = true;
   r.epoch = map_.epoch;
   r.placement = placement;
+  return r;
+}
+
+void ObjectService::destroy_pipeline(const std::shared_ptr<PutPipeline>& pl, bool abort_peers) {
+  if (!pl) return;
+  std::lock_guard plock(pl->mu);
+  if (pl->fd >= 0) {
+    ::close(pl->fd);
+    pl->fd = -1;
+  }
+  if (!pl->staging_path.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(pl->staging_path, ec);
+    pl->staging_path.clear();
+  }
+  for (auto& lp : pl->local_peers) {
+    if (lp.fd >= 0) {
+      ::close(lp.fd);
+      lp.fd = -1;
+    }
+    if (!lp.stage_path.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(lp.stage_path, ec);
+      lp.stage_path.clear();
+    }
+    if (abort_peers && pl->seq > 0) {
+      std::string err;
+      local_abort(lp.aios_path, pl->oid, pl->seq, err);
+    }
+  }
+  pl->local_peers.clear();
+  for (auto& rs : pl->remote_peers) {
+    if (abort_peers) rs.abort();
+  }
+  pl->remote_peers.clear();
+}
+
+ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
+                                               const LayoutRequest& layout_req,
+                                               std::uint64_t expected_size,
+                                               std::string& staging_abs_out) {
+  staging_abs_out.clear();
+  ObjectLayout layout;
+  std::string err;
+  if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
+    return fail("bad_request", err);
+  }
+  if (layout.is_ec()) {
+    return fail("not_supported", "pipeline put not supported for erasure-coded objects");
+  }
+  if (cfg_.compression == kCompAlgoZstd && zstd_available()) {
+    return fail("not_supported", "pipeline put not supported with compression");
+  }
+
+  auto pl = std::make_shared<PutPipeline>();
+  {
+    std::lock_guard lock(mu_);
+    if (pipelines_.count(oid)) {
+      return fail("conflict", "pipelined put already in progress for oid");
+    }
+    auto placement = place(oid, map_, layout.n, layout.storage_class);
+    if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+    if (placement.acting_set[0].node_id != cfg_.node_id) {
+      auto r = fail("not_primary", "this node is not primary for oid");
+      r.placement = placement;
+      return r;
+    }
+    auto* store = primary_store(placement, err);
+    if (!store) return fail("store_error", err);
+    {
+      auto tip_attrs = store->list_attrs(oid, err);
+      if (attrs_are_frozen(tip_attrs)) {
+        return fail("frozen", "object is archived/frozen; recall before mutate");
+      }
+    }
+    if (!store->peek_next_seq(oid, pl->seq, pl->prev_tip, err)) {
+      return fail("store_error", err);
+    }
+    if (!store->create_staging_file(oid, pl->staging_path, err)) {
+      return fail("store_error", err);
+    }
+    pl->fd = ::open(pl->staging_path.c_str(), O_RDWR | O_TRUNC, 0644);
+    if (pl->fd < 0) {
+      std::error_code ec;
+      std::filesystem::remove(pl->staging_path, ec);
+      return fail("store_error", std::string("open staging: ") + std::strerror(errno));
+    }
+    pl->oid = oid;
+    pl->expected_size = expected_size;
+    pl->placement = placement;
+    pl->layout = layout;
+    pl->meta.oid = oid;
+    pl->meta.seq = pl->seq;
+    pl->meta.prev_tip = pl->prev_tip;
+    pl->meta.size = expected_size;
+    pl->meta.crc32c = 0;
+    pl->meta.inline_body = false;
+    pl->meta.is_delete = false;
+
+    // Open local replica staging sessions before advertising the pipeline.
+    for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
+      const auto& t = placement.acting_set[i];
+      if (t.node_id != cfg_.node_id) continue;
+      PutPipeline::LocalPeer lp;
+      lp.aios_path = t.aios_path;
+      if (!stores_.get(t.aios_path) ||
+          !stores_.get(t.aios_path)->stage_path_for(oid, pl->seq, lp.stage_path, err) ||
+          !stores_.get(t.aios_path)->stage_truncate(lp.stage_path, err)) {
+        destroy_pipeline(pl, false);
+        return fail("store_error", err.empty() ? "local replica stage begin failed" : err);
+      }
+      lp.fd = ::open(lp.stage_path.c_str(), O_RDWR, 0644);
+      if (lp.fd < 0) {
+        destroy_pipeline(pl, false);
+        return fail("store_error", std::string("open local stage: ") + std::strerror(errno));
+      }
+      pl->local_peers.push_back(std::move(lp));
+    }
+    pipelines_[oid] = pl;
+  }
+
+  // Remote StageBegin off the service lock (avoids gossip/RPC deadlock).
+  std::vector<RemoteStageSession> remotes;
+  remotes.reserve(pl->placement.acting_set.size());
+  for (std::size_t i = 1; i < pl->placement.acting_set.size(); ++i) {
+    const auto& t = pl->placement.acting_set[i];
+    if (t.node_id == cfg_.node_id) continue;
+    RemoteStageSession sess;
+    if (!sess.begin(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key, cfg_.auth_skew_ms,
+                    pl->placement.epoch, t.aios_path, pl->meta)) {
+      {
+        std::lock_guard lock(mu_);
+        pipelines_.erase(oid);
+      }
+      destroy_pipeline(pl, true);
+      for (auto& r : remotes) r.abort();
+      return fail("quorum_failed", "stage begin failed: " + sess.error());
+    }
+    remotes.push_back(std::move(sess));
+  }
+  {
+    std::lock_guard plock(pl->mu);
+    pl->remote_peers = std::move(remotes);
+  }
+  staging_abs_out = pl->staging_path;
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = pl->placement;
+  return r;
+}
+
+ApiResult ObjectService::api_put_pipeline_data(const std::string& oid, std::uint64_t offset,
+                                              const std::uint8_t* data, std::size_t len) {
+  std::shared_ptr<PutPipeline> pl;
+  {
+    std::lock_guard lock(mu_);
+    auto it = pipelines_.find(oid);
+    if (it == pipelines_.end()) return fail("not_found", "no pipelined put for oid");
+    pl = it->second;
+  }
+  std::lock_guard plock(pl->mu);
+  if (pl->fd < 0) return fail("store_error", "pipeline staging closed");
+  if (offset != pl->bytes) {
+    return fail("bad_request", "pipeline offset mismatch");
+  }
+  if (pl->expected_size > 0 && offset + len > pl->expected_size) {
+    return fail("bad_request", "pipeline exceeds expected size");
+  }
+  if (len > 0 && data == nullptr) return fail("bad_request", "null pipeline chunk");
+
+  std::size_t done = 0;
+  while (done < len) {
+    const ssize_t n =
+        ::pwrite(pl->fd, data + done, len - done, static_cast<off_t>(offset + done));
+    if (n < 0) {
+      return fail("store_error", std::string("pwrite: ") + std::strerror(errno));
+    }
+    if (n == 0) return fail("store_error", "pwrite short write");
+    done += static_cast<std::size_t>(n);
+  }
+  for (auto& lp : pl->local_peers) {
+    done = 0;
+    while (done < len) {
+      const ssize_t n =
+          ::pwrite(lp.fd, data + done, len - done, static_cast<off_t>(offset + done));
+      if (n < 0) {
+        return fail("store_error", std::string("local peer pwrite: ") + std::strerror(errno));
+      }
+      if (n == 0) return fail("store_error", "local peer pwrite short write");
+      done += static_cast<std::size_t>(n);
+    }
+    lp.crc = crc32c_update(lp.crc, data, len);
+    lp.bytes += len;
+  }
+
+  std::atomic<int> fail_count{0};
+  std::string peer_err;
+  std::mutex err_mu;
+  std::vector<std::thread> workers;
+  workers.reserve(pl->remote_peers.size());
+  for (std::size_t i = 0; i < pl->remote_peers.size(); ++i) {
+    workers.emplace_back([&, i] {
+      if (!pl->remote_peers[i].data(offset, data, len)) {
+        fail_count.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard elock(err_mu);
+        if (peer_err.empty()) peer_err = pl->remote_peers[i].error();
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+  if (fail_count.load() > 0) {
+    return fail("quorum_failed", "stage data failed: " + peer_err);
+  }
+
+  pl->crc = crc32c_update(pl->crc, data, len);
+  pl->bytes += len;
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = pl->placement;
+  return r;
+}
+
+ApiResult ObjectService::api_put_pipeline_abort(const std::string& oid) {
+  std::shared_ptr<PutPipeline> pl;
+  {
+    std::lock_guard lock(mu_);
+    auto it = pipelines_.find(oid);
+    if (it == pipelines_.end()) {
+      ApiResult r;
+      r.ok = true;
+      r.epoch = map_.epoch;
+      return r;
+    }
+    pl = it->second;
+    pipelines_.erase(it);
+  }
+  destroy_pipeline(pl, true);
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  return r;
+}
+
+ApiResult ObjectService::api_put_pipeline_finish(
+    const std::string& oid, const std::unordered_map<std::string, std::string>& attrs,
+    bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+    std::optional<std::uint32_t> expected_crc32c, const std::optional<std::string>& lock_token) {
+  std::shared_ptr<PutPipeline> pl;
+  {
+    std::lock_guard lock(mu_);
+    auto it = pipelines_.find(oid);
+    if (it == pipelines_.end()) return fail("not_found", "no pipelined put for oid");
+    pl = it->second;
+  }
+
+  Placement placement;
+  ObjectLayout layout;
+  std::uint64_t seq = 0;
+  std::uint64_t prev_tip = 0;
+  std::uint64_t size = 0;
+  std::uint32_t crc = 0;
+  std::string staging;
+  {
+    std::unique_lock plock(pl->mu);
+    if (pl->expected_size > 0 && pl->bytes != pl->expected_size) {
+      plock.unlock();
+      api_put_pipeline_abort(oid);
+      return fail("bad_request", "pipeline size mismatch");
+    }
+    if (expected_crc32c && *expected_crc32c != pl->crc) {
+      plock.unlock();
+      api_put_pipeline_abort(oid);
+      return fail("crc_mismatch", "crc32c mismatch");
+    }
+    placement = pl->placement;
+    layout = pl->layout;
+    seq = pl->seq;
+    prev_tip = pl->prev_tip;
+    size = pl->bytes;
+    crc = pl->crc;
+    staging = pl->staging_path;
+    if (pl->fd >= 0) {
+      if (cfg_.data_fsync) ::fsync(pl->fd);
+      ::close(pl->fd);
+      pl->fd = -1;
+    }
+    pl->staging_path.clear();
+  }
+
+  // Never take mu_ while holding pl->mu (abort/finish lock inversion).
+  std::string err;
+  ObjectStore* store = nullptr;
+  {
+    std::lock_guard lock(mu_);
+    if (auto lk = enforce_lock(oid, lock_token); !lk.ok) {
+      api_put_pipeline_abort(oid);
+      return lk;
+    }
+    store = primary_store(placement, err);
+    if (!store) {
+      api_put_pipeline_abort(oid);
+      return fail("store_error", err);
+    }
+    auto pr = check_preds_on(store, oid, preds, err);
+    if (pr == PrecondResult::NotFound) {
+      api_put_pipeline_abort(oid);
+      return fail("not_found", err);
+    }
+    if (pr == PrecondResult::Conflict) {
+      api_put_pipeline_abort(oid);
+      return fail("precondition_failed", err);
+    }
+  }
+
+  auto put_attrs = attrs;
+  apply_layout_attrs(put_attrs, layout);
+  PreparedVersion pv;
+  {
+    std::lock_guard lock(mu_);
+    store = primary_store(placement, err);
+    if (!store) {
+      api_put_pipeline_abort(oid);
+      return fail("store_error", err);
+    }
+    if (!store->prepare_put_file_at_seq(oid, seq, prev_tip, staging, size, crc, put_attrs,
+                                        replace_attrs, expected_crc32c, pv, err)) {
+      api_put_pipeline_abort(oid);
+      if (err == "crc32c mismatch") return fail("crc_mismatch", err);
+      return fail("store_error", err);
+    }
+  }
+
+  // Commit replicas that already have the body staged.
+  std::atomic<int> peer_ok{0};
+  std::string peer_err;
+  std::mutex err_mu;
+  {
+    std::lock_guard plock(pl->mu);
+    std::vector<std::thread> workers;
+    workers.reserve(pl->local_peers.size() + pl->remote_peers.size());
+    for (std::size_t i = 0; i < pl->local_peers.size(); ++i) {
+      workers.emplace_back([&, i] {
+        auto& lp = pl->local_peers[i];
+        if (lp.bytes != size || lp.crc != crc) {
+          std::lock_guard elock(err_mu);
+          if (peer_err.empty()) peer_err = "local peer stage mismatch";
+          return;
+        }
+        if (lp.fd >= 0) {
+          if (cfg_.data_fsync) ::fsync(lp.fd);
+          ::close(lp.fd);
+          lp.fd = -1;
+        }
+        std::string lerr;
+        auto* rs = stores_.get(lp.aios_path);
+        if (!rs) {
+          std::lock_guard elock(err_mu);
+          if (peer_err.empty()) peer_err = "no local replica store";
+          return;
+        }
+        PreparedVersion rv = pv;
+        std::string rel;
+        if (!rs->place_staging_as_version(oid, seq, lp.stage_path, rel, lerr)) {
+          std::lock_guard elock(err_mu);
+          if (peer_err.empty()) peer_err = lerr;
+          return;
+        }
+        lp.stage_path.clear();
+        rv.fs_path = rel;
+        rv.crc_verified = true;
+        if (!rs->install_version(rv, nullptr, 0, put_attrs, lerr)) {
+          std::lock_guard elock(err_mu);
+          if (peer_err.empty()) peer_err = lerr;
+          return;
+        }
+        peer_ok.fetch_add(1, std::memory_order_relaxed);
+      });
+    }
+    for (std::size_t i = 0; i < pl->remote_peers.size(); ++i) {
+      workers.emplace_back([&, i] {
+        if (!pl->remote_peers[i].commit(pv, put_attrs)) {
+          std::lock_guard elock(err_mu);
+          if (peer_err.empty()) peer_err = pl->remote_peers[i].error();
+          return;
+        }
+        peer_ok.fetch_add(1, std::memory_order_relaxed);
+      });
+    }
+    for (auto& w : workers) w.join();
+  }
+
+  const int total_ok = 1 + peer_ok.load();
+  if (total_ok < quorum_need(placement)) {
+    {
+      std::lock_guard lock(mu_);
+      store->abort_version(oid, seq, err);
+      pipelines_.erase(oid);
+      // replicate_* use UnlockForRpc and require mu_ to be held by the caller.
+      replicate_abort(placement, oid, seq);
+    }
+    destroy_pipeline(pl, true);
+    return fail("quorum_failed",
+                peer_err.empty() ? "quorum failed" : ("quorum failed: " + peer_err));
+  }
+
+  {
+    std::lock_guard plock(pl->mu);
+    pl->local_peers.clear();
+    pl->remote_peers.clear();
+  }
+  destroy_pipeline(pl, false);
+
+  ApiResult r;
+  {
+    std::lock_guard lock(mu_);
+    if (!store->publish_tip(oid, seq, err)) {
+      store->abort_version(oid, seq, err);
+      pipelines_.erase(oid);
+      replicate_abort(placement, oid, seq);
+      return fail("store_error", err);
+    }
+    pipelines_.erase(oid);
+    // replicate_* use UnlockForRpc and require mu_ to be held by the caller.
+    replicate_publish(placement, oid, seq);
+    signal_watch(oid, seq, "put");
+    ops_.note_put(size);
+
+    r.ok = true;
+    r.epoch = map_.epoch;
+    r.replicas = total_ok;
+    r.placement = placement;
+    r.attrs = put_attrs;
+    r.info = ObjectInfo{};
+    r.info->oid = oid;
+    r.info->seq = seq;
+    r.info->size = size;
+    r.info->crc32c = crc;
+    r.info->crc32c_known = true;
+    r.info->inline_body = false;
+    r.info->fs_path = pv.fs_path;
+  }
   return r;
 }
 

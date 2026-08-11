@@ -5,6 +5,7 @@
 #include "config.hpp"
 #include "metrics/ops_counters.hpp"
 #include "net/framing.hpp"
+#include "net/object_client.hpp"
 #include "object/locks_watches.hpp"
 #include "object/object_layout.hpp"
 #include "object/pubsub.hpp"
@@ -14,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -73,6 +75,19 @@ class ObjectService {
   // Returns not_primary without creating a file when this node is not primary.
   ApiResult api_begin_put_staging(const std::string& oid, const LayoutRequest& layout,
                                   std::string& staging_abs_out);
+  // Pipelined large PUT: reserve seq, StageBegin on peers, then stream chunks while
+  // the HTTP body arrives. Unsupported for EC / compression (returns not_supported).
+  ApiResult api_begin_put_pipeline(const std::string& oid, const LayoutRequest& layout,
+                                   std::uint64_t expected_size, std::string& staging_abs_out);
+  ApiResult api_put_pipeline_data(const std::string& oid, std::uint64_t offset,
+                                  const std::uint8_t* data, std::size_t len);
+  ApiResult api_put_pipeline_finish(const std::string& oid,
+                                    const std::unordered_map<std::string, std::string>& attrs,
+                                    bool replace_attrs,
+                                    const std::vector<AttrPrecondition>& preds,
+                                    std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                                    const std::optional<std::string>& lock_token = std::nullopt);
+  ApiResult api_put_pipeline_abort(const std::string& oid);
   ApiResult api_put_redirect(const std::string& oid, const std::string& target_oid,
                              const std::unordered_map<std::string, std::string>& attrs,
                              bool replace_attrs, const std::vector<AttrPrecondition>& preds,
@@ -290,6 +305,31 @@ class ObjectService {
                                std::uint64_t seq);
   void close_stage_session(const std::string& key);
 
+  struct PutPipeline {
+    std::mutex mu;
+    std::string oid;
+    std::string staging_path;
+    int fd{-1};
+    std::uint64_t seq{0};
+    std::uint64_t prev_tip{0};
+    std::uint64_t expected_size{0};
+    std::uint64_t bytes{0};
+    std::uint32_t crc{0};
+    Placement placement;
+    ObjectLayout layout;
+    PreparedVersion meta;
+    struct LocalPeer {
+      std::string aios_path;
+      std::string stage_path;
+      int fd{-1};
+      std::uint32_t crc{0};
+      std::uint64_t bytes{0};
+    };
+    std::vector<LocalPeer> local_peers;
+    std::vector<RemoteStageSession> remote_peers;
+  };
+  void destroy_pipeline(const std::shared_ptr<PutPipeline>& pl, bool abort_peers);
+
   Config cfg_;
   ClusterMap& map_;
   LocalStores& stores_;
@@ -301,6 +341,8 @@ class ObjectService {
   TopicHub pubsub_;
   // Keep staging FDs open across ObjectStageData chunks (CRC accumulated here).
   std::unordered_map<std::string, StageSession> stages_;
+  // At most one in-flight pipelined PUT per oid (serializes seq reservation).
+  std::unordered_map<std::string, std::shared_ptr<PutPipeline>> pipelines_;
 };
 
 }  // namespace aios

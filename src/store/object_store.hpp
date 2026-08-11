@@ -153,6 +153,16 @@ class ObjectStore {
                         const std::unordered_map<std::string, std::string>& attrs,
                         bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
                         PreparedVersion& out, std::string& err);
+  // Like prepare_put_file but uses a seq reserved earlier (pipelined upload).
+  bool prepare_put_file_at_seq(const std::string& oid, std::uint64_t seq, std::uint64_t prev_tip,
+                               const std::string& staging_abs_path, std::uint64_t size,
+                               std::uint32_t crc32c_val,
+                               const std::unordered_map<std::string, std::string>& attrs,
+                               bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
+                               PreparedVersion& out, std::string& err);
+  // Peek next seq / tip without inserting (caller must serialize with pipelines_).
+  bool peek_next_seq(const std::string& oid, std::uint64_t& seq_out, std::uint64_t& tip_out,
+                     std::string& err);
 
   // Streaming upload helpers (shard tmp → version path).
   bool create_staging_file(const std::string& oid, std::string& abs_path_out,

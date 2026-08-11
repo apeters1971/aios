@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -989,10 +990,13 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     std::vector<std::uint8_t> body;
     std::string upload_path;
     std::uint32_t upload_crc = 0;
+    bool upload_pipeline = false;
+    std::string upload_pipeline_oid;
     if (content_length > 0 && content_length > kMemThreshold) {
       // Prefer store-local staging for plain PUT /o/{oid} so place() is a rename,
       // not a cross-volume copy out of the process temp directory.
       // With Expect: 100-continue, reject non-primary before the client sends the body.
+      // Pipelined puts overlap peer StageData with the HTTP body read when supported.
       if (method == "PUT") {
         std::string path_only = target;
         const auto qpos = path_only.find('?');
@@ -1002,11 +1006,20 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           const auto slash = rest.find('/');
           if (slash == std::string::npos) {
             const std::string oid = url_decode(rest);
-            if (!oid.empty()) {
+            const bool ranged = !header_get(headers, "content-range").empty();
+            const bool is_redirect = !header_get(headers, "x-aios-redirect").empty();
+            if (!oid.empty() && !ranged && !is_redirect) {
               const LayoutRequest layout_req = layout_request_from_headers(headers);
               std::string staging;
-              auto br = objects_.api_begin_put_staging(oid, layout_req, staging);
-              if (!br.ok && (br.code == "not_primary" || br.code == "not_local")) {
+              auto br = objects_.api_begin_put_pipeline(oid, layout_req, content_length,
+                                                       staging);
+              if (br.ok) {
+                upload_pipeline = true;
+                upload_pipeline_oid = oid;
+              } else if (br.code == "not_supported") {
+                br = objects_.api_begin_put_staging(oid, layout_req, staging);
+                if (br.ok) upload_path = std::move(staging);
+              } else if (br.code == "not_primary" || br.code == "not_local") {
                 if (!want_continue) {
                   // Legacy clients already put the body on the wire; drain so keep-alive
                   // stays usable. Prefer Expect: 100-continue to skip this path.
@@ -1022,66 +1035,136 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                 // Expect clients never send the body after a 307, so keep-alive is safe.
                 write_api_error(*sock, br, target, keep_alive);
                 continue;
+              } else {
+                // Pipeline failed for another reason; try non-pipelined staging.
+                br = objects_.api_begin_put_staging(oid, layout_req, staging);
+                if (!br.ok && (br.code == "not_primary" || br.code == "not_local")) {
+                  if (!want_continue) {
+                    std::vector<std::uint8_t> drain(
+                        std::min(content_length, std::size_t{256 * 1024}));
+                    std::size_t left = content_length;
+                    while (left > 0) {
+                      const auto n = std::min(left, drain.size());
+                      if (!sock_read_exact(*sock, drain.data(), n, ec)) return;
+                      left -= n;
+                    }
+                  }
+                  write_api_error(*sock, br, target, keep_alive);
+                  continue;
+                }
+                if (br.ok) upload_path = std::move(staging);
               }
-              if (br.ok) upload_path = std::move(staging);
             }
           }
         }
       }
-      if (want_continue && !write_100_continue(*sock)) return;
-      int tmp_fd = -1;
-      if (upload_path.empty()) {
-        // Fallback when not a plain object PUT (ranged/txn) or staging unavailable.
-        std::string tmpl =
-            (fs::temp_directory_path() / "aios-upload-XXXXXX").string();
-        std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
-        tmpl_buf.push_back('\0');
-        tmp_fd = ::mkstemp(tmpl_buf.data());
-        if (tmp_fd < 0) {
-          write_json(*sock, 500, "Error", {{"error", "cannot create upload temp"}}, false);
-          return;
-        }
-        upload_path.assign(tmpl_buf.data());
-      } else {
-        tmp_fd = ::open(upload_path.c_str(), O_WRONLY | O_TRUNC, 0644);
-        if (tmp_fd < 0) {
-          fs::remove(upload_path);
-          upload_path.clear();
-          write_json(*sock, 500, "Error", {{"error", "cannot open upload staging"}}, false);
-          return;
-        }
+      if (want_continue && !write_100_continue(*sock)) {
+        if (upload_pipeline) objects_.api_put_pipeline_abort(upload_pipeline_oid);
+        return;
       }
-      std::vector<std::uint8_t> buf(1024 * 1024);
-      std::size_t left = content_length;
-      upload_crc = 0;
-      std::uint32_t crc = 0;
-      bool write_ok = true;
-      while (left > 0) {
-        const auto n = std::min(left, buf.size());
-        if (!sock_read_exact(*sock, buf.data(), n, ec)) {
-          write_ok = false;
-          break;
-        }
-        std::size_t off = 0;
-        while (off < n) {
-          const auto w = ::write(tmp_fd, buf.data() + off, n - off);
-          if (w < 0) {
+      if (upload_pipeline) {
+        // Double-buffer: read the next HTTP chunk while the previous chunk's
+        // local+peer StageData runs, so upload and replication overlap.
+        std::vector<std::uint8_t> buf_a(1024 * 1024), buf_b(1024 * 1024);
+        std::vector<std::uint8_t>* fill = &buf_a;
+        std::vector<std::uint8_t>* send = &buf_b;
+        std::size_t left = content_length;
+        std::uint64_t offset = 0;
+        bool write_ok = true;
+        std::future<ApiResult> inflight;
+        std::size_t inflight_n = 0;
+        while (left > 0) {
+          const auto n = std::min(left, fill->size());
+          if (!sock_read_exact(*sock, fill->data(), n, ec)) {
             write_ok = false;
             break;
           }
-          off += static_cast<std::size_t>(w);
+          if (inflight.valid()) {
+            auto dr = inflight.get();
+            if (!dr.ok) {
+              write_ok = false;
+              break;
+            }
+            offset += inflight_n;
+          }
+          std::swap(fill, send);
+          inflight_n = n;
+          const std::uint64_t chunk_off = offset;
+          const std::string oid = upload_pipeline_oid;
+          auto* payload = send;
+          inflight = std::async(std::launch::async, [this, oid, chunk_off, payload, n] {
+            return objects_.api_put_pipeline_data(oid, chunk_off, payload->data(), n);
+          });
+          left -= n;
         }
-        if (!write_ok) break;
-        crc = crc32c_update(crc, buf.data(), n);
-        left -= n;
+        if (write_ok && inflight.valid()) {
+          auto dr = inflight.get();
+          if (!dr.ok) write_ok = false;
+          else offset += inflight_n;
+        } else if (inflight.valid()) {
+          inflight.wait();
+        }
+        if (!write_ok || left != 0 || offset != content_length) {
+          objects_.api_put_pipeline_abort(upload_pipeline_oid);
+          upload_pipeline = false;
+          upload_pipeline_oid.clear();
+          return;
+        }
+      } else {
+        int tmp_fd = -1;
+        if (upload_path.empty()) {
+          // Fallback when not a plain object PUT (ranged/txn) or staging unavailable.
+          std::string tmpl =
+              (fs::temp_directory_path() / "aios-upload-XXXXXX").string();
+          std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
+          tmpl_buf.push_back('\0');
+          tmp_fd = ::mkstemp(tmpl_buf.data());
+          if (tmp_fd < 0) {
+            write_json(*sock, 500, "Error", {{"error", "cannot create upload temp"}}, false);
+            return;
+          }
+          upload_path.assign(tmpl_buf.data());
+        } else {
+          tmp_fd = ::open(upload_path.c_str(), O_WRONLY | O_TRUNC, 0644);
+          if (tmp_fd < 0) {
+            fs::remove(upload_path);
+            upload_path.clear();
+            write_json(*sock, 500, "Error", {{"error", "cannot open upload staging"}}, false);
+            return;
+          }
+        }
+        std::vector<std::uint8_t> buf(1024 * 1024);
+        std::size_t left = content_length;
+        upload_crc = 0;
+        std::uint32_t crc = 0;
+        bool write_ok = true;
+        while (left > 0) {
+          const auto n = std::min(left, buf.size());
+          if (!sock_read_exact(*sock, buf.data(), n, ec)) {
+            write_ok = false;
+            break;
+          }
+          std::size_t off = 0;
+          while (off < n) {
+            const auto w = ::write(tmp_fd, buf.data() + off, n - off);
+            if (w < 0) {
+              write_ok = false;
+              break;
+            }
+            off += static_cast<std::size_t>(w);
+          }
+          if (!write_ok) break;
+          crc = crc32c_update(crc, buf.data(), n);
+          left -= n;
+        }
+        ::close(tmp_fd);
+        if (!write_ok || left != 0) {
+          fs::remove(upload_path);
+          upload_path.clear();
+          return;
+        }
+        upload_crc = crc;
       }
-      ::close(tmp_fd);
-      if (!write_ok || left != 0) {
-        fs::remove(upload_path);
-        upload_path.clear();
-        return;
-      }
-      upload_crc = crc;
     } else if (content_length > 0) {
       if (want_continue && !write_100_continue(*sock)) return;
       body.resize(content_length);
@@ -2787,6 +2870,11 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         const auto lock_token = lock_token_hdr();
         ApiResult r;
         if (!redirect_to.empty()) {
+          if (upload_pipeline) {
+            objects_.api_put_pipeline_abort(upload_pipeline_oid);
+            upload_pipeline = false;
+            upload_pipeline_oid.clear();
+          }
           if (!cr.empty()) {
             write_json(*sock, 400, "Bad Request",
                        {{"error", "Content-Range not allowed with redirect"}}, keep_alive);
@@ -2842,6 +2930,11 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
           r = objects_.api_put_range(oid, start, body.data(), body.size(), attrs, false,
                                      preds, layout_req, lock_token);
+        } else if (upload_pipeline) {
+          r = objects_.api_put_pipeline_finish(oid, attrs, true, preds, expected_crc,
+                                               lock_token);
+          upload_pipeline = false;
+          upload_pipeline_oid.clear();
         } else if (!upload_path.empty()) {
           r = objects_.api_put_file(oid, upload_path, content_length, upload_crc, attrs, true,
                                     preds, expected_crc, layout_req, lock_token);
@@ -2853,6 +2946,11 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                                expected_crc, layout_req, lock_token);
         }
         if (!r.ok) {
+          if (upload_pipeline) {
+            objects_.api_put_pipeline_abort(upload_pipeline_oid);
+            upload_pipeline = false;
+            upload_pipeline_oid.clear();
+          }
           if (!upload_path.empty()) {
             std::error_code rec;
             fs::remove(upload_path, rec);

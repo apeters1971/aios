@@ -5,6 +5,7 @@
 #include "store/object_store.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -83,6 +84,43 @@ ObjectRpcResult object_install_bytes_remote(
     std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
     const std::unordered_map<std::string, std::string>& attrs, const std::uint8_t* data,
     std::size_t len);
+
+// Sticky ObjectStageBegin/Data/Commit session on one pooled connection (pipelined PUT).
+class RemoteStageSession {
+ public:
+  RemoteStageSession();
+  ~RemoteStageSession();
+  RemoteStageSession(RemoteStageSession&&) noexcept;
+  RemoteStageSession& operator=(RemoteStageSession&&) noexcept;
+  RemoteStageSession(const RemoteStageSession&) = delete;
+  RemoteStageSession& operator=(const RemoteStageSession&) = delete;
+
+  bool begin(const std::string& peer_addr, const std::string& local_node_id,
+             const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+             std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v);
+  bool data(std::uint64_t offset, const std::uint8_t* p, std::size_t n);
+  bool commit(const PreparedVersion& v,
+              const std::unordered_map<std::string, std::string>& attrs);
+  // Best-effort abort + connection drop.
+  void abort();
+
+  bool ok() const { return ok_; }
+  const std::string& error() const { return error_; }
+  const std::string& peer_addr() const { return peer_addr_; }
+  const std::string& aios_path() const { return aios_path_; }
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+  std::string peer_addr_;
+  std::string aios_path_;
+  std::string cluster_key_;
+  int auth_skew_ms_{0};
+  std::uint64_t epoch_{0};
+  PreparedVersion meta_;
+  bool ok_{false};
+  std::string error_;
+};
 
 ObjectRpcResult object_list_remote(const std::string& peer_addr,
                                    const std::string& local_node_id,

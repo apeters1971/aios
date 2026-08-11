@@ -1207,19 +1207,50 @@ bool ObjectStore::place_staging_as_version(const std::string& oid, std::uint64_t
   return true;
 }
 
+bool ObjectStore::peek_next_seq(const std::string& oid, std::uint64_t& seq_out,
+                               std::uint64_t& tip_out, std::string& err) {
+  seq_out = 0;
+  tip_out = 0;
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  Shard& s = *sp;
+  std::lock_guard<std::recursive_mutex> guard(s.mu);
+  if (!tip_seq_locked(s, oid, tip_out, err)) return false;
+  return next_seq_locked(s, oid, seq_out, err);
+}
+
 bool ObjectStore::prepare_put_file(const std::string& oid, const std::string& staging_abs_path,
                                    std::uint64_t size, std::uint32_t crc32c_val,
                                    const std::unordered_map<std::string, std::string>& attrs,
                                    bool replace_attrs,
                                    std::optional<std::uint32_t> expected_crc32c,
                                    PreparedVersion& out, std::string& err) {
+  std::uint64_t seq = 0;
+  std::uint64_t tip = 0;
+  if (!peek_next_seq(oid, seq, tip, err)) return false;
+  return prepare_put_file_at_seq(oid, seq, tip, staging_abs_path, size, crc32c_val, attrs,
+                                 replace_attrs, expected_crc32c, out, err);
+}
+
+bool ObjectStore::prepare_put_file_at_seq(
+    const std::string& oid, std::uint64_t seq, std::uint64_t prev_tip,
+    const std::string& staging_abs_path, std::uint64_t size, std::uint32_t crc32c_val,
+    const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
+    std::optional<std::uint32_t> expected_crc32c, PreparedVersion& out, std::string& err) {
   out = PreparedVersion{};
   if (!is_open()) {
     err = "store not open";
     return false;
   }
-  if (oid.empty()) {
-    err = "empty oid";
+  if (oid.empty() || seq == 0) {
+    err = "empty oid or seq";
     return false;
   }
   if (expected_crc32c.has_value() && *expected_crc32c != crc32c_val) {
@@ -1241,6 +1272,25 @@ bool ObjectStore::prepare_put_file(const std::string& oid, const std::string& st
     rollback(s);
     return false;
   }
+  if (tip != prev_tip) {
+    rollback(s);
+    err = "tip changed during upload";
+    return false;
+  }
+  {
+    ObjectInfo existing;
+    std::string lerr;
+    if (load_version_locked(s, oid, seq, existing, lerr)) {
+      rollback(s);
+      err = "version already exists";
+      return false;
+    }
+    if (lerr != "object not found") {
+      rollback(s);
+      err = lerr;
+      return false;
+    }
+  }
 
   std::unordered_map<std::string, std::string> merged;
   if (replace_attrs) {
@@ -1261,12 +1311,6 @@ bool ObjectStore::prepare_put_file(const std::string& oid, const std::string& st
     merged = attrs;
   }
 
-  std::uint64_t seq = 0;
-  if (!next_seq_locked(s, oid, seq, err)) {
-    rollback(s);
-    return false;
-  }
-
   PreparedVersion pv;
   pv.oid = oid;
   pv.seq = seq;
@@ -1275,6 +1319,7 @@ bool ObjectStore::prepare_put_file(const std::string& oid, const std::string& st
   pv.crc32c = crc32c_val;
   pv.inline_body = false;
   pv.is_delete = false;
+  pv.crc_verified = true;
 
   std::string rel;
   if (!place_staging_as_version(oid, seq, staging_abs_path, rel, err)) {
