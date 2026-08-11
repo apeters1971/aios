@@ -1143,26 +1143,30 @@ bool ObjectStore::stage_truncate(const std::string& abs_path, std::string& err) 
 
 bool ObjectStore::stage_pwrite(const std::string& abs_path, std::uint64_t offset,
                                const std::uint8_t* data, std::size_t len, std::string& err) {
-  FILE* f = std::fopen(abs_path.c_str(), "r+b");
-  if (!f) {
-    f = std::fopen(abs_path.c_str(), "w+b");
-  }
-  if (!f) {
-    err = "cannot open staging file";
+  // Prefer a caller-held FD (ObjectService stage sessions). This path is the
+  // fallback: still avoid stdio open/seek/close thrash via pwrite.
+  int fd = ::open(abs_path.c_str(), O_RDWR | O_CREAT, 0644);
+  if (fd < 0) {
+    err = std::string("cannot open staging file: ") + std::strerror(errno);
     return false;
   }
-  if (fseeko(f, static_cast<off_t>(offset), SEEK_SET) != 0) {
-    std::fclose(f);
-    err = "seek failed";
-    return false;
+  std::size_t done = 0;
+  while (done < len) {
+    const ssize_t n =
+        ::pwrite(fd, data + done, len - done, static_cast<off_t>(offset + done));
+    if (n < 0) {
+      err = std::string("pwrite: ") + std::strerror(errno);
+      ::close(fd);
+      return false;
+    }
+    if (n == 0) {
+      err = "pwrite short write";
+      ::close(fd);
+      return false;
+    }
+    done += static_cast<std::size_t>(n);
   }
-  if (len > 0 && std::fwrite(data, 1, len, f) != len) {
-    std::fclose(f);
-    err = "write failed";
-    return false;
-  }
-  std::fflush(f);
-  std::fclose(f);
+  ::close(fd);
   return true;
 }
 
@@ -1721,15 +1725,17 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
         err = ec ? ("install stat body: " + ec.message()) : "install fs size mismatch";
         return false;
       }
-      std::uint32_t got_crc = 0;
-      if (!crc_file_range(s, pv.fs_path, 0, pv.size, got_crc, err)) {
-        rollback(s);
-        return false;
-      }
-      if (got_crc != pv.crc32c) {
-        rollback(s);
-        err = "install crc32c mismatch";
-        return false;
+      if (!pv.crc_verified) {
+        std::uint32_t got_crc = 0;
+        if (!crc_file_range(s, pv.fs_path, 0, pv.size, got_crc, err)) {
+          rollback(s);
+          return false;
+        }
+        if (got_crc != pv.crc32c) {
+          rollback(s);
+          err = "install crc32c mismatch";
+          return false;
+        }
       }
     } else {
       if (!ensure_fs_size(s, pv.fs_path, 0, err)) {

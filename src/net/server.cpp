@@ -47,6 +47,44 @@ bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
 bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
                  boost::system::error_code& ec) {
   try {
+    // Large raw stage/get-range frames: gather-write header+json and raw to avoid
+    // an extra full-body memcpy through encode_frame's contiguous buffer.
+    if (!frame.raw.empty() || (frame.flags & kFlagRawBody)) {
+      const std::string json = frame.body.dump();
+      if (json.size() > 0xffffffffu) {
+        err = "json too large";
+        return false;
+      }
+      const auto body_len = static_cast<std::uint32_t>(4 + json.size() + frame.raw.size());
+      if (body_len > kMaxBodySize) {
+        err = "frame body too large";
+        return false;
+      }
+      const std::uint16_t flags = static_cast<std::uint16_t>(frame.flags | kFlagRawBody);
+      std::vector<std::uint8_t> head(kHeaderSize + 4 + json.size());
+      std::memcpy(head.data(), kMagic, 4);
+      head[4] = kProtoVersion;
+      head[5] = static_cast<std::uint8_t>(frame.type);
+      const std::uint16_t flags_be = htons(flags);
+      std::memcpy(head.data() + 6, &flags_be, 2);
+      const std::uint32_t len_be = htonl(body_len);
+      std::memcpy(head.data() + 8, &len_be, 4);
+      const std::uint32_t jlen_be = htonl(static_cast<std::uint32_t>(json.size()));
+      std::memcpy(head.data() + kHeaderSize, &jlen_be, 4);
+      if (!json.empty()) {
+        std::memcpy(head.data() + kHeaderSize + 4, json.data(), json.size());
+      }
+      std::array<boost::asio::const_buffer, 2> bufs{
+          boost::asio::buffer(head),
+          boost::asio::buffer(frame.raw),
+      };
+      boost::asio::write(sock, bufs, ec);
+      if (ec) {
+        err = ec.message();
+        return false;
+      }
+      return true;
+    }
     auto bytes = encode_frame(frame);
     boost::asio::write(sock, boost::asio::buffer(bytes), ec);
     if (ec) {
@@ -157,6 +195,8 @@ void TcpServer::do_accept() {
 void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
   boost::system::error_code ec;
   std::string err;
+  sock->set_option(tcp::no_delay(true), ec);
+  ec.clear();
 
   Frame hello;
   if (!read_frame(*sock, hello, err, ec) || hello.type != MsgType::Hello) {

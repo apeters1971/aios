@@ -16,12 +16,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <mutex>
 #include <random>
 #include <span>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 #include <unordered_set>
 #include <vector>
 
@@ -334,10 +338,9 @@ int ObjectService::replicate_install(
   const bool use_file =
       !v.inline_body && !v.is_delete && v.redirect_oid.empty() && v.size > 0 &&
       (!abs_body_path.empty() || (data == nullptr));
-  // Prefer file streaming when body is large or only a path is available.
-  const bool file_stream =
-      use_file && (abs_body_path.empty() == false) &&
-      (data == nullptr || len > 4u * 1024u * 1024u || v.size > 4u * 1024u * 1024u);
+  // Always stage from the FS body when we have a path. The old ">4MiB" gate left
+  // 256KiB–4MiB replicas on base64 ObjectPut (JSON blow-up + huge copies).
+  const bool file_stream = use_file && !abs_body_path.empty();
 
   UnlockForRpc unlock(mu_);
   if (placement.acting_set.size() <= 1) return 0;
@@ -1368,6 +1371,47 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
   return r;
 }
 
+std::string ObjectService::stage_key(const std::string& aios_path, const std::string& oid,
+                                     std::uint64_t seq) {
+  return aios_path + '\n' + oid + '\n' + std::to_string(seq);
+}
+
+void ObjectService::close_stage_session(const std::string& key) {
+  auto it = stages_.find(key);
+  if (it == stages_.end()) return;
+  if (it->second.fd >= 0) ::close(it->second.fd);
+  stages_.erase(it);
+}
+
+ApiResult ObjectService::api_begin_put_staging(const std::string& oid,
+                                              const LayoutRequest& layout_req,
+                                              std::string& staging_abs_out) {
+  staging_abs_out.clear();
+  std::lock_guard lock(mu_);
+  ObjectLayout layout;
+  std::string err;
+  if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
+    return fail("bad_request", err);
+  }
+  auto placement = place(oid, map_, layout.n, layout.storage_class);
+  if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+  if (placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  if (!store->create_staging_file(oid, staging_abs_out, err)) {
+    return fail("store_error", err);
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = map_.epoch;
+  r.placement = placement;
+  return r;
+}
+
 ApiResult ObjectService::api_put_file(
     const std::string& oid, const std::string& staging_abs_path, std::uint64_t size,
     std::uint32_t crc32c_val, const std::unordered_map<std::string, std::string>& attrs,
@@ -2189,6 +2233,16 @@ Frame ObjectService::handle_stage_begin(const nlohmann::json& body) {
   if (!store->stage_truncate(path, err)) {
     return reply_err(map_.epoch, "store_error", err);
   }
+  const std::string key = stage_key(aios_path, oid, seq);
+  close_stage_session(key);
+  StageSession sess;
+  sess.path = path;
+  sess.fd = ::open(path.c_str(), O_RDWR, 0644);
+  if (sess.fd < 0) {
+    return reply_err(map_.epoch, "store_error",
+                     std::string("open staging: ") + std::strerror(errno));
+  }
+  stages_[key] = sess;
   return reply_ok(map_.epoch);
 }
 
@@ -2202,16 +2256,55 @@ Frame ObjectService::handle_stage_data(const Frame& req) {
   if (oid.empty() || aios_path.empty() || seq == 0) {
     return reply_err(map_.epoch, "bad_request", "oid/aios_path/seq required");
   }
-  std::lock_guard lock(mu_);
-  auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
-  std::string path, err;
-  if (!store->stage_path_for(oid, seq, path, err)) {
-    return reply_err(map_.epoch, "store_error", err);
+
+  int fd = -1;
+  std::string path;
+  {
+    std::lock_guard lock(mu_);
+    const std::string key = stage_key(aios_path, oid, seq);
+    auto it = stages_.find(key);
+    if (it == stages_.end() || it->second.fd < 0) {
+      // Fallback for peers that skip begin or after restart.
+      auto* store = stores_.get(aios_path);
+      if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+      std::string err;
+      if (!store->stage_path_for(oid, seq, path, err)) {
+        return reply_err(map_.epoch, "store_error", err);
+      }
+      if (!store->stage_pwrite(path, offset, req.raw.data(), req.raw.size(), err)) {
+        return reply_err(map_.epoch, "store_error", err);
+      }
+      return reply_ok(map_.epoch);
+    }
+    fd = it->second.fd;
+    path = it->second.path;
   }
-  if (!store->stage_pwrite(path, offset, req.raw.data(), req.raw.size(), err)) {
-    return reply_err(map_.epoch, "store_error", err);
+
+  // Disk I/O off mu_ so concurrent stage streams do not serialize on the service lock.
+  std::size_t done = 0;
+  while (done < req.raw.size()) {
+    const ssize_t n = ::pwrite(fd, req.raw.data() + done, req.raw.size() - done,
+                               static_cast<off_t>(offset + done));
+    if (n < 0) {
+      return reply_err(map_.epoch, "store_error",
+                       std::string("pwrite: ") + std::strerror(errno));
+    }
+    if (n == 0) {
+      return reply_err(map_.epoch, "store_error", "pwrite short write");
+    }
+    done += static_cast<std::size_t>(n);
   }
+
+  {
+    std::lock_guard lock(mu_);
+    const std::string key = stage_key(aios_path, oid, seq);
+    auto it = stages_.find(key);
+    if (it != stages_.end()) {
+      it->second.crc = crc32c_update(it->second.crc, req.raw.data(), req.raw.size());
+      it->second.bytes += req.raw.size();
+    }
+  }
+  (void)path;
   return reply_ok(map_.epoch);
 }
 
@@ -2239,11 +2332,31 @@ Frame ObjectService::handle_stage_commit(const nlohmann::json& body) {
   v.redirect_oid = body.value("redirect", "");
   if (v.seq == 0) return reply_err(map_.epoch, "bad_request", "seq required");
 
+  const std::string key = stage_key(aios_path, oid, v.seq);
+  std::string staging;
+  if (auto sit = stages_.find(key); sit != stages_.end()) {
+    if (sit->second.bytes != v.size) {
+      close_stage_session(key);
+      return reply_err(map_.epoch, "store_error", "stage size mismatch");
+    }
+    if (sit->second.crc != v.crc32c) {
+      close_stage_session(key);
+      return reply_err(map_.epoch, "store_error", "stage crc32c mismatch");
+    }
+    v.crc_verified = true;
+    staging = sit->second.path;
+    if (sit->second.fd >= 0) {
+      if (cfg_.data_fsync) ::fsync(sit->second.fd);
+      ::close(sit->second.fd);
+      sit->second.fd = -1;
+    }
+    stages_.erase(sit);
+  }
+
   auto attrs = parse_attrs_json(body);
   std::string err;
   if (!v.is_delete && v.redirect_oid.empty() && v.size > 0) {
-    std::string staging;
-    if (!store->stage_path_for(oid, v.seq, staging, err)) {
+    if (staging.empty() && !store->stage_path_for(oid, v.seq, staging, err)) {
       return reply_err(map_.epoch, "store_error", err);
     }
     std::string rel;
@@ -2251,6 +2364,8 @@ Frame ObjectService::handle_stage_commit(const nlohmann::json& body) {
       return reply_err(map_.epoch, "store_error", err);
     }
     v.fs_path = rel;
+  } else {
+    close_stage_session(key);
   }
   if (!store->install_version(v, nullptr, 0, attrs, err)) {
     return reply_err(map_.epoch, "store_error", err);

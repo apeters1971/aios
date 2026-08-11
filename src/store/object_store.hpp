@@ -88,6 +88,9 @@ struct PreparedVersion {
   std::string fs_path;
   bool is_delete{false};
   std::string redirect_oid;
+  // When true, install_version trusts crc32c/size without re-reading the FS body
+  // (e.g. CRC was accumulated while staging).
+  bool crc_verified{false};
 };
 
 std::uint32_t shard_of_oid(const std::string& oid, std::uint32_t shard_count);

@@ -335,6 +335,18 @@ void write_response(tcp::socket& sock, int status, const std::string& reason,
   }
 }
 
+bool expects_100_continue(const std::unordered_map<std::string, std::string>& headers) {
+  auto exp = header_get(headers, "expect");
+  for (char& c : exp) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return exp.find("100-continue") != std::string::npos;
+}
+
+bool write_100_continue(tcp::socket& sock) {
+  static constexpr char kMsg[] = "HTTP/1.1 100 Continue\r\n\r\n";
+  boost::system::error_code ec;
+  return sock_write_all(sock, kMsg, sizeof(kMsg) - 1, ec);
+}
+
 void write_json(tcp::socket& sock, int status, const std::string& reason,
                 const nlohmann::json& j, bool keep_alive) {
   const auto body = j.dump();
@@ -889,6 +901,10 @@ void HttpServer::do_accept() {
         sessions_.insert(sock);
       }
       set_session_timeouts(*sock, cfg_.http_idle_timeout_ms);
+      {
+        boost::system::error_code nec;
+        sock->set_option(tcp::no_delay(true), nec);
+      }
       // Session I/O is synchronous; run off ioc_ so parallel browser connections
       // (HTML + CSS + JS) are not stalled by keep-alive reads.
       boost::asio::post(workers_, [this, sock] {
@@ -960,24 +976,82 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       return;
     }
 
+    // Header names are lowercased above, values are not; Connection is a token and
+    // clients do send "Keep-Alive" and "Close". Resolve keep-alive before any early
+    // 307 so large wrong-primary redirects can still reuse the socket when drained.
+    auto conn = header_get(headers, "connection");
+    for (char& c : conn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (version == "HTTP/1.0") keep_alive = (conn == "keep-alive");
+    else keep_alive = (conn != "close");
+
+    const bool want_continue = expects_100_continue(headers);
     constexpr std::size_t kMemThreshold = 256u * 1024u;
     std::vector<std::uint8_t> body;
     std::string upload_path;
     std::uint32_t upload_crc = 0;
     if (content_length > 0 && content_length > kMemThreshold) {
-      // Unique per request — now_ms alone collided under concurrent large PUTs and
-      // produced install crc32c mismatch / torn bodies on replicas.
-      std::string tmpl =
-          (fs::temp_directory_path() / "aios-upload-XXXXXX").string();
-      std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
-      tmpl_buf.push_back('\0');
-      const int tmp_fd = ::mkstemp(tmpl_buf.data());
-      if (tmp_fd < 0) {
-        write_json(*sock, 500, "Error", {{"error", "cannot create upload temp"}}, false);
-        return;
+      // Prefer store-local staging for plain PUT /o/{oid} so place() is a rename,
+      // not a cross-volume copy out of the process temp directory.
+      // With Expect: 100-continue, reject non-primary before the client sends the body.
+      if (method == "PUT") {
+        std::string path_only = target;
+        const auto qpos = path_only.find('?');
+        if (qpos != std::string::npos) path_only.resize(qpos);
+        if (path_only.rfind("/o/", 0) == 0) {
+          const std::string rest = path_only.substr(3);
+          const auto slash = rest.find('/');
+          if (slash == std::string::npos) {
+            const std::string oid = url_decode(rest);
+            if (!oid.empty()) {
+              const LayoutRequest layout_req = layout_request_from_headers(headers);
+              std::string staging;
+              auto br = objects_.api_begin_put_staging(oid, layout_req, staging);
+              if (!br.ok && (br.code == "not_primary" || br.code == "not_local")) {
+                if (!want_continue) {
+                  // Legacy clients already put the body on the wire; drain so keep-alive
+                  // stays usable. Prefer Expect: 100-continue to skip this path.
+                  std::vector<std::uint8_t> drain(
+                      std::min(content_length, std::size_t{256 * 1024}));
+                  std::size_t left = content_length;
+                  while (left > 0) {
+                    const auto n = std::min(left, drain.size());
+                    if (!sock_read_exact(*sock, drain.data(), n, ec)) return;
+                    left -= n;
+                  }
+                }
+                // Expect clients never send the body after a 307, so keep-alive is safe.
+                write_api_error(*sock, br, target, keep_alive);
+                continue;
+              }
+              if (br.ok) upload_path = std::move(staging);
+            }
+          }
+        }
       }
-      upload_path.assign(tmpl_buf.data());
-      std::vector<std::uint8_t> buf(256 * 1024);
+      if (want_continue && !write_100_continue(*sock)) return;
+      int tmp_fd = -1;
+      if (upload_path.empty()) {
+        // Fallback when not a plain object PUT (ranged/txn) or staging unavailable.
+        std::string tmpl =
+            (fs::temp_directory_path() / "aios-upload-XXXXXX").string();
+        std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
+        tmpl_buf.push_back('\0');
+        tmp_fd = ::mkstemp(tmpl_buf.data());
+        if (tmp_fd < 0) {
+          write_json(*sock, 500, "Error", {{"error", "cannot create upload temp"}}, false);
+          return;
+        }
+        upload_path.assign(tmpl_buf.data());
+      } else {
+        tmp_fd = ::open(upload_path.c_str(), O_WRONLY | O_TRUNC, 0644);
+        if (tmp_fd < 0) {
+          fs::remove(upload_path);
+          upload_path.clear();
+          write_json(*sock, 500, "Error", {{"error", "cannot open upload staging"}}, false);
+          return;
+        }
+      }
+      std::vector<std::uint8_t> buf(1024 * 1024);
       std::size_t left = content_length;
       upload_crc = 0;
       std::uint32_t crc = 0;
@@ -1009,16 +1083,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
       upload_crc = crc;
     } else if (content_length > 0) {
+      if (want_continue && !write_100_continue(*sock)) return;
       body.resize(content_length);
       if (!sock_read_exact(*sock, body.data(), body.size(), ec)) return;
     }
-
-    // Header names are lowercased above, values are not; Connection is a token and
-    // clients do send "Keep-Alive" and "Close".
-    auto conn = header_get(headers, "connection");
-    for (char& c : conn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (version == "HTTP/1.0") keep_alive = (conn == "keep-alive");
-    else keep_alive = (conn != "close");
 
     std::string path = target;
     std::string query;

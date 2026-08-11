@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -67,6 +68,11 @@ class ObjectService {
                          std::optional<std::uint32_t> expected_crc32c = std::nullopt,
                          const LayoutRequest& layout = {},
                          const std::optional<std::string>& lock_token = std::nullopt);
+  // Allocate a primary-local staging file under the object store (same FS as
+  // versions) so HTTP can spill large bodies without a /tmp → store copy.
+  // Returns not_primary without creating a file when this node is not primary.
+  ApiResult api_begin_put_staging(const std::string& oid, const LayoutRequest& layout,
+                                  std::string& staging_abs_out);
   ApiResult api_put_redirect(const std::string& oid, const std::string& target_oid,
                              const std::unordered_map<std::string, std::string>& attrs,
                              bool replace_attrs, const std::vector<AttrPrecondition>& preds,
@@ -274,6 +280,16 @@ class ObjectService {
   ApiResult ensure_pubsub_topic(const std::string& topic, std::optional<DeliveryMode> mode,
                                 std::size_t capacity, DeliveryMode& mode_out);
 
+  struct StageSession {
+    std::string path;
+    int fd{-1};
+    std::uint32_t crc{0};
+    std::uint64_t bytes{0};
+  };
+  static std::string stage_key(const std::string& aios_path, const std::string& oid,
+                               std::uint64_t seq);
+  void close_stage_session(const std::string& key);
+
   Config cfg_;
   ClusterMap& map_;
   LocalStores& stores_;
@@ -283,6 +299,8 @@ class ObjectService {
   LockTable locks_;
   WatchHub watches_;
   TopicHub pubsub_;
+  // Keep staging FDs open across ObjectStageData chunks (CRC accumulated here).
+  std::unordered_map<std::string, StageSession> stages_;
 };
 
 }  // namespace aios

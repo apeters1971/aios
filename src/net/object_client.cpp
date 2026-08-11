@@ -95,6 +95,8 @@ class ObjectRpcConn {
       close();
       return false;
     }
+    sock_.set_option(tcp::no_delay(true), ec);
+    ec.clear();
     Frame hello;
     hello.type = MsgType::Hello;
     hello.body = {{"node_id", local_node_id}, {"listen", local_listen}};
@@ -534,12 +536,13 @@ ObjectRpcResult object_install_file_remote(
     ObjectRpcPool::instance().release(peer_addr, std::move(conn), false);
     return result;
   }
-  std::vector<std::uint8_t> buf(kStageChunkSize);
+  std::vector<std::uint8_t> raw(kStageChunkSize);
   std::uint64_t offset = 0;
   while (in) {
-    in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+    in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
     const auto n = static_cast<std::size_t>(in.gcount());
     if (n == 0) break;
+    raw.resize(n);
     nlohmann::json chunk = {
         {"epoch", epoch},
         {"aios_path", aios_path},
@@ -548,9 +551,9 @@ ObjectRpcResult object_install_file_remote(
         {"offset", offset},
         {"role", "replica"},
     };
-    std::vector<std::uint8_t> raw(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(n));
     result = rpc_one(conn->socket(), MsgType::ObjectStageData, std::move(chunk), std::move(raw),
                      cluster_key, auth_skew_ms);
+    raw.resize(kStageChunkSize);
     if (!result.ok) {
       ObjectRpcPool::instance().release(peer_addr, std::move(conn),
                                         !rpc_transport_failed(result));

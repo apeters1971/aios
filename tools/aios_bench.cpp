@@ -402,6 +402,7 @@ class HttpSession {
     // Prefer blocking + SO_*TIMEO so a wedged peer cannot stall forever. Asio may
     // leave the socket non-blocking after some reactor paths; force blocking first.
     sock_.non_blocking(false, ec);
+    sock_.set_option(tcp::no_delay(true), ec);
     const int fd = static_cast<int>(sock_.native_handle());
     timeval tv{};
     tv.tv_sec = 30;
@@ -529,39 +530,13 @@ class HttpSession {
                                signed_headers + ", Signature=" + sig;
   }
 
-  HttpResp do_request(const std::string& method, const std::string& target,
-                      const std::uint8_t* body, std::size_t body_len,
-                      const std::unordered_map<std::string, std::string>& extra_headers) {
+  // Avoid uploading large bodies to the wrong replica: wait for 100 Continue (or a
+  // final error/redirect) before sending the payload.
+  static constexpr std::size_t kExpectContinueBytes = 256u * 1024u;
+
+  HttpResp read_http_message(asio::streambuf& buf) {
     HttpResp resp;
-    std::unordered_map<std::string, std::string> headers = extra_headers;
-    headers.erase("authorization");
-    headers.erase("x-aios-date");
-    headers["content-length"] = std::to_string(body_len);
-    add_auth(headers, method, target);
-
-    std::ostringstream req;
-    req << method << ' ' << target << " HTTP/1.1\r\n";
-    req << "Host: " << host_ << ':' << port_ << "\r\n";
-    req << "Connection: keep-alive\r\n";
-    for (const auto& [k, v] : headers) {
-      req << k << ": " << v << "\r\n";
-    }
-    req << "\r\n";
-    const auto head = req.str();
-
     boost::system::error_code ec;
-    asio::write(sock_, asio::buffer(head), ec);
-    if (!ec && body_len > 0) {
-      asio::write(sock_, asio::buffer(body, body_len), ec);
-    }
-    if (ec) {
-      resp.status = -1;
-      resp.error = "write: " + ec.message();
-      close();
-      return resp;
-    }
-
-    asio::streambuf buf;
     asio::read_until(sock_, buf, "\r\n\r\n", ec);
     if (ec && ec != asio::error::eof) {
       resp.status = -1;
@@ -605,6 +580,12 @@ class HttpSession {
       }
     }
 
+    // 1xx responses have no body.
+    if (resp.status >= 100 && resp.status < 200) {
+      if (close_conn || ec == asio::error::eof) close();
+      return resp;
+    }
+
     resp.body.resize(content_length);
     std::size_t have = buf.size();
     if (have > content_length) have = content_length;
@@ -626,6 +607,61 @@ class HttpSession {
 
     if (close_conn || ec == asio::error::eof) close();
     return resp;
+  }
+
+  HttpResp do_request(const std::string& method, const std::string& target,
+                      const std::uint8_t* body, std::size_t body_len,
+                      const std::unordered_map<std::string, std::string>& extra_headers) {
+    HttpResp resp;
+    std::unordered_map<std::string, std::string> headers = extra_headers;
+    headers.erase("authorization");
+    headers.erase("x-aios-date");
+    headers["content-length"] = std::to_string(body_len);
+    const bool use_continue = body_len > kExpectContinueBytes;
+    if (use_continue) headers["Expect"] = "100-continue";
+    add_auth(headers, method, target);
+
+    std::ostringstream req;
+    req << method << ' ' << target << " HTTP/1.1\r\n";
+    req << "Host: " << host_ << ':' << port_ << "\r\n";
+    req << "Connection: keep-alive\r\n";
+    for (const auto& [k, v] : headers) {
+      req << k << ": " << v << "\r\n";
+    }
+    req << "\r\n";
+    const auto head = req.str();
+
+    boost::system::error_code ec;
+    asio::write(sock_, asio::buffer(head), ec);
+    if (ec) {
+      resp.status = -1;
+      resp.error = "write: " + ec.message();
+      close();
+      return resp;
+    }
+
+    if (use_continue) {
+      asio::streambuf buf;
+      resp = read_http_message(buf);
+      if (resp.status < 0) return resp;
+      if (resp.status != 100) {
+        // 307/4xx/5xx before the body — do not upload.
+        return resp;
+      }
+    }
+
+    if (body_len > 0) {
+      asio::write(sock_, asio::buffer(body, body_len), ec);
+      if (ec) {
+        resp.status = -1;
+        resp.error = "write body: " + ec.message();
+        close();
+        return resp;
+      }
+    }
+
+    asio::streambuf buf;
+    return read_http_message(buf);
   }
 
   std::string host_;

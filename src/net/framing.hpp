@@ -35,8 +35,10 @@ constexpr std::uint8_t kProtoVersion = 1;
 constexpr char kMagic[4] = {'A', 'I', 'O', 'S'};
 constexpr std::size_t kHeaderSize = 12;
 // Max TCP++ frame body (JSON or json+raw chunk). Object bodies may be larger via staging.
-constexpr std::size_t kMaxBodySize = 16u * 1024u * 1024u;
-constexpr std::size_t kStageChunkSize = 4u * 1024u * 1024u;
+// Must exceed kStageChunkSize by the [u32be json_len][json] envelope (stage/get-range).
+constexpr std::size_t kMaxBodySize = 32u * 1024u * 1024u;
+// One chunk per typical large object keeps install RTTs down (was 4 MiB).
+constexpr std::size_t kStageChunkSize = 16u * 1024u * 1024u;
 // flags bit0: body is [u32be json_len][json][raw]
 constexpr std::uint16_t kFlagRawBody = 0x0001;
 
