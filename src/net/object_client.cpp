@@ -5,16 +5,19 @@
 #include "util/auth.hpp"
 #include "util/base64.hpp"
 #include "util/crc32c.hpp"
+#include "util/file_io.hpp"
 #include "util/log.hpp"
 
 #include <boost/asio.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -582,8 +585,8 @@ ObjectRpcResult object_install_file_remote(
     return result;
   }
 
-  std::ifstream in(abs_body_path, std::ios::binary);
-  if (!in) {
+  const int in_fd = ::open(abs_body_path.c_str(), O_RDONLY);
+  if (in_fd < 0) {
     result.ok = false;
     result.error = "cannot open " + abs_body_path;
     result.code = "io";
@@ -592,10 +595,19 @@ ObjectRpcResult object_install_file_remote(
   }
   std::vector<std::uint8_t> raw(kStageChunkSize);
   std::uint64_t offset = 0;
-  while (in) {
-    in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
-    const auto n = static_cast<std::size_t>(in.gcount());
-    if (n == 0) break;
+  while (true) {
+    const ssize_t nr = ::read(in_fd, raw.data(), raw.size());
+    if (nr == 0) break;
+    if (nr < 0) {
+      if (errno == EINTR) continue;
+      result.ok = false;
+      result.error = "read " + abs_body_path;
+      result.code = "io";
+      ::close(in_fd);
+      ObjectRpcPool::instance().release(peer_addr, std::move(conn), false);
+      return result;
+    }
+    const auto n = static_cast<std::size_t>(nr);
     raw.resize(n);
     nlohmann::json chunk = {
         {"epoch", epoch},
@@ -609,12 +621,14 @@ ObjectRpcResult object_install_file_remote(
                      cluster_key, auth_skew_ms);
     raw.resize(kStageChunkSize);
     if (!result.ok) {
+      ::close(in_fd);
       ObjectRpcPool::instance().release(peer_addr, std::move(conn),
                                         !rpc_transport_failed(result));
       return result;
     }
     offset += n;
   }
+  ::close(in_fd);
 
   result = stage_begin_commit_envelope(conn, cluster_key, auth_skew_ms, epoch, aios_path, v,
                                        attrs_j, false);
@@ -845,10 +859,17 @@ ObjectRpcResult object_get_file_remote(
   const auto total = st.size;
   const auto seq = st.body.value("seq", static_cast<std::uint64_t>(0));
 
-  std::ofstream out(abs_out_path, std::ios::binary | std::ios::trunc);
-  if (!out) {
+  std::string ferr;
+  if (!file_write_trunc(abs_out_path, nullptr, 0, ferr)) {
     ObjectRpcResult r;
     r.error = "cannot create " + abs_out_path;
+    r.code = "io";
+    return r;
+  }
+  const int out_fd = ::open(abs_out_path.c_str(), O_WRONLY);
+  if (out_fd < 0) {
+    ObjectRpcResult r;
+    r.error = "cannot open " + abs_out_path;
     r.code = "io";
     return r;
   }
@@ -860,9 +881,13 @@ ObjectRpcResult object_get_file_remote(
     auto chunk =
         object_get_range_remote(peer_addr, local_node_id, local_listen, cluster_key,
                                 auth_skew_ms, epoch, aios_path, oid, offset, n, seq);
-    if (!chunk.ok) return chunk;
+    if (!chunk.ok) {
+      ::close(out_fd);
+      return chunk;
+    }
     const auto& bytes = !chunk.raw.empty() ? chunk.raw : (chunk.data ? *chunk.data : chunk.raw);
     if (bytes.size() != n && offset + bytes.size() != total && bytes.empty()) {
+      ::close(out_fd);
       ObjectRpcResult r;
       r.ok = false;
       r.error = "empty get range";
@@ -870,14 +895,20 @@ ObjectRpcResult object_get_file_remote(
       return r;
     }
     if (!bytes.empty()) {
-      out.write(reinterpret_cast<const char*>(bytes.data()),
-                static_cast<std::streamsize>(bytes.size()));
+      if (!file_write_all_fd(out_fd, bytes.data(), bytes.size(), ferr)) {
+        ::close(out_fd);
+        ObjectRpcResult r;
+        r.ok = false;
+        r.error = ferr;
+        r.code = "io";
+        return r;
+      }
       offset += bytes.size();
     } else {
       break;
     }
   }
-  out.close();
+  ::close(out_fd);
   ObjectRpcResult r;
   r.ok = (offset == total);
   r.epoch = st.epoch;

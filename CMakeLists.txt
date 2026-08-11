@@ -157,6 +157,7 @@ add_library(aios_core STATIC
   src/util/auth.cpp
   src/util/base64.cpp
   src/util/crc32c.cpp
+  src/util/file_io.cpp
   src/util/compression.cpp
   src/util/aes_gcm.cpp
   src/store/object_store.cpp

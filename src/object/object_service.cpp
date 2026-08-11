@@ -10,6 +10,7 @@
 #include "util/base64.hpp"
 #include "util/compression.hpp"
 #include "util/crc32c.hpp"
+#include "util/file_io.hpp"
 #include "util/log.hpp"
 
 #include <utility>
@@ -20,7 +21,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -93,16 +93,11 @@ bool decompress_api_result(ApiResult& r, std::string& err, std::uint64_t max_obj
       err = "compressed object has no body";
       return false;
     }
-    std::ifstream in(r.body_path, std::ios::binary);
-    if (!in) {
-      err = "cannot open compressed body";
+    std::vector<std::uint8_t> stored;
+    if (!file_read_all(r.body_path, stored, err)) {
+      if (err.empty()) err = "cannot open compressed body";
       return false;
     }
-    in.seekg(0, std::ios::end);
-    const auto sz = static_cast<std::size_t>(in.tellg());
-    in.seekg(0);
-    std::vector<std::uint8_t> stored(sz);
-    if (sz) in.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(sz));
     r.data = std::move(stored);
     r.body_path.clear();
   }
@@ -283,14 +278,9 @@ bool ObjectService::local_install_file(
     // Always copy — source path is shared across replica installs / primary body.
     std::string staging;
     if (!store->create_staging_file(v.oid, staging, err)) return false;
-    {
-      std::ifstream in(abs_body_path, std::ios::binary);
-      std::ofstream out(staging, std::ios::binary | std::ios::trunc);
-      if (!in || !out) {
-        err = "copy staging failed";
-        return false;
-      }
-      out << in.rdbuf();
+    if (!file_copy(abs_body_path, staging, err)) {
+      err = "copy staging failed";
+      return false;
     }
     if (!store->place_staging_as_version(v.oid, v.seq, staging, rel, err)) return false;
     pv.fs_path = rel;
@@ -357,16 +347,13 @@ int ObjectService::replicate_install(
   if (data != nullptr && len == v.size && len > 0) {
     use_shared = true;
   } else if (file_stream && v.size > 0 && v.size <= kSharedFanoutMax) {
-    auto buf = std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(v.size));
-    std::ifstream in(abs_body_path, std::ios::binary);
-    if (in && v.size > 0) {
-      in.read(reinterpret_cast<char*>(buf->data()), static_cast<std::streamsize>(v.size));
-      if (static_cast<std::uint64_t>(in.gcount()) == v.size) {
-        shared_body = std::move(buf);
-        fanout = shared_body->data();
-        fanout_len = shared_body->size();
-        use_shared = true;
-      }
+    auto buf = std::make_shared<std::vector<std::uint8_t>>();
+    std::string rerr;
+    if (file_read_exact(abs_body_path, static_cast<std::size_t>(v.size), *buf, rerr)) {
+      shared_body = std::move(buf);
+      fanout = shared_body->data();
+      fanout_len = shared_body->size();
+      use_shared = true;
     }
   }
 
@@ -1928,14 +1915,9 @@ ApiResult ObjectService::api_put_file(
         return fail("bad_request", "ec v1 supports objects up to 16 MiB");
       }
     }
-    std::ifstream in(staging_abs_path, std::ios::binary);
-    if (!in) return fail("store_error", "cannot open staging file");
-    std::vector<std::uint8_t> buf(static_cast<std::size_t>(size));
-    if (size > 0) {
-      in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(size));
-      if (static_cast<std::uint64_t>(in.gcount()) != size) {
-        return fail("store_error", "short read of staging file");
-      }
+    std::vector<std::uint8_t> buf;
+    if (!file_read_exact(staging_abs_path, static_cast<std::size_t>(size), buf, err)) {
+      return fail("store_error", err.empty() ? "cannot read staging file" : err);
     }
     PutPayload payload;
     if (!prepare_put_payload(cfg_, ops_, buf.data(), buf.size(),

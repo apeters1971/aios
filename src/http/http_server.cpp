@@ -16,6 +16,7 @@
 #include "util/auth.hpp"
 #include "util/base64.hpp"
 #include "util/crc32c.hpp"
+#include "util/file_io.hpp"
 #include "util/log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -24,6 +25,12 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#ifdef __APPLE__
+#include <sys/uio.h>
+#else
+#include <sys/sendfile.h>
+#endif
 
 #include <cerrno>
 
@@ -31,7 +38,6 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <future>
 #include <limits>
 #include <optional>
@@ -391,6 +397,69 @@ void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
                  keep_alive);
 }
 
+// Stream a regular file to an already-connected TCP socket. Prefer sendfile
+// (no userspace bounce); fall back to read+send. Avoids iostreams on the hot path.
+bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t size,
+                    boost::system::error_code& ec) {
+  const int out_fd = static_cast<int>(sock.native_handle());
+  std::uint64_t sent = 0;
+
+#if defined(__APPLE__)
+  while (sent < size) {
+    off_t len = static_cast<off_t>(size - sent);
+    const off_t offset = static_cast<off_t>(sent);
+    if (::sendfile(in_fd, out_fd, offset, &len, nullptr, 0) == 0) {
+      if (len <= 0) break;
+      sent += static_cast<std::uint64_t>(len);
+      continue;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+    break;  // fall back for the remainder
+  }
+#elif defined(__linux__)
+  while (sent < size) {
+    off_t offset = static_cast<off_t>(sent);
+    const auto n = ::sendfile(out_fd, in_fd, &offset,
+                              static_cast<std::size_t>(size - sent));
+    if (n > 0) {
+      sent += static_cast<std::uint64_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    break;
+  }
+#endif
+
+  if (sent == size) {
+    ec = {};
+    return true;
+  }
+
+  // Remaining bytes (or full body if sendfile unavailable/unsupported).
+  if (sent > 0 && ::lseek(in_fd, static_cast<off_t>(sent), SEEK_SET) < 0) {
+    ec = boost::system::error_code(errno, boost::system::system_category());
+    return false;
+  }
+  std::vector<char> buf(256 * 1024);
+  while (sent < size) {
+    const auto chunk = static_cast<std::size_t>(
+        std::min<std::uint64_t>(size - sent, static_cast<std::uint64_t>(buf.size())));
+    const auto n = ::read(in_fd, buf.data(), chunk);
+    if (n > 0) {
+      if (!sock_write_all(sock, buf.data(), static_cast<std::size_t>(n), ec)) return false;
+      sent += static_cast<std::uint64_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    ec = boost::system::error_code(n == 0 ? EIO : errno, boost::system::system_category());
+    return false;
+  }
+  ec = {};
+  return true;
+}
+
 bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
                      std::unordered_map<std::string, std::string> headers,
                      const std::string& path, std::uint64_t size, bool head_only,
@@ -410,20 +479,12 @@ bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
   boost::system::error_code ec;
   if (!sock_write_all(sock, head.data(), head.size(), ec)) return false;
   if (head_only || size == 0) return true;
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return false;
-  std::vector<char> buf(256 * 1024);
-  std::uint64_t left = size;
-  while (left > 0 && in) {
-    const auto chunk = static_cast<std::streamsize>(
-        std::min<std::uint64_t>(left, static_cast<std::uint64_t>(buf.size())));
-    in.read(buf.data(), chunk);
-    const auto n = in.gcount();
-    if (n <= 0) break;
-    if (!sock_write_all(sock, buf.data(), static_cast<std::size_t>(n), ec)) return false;
-    left -= static_cast<std::uint64_t>(n);
-  }
-  return left == 0;
+
+  const int in_fd = ::open(path.c_str(), O_RDONLY);
+  if (in_fd < 0) return false;
+  const bool ok = sock_send_file(sock, in_fd, size, ec);
+  ::close(in_fd);
+  return ok;
 }
 
 void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& path_q,
@@ -581,14 +642,14 @@ bool serve_admin_static(tcp::socket& sock, const std::string& path, bool keep_al
     write_json(sock, 404, "Not Found", {{"error", "asset missing"}}, keep_alive);
     return true;
   }
-  std::ifstream in(file, std::ios::binary);
-  if (!in) {
+  std::vector<std::uint8_t> data;
+  std::string rerr;
+  if (!file_read_all(file.string(), data, rerr)) {
     write_json(sock, 404, "Not Found", {{"error", "asset unreadable"}}, keep_alive);
     return true;
   }
-  std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   write_response(sock, 200, "OK", {{"Content-Type", admin_static_content_type(rel)}},
-                 reinterpret_cast<const std::uint8_t*>(data.data()), data.size(), keep_alive);
+                 data.data(), data.size(), keep_alive);
   return true;
 }
 
@@ -2364,11 +2425,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         if (!upload_path.empty()) {
           // Bodies past the 256 KiB spill threshold are on disk, but the publish
           // limit is 1 MiB: read it back instead of rejecting a legal message.
-          std::ifstream in(upload_path, std::ios::binary);
-          std::string raw((std::istreambuf_iterator<char>(in)),
-                          std::istreambuf_iterator<char>());
-          const bool read_ok = static_cast<bool>(in) || in.eof();
-          in.close();
+          std::vector<std::uint8_t> raw;
+          std::string rerr;
+          const bool read_ok = file_read_all(upload_path, raw, rerr);
           std::error_code rec;
           fs::remove(upload_path, rec);
           upload_path.clear();
@@ -2376,7 +2435,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             write_json(*sock, 500, "Error", {{"error", "cannot read upload temp"}}, keep_alive);
             continue;
           }
-          body.assign(raw.begin(), raw.end());
+          body = std::move(raw);
         }
         std::optional<DeliveryMode> mode = parse_delivery();
         if (qmap.count("delivery") && !mode) {
@@ -2708,10 +2767,14 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                        keep_alive);
             continue;
           }
-          std::ifstream in(upload_path, std::ios::binary);
-          body.resize(content_length);
-          in.read(reinterpret_cast<char*>(body.data()),
-                  static_cast<std::streamsize>(content_length));
+          std::string rerr;
+          if (!file_read_exact(upload_path, content_length, body, rerr)) {
+            std::error_code rec;
+            fs::remove(upload_path, rec);
+            upload_path.clear();
+            write_json(*sock, 500, "Error", {{"error", "read upload temp"}}, keep_alive);
+            continue;
+          }
           std::error_code rec;
           fs::remove(upload_path, rec);
           upload_path.clear();
@@ -2897,17 +2960,17 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                          {{"error", "ranged PUT patch too large"}}, keep_alive);
               continue;
             }
-            std::ifstream in(upload_path, std::ios::binary);
-            body.resize(content_length);
-            in.read(reinterpret_cast<char*>(body.data()),
-                    static_cast<std::streamsize>(content_length));
-            std::error_code rec;
-            fs::remove(upload_path, rec);
-            upload_path.clear();
-            if (!in) {
+            std::string rerr;
+            if (!file_read_exact(upload_path, content_length, body, rerr)) {
+              std::error_code rec;
+              fs::remove(upload_path, rec);
+              upload_path.clear();
               write_json(*sock, 500, "Error", {{"error", "read upload temp"}}, keep_alive);
               continue;
             }
+            std::error_code rec;
+            fs::remove(upload_path, rec);
+            upload_path.clear();
           }
           std::uint64_t start = 0, end = 0;
           std::string perr;

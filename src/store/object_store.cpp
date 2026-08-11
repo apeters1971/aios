@@ -2,6 +2,7 @@
 
 #include "store/fs_clone.hpp"
 #include "util/crc32c.hpp"
+#include "util/file_io.hpp"
 #include "util/log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -1100,12 +1101,9 @@ bool ObjectStore::create_staging_file(const std::string& oid, std::string& abs_p
   const fs::path tmp = fs::path(sp->dir) / "tmp" / name;
   std::error_code ec;
   fs::create_directories(tmp.parent_path(), ec);
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out) {
-      err = "cannot create staging file";
-      return false;
-    }
+  if (!file_create_empty(tmp.string(), err)) {
+    err = "cannot create staging file";
+    return false;
   }
   abs_path_out = tmp.string();
   return true;
@@ -1133,8 +1131,7 @@ bool ObjectStore::stage_path_for(const std::string& oid, std::uint64_t seq,
 }
 
 bool ObjectStore::stage_truncate(const std::string& abs_path, std::string& err) {
-  std::ofstream out(abs_path, std::ios::binary | std::ios::trunc);
-  if (!out) {
+  if (!file_truncate(abs_path, err)) {
     err = "cannot truncate staging file";
     return false;
   }
@@ -2076,19 +2073,11 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get(const std::string& oid
   std::lock_guard<std::recursive_mutex> guard(s.mu);
 
   if (!info->fs_path.empty()) {
-    std::ifstream in(fs::path(s.dir) / info->fs_path, std::ios::binary);
-    if (!in) {
-      err = "cannot open fs object: " + info->fs_path;
+    const auto abs = (fs::path(s.dir) / info->fs_path).string();
+    std::vector<std::uint8_t> out;
+    if (!file_read_exact(abs, static_cast<std::size_t>(info->size), out, err)) {
+      if (err.empty()) err = "cannot open fs object: " + info->fs_path;
       return std::nullopt;
-    }
-    std::vector<std::uint8_t> out(static_cast<std::size_t>(info->size));
-    if (info->size > 0) {
-      in.read(reinterpret_cast<char*>(out.data()),
-              static_cast<std::streamsize>(info->size));
-      if (!in) {
-        err = "short read on fs object";
-        return std::nullopt;
-      }
     }
     return out;
   }

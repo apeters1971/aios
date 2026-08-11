@@ -7,10 +7,10 @@
 #include "net/object_client.hpp"
 #include "object/object_layout.hpp"
 #include "util/crc32c.hpp"
+#include "util/file_io.hpp"
 #include "util/log.hpp"
 
 #include <filesystem>
-#include <fstream>
 #include <unordered_map>
 #include <vector>
 
@@ -178,18 +178,12 @@ bool push_replica(const Config& cfg, const std::string& advertise, const Cluster
       ok = store->install_version(pv, nullptr, 0, attrs, err);
     } else if (have_file) {
       std::string staging;
-      if (store->create_staging_file(oid, staging, err)) {
-        std::ifstream in(body_path, std::ios::binary);
-        std::ofstream out(staging, std::ios::binary | std::ios::trunc);
-        if (in && out) {
-          out << in.rdbuf();
-          out.close();
-          std::string rel;
-          if (store->place_staging_as_version(oid, pv.seq, staging, rel, err)) {
-            pv.fs_path = rel;
-            pv.inline_body = false;
-            ok = store->install_version(pv, nullptr, 0, attrs, err);
-          }
+      if (store->create_staging_file(oid, staging, err) && file_copy(body_path, staging, err)) {
+        std::string rel;
+        if (store->place_staging_as_version(oid, pv.seq, staging, rel, err)) {
+          pv.fs_path = rel;
+          pv.inline_body = false;
+          ok = store->install_version(pv, nullptr, 0, attrs, err);
         }
       }
     } else {
