@@ -46,7 +46,43 @@ struct Frame {
   MsgType type{MsgType::Ping};
   std::uint16_t flags{0};
   nlohmann::json body = nlohmann::json::object();
-  std::vector<std::uint8_t> raw;  // optional binary trailer (ObjectPutRange)
+  // Optional binary trailer (ObjectStageData / ObjectPutRange / ranged get).
+  // When raw_off > 0, `raw` owns [json envelope][payload] and the payload starts
+  // at raw_off — used by read_frame to avoid a full-body memcpy on decode.
+  // raw_ext_* references caller-owned bytes for zero-copy sends (shared fan-out).
+  std::vector<std::uint8_t> raw;
+  std::size_t raw_off{0};
+  const std::uint8_t* raw_ext{nullptr};
+  std::size_t raw_ext_len{0};
+
+  const std::uint8_t* raw_data() const noexcept {
+    if (raw_ext) return raw_ext_len ? raw_ext : nullptr;
+    return raw.size() <= raw_off ? nullptr : raw.data() + raw_off;
+  }
+  std::size_t raw_size() const noexcept {
+    if (raw_ext) return raw_ext_len;
+    return raw.size() <= raw_off ? 0 : raw.size() - raw_off;
+  }
+  bool raw_empty() const noexcept { return raw_size() == 0; }
+
+  void clear_raw() {
+    raw.clear();
+    raw_off = 0;
+    raw_ext = nullptr;
+    raw_ext_len = 0;
+  }
+
+  // Slide payload to offset 0 (memmove). Call before handing `raw` to APIs that
+  // expect a bare buffer.
+  void compact_raw() {
+    if (raw_off == 0) return;
+    if (raw_off >= raw.size()) {
+      clear_raw();
+      return;
+    }
+    raw.erase(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(raw_off));
+    raw_off = 0;
+  }
 };
 
 // Encode frame into bytes (header + body).

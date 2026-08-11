@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <span>
@@ -345,6 +346,29 @@ int ObjectService::replicate_install(
   UnlockForRpc unlock(mu_);
   if (placement.acting_set.size() <= 1) return 0;
 
+  // One primary read shared by all replica workers (avoids 2× re-read for r=3).
+  // Cap keeps huge objects on the per-peer file stream path.
+  constexpr std::uint64_t kSharedFanoutMax = 256ull * 1024ull * 1024ull;
+  std::shared_ptr<const std::vector<std::uint8_t>> shared_body;
+  const std::uint8_t* fanout = data;
+  std::size_t fanout_len = len;
+  bool use_shared = false;
+  if (data != nullptr && len == v.size && len > 0) {
+    use_shared = true;
+  } else if (file_stream && v.size > 0 && v.size <= kSharedFanoutMax) {
+    auto buf = std::make_shared<std::vector<std::uint8_t>>(static_cast<std::size_t>(v.size));
+    std::ifstream in(abs_body_path, std::ios::binary);
+    if (in && v.size > 0) {
+      in.read(reinterpret_cast<char*>(buf->data()), static_cast<std::streamsize>(v.size));
+      if (static_cast<std::uint64_t>(in.gcount()) == v.size) {
+        shared_body = std::move(buf);
+        fanout = shared_body->data();
+        fanout_len = shared_body->size();
+        use_shared = true;
+      }
+    }
+  }
+
   std::atomic<int> ok{0};
   std::vector<std::thread> workers;
   workers.reserve(placement.acting_set.size() - 1);
@@ -354,7 +378,9 @@ int ObjectService::replicate_install(
       if (t.node_id == cfg_.node_id) {
         std::string err;
         bool done = false;
-        if (file_stream) {
+        if (use_shared) {
+          done = local_install(t.aios_path, v, fanout, fanout_len, attrs, err);
+        } else if (file_stream) {
           done = local_install_file(t.aios_path, v, abs_body_path, attrs, err);
         } else {
           done = local_install(t.aios_path, v, data, len, attrs, err);
@@ -368,7 +394,11 @@ int ObjectService::replicate_install(
         return;
       }
       ObjectRpcResult r;
-      if (file_stream) {
+      if (use_shared) {
+        r = object_install_bytes_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                        cfg_.auth_skew_ms, placement.epoch, t.aios_path, v,
+                                        attrs, fanout, fanout_len);
+      } else if (file_stream) {
         r = object_install_file_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
                                        cfg_.auth_skew_ms, placement.epoch, t.aios_path, v,
                                        attrs, abs_body_path);
@@ -782,13 +812,13 @@ Frame ObjectService::handle_put_range(const Frame& req) {
     return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
   }
 
-  const auto* data = req.raw.data();
-  const auto len = req.raw.size();
+  const auto* data = req.raw_data();
+  const auto len = req.raw_size();
   auto attrs = parse_attrs_json(body);
 
   if (body.contains("range_crc32c") && !body["range_crc32c"].is_null()) {
     const auto expect = body.value("range_crc32c", 0u);
-    if (crc32c(data, len) != expect) {
+    if (!data || crc32c(data, len) != expect) {
       return reply_err(map_.epoch, "crc_mismatch", "range crc32c mismatch");
     }
   }
@@ -2271,8 +2301,10 @@ Frame ObjectService::handle_stage_data(const Frame& req) {
       if (!store->stage_path_for(oid, seq, path, err)) {
         return reply_err(map_.epoch, "store_error", err);
       }
-      if (!store->stage_pwrite(path, offset, req.raw.data(), req.raw.size(), err)) {
-        return reply_err(map_.epoch, "store_error", err);
+      const auto* pdata = req.raw_data();
+      const auto plen = req.raw_size();
+      if (!pdata || !store->stage_pwrite(path, offset, pdata, plen, err)) {
+        return reply_err(map_.epoch, "store_error", err.empty() ? "empty stage chunk" : err);
       }
       return reply_ok(map_.epoch);
     }
@@ -2280,10 +2312,16 @@ Frame ObjectService::handle_stage_data(const Frame& req) {
     path = it->second.path;
   }
 
+  const auto* pdata = req.raw_data();
+  const auto plen = req.raw_size();
+  if (!pdata && plen > 0) {
+    return reply_err(map_.epoch, "store_error", "empty stage chunk");
+  }
+
   // Disk I/O off mu_ so concurrent stage streams do not serialize on the service lock.
   std::size_t done = 0;
-  while (done < req.raw.size()) {
-    const ssize_t n = ::pwrite(fd, req.raw.data() + done, req.raw.size() - done,
+  while (done < plen) {
+    const ssize_t n = ::pwrite(fd, pdata + done, plen - done,
                                static_cast<off_t>(offset + done));
     if (n < 0) {
       return reply_err(map_.epoch, "store_error",
@@ -2300,8 +2338,8 @@ Frame ObjectService::handle_stage_data(const Frame& req) {
     const std::string key = stage_key(aios_path, oid, seq);
     auto it = stages_.find(key);
     if (it != stages_.end()) {
-      it->second.crc = crc32c_update(it->second.crc, req.raw.data(), req.raw.size());
-      it->second.bytes += req.raw.size();
+      it->second.crc = crc32c_update(it->second.crc, pdata, plen);
+      it->second.bytes += plen;
     }
   }
   (void)path;

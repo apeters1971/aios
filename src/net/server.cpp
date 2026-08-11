@@ -13,6 +13,7 @@ namespace aios {
 
 bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
                 boost::system::error_code& ec) {
+  out = Frame{};
   std::array<std::uint8_t, kHeaderSize> header{};
   boost::asio::read(sock, boost::asio::buffer(header), ec);
   if (ec) {
@@ -23,6 +24,14 @@ bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
     err = "bad magic";
     return false;
   }
+  if (header[4] != kProtoVersion) {
+    err = "unsupported version";
+    return false;
+  }
+  const auto type = static_cast<MsgType>(header[5]);
+  std::uint16_t flags_be = 0;
+  std::memcpy(&flags_be, header.data() + 6, 2);
+  const std::uint16_t flags = ntohs(flags_be);
   std::uint32_t len_be = 0;
   std::memcpy(&len_be, header.data() + 8, 4);
   const std::uint32_t body_len = ntohl(len_be);
@@ -30,18 +39,56 @@ bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
     err = "body too large";
     return false;
   }
-  std::vector<std::uint8_t> buf(kHeaderSize + body_len);
-  std::memcpy(buf.data(), header.data(), kHeaderSize);
+
+  std::vector<std::uint8_t> body(body_len);
   if (body_len > 0) {
-    boost::asio::read(sock, boost::asio::buffer(buf.data() + kHeaderSize, body_len),
-                      ec);
+    boost::asio::read(sock, boost::asio::buffer(body), ec);
     if (ec) {
       err = ec.message();
       return false;
     }
   }
-  std::size_t consumed = 0;
-  return decode_frame(buf.data(), buf.size(), out, consumed, err);
+
+  nlohmann::json json_body = nlohmann::json::object();
+  if (flags & kFlagRawBody) {
+    if (body_len < 4) {
+      err = "raw body missing json_len";
+      return false;
+    }
+    std::uint32_t jlen_be = 0;
+    std::memcpy(&jlen_be, body.data(), 4);
+    const std::uint32_t jlen = ntohl(jlen_be);
+    if (4u + jlen > body_len) {
+      err = "raw body json_len overflow";
+      return false;
+    }
+    if (jlen > 0) {
+      try {
+        json_body = nlohmann::json::parse(reinterpret_cast<const char*>(body.data() + 4),
+                                          reinterpret_cast<const char*>(body.data() + 4 + jlen));
+      } catch (const std::exception& e) {
+        err = std::string("json parse: ") + e.what();
+        return false;
+      }
+    }
+    // Keep the recv buffer; payload starts after the JSON envelope (no memcpy).
+    out.raw = std::move(body);
+    out.raw_off = 4u + jlen;
+  } else if (body_len > 0) {
+    try {
+      json_body = nlohmann::json::parse(reinterpret_cast<const char*>(body.data()),
+                                        reinterpret_cast<const char*>(body.data() + body_len));
+    } catch (const std::exception& e) {
+      err = std::string("json parse: ") + e.what();
+      return false;
+    }
+  }
+
+  out.type = type;
+  out.flags = flags;
+  out.body = std::move(json_body);
+  err.clear();
+  return true;
 }
 
 bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
@@ -49,13 +96,14 @@ bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
   try {
     // Large raw stage/get-range frames: gather-write header+json and raw to avoid
     // an extra full-body memcpy through encode_frame's contiguous buffer.
-    if (!frame.raw.empty() || (frame.flags & kFlagRawBody)) {
+    if (!frame.raw_empty() || (frame.flags & kFlagRawBody)) {
       const std::string json = frame.body.dump();
       if (json.size() > 0xffffffffu) {
         err = "json too large";
         return false;
       }
-      const auto body_len = static_cast<std::uint32_t>(4 + json.size() + frame.raw.size());
+      const auto raw_n = frame.raw_size();
+      const auto body_len = static_cast<std::uint32_t>(4 + json.size() + raw_n);
       if (body_len > kMaxBodySize) {
         err = "frame body too large";
         return false;
@@ -74,11 +122,15 @@ bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
       if (!json.empty()) {
         std::memcpy(head.data() + kHeaderSize + 4, json.data(), json.size());
       }
-      std::array<boost::asio::const_buffer, 2> bufs{
-          boost::asio::buffer(head),
-          boost::asio::buffer(frame.raw),
-      };
-      boost::asio::write(sock, bufs, ec);
+      if (raw_n == 0) {
+        boost::asio::write(sock, boost::asio::buffer(head), ec);
+      } else {
+        std::array<boost::asio::const_buffer, 2> bufs{
+            boost::asio::buffer(head),
+            boost::asio::buffer(frame.raw_data(), raw_n),
+        };
+        boost::asio::write(sock, bufs, ec);
+      }
       if (ec) {
         err = ec.message();
         return false;

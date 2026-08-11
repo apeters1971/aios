@@ -37,7 +37,8 @@ TEST(FramingRaw, RoundTrip) {
   EXPECT_TRUE((out.flags & kFlagRawBody) != 0) << "raw flag set";
   EXPECT_TRUE(out.body.value("oid", "") == "raw-obj") << "json oid";
   EXPECT_TRUE(out.body.value("offset", static_cast<std::uint64_t>(0)) == 4) << "json offset";
-  EXPECT_TRUE(std::string(out.raw.begin(), out.raw.end()) == raw_bytes) << "raw bytes roundtrip";
+  EXPECT_TRUE(std::string(out.raw_data(), out.raw_data() + out.raw_size()) == raw_bytes)
+      << "raw bytes roundtrip";
 
   EXPECT_TRUE(std::string(msg_type_name(MsgType::ObjectPublishTip)) == "ObjectPublishTip") << "msg ObjectPublishTip";
   EXPECT_TRUE(std::string(msg_type_name(MsgType::ObjectAbortVersion)) == "ObjectAbortVersion") << "msg ObjectAbortVersion";

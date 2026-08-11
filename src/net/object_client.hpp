@@ -76,6 +76,14 @@ ObjectRpcResult object_install_file_remote(
     const std::unordered_map<std::string, std::string>& attrs,
     const std::string& abs_body_path);
 
+// Stage from an already-buffered body (shared fan-out after one primary read).
+ObjectRpcResult object_install_bytes_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
+    const std::unordered_map<std::string, std::string>& attrs, const std::uint8_t* data,
+    std::size_t len);
+
 ObjectRpcResult object_list_remote(const std::string& peer_addr,
                                    const std::string& local_node_id,
                                    const std::string& local_listen,

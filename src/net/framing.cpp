@@ -58,18 +58,19 @@ std::vector<std::uint8_t> encode_frame(const Frame& frame) {
   std::vector<std::uint8_t> payload;
   std::uint16_t flags = frame.flags;
 
-  if (!frame.raw.empty() || (flags & kFlagRawBody)) {
+  if (!frame.raw_empty() || (flags & kFlagRawBody)) {
     flags |= kFlagRawBody;
     if (json.size() > 0xffffffffu) throw std::runtime_error("json too large");
     const std::uint32_t jlen = static_cast<std::uint32_t>(json.size());
-    payload.resize(4 + json.size() + frame.raw.size());
+    const auto raw_n = frame.raw_size();
+    payload.resize(4 + json.size() + raw_n);
     const std::uint32_t jlen_be = htonl(jlen);
     std::memcpy(payload.data(), &jlen_be, 4);
     if (!json.empty()) {
       std::memcpy(payload.data() + 4, json.data(), json.size());
     }
-    if (!frame.raw.empty()) {
-      std::memcpy(payload.data() + 4 + json.size(), frame.raw.data(), frame.raw.size());
+    if (raw_n > 0) {
+      std::memcpy(payload.data() + 4 + json.size(), frame.raw_data(), raw_n);
     }
   } else {
     payload.assign(json.begin(), json.end());
@@ -95,7 +96,7 @@ std::vector<std::uint8_t> encode_frame(const Frame& frame) {
 bool decode_frame(const std::uint8_t* data, std::size_t len, Frame& out,
                   std::size_t& consumed, std::string& err) {
   consumed = 0;
-  out.raw.clear();
+  out.clear_raw();
   if (len < kHeaderSize) {
     err = "incomplete header";
     return false;
@@ -149,7 +150,9 @@ bool decode_frame(const std::uint8_t* data, std::size_t len, Frame& out,
     }
     const std::size_t raw_len = body_len - 4 - jlen;
     if (raw_len > 0) {
+      // Contiguous external buffer: must copy (caller may free `data`).
       out.raw.assign(payload + 4 + jlen, payload + 4 + jlen + raw_len);
+      out.raw_off = 0;
     }
   } else if (body_len > 0) {
     try {

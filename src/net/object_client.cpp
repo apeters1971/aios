@@ -10,7 +10,9 @@
 #include <boost/asio.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -23,7 +25,9 @@ namespace {
 ObjectRpcResult parse_object_reply(Frame& reply) {
   ObjectRpcResult result;
   result.body = reply.body;
+  reply.compact_raw();
   result.raw = std::move(reply.raw);
+  reply.raw_off = 0;
   result.ok = reply.body.value("ok", false);
   result.error = reply.body.value("error", "");
   result.code = reply.body.value("code", result.ok ? "" : "error");
@@ -136,7 +140,7 @@ class ObjectRpcConn {
     req.type = req_type;
     req.body = std::move(req_body);
     req.raw = std::move(raw);
-    if (!req.raw.empty()) req.flags |= kFlagRawBody;
+    if (!req.raw_empty()) req.flags |= kFlagRawBody;
     auth_sign(req.body, req_type, cluster_key);
     if (!write_frame(sock_, req, err, ec)) {
       result.error = "request write: " + err;
@@ -460,7 +464,44 @@ ObjectRpcResult rpc_one(tcp::socket& sock, MsgType type, nlohmann::json body,
   req.type = type;
   req.body = std::move(body);
   req.raw = std::move(raw);
-  if (!req.raw.empty()) req.flags |= kFlagRawBody;
+  if (!req.raw_empty()) req.flags |= kFlagRawBody;
+  auth_sign(req.body, type, cluster_key);
+  if (!write_frame(sock, req, err, ec)) {
+    result.error = "write: " + err;
+    result.code = "io";
+    return result;
+  }
+  Frame reply;
+  if (!read_frame(sock, reply, err, ec) || reply.type != MsgType::ObjectReply) {
+    result.error = "reply: " + err;
+    result.code = "io";
+    return result;
+  }
+  if (!auth_verify(reply.body, MsgType::ObjectReply, cluster_key, auth_skew_ms, err)) {
+    result.error = "auth: " + err;
+    result.code = "auth";
+    return result;
+  }
+  result.body = reply.body;
+  result.ok = reply.body.value("ok", false);
+  result.error = reply.body.value("error", "");
+  result.code = reply.body.value("code", result.ok ? "" : "error");
+  result.epoch = reply.body.value("epoch", static_cast<std::uint64_t>(0));
+  return result;
+}
+
+ObjectRpcResult rpc_one_ext(tcp::socket& sock, MsgType type, nlohmann::json body,
+                            const std::uint8_t* raw, std::size_t raw_len,
+                            const std::string& cluster_key, int auth_skew_ms) {
+  ObjectRpcResult result;
+  std::string err;
+  boost::system::error_code ec;
+  Frame req;
+  req.type = type;
+  req.body = std::move(body);
+  req.raw_ext = raw;
+  req.raw_ext_len = raw_len;
+  if (!req.raw_empty()) req.flags |= kFlagRawBody;
   auth_sign(req.body, type, cluster_key);
   if (!write_frame(sock, req, err, ec)) {
     result.error = "write: " + err;
@@ -488,6 +529,33 @@ ObjectRpcResult rpc_one(tcp::socket& sock, MsgType type, nlohmann::json body,
 
 }  // namespace
 
+namespace {
+
+ObjectRpcResult stage_begin_commit_envelope(
+    std::unique_ptr<ObjectRpcConn>& conn, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
+    const nlohmann::json& attrs_j, bool begin) {
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", v.oid},
+      {"seq", v.seq},
+      {"base_seq", v.prev_tip},
+      {"size", v.size},
+      {"crc32c", v.crc32c},
+      {"inline_body", false},
+      {"fs_path", v.fs_path},
+      {"is_delete", v.is_delete},
+      {"attrs", attrs_j},
+      {"role", "replica"},
+  };
+  if (!v.redirect_oid.empty()) body["redirect"] = v.redirect_oid;
+  return rpc_one(conn->socket(), begin ? MsgType::ObjectStageBegin : MsgType::ObjectStageCommit,
+                 std::move(body), {}, cluster_key, auth_skew_ms);
+}
+
+}  // namespace
+
 ObjectRpcResult object_install_file_remote(
     const std::string& peer_addr, const std::string& local_node_id,
     const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
@@ -506,23 +574,9 @@ ObjectRpcResult object_install_file_remote(
 
   nlohmann::json attrs_j = nlohmann::json::object();
   for (const auto& [k, vattr] : attrs) attrs_j[k] = vattr;
-  nlohmann::json begin = {
-      {"epoch", epoch},
-      {"aios_path", aios_path},
-      {"oid", v.oid},
-      {"seq", v.seq},
-      {"base_seq", v.prev_tip},
-      {"size", v.size},
-      {"crc32c", v.crc32c},
-      {"inline_body", false},
-      {"fs_path", v.fs_path},
-      {"is_delete", v.is_delete},
-      {"attrs", attrs_j},
-      {"role", "replica"},
-  };
-  if (!v.redirect_oid.empty()) begin["redirect"] = v.redirect_oid;
-  result = rpc_one(conn->socket(), MsgType::ObjectStageBegin, std::move(begin), {}, cluster_key,
-                   auth_skew_ms);
+
+  result = stage_begin_commit_envelope(conn, cluster_key, auth_skew_ms, epoch, aios_path, v,
+                                       attrs_j, true);
   if (!result.ok) {
     ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
     return result;
@@ -562,23 +616,72 @@ ObjectRpcResult object_install_file_remote(
     offset += n;
   }
 
-  nlohmann::json commit = {
-      {"epoch", epoch},
-      {"aios_path", aios_path},
-      {"oid", v.oid},
-      {"seq", v.seq},
-      {"base_seq", v.prev_tip},
-      {"size", v.size},
-      {"crc32c", v.crc32c},
-      {"inline_body", false},
-      {"fs_path", v.fs_path},
-      {"is_delete", v.is_delete},
-      {"attrs", attrs_j},
-      {"role", "replica"},
-  };
-  if (!v.redirect_oid.empty()) commit["redirect"] = v.redirect_oid;
-  result = rpc_one(conn->socket(), MsgType::ObjectStageCommit, std::move(commit), {},
-                   cluster_key, auth_skew_ms);
+  result = stage_begin_commit_envelope(conn, cluster_key, auth_skew_ms, epoch, aios_path, v,
+                                       attrs_j, false);
+  ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
+  return result;
+}
+
+ObjectRpcResult object_install_bytes_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
+    const std::unordered_map<std::string, std::string>& attrs, const std::uint8_t* data,
+    std::size_t len) {
+  ObjectRpcResult result;
+  if (v.size != len) {
+    result.error = "install size mismatch";
+    result.code = "bad_request";
+    return result;
+  }
+  if (len > 0 && data == nullptr) {
+    result.error = "null body";
+    result.code = "bad_request";
+    return result;
+  }
+  std::string err;
+  auto conn = ObjectRpcPool::instance().acquire(peer_addr, local_node_id, local_listen,
+                                                cluster_key, auth_skew_ms, err);
+  if (!conn) {
+    result.error = err;
+    result.code = "io";
+    return result;
+  }
+
+  nlohmann::json attrs_j = nlohmann::json::object();
+  for (const auto& [k, vattr] : attrs) attrs_j[k] = vattr;
+
+  result = stage_begin_commit_envelope(conn, cluster_key, auth_skew_ms, epoch, aios_path, v,
+                                       attrs_j, true);
+  if (!result.ok) {
+    ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
+    return result;
+  }
+
+  std::uint64_t offset = 0;
+  while (offset < len) {
+    const auto n = static_cast<std::size_t>(
+        std::min<std::uint64_t>(kStageChunkSize, static_cast<std::uint64_t>(len) - offset));
+    nlohmann::json chunk = {
+        {"epoch", epoch},
+        {"aios_path", aios_path},
+        {"oid", v.oid},
+        {"seq", v.seq},
+        {"offset", offset},
+        {"role", "replica"},
+    };
+    result = rpc_one_ext(conn->socket(), MsgType::ObjectStageData, std::move(chunk),
+                         data + offset, n, cluster_key, auth_skew_ms);
+    if (!result.ok) {
+      ObjectRpcPool::instance().release(peer_addr, std::move(conn),
+                                        !rpc_transport_failed(result));
+      return result;
+    }
+    offset += n;
+  }
+
+  result = stage_begin_commit_envelope(conn, cluster_key, auth_skew_ms, epoch, aios_path, v,
+                                       attrs_j, false);
   ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
   return result;
 }
