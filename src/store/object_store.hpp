@@ -282,7 +282,8 @@ class ObjectStore {
   bool ensure_fs_size(Shard& shard, const std::string& relpath, std::uint64_t size,
                       std::string& err);
   bool pwrite_fs(Shard& shard, const std::string& relpath, std::uint64_t offset,
-                 const std::uint8_t* data, std::size_t len, std::string& err);
+                 const std::uint8_t* data, std::size_t len, std::string& err,
+                 bool do_fsync = true);
   bool crc_file_range(Shard& shard, const std::string& relpath, std::uint64_t offset,
                       std::uint64_t len, std::uint32_t& out_crc, std::string& err);
   bool crc_after_range_update(Shard& shard, const std::string& relpath,

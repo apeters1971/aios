@@ -17,9 +17,11 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aios {
@@ -33,6 +35,9 @@ struct ApiResult {
   std::optional<std::vector<std::uint8_t>> data;
   // When set, HTTP should stream this FS body instead of loading `data`.
   std::string body_path;
+  // File offset / length for sendfile of a Range (0 length = whole file).
+  std::uint64_t body_offset{0};
+  std::uint64_t body_length{0};
   std::optional<ObjectInfo> info;
   std::unordered_map<std::string, std::string> attrs;
   ObjectListResult list;
@@ -108,7 +113,8 @@ class ObjectService {
   ApiResult api_get(const std::string& oid, std::optional<std::uint64_t> offset,
                     std::optional<std::uint64_t> end_inclusive,
                     const std::vector<AttrPrecondition>& preds,
-                    std::optional<std::uint64_t> seq = std::nullopt);
+                    std::optional<std::uint64_t> seq = std::nullopt,
+                    bool meta_only = false);
   ApiResult api_head(const std::string& oid, const std::vector<AttrPrecondition>& preds,
                      std::optional<std::uint64_t> seq = std::nullopt);
   ApiResult api_del(const std::string& oid, const std::vector<AttrPrecondition>& preds,
@@ -335,6 +341,9 @@ class ObjectService {
   LocalStores& stores_;
   std::string advertise_;
   mutable std::recursive_mutex mu_;
+  std::mutex mutating_mu_;
+  std::condition_variable mutating_cv_;
+  std::unordered_set<std::string> mutating_oids_;
   mutable OpsRegistry ops_;
   LockTable locks_;
   WatchHub watches_;

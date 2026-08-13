@@ -18,6 +18,7 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -28,6 +29,8 @@
 namespace {
 
 using aios::test::temp_root;
+
+std::atomic<int> g_mini_seq{0};
 
 struct MiniNode {
   std::string id;
@@ -87,6 +90,8 @@ struct MiniNode {
     // Drop pooled outbound keep-alives so peer session workers can exit.
     aios::object_rpc_pool_clear();
     if (server) server->close();
+    // Catch connections released into the pool after the first clear.
+    aios::object_rpc_pool_clear();
     work.reset();
     ioc.stop();
     if (thr.joinable()) thr.join();
@@ -105,8 +110,9 @@ struct MiniCluster {
   explicit MiniCluster(int n, int replica_count, int write_quorum,
                        const std::string& durability = "replica", int ec_k = 2, int ec_m = 1,
                        const std::string& ec_codec = "") {
-    root = temp_root("aios-mini-cluster");
-    const int base_port = 19100 + static_cast<int>(::getpid() % 400);
+    const int seq = g_mini_seq.fetch_add(1);
+    root = temp_root(("aios-mini-cluster-" + std::to_string(seq)).c_str());
+    const int base_port = 19100 + static_cast<int>(::getpid() % 200) * 20 + seq * 8;
 
     aios::MembershipTable membership;
     aios::FsTable fs_table;

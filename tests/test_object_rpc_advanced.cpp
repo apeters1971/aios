@@ -76,9 +76,7 @@ TEST(ObjectRpcAdvanced, Basic) {
   };
   auto get_reply = svc.handle(get);
   EXPECT_TRUE(get_reply.body.value("ok", false)) << "get seq ok";
-  std::vector<std::uint8_t> data;
-  std::string derr;
-  EXPECT_TRUE(base64_decode(get_reply.body["data_b64"].get<std::string>(), data, derr)) << "get decode";
+  auto data = aios::test::rpc_payload(get_reply);
   EXPECT_TRUE(std::string(data.begin(), data.end()) == "alpha") << "get seq body";
 
   // Replica install: prepare_put on primary, install on secondary, publish both.
@@ -139,8 +137,7 @@ TEST(ObjectRpcAdvanced, Basic) {
       };
       auto tip_reply = svc.handle(tip_get);
       EXPECT_TRUE(tip_reply.body.value("ok", false)) << "tip readable after publish";
-      data.clear();
-      EXPECT_TRUE(base64_decode(tip_reply.body["data_b64"].get<std::string>(), data, derr)) << "tip decode";
+      auto data = aios::test::rpc_payload(tip_reply);
       EXPECT_TRUE(std::string(data.begin(), data.end()) == "installed") << "tip body installed";
     }
   }
@@ -213,8 +210,7 @@ TEST(ObjectRpcAdvanced, Basic) {
       auto tip_reply = svc.handle(tip_get);
       EXPECT_TRUE(tip_reply.body.value("ok", false)) << "tip still readable";
       EXPECT_TRUE(tip_reply.body.value("seq", static_cast<std::uint64_t>(0)) == tip_seq) << "tip unchanged after abort";
-      data.clear();
-      EXPECT_TRUE(base64_decode(tip_reply.body["data_b64"].get<std::string>(), data, derr)) << "abort tip decode";
+      auto data = aios::test::rpc_payload(tip_reply);
       EXPECT_TRUE(std::string(data.begin(), data.end()) == "keep-me") << "abort tip body";
     }
   }
@@ -330,8 +326,7 @@ TEST(ObjectRpcAdvanced, Basic) {
     };
     auto gr = svc.handle(g);
     EXPECT_TRUE(gr.body.value("ok", false)) << "get after range";
-    data.clear();
-    EXPECT_TRUE(base64_decode(gr.body["data_b64"].get<std::string>(), data, derr)) << "range decode";
+    auto data = aios::test::rpc_payload(gr);
     EXPECT_TRUE(std::string(data.begin(), data.end()) == "01XX456789") << "range patched";
   }
 

@@ -12,6 +12,7 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -53,6 +54,7 @@ class HttpServer {
  private:
   void do_accept();
   void handle_session(std::shared_ptr<boost::asio::ip::tcp::socket> sock);
+  void kick_sessions();
   // Long-poll replies (watch, pubsub subscribe) are written from a detached thread
   // so the worker is freed. Those threads hold references to this server and to
   // ObjectService, so close_sessions() has to wait for them. Call detached_begin()
@@ -79,6 +81,7 @@ class HttpServer {
   // A session owns its thread for its whole keep-alive lifetime, so the pool size
   // is the concurrent client limit; see cfg_.http_workers.
   boost::asio::thread_pool workers_;
+  std::atomic<bool> closing_{false};
   std::mutex sessions_mu_;
   std::unordered_set<std::shared_ptr<boost::asio::ip::tcp::socket>> sessions_;
   std::mutex detached_mu_;

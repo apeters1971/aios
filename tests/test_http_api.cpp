@@ -7,12 +7,14 @@
 #include "membership.hpp"
 #include "object/object_service.hpp"
 #include "store/local_stores.hpp"
+#include "test_helpers.hpp"
 #include "util/log.hpp"
 
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -114,4 +116,39 @@ TEST(HttpApi, Basic) {
   EXPECT_TRUE(del.ok) << "del";
 
   fs::remove_all(root);
+}
+
+TEST(HttpApi, HeadIsMetadataOnlyAndRangeCanStream) {
+  using namespace aios;
+  using aios::test::DualStoreFixture;
+  DualStoreFixture fx("aios-http-head");
+  fx.cfg.compression = "none";
+  const auto payload = std::vector<std::uint8_t>(300 * 1024, 0xAB);
+  auto put = fx.svc->api_put("big/o", payload.data(), payload.size(), {}, true, {});
+  ASSERT_TRUE(put.ok) << put.code << " " << put.error;
+
+  auto head = fx.svc->api_head("big/o", {});
+  ASSERT_TRUE(head.ok) << head.code << " " << head.error;
+  ASSERT_TRUE(head.info);
+  EXPECT_EQ(head.info->size, payload.size());
+  EXPECT_FALSE(head.data.has_value());
+  EXPECT_TRUE(head.body_path.empty());
+
+  auto ranged = fx.svc->api_get("big/o", 10, 19, {});
+  ASSERT_TRUE(ranged.ok) << ranged.code << " " << ranged.error;
+  if (ranged.data) {
+    EXPECT_EQ(ranged.data->size(), 10u);
+    EXPECT_EQ((*ranged.data)[0], 0xAB);
+  } else {
+    EXPECT_FALSE(ranged.body_path.empty());
+    EXPECT_EQ(ranged.body_offset, 10u);
+    EXPECT_EQ(ranged.body_length, 10u);
   }
+
+  auto head_range = fx.svc->api_get("big/o", 10, 19, {}, std::nullopt, /*meta_only=*/true);
+  ASSERT_TRUE(head_range.ok);
+  EXPECT_FALSE(head_range.data.has_value());
+  EXPECT_TRUE(head_range.body_path.empty());
+  EXPECT_EQ(head_range.body_offset, 10u);
+  EXPECT_EQ(head_range.body_length, 10u);
+}

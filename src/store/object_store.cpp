@@ -624,7 +624,8 @@ bool ObjectStore::ensure_fs_size(Shard& shard, const std::string& relpath, std::
 }
 
 bool ObjectStore::pwrite_fs(Shard& shard, const std::string& relpath, std::uint64_t offset,
-                            const std::uint8_t* data, std::size_t len, std::string& err) {
+                            const std::uint8_t* data, std::size_t len, std::string& err,
+                            bool do_fsync) {
   const fs::path path = fs::path(shard.dir) / relpath;
   int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
   if (fd < 0) {
@@ -647,7 +648,7 @@ bool ObjectStore::pwrite_fs(Shard& shard, const std::string& relpath, std::uint6
     }
     done += static_cast<std::size_t>(n);
   }
-  if (opts_.data_fsync && ::fsync(fd) != 0) {
+  if (do_fsync && opts_.data_fsync && ::fsync(fd) != 0) {
     err = std::string("fsync: ") + std::strerror(errno);
     ::close(fd);
     return false;
@@ -752,9 +753,11 @@ bool ObjectStore::next_seq_locked(Shard& s, const std::string& oid, std::uint64_
                                   std::string& err) {
   std::uint64_t tip = 0;
   if (!tip_seq_locked(s, oid, tip, err)) return false;
+  // PRIMARY KEY (oid, seq) makes this an index probe, not a history scan.
   std::uint64_t max_seq = 0;
   sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(s.db, "SELECT COALESCE(MAX(seq),0) FROM object_versions WHERE oid=?1;",
+  if (sqlite3_prepare_v2(s.db,
+                         "SELECT seq FROM object_versions WHERE oid=?1 ORDER BY seq DESC LIMIT 1;",
                          -1, &stmt, nullptr) != SQLITE_OK) {
     err = sqlite3_errmsg(s.db);
     return false;
@@ -1458,7 +1461,7 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
     return false;
   }
   if (len > 0) {
-    if (!pwrite_fs(s, new_rel, offset, data, len, err)) {
+    if (!pwrite_fs(s, new_rel, offset, data, len, err, /*do_fsync=*/false)) {
       std::string rm_err;
       remove_fs_object(s, new_rel, rm_err);
       rollback(s);
@@ -1473,6 +1476,14 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
     remove_fs_object(s, new_rel, rm_err);
     rollback(s);
     return false;
+  }
+  if (opts_.data_fsync) {
+    if (!pwrite_fs(s, new_rel, 0, nullptr, 0, err, /*do_fsync=*/true)) {
+      std::string rm_err;
+      remove_fs_object(s, new_rel, rm_err);
+      rollback(s);
+      return false;
+    }
   }
 
   PreparedVersion pv;

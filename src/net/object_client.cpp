@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -173,6 +174,10 @@ class ObjectRpcConn {
   void close() {
     open_ = false;
     boost::system::error_code ec;
+    if (sock_.is_open()) {
+      const int fd = static_cast<int>(sock_.native_handle());
+      if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+    }
     sock_.shutdown(tcp::socket::shutdown_both, ec);
     sock_.close(ec);
   }

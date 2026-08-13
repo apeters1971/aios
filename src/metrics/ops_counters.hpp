@@ -66,6 +66,7 @@ class OpsRegistry {
   void note_put_range(std::uint64_t bytes);
   void note_append(std::uint64_t bytes);
   void note_get(std::uint64_t bytes);
+  void note_head();
   void note_compress(std::uint64_t logical_bytes, std::uint64_t stored_bytes);
   void note_compress_skipped();
   // Undo a get count and record a head instead (HTTP HEAD path).

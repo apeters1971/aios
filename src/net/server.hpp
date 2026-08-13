@@ -57,6 +57,7 @@ class TcpServer {
  private:
   void do_accept();
   void handle_session(std::shared_ptr<tcp::socket> sock);
+  void kick_sessions();
 
   boost::asio::io_context& ioc_;
   tcp::acceptor acceptor_;
@@ -66,6 +67,7 @@ class TcpServer {
   // Sized for concurrent replica install/publish under multi-threaded clients.
   boost::asio::thread_pool workers_{32};
   std::atomic<bool> workers_drained_{false};
+  std::atomic<bool> closing_{false};
   std::mutex sessions_mu_;
   std::unordered_set<std::shared_ptr<tcp::socket>> sessions_;
 };

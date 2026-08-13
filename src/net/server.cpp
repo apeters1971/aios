@@ -4,9 +4,12 @@
 #include "util/log.hpp"
 
 #include <arpa/inet.h>
+#include <sys/socket.h>
 
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace aios {
@@ -197,46 +200,92 @@ TcpServer::TcpServer(boost::asio::io_context& ioc, const std::string& listen_hos
   AIOS_LOG_INFO("listening on ", ep.address().to_string(), ":", ep.port());
 }
 
+namespace {
+
+void force_close_socket(tcp::socket& s) {
+  boost::system::error_code ignored;
+  // shutdown() on the native fd wakes a blocking poll/recv in another thread;
+  // asio close() alone is not reliable for that on macOS.
+  if (s.is_open()) {
+    const int fd = static_cast<int>(s.native_handle());
+    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+  }
+  s.cancel(ignored);
+  s.shutdown(tcp::socket::shutdown_both, ignored);
+  s.close(ignored);
+}
+
+}  // namespace
+
 void TcpServer::start() { do_accept(); }
 
-void TcpServer::close() {
-  boost::system::error_code ec;
-  acceptor_.close(ec);
+void TcpServer::kick_sessions() {
   std::unordered_set<std::shared_ptr<tcp::socket>> socks;
   {
     std::lock_guard lock(sessions_mu_);
-    socks.swap(sessions_);
+    socks = sessions_;
   }
   for (const auto& s : socks) {
-    boost::system::error_code ignored;
-    s->cancel(ignored);
-    s->shutdown(tcp::socket::shutdown_both, ignored);
-    s->close(ignored);
+    if (!s || !s->is_open()) continue;
+    const int fd = static_cast<int>(s->native_handle());
+    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
   }
-  // Sockets are closed, so blocking session reads have returned; joining here means
-  // no session can still be dispatching into handlers_ after close() returns.
+}
+
+void TcpServer::close() {
+  closing_.store(true, std::memory_order_release);
+  boost::system::error_code ec;
+  acceptor_.close(ec);
+
+  // ioc_ may still be running, so a late accept can insert a keep-alive session
+  // after a one-shot snapshot. Keep waking sockets until workers drain.
+  std::atomic<bool> joining{true};
+  std::thread waker([this, &joining] {
+    while (joining.load(std::memory_order_acquire)) {
+      kick_sessions();
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  });
+  kick_sessions();
+
   if (!workers_drained_.exchange(true)) {
+    // Any accept callback that posts to workers_ holds sessions_mu_ across the
+    // post, so this lock is a barrier: no post can land after stop().
+    {
+      std::lock_guard lock(sessions_mu_);
+    }
     workers_.stop();
     workers_.join();
   }
+  joining.store(false, std::memory_order_release);
+  waker.join();
 }
 
 TcpServer::~TcpServer() { close(); }
 
 void TcpServer::do_accept() {
-  if (!acceptor_.is_open()) return;
+  if (closing_.load(std::memory_order_acquire) || !acceptor_.is_open()) return;
   auto sock = std::make_shared<tcp::socket>(ioc_);
   acceptor_.async_accept(*sock, [this, sock](boost::system::error_code ec) {
     if (!ec) {
+      bool drop = false;
       {
         std::lock_guard lock(sessions_mu_);
-        sessions_.insert(sock);
+        if (closing_.load(std::memory_order_acquire) || workers_drained_.load()) {
+          drop = true;
+        } else {
+          sessions_.insert(sock);
+          boost::asio::post(workers_, [this, sock] {
+            handle_session(sock);
+            std::lock_guard lock(sessions_mu_);
+            sessions_.erase(sock);
+          });
+        }
       }
-      boost::asio::post(workers_, [this, sock] {
-        handle_session(sock);
-        std::lock_guard lock(sessions_mu_);
-        sessions_.erase(sock);
-      });
+      if (drop) {
+        force_close_socket(*sock);
+        return;
+      }
       do_accept();
     } else if (ec != boost::asio::error::operation_aborted) {
       AIOS_LOG_WARN("accept error: ", ec.message());
@@ -275,6 +324,7 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
 
   // Allow multiple object RPCs per connection (e.g. ObjectStageBegin/Data/Commit).
   for (;;) {
+    if (closing_.load(std::memory_order_acquire)) return;
     Frame req;
     if (!read_frame(*sock, req, err, ec)) {
       if (ec && ec != boost::asio::error::eof) {

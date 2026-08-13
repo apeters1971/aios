@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -66,4 +67,42 @@ TEST(StoreRange, Basic) {
   EXPECT_TRUE(!bad_r.has_value()) << "unsat range";
 
   fs::remove_all(root);
-  }
+}
+
+TEST(StoreRange, NextSeqIsTipPlusOne) {
+  using namespace aios;
+  const auto root = fs::temp_directory_path() / ("aios-seq-" + std::to_string(::getpid()));
+  fs::create_directories(root);
+  ObjectStore store;
+  ObjectStoreOptions opts;
+  opts.shard_count = 4;
+  std::string err;
+  ASSERT_TRUE(store.open(root.string(), opts, err)) << err;
+
+  std::uint64_t seq = 0, tip = 0;
+  ASSERT_TRUE(store.peek_next_seq("seq-o", seq, tip, err)) << err;
+  EXPECT_EQ(tip, 0u);
+  EXPECT_EQ(seq, 1u);
+
+  ASSERT_TRUE(store.put("seq-o", std::string("a"), {}, true, err)) << err;
+  ASSERT_TRUE(store.peek_next_seq("seq-o", seq, tip, err)) << err;
+  EXPECT_EQ(tip, 1u);
+  EXPECT_EQ(seq, 2u);
+
+  ASSERT_TRUE(store.put("seq-o", std::string("bb"), {}, true, err)) << err;
+  ASSERT_TRUE(store.peek_next_seq("seq-o", seq, tip, err)) << err;
+  EXPECT_EQ(tip, 2u);
+  EXPECT_EQ(seq, 3u);
+
+  PreparedVersion pv;
+  ASSERT_TRUE(store.prepare_put("seq-o", reinterpret_cast<const std::uint8_t*>("ccc"), 3, {}, true,
+                                std::nullopt, pv, err))
+      << err;
+  EXPECT_EQ(pv.seq, 3u);
+  ASSERT_TRUE(store.abort_version("seq-o", pv.seq, err)) << err;
+  ASSERT_TRUE(store.peek_next_seq("seq-o", seq, tip, err)) << err;
+  EXPECT_EQ(tip, 2u);
+  EXPECT_GE(seq, 3u);
+
+  fs::remove_all(root);
+}

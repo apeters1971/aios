@@ -331,4 +331,42 @@ using namespace aios;
   }
 }
 
+TEST(Placement, RingCacheDoesNotCollideOnEpochZero) {
+  using namespace aios;
+  ClusterMap one;
+  one.replica_count = 1;
+  one.placement = PlacementConfig{};
+  StorageTarget a;
+  a.node_id = "solo";
+  a.addr = "127.0.0.1:1";
+  a.aios_path = "/solo/aios";
+  a.mount = "/solo/aios";
+  a.storage_class = "nvme";
+  a.weight = 1;
+  a.state = LifecycleState::Up;
+  one.targets = {a};
+
+  ClusterMap three;
+  three.replica_count = 3;
+  three.placement = PlacementConfig{};
+  auto mk = [](const char* node, const char* path, const char* rack) {
+    StorageTarget t;
+    t.node_id = node;
+    t.addr = "127.0.0.1:1";
+    t.aios_path = path;
+    t.mount = path;
+    t.storage_class = "nvme";
+    t.rack = rack;
+    t.weight = 1;
+    t.state = LifecycleState::Up;
+    return t;
+  };
+  three.targets = {mk("n1", "/n1/a/aios", "r1"), mk("n1", "/n1/b/aios", "r1"),
+                   mk("n2", "/n2/a/aios", "r2")};
+
+  ASSERT_EQ(place("cache/obj", one, 1, "nvme").acting_set.size(), 1u);
+  const auto p = place("cache/obj", three, 3, "nvme");
+  ASSERT_EQ(p.acting_set.size(), 3u) << "epoch-0 maps with different targets must not share a ring";
+}
+
 

@@ -138,6 +138,9 @@ HttpResponse http_request(const std::string& host, const std::string& port,
   }
 
   std::string already(std::istreambuf_iterator<char>(is), {});
+  if (method == "HEAD") {
+    return resp;
+  }
   if (content_length > 0) {
     resp.body = already;
     while (resp.body.size() < content_length) {
@@ -412,6 +415,45 @@ TEST(HttpWire, ConcurrentLargePutsUseUniqueTemps) {
     EXPECT_EQ(g.status, 200) << "GET large-" << i;
     EXPECT_EQ(g.body, bodies[i]) << "body large-" << i;
   }
+
+  ioc.stop();
+  th.join();
+}
+
+TEST(HttpWire, HeadIsEmptyAndLargeRangeStreams) {
+  using namespace aios;
+  using aios::test::DualStoreFixture;
+  DualStoreFixture fx("aios-http-head-range");
+  fx.cfg.compression = "none";
+  const int port_num = 18100 + static_cast<int>(::getpid() % 1000);
+  const std::string port = std::to_string(port_num);
+  fx.cfg.http_listen = "127.0.0.1:" + port;
+
+  boost::asio::io_context ioc;
+  HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
+  http.start();
+  std::thread th([&] { ioc.run(); });
+
+  const std::string host = "127.0.0.1";
+  const std::string key = fx.cfg.cluster_key;
+  const std::string big(300 * 1024, 'Q');
+
+  auto put = http_request(host, port, "PUT", "/o/big-head", {}, big, key);
+  EXPECT_EQ(put.status, 204) << put.body;
+
+  auto head = http_request(host, port, "HEAD", "/o/big-head", {}, "", key);
+  EXPECT_EQ(head.status, 200);
+  EXPECT_TRUE(head.body.empty()) << "HEAD must not send an entity body";
+  EXPECT_EQ(head.headers["content-length"], std::to_string(big.size()));
+
+  std::unordered_map<std::string, std::string> rh = {{"range", "bytes=10-19"}};
+  auto ranged = http_request(host, port, "GET", "/o/big-head", rh, "", key);
+  EXPECT_EQ(ranged.status, 206);
+  EXPECT_EQ(ranged.body, big.substr(10, 10));
+
+  auto head_range = http_request(host, port, "HEAD", "/o/big-head", rh, "", key);
+  EXPECT_EQ(head_range.status, 206);
+  EXPECT_TRUE(head_range.body.empty());
 
   ioc.stop();
   th.join();

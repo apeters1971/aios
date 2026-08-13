@@ -177,6 +177,11 @@ void OpsRegistry::note_get(std::uint64_t bytes) {
   }
 }
 
+void OpsRegistry::note_head() {
+  total_.head.fetch_add(1, std::memory_order_relaxed);
+  if (auto* b = label_bucket()) b->head.fetch_add(1, std::memory_order_relaxed);
+}
+
 void OpsRegistry::note_compress(std::uint64_t logical_bytes, std::uint64_t stored_bytes) {
   total_.compress_puts.fetch_add(1, std::memory_order_relaxed);
   total_.compress_logical_bytes.fetch_add(logical_bytes, std::memory_order_relaxed);

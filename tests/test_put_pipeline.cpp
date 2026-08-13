@@ -5,6 +5,7 @@
 #include "cluster/place.hpp"
 #include "http/http_auth.hpp"
 #include "http/http_server.hpp"
+#include "net/framing.hpp"
 #include "net/object_client.hpp"
 #include "net/server.hpp"
 #include "util/crc32c.hpp"
@@ -12,6 +13,7 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -27,6 +29,8 @@ namespace {
 using tcp = boost::asio::ip::tcp;
 using aios::test::DualStoreFixture;
 using aios::test::temp_root;
+
+std::atomic<int> g_pipe_cluster_seq{0};
 
 std::vector<std::uint8_t> make_payload(std::size_t n, std::uint8_t seed = 0x5A) {
   std::vector<std::uint8_t> out(n);
@@ -193,6 +197,7 @@ struct MiniNode {
     if (!running) return;
     aios::object_rpc_pool_clear();
     if (server) server->close();
+    aios::object_rpc_pool_clear();
     work.reset();
     ioc.stop();
     if (thr.joinable()) thr.join();
@@ -209,8 +214,9 @@ struct MiniCluster {
   std::string cluster_key{"550e8400-e29b-41d4-a716-446655440000"};
 
   MiniCluster(int n, int replica_count, int write_quorum) {
-    root = temp_root("aios-pipe-cluster");
-    const int base_port = 19300 + static_cast<int>(::getpid() % 400);
+    const int seq = g_pipe_cluster_seq.fetch_add(1);
+    root = temp_root(("aios-pipe-cluster-" + std::to_string(seq)).c_str());
+    const int base_port = 20000 + static_cast<int>(::getpid() % 200) * 20 + seq * 8;
     aios::MembershipTable membership;
     aios::FsTable fs_table;
     std::vector<aios::FsEntry> remotes;
@@ -478,4 +484,133 @@ TEST(PutPipeline, HttpLargePut) {
 
   ioc.stop();
   if (th.joinable()) th.join();
+}
+
+TEST(PutPipeline, HttpUnauthorizedDoesNotLeakPipeline) {
+  using namespace aios;
+  DualStoreFixture fx("aios-pipe-401");
+  fx.cfg.compression = "none";
+  const int port_num = 18300 + static_cast<int>(::getpid() % 1000);
+  const std::string port = std::to_string(port_num);
+  fx.cfg.http_listen = "127.0.0.1:" + port;
+
+  boost::asio::io_context ioc;
+  HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
+  http.start();
+  std::thread th([&] { ioc.run(); });
+
+  const auto payload = make_payload(300 * 1024, 0x33);
+  auto r = http_put_large("127.0.0.1", port, "/o/pipe-401", payload, "wrong-key");
+  EXPECT_EQ(r.status, 401) << r.body;
+
+  std::string staging;
+  auto br = fx.svc->api_begin_put_pipeline("pipe-401", {}, payload.size(), staging);
+  EXPECT_TRUE(br.ok) << br.code << " " << br.error
+                    << " (401 must abort so a new pipeline can start)";
+  if (br.ok) ASSERT_TRUE(fx.svc->api_put_pipeline_abort("pipe-401").ok);
+
+  ioc.stop();
+  if (th.joinable()) th.join();
+}
+
+TEST(PutPipeline, HttpStreamedPutRequiresUnsignedPayload) {
+  using namespace aios;
+  DualStoreFixture fx("aios-pipe-unsigned");
+  fx.cfg.compression = "none";
+  const int port_num = 18400 + static_cast<int>(::getpid() % 1000);
+  const std::string port = std::to_string(port_num);
+  fx.cfg.http_listen = "127.0.0.1:" + port;
+
+  boost::asio::io_context ioc;
+  HttpServer http(ioc, fx.cfg, *fx.svc, fx.membership);
+  http.start();
+  std::thread th([&] { ioc.run(); });
+
+  const auto payload = make_payload(300 * 1024, 0x44);
+  boost::asio::io_context cioc;
+  tcp::resolver resolver(cioc);
+  boost::system::error_code ec;
+  auto endpoints = resolver.resolve("127.0.0.1", port, ec);
+  ASSERT_FALSE(ec);
+  tcp::socket sock(cioc);
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    boost::asio::connect(sock, endpoints, ec);
+    if (!ec) break;
+    sock = tcp::socket(cioc);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_FALSE(ec);
+  std::ostringstream req;
+  req << "PUT /o/pipe-signed HTTP/1.1\r\nHost: 127.0.0.1:" << port << "\r\n";
+  req << "Content-Length: " << payload.size() << "\r\nConnection: close\r\n\r\n";
+  boost::asio::write(sock, boost::asio::buffer(req.str()), ec);
+  boost::asio::streambuf buf;
+  boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
+  std::istream is(&buf);
+  std::string status_line;
+  std::getline(is, status_line);
+  int status = 0;
+  {
+    std::istringstream ss(status_line);
+    std::string ver, reason;
+    ss >> ver >> status;
+  }
+  EXPECT_EQ(status, 400) << status_line;
+
+  std::string staging;
+  auto br = fx.svc->api_begin_put_pipeline("pipe-signed", {}, payload.size(), staging);
+  EXPECT_TRUE(br.ok) << br.code << " " << br.error;
+  if (br.ok) ASSERT_TRUE(fx.svc->api_put_pipeline_abort("pipe-signed").ok);
+
+  ioc.stop();
+  if (th.joinable()) th.join();
+}
+
+TEST(PutPipeline, ReplicaStageRequiresBeginAndSequentialOffset) {
+  using namespace aios;
+  DualStoreFixture fx("aios-pipe-stage");
+  const std::string oid = "pipe/stage-seq";
+  const auto chunk = make_payload(16, 0x7);
+  Frame begin;
+  begin.type = MsgType::ObjectStageBegin;
+  begin.body = {{"epoch", fx.map.epoch}, {"aios_path", fx.p1}, {"oid", oid}, {"seq", 1}};
+  auto br = fx.svc->handle(begin);
+  ASSERT_TRUE(br.body.value("ok", false)) << br.body.dump();
+
+  Frame bad_off;
+  bad_off.type = MsgType::ObjectStageData;
+  bad_off.flags = kFlagRawBody;
+  bad_off.body = {{"epoch", fx.map.epoch},
+                  {"aios_path", fx.p1},
+                  {"oid", oid},
+                  {"seq", 1},
+                  {"offset", 4}};
+  bad_off.raw = chunk;
+  auto dr = fx.svc->handle(bad_off);
+  EXPECT_FALSE(dr.body.value("ok", true));
+  EXPECT_EQ(dr.body.value("code", ""), "bad_request");
+
+  Frame ok_off;
+  ok_off.type = MsgType::ObjectStageData;
+  ok_off.flags = kFlagRawBody;
+  ok_off.body = {{"epoch", fx.map.epoch},
+                 {"aios_path", fx.p1},
+                 {"oid", oid},
+                 {"seq", 1},
+                 {"offset", 0}};
+  ok_off.raw = chunk;
+  auto ok = fx.svc->handle(ok_off);
+  EXPECT_TRUE(ok.body.value("ok", false)) << ok.body.dump();
+
+  Frame commit_no_sess;
+  commit_no_sess.type = MsgType::ObjectStageCommit;
+  commit_no_sess.body = {{"epoch", fx.map.epoch},
+                         {"aios_path", fx.p2},
+                         {"oid", "never-begun"},
+                         {"seq", 9},
+                         {"size", 16},
+                         {"crc32c", 1}};
+  auto cr = fx.svc->handle(commit_no_sess);
+  EXPECT_FALSE(cr.body.value("ok", true));
+  EXPECT_EQ(cr.body.value("code", ""), "not_found");
 }

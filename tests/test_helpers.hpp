@@ -5,9 +5,11 @@
 #include "fs/aios_scan.hpp"
 #include "fs/fs_table.hpp"
 #include "membership.hpp"
+#include "net/framing.hpp"
 #include "object/object_service.hpp"
 #include "store/local_stores.hpp"
 #include "store/object_store.hpp"
+#include "util/base64.hpp"
 
 #include <gtest/gtest.h>
 
@@ -26,6 +28,18 @@ inline std::filesystem::path temp_root(const char* prefix) {
   std::filesystem::remove_all(p);
   std::filesystem::create_directories(p);
   return p;
+}
+
+inline std::vector<std::uint8_t> rpc_payload(const Frame& f) {
+  if (!f.raw_empty()) {
+    return std::vector<std::uint8_t>(f.raw_data(), f.raw_data() + f.raw_size());
+  }
+  std::vector<std::uint8_t> data;
+  if (f.body.contains("data_b64") && f.body["data_b64"].is_string()) {
+    std::string err;
+    (void)base64_decode(f.body["data_b64"].get<std::string>(), data, err);
+  }
+  return data;
 }
 
 inline AiosTarget make_target(const std::string& path, const std::string& storage_class = "nvme",

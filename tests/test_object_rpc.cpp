@@ -1,3 +1,4 @@
+#include "test_helpers.hpp"
 #include "cluster/cluster_map.hpp"
 #include <gtest/gtest.h>
 #include "cluster/place.hpp"
@@ -105,8 +106,8 @@ TEST(ObjectRpc, Basic) {
   };
   auto get_reply = svc.handle(get);
   EXPECT_TRUE(get_reply.body.value("ok", false)) << "get ok";
-  std::vector<std::uint8_t> data;
-  EXPECT_TRUE(base64_decode(get_reply.body["data_b64"].get<std::string>(), data, err)) << "get decode";
+  auto data = aios::test::rpc_payload(get_reply);
+  EXPECT_TRUE((get_reply.flags & aios::kFlagRawBody) != 0) << "get uses raw body";
   EXPECT_TRUE(std::string(data.begin(), data.end()) == "payload-data") << "get data";
 
   Frame st;

@@ -18,11 +18,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <span>
 #include <sstream>
@@ -321,6 +323,34 @@ struct UnlockForRpc {
   UnlockForRpc& operator=(const UnlockForRpc&) = delete;
 };
 
+bool placement_has_remote(const Placement& placement, const std::string& node_id) {
+  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
+    if (placement.acting_set[i].node_id != node_id) return true;
+  }
+  return false;
+}
+
+struct MutatingOid {
+  std::mutex& mu;
+  std::condition_variable& cv;
+  std::unordered_set<std::string>& oids;
+  std::string oid;
+  MutatingOid(std::mutex& mu, std::condition_variable& cv, std::unordered_set<std::string>& oids,
+              std::string o)
+      : mu(mu), cv(cv), oids(oids), oid(std::move(o)) {
+    std::unique_lock lk(mu);
+    cv.wait(lk, [&] { return this->oids.count(oid) == 0; });
+    this->oids.insert(oid);
+  }
+  ~MutatingOid() {
+    std::lock_guard lk(mu);
+    oids.erase(oid);
+    cv.notify_all();
+  }
+  MutatingOid(const MutatingOid&) = delete;
+  MutatingOid& operator=(const MutatingOid&) = delete;
+};
+
 }  // namespace
 
 int ObjectService::replicate_install(
@@ -334,8 +364,9 @@ int ObjectService::replicate_install(
   // 256KiB–4MiB replicas on base64 ObjectPut (JSON blow-up + huge copies).
   const bool file_stream = use_file && !abs_body_path.empty();
 
-  UnlockForRpc unlock(mu_);
   if (placement.acting_set.size() <= 1) return 0;
+  std::optional<UnlockForRpc> unlock;
+  if (placement_has_remote(placement, cfg_.node_id)) unlock.emplace(mu_);
 
   // One primary read shared by all replica workers (avoids 2× re-read for r=3).
   // Cap keeps huge objects on the per-peer file stream path.
@@ -408,8 +439,9 @@ int ObjectService::replicate_install(
 
 int ObjectService::replicate_publish(const Placement& placement, const std::string& oid,
                                      std::uint64_t seq) {
-  UnlockForRpc unlock(mu_);
   if (placement.acting_set.size() <= 1) return 0;
+  std::optional<UnlockForRpc> unlock;
+  if (placement_has_remote(placement, cfg_.node_id)) unlock.emplace(mu_);
 
   std::atomic<int> ok{0};
   std::vector<std::thread> workers;
@@ -442,8 +474,8 @@ int ObjectService::replicate_publish(const Placement& placement, const std::stri
 
 void ObjectService::replicate_abort(const Placement& placement, const std::string& oid,
                                     std::uint64_t seq) {
-  UnlockForRpc unlock(mu_);
   if (placement.acting_set.size() <= 1) return;
+  UnlockForRpc unlock(mu_);
 
   std::vector<std::thread> workers;
   workers.reserve(placement.acting_set.size() - 1);
@@ -859,31 +891,46 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
   f.body["size"] = st->size;
   if (st->crc32c_known) f.body["crc32c"] = st->crc32c;
 
-  // Optional ranged raw get (avoids base64 / full-object buffer on wire).
+  auto attach_raw = [&](std::vector<std::uint8_t>&& data, std::uint64_t offset) {
+    f.body["offset"] = offset;
+    f.body["length"] = data.size();
+    f.body["size"] = st->size;
+    f.flags |= kFlagRawBody;
+    f.raw = std::move(data);
+  };
+
+  // Ranged or full raw get (avoids base64 / extra copies on the wire).
   if (body.contains("offset")) {
     const auto offset = body.value("offset", static_cast<std::uint64_t>(0));
     const auto len = body.value("length", static_cast<std::uint64_t>(0));
     if (len == 0 || len > kMaxBodySize) {
       return reply_err(map_.epoch, "bad_request", "invalid get length");
     }
-    auto data = store->get_range(oid, seq, offset, static_cast<std::size_t>(len), err);
+    std::optional<std::vector<std::uint8_t>> data;
+    {
+      UnlockForRpc unlock(mu_);
+      data = store->get_range(oid, seq, offset, static_cast<std::size_t>(len), err);
+    }
     if (!data) {
       if (err == "range unsatisfiable") {
         return reply_err(map_.epoch, "range_unsatisfiable", err);
       }
       return reply_err(map_.epoch, "not_found", err);
     }
-    f.body["offset"] = offset;
-    f.body["length"] = data->size();
-    f.flags |= kFlagRawBody;
-    f.raw = std::move(*data);
+    attach_raw(std::move(*data), offset);
     return f;
   }
 
-  auto data = store->get(oid, seq, err);
+  if (st->size > kMaxBodySize) {
+    return reply_err(map_.epoch, "bad_request", "object exceeds RPC body limit; use ranged get");
+  }
+  std::optional<std::vector<std::uint8_t>> data;
+  {
+    UnlockForRpc unlock(mu_);
+    data = store->get(oid, seq, err);
+  }
   if (!data) return reply_err(map_.epoch, "not_found", err);
-  f.body["data_b64"] = base64_encode(*data);
-  f.body["size"] = data->size();
+  attach_raw(std::move(*data), 0);
   return f;
 }
 
@@ -1165,9 +1212,13 @@ ApiResult ObjectService::commit_ec_put(
     if (t.node_id == cfg_.node_id) {
       done = local_install(t.aios_path, sv, sd, sl, ai, err);
     } else {
-      auto r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                     cfg_.auth_skew_ms, placement.epoch, t.aios_path, sv, sd,
-                                     sl, ai);
+      ObjectRpcResult r;
+      {
+        UnlockForRpc unlock(mu_);
+        r = object_install_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                  cfg_.auth_skew_ms, placement.epoch, t.aios_path, sv, sd, sl,
+                                  ai);
+      }
       done = r.ok;
       if (!done) err = r.error;
     }
@@ -1318,6 +1369,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
                                 std::optional<std::uint32_t> expected_crc32c,
                                 const LayoutRequest& layout_req,
                                 const std::optional<std::string>& lock_token) {
+  MutatingOid mutating(mutating_mu_, mutating_cv_, mutating_oids_, oid);
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
@@ -2014,6 +2066,7 @@ ApiResult ObjectService::api_put_range(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
     const std::optional<std::string>& lock_token) {
+  MutatingOid mutating(mutating_mu_, mutating_cv_, mutating_oids_, oid);
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
@@ -2075,6 +2128,7 @@ ApiResult ObjectService::api_append(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
     const std::optional<std::string>& lock_token) {
+  MutatingOid mutating(mutating_mu_, mutating_cv_, mutating_oids_, oid);
   std::lock_guard lock(mu_);
   ObjectLayout layout;
   std::string err;
@@ -2146,7 +2200,7 @@ ApiResult ObjectService::api_append(
 ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint64_t> offset,
                                 std::optional<std::uint64_t> end_inclusive,
                                 const std::vector<AttrPrecondition>& preds,
-                                std::optional<std::uint64_t> seq) {
+                                std::optional<std::uint64_t> seq, bool meta_only) {
   std::lock_guard lock(mu_);
   std::string err;
   ObjectStore* store = nullptr;
@@ -2222,6 +2276,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
 
   // Degraded read: no local tip — pull attrs from a remote acting-set member.
   if (!info) {
+    UnlockForRpc unlock(mu_);
     for (const auto& t : placement.acting_set) {
       if (t.node_id == cfg_.node_id) continue;
       auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
@@ -2297,9 +2352,31 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
       }
       return r;
     }
+    if (meta_only) {
+      ApiResult r;
+      r.ok = true;
+      r.epoch = map_.epoch;
+      r.info = info;
+      r.attrs = attrs;
+      r.placement = placement;
+      if (auto it = attrs.find(kBagLengthAttr); it != attrs.end()) {
+        try {
+          info->size = std::stoull(it->second);
+          r.info->size = info->size;
+        } catch (...) {
+        }
+      }
+      ops_.note_head();
+      return r;
+    }
     std::vector<std::uint8_t> member;
     std::string ferr;
-    if (!read_frozen_member(cfg_, advertise_, map_, stores_, attrs, member, ferr)) {
+    bool froze_ok = false;
+    {
+      UnlockForRpc unlock(mu_);
+      froze_ok = read_frozen_member(cfg_, advertise_, map_, stores_, attrs, member, ferr);
+    }
+    if (!froze_ok) {
       if (ferr == "restoring") {
         ApiResult r;
         r.ok = false;
@@ -2344,13 +2421,43 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
 
   // EC objects carry aios.ec.* attrs. Non-EC tips (e.g. txn-prepared full copies) still
   // use the normal local read path even when the cluster default layout is ec.
+  auto apply_range = [&](ApiResult& r, std::uint64_t total) -> ApiResult {
+    if (!offset.has_value()) return r;
+    if (*offset >= total) return fail("range_unsatisfiable", "range unsatisfiable");
+    std::uint64_t end = end_inclusive.value_or(total - 1);
+    if (end >= total) end = total - 1;
+    if (end < *offset) return fail("range_unsatisfiable", "range unsatisfiable");
+    r.body_offset = *offset;
+    r.body_length = end - *offset + 1;
+    return r;
+  };
+
   auto note_get = [this](ApiResult& r) {
     if (!r.ok || r.code == "redirect") return;
     std::uint64_t bytes = 0;
-    if (r.data) bytes = r.data->size();
+    if (r.body_length > 0) bytes = r.body_length;
+    else if (r.data) bytes = r.data->size();
     else if (r.info) bytes = r.info->size;
     ops_.note_get(bytes);
   };
+
+  if (meta_only) {
+    ApiResult r;
+    r.ok = true;
+    r.epoch = map_.epoch;
+    r.info = info;
+    r.attrs = attrs;
+    r.placement = placement;
+    if (attrs_are_compressed(attrs)) {
+      if (auto sz = compression_full_size(attrs)) r.info->size = *sz;
+    } else if (attrs_are_ec(attrs)) {
+      if (auto em = parse_ec_attrs(attrs)) r.info->size = em->full_size;
+    }
+    r = apply_range(r, r.info->size);
+    if (!r.ok) return r;
+    ops_.note_head();
+    return r;
+  }
 
   if (attrs_are_ec(attrs)) {
     const int en = placement_n_for_attrs(attrs, map_.replica_count);
@@ -2361,7 +2468,11 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
       if (!prev.empty()) placement = place(oid, map_, en, prev);
     }
     if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
-    auto rec = reconstruct_ec_object(placement, oid, seq, attrs);
+    ApiResult rec;
+    {
+      UnlockForRpc unlock(mu_);
+      rec = reconstruct_ec_object(placement, oid, seq, attrs);
+    }
     if (!rec.ok) return rec;
     rec.info->seq = info->seq;
     rec.info->mtime_ms = info->mtime_ms;
@@ -2392,20 +2503,24 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   r.placement = placement;
 
   const bool compressed = attrs_are_compressed(attrs);
-  if (!offset.has_value() && !compressed) {
-    constexpr std::uint64_t kStreamThreshold = 256u * 1024u;
-    if (!info->inline_body && info->size >= kStreamThreshold) {
-      if (auto path = store->fs_body_path(oid, seq, err)) {
-        r.body_path = *path;
-        note_get(r);
-        return r;
-      }
+  constexpr std::uint64_t kStreamThreshold = 256u * 1024u;
+  if (!compressed && !info->inline_body && info->size >= kStreamThreshold) {
+    if (auto path = store->fs_body_path(oid, seq, err)) {
+      r.body_path = *path;
+      r = apply_range(r, info->size);
+      if (!r.ok) return r;
+      if (!offset.has_value()) r.body_length = info->size;
+      note_get(r);
+      return r;
     }
   }
 
   // Compressed tips: always load full stored body, decompress, then slice.
   if (compressed || !offset.has_value()) {
-    r.data = store->get(oid, seq, err);
+    {
+      UnlockForRpc unlock(mu_);
+      r.data = store->get(oid, seq, err);
+    }
     if (!r.data) {
       if (info->is_delete) {
         r.data = std::vector<std::uint8_t>{};
@@ -2435,7 +2550,10 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   if (end >= info->size) end = info->size - 1;
   if (end < *offset) return fail("range_unsatisfiable", "range unsatisfiable");
   const std::size_t len = static_cast<std::size_t>(end - *offset + 1);
-  r.data = store->get_range(oid, seq, *offset, len, err);
+  {
+    UnlockForRpc unlock(mu_);
+    r.data = store->get_range(oid, seq, *offset, len, err);
+  }
   if (!r.data) {
     if (err == "range unsatisfiable") return fail("range_unsatisfiable", err);
     return fail("store_error", err);
@@ -2447,13 +2565,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
 ApiResult ObjectService::api_head(const std::string& oid,
                                  const std::vector<AttrPrecondition>& preds,
                                  std::optional<std::uint64_t> seq) {
-  auto r = api_get(oid, std::nullopt, std::nullopt, preds, seq);
-  if (r.ok) {
-    // api_get counted a get; reclassify as head (no body transfer for HEAD).
-    const std::uint64_t bytes = r.data ? r.data->size() : (r.info ? r.info->size : 0);
-    ops_.note_reclass_get_to_head(bytes);
-  }
-  return r;
+  return api_get(oid, std::nullopt, std::nullopt, preds, seq, /*meta_only=*/true);
 }
 
 ApiResult ObjectService::api_del(const std::string& oid,
@@ -2547,6 +2659,7 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
       if (!lr.ok) return lr;
       part = std::move(lr.list);
     } else {
+      UnlockForRpc unlock(mu_);
       auto remote =
           object_list_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
                              cfg_.auth_skew_ms, map_.epoch, prefix, attr_eq_key,
@@ -2720,19 +2833,10 @@ Frame ObjectService::handle_stage_data(const Frame& req) {
     const std::string key = stage_key(aios_path, oid, seq);
     auto it = stages_.find(key);
     if (it == stages_.end() || it->second.fd < 0) {
-      // Fallback for peers that skip begin or after restart.
-      auto* store = stores_.get(aios_path);
-      if (!store) return reply_err(map_.epoch, "store_error", "no local store");
-      std::string err;
-      if (!store->stage_path_for(oid, seq, path, err)) {
-        return reply_err(map_.epoch, "store_error", err);
-      }
-      const auto* pdata = req.raw_data();
-      const auto plen = req.raw_size();
-      if (!pdata || !store->stage_pwrite(path, offset, pdata, plen, err)) {
-        return reply_err(map_.epoch, "store_error", err.empty() ? "empty stage chunk" : err);
-      }
-      return reply_ok(map_.epoch);
+      return reply_err(map_.epoch, "not_found", "no stage session; StageBegin required");
+    }
+    if (offset != it->second.bytes) {
+      return reply_err(map_.epoch, "bad_request", "stage offset mismatch");
     }
     fd = it->second.fd;
     path = it->second.path;
@@ -2798,7 +2902,28 @@ Frame ObjectService::handle_stage_commit(const nlohmann::json& body) {
 
   const std::string key = stage_key(aios_path, oid, v.seq);
   std::string staging;
-  if (auto sit = stages_.find(key); sit != stages_.end()) {
+  auto sit = stages_.find(key);
+  if (!v.is_delete && v.redirect_oid.empty() && v.size > 0) {
+    if (sit == stages_.end()) {
+      return reply_err(map_.epoch, "not_found", "no stage session; StageBegin required");
+    }
+    if (sit->second.bytes != v.size) {
+      close_stage_session(key);
+      return reply_err(map_.epoch, "store_error", "stage size mismatch");
+    }
+    if (sit->second.crc != v.crc32c) {
+      close_stage_session(key);
+      return reply_err(map_.epoch, "store_error", "stage crc32c mismatch");
+    }
+    v.crc_verified = true;
+    staging = sit->second.path;
+    if (sit->second.fd >= 0) {
+      if (cfg_.data_fsync) ::fsync(sit->second.fd);
+      ::close(sit->second.fd);
+      sit->second.fd = -1;
+    }
+    stages_.erase(sit);
+  } else if (sit != stages_.end()) {
     if (sit->second.bytes != v.size) {
       close_stage_session(key);
       return reply_err(map_.epoch, "store_error", "stage size mismatch");

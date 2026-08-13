@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -452,6 +453,82 @@ TEST(TcpServerRegression, IdleSessionDoesNotBlockTheIoContextThread) {
   boost::system::error_code ignored;
   idle.close(ignored);
   server.close();
+  work.reset();
+  ioc.stop();
+  io.join();
+}
+
+// close() used to snapshot sessions once then pthread_join the pool. With ioc
+// still running, a late accept (or a keep-alive the snapshot missed) parked in
+// poll forever and MiniCluster / aiosd shutdown hung.
+TEST(TcpServerRegression, CloseUnblocksIdleKeepAlive) {
+  using namespace aios;
+  boost::asio::io_context ioc;
+  auto work = boost::asio::make_work_guard(ioc);
+  const std::string port = std::to_string(unique_port(19450));
+
+  RpcHandlers handlers;
+  handlers.local_node_id = "node-a";
+  handlers.local_listen = "127.0.0.1:" + port;
+  handlers.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+
+  TcpServer server(ioc, "127.0.0.1", port, handlers);
+  server.start();
+  std::thread io([&] { ioc.run(); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  boost::asio::io_context client_ioc;
+  tcp::resolver resolver(client_ioc);
+  boost::system::error_code ec;
+  auto endpoints = resolver.resolve("127.0.0.1", port, ec);
+  ASSERT_FALSE(ec);
+
+  std::vector<std::unique_ptr<tcp::socket>> idle;
+  for (int i = 0; i < 4; ++i) {
+    auto s = std::make_unique<tcp::socket>(client_ioc);
+    boost::asio::connect(*s, endpoints, ec);
+    ASSERT_FALSE(ec);
+    idle.push_back(std::move(s));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  std::atomic<bool> connecting{true};
+  std::thread storm([&] {
+    boost::asio::io_context storm_ioc;
+    tcp::resolver storm_resolver(storm_ioc);
+    boost::system::error_code rec;
+    auto storm_ep = storm_resolver.resolve("127.0.0.1", port, rec);
+    while (connecting.load()) {
+      if (rec) break;
+      tcp::socket extra(storm_ioc);
+      boost::system::error_code cec;
+      boost::asio::connect(extra, storm_ep, cec);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+
+  std::atomic<bool> closed{false};
+  std::thread closer([&] {
+    server.close();
+    closed.store(true);
+  });
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!closed.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  connecting.store(false);
+  const bool returned = closed.load();
+  if (!returned) {
+    for (auto& s : idle) {
+      boost::system::error_code ignored;
+      s->close(ignored);
+    }
+  }
+  closer.join();
+  storm.join();
+  EXPECT_TRUE(returned) << "TcpServer::close must return while idle clients stay connected";
+
   work.reset();
   ioc.stop();
   io.join();

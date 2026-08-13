@@ -36,11 +36,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
-#include <future>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <poll.h>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -324,7 +327,7 @@ bool sock_write_all(tcp::socket& sock, const void* in, std::size_t n,
   return true;
 }
 
-void write_response(tcp::socket& sock, int status, const std::string& reason,
+bool write_response(tcp::socket& sock, int status, const std::string& reason,
                     const std::unordered_map<std::string, std::string>& headers,
                     const std::uint8_t* body, std::size_t body_len, bool keep_alive) {
   std::ostringstream oss;
@@ -337,9 +340,9 @@ void write_response(tcp::socket& sock, int status, const std::string& reason,
   oss << "\r\n";
   const auto head = oss.str();
   boost::system::error_code ec;
-  if (sock_write_all(sock, head.data(), head.size(), ec) && body_len > 0 && body) {
-    sock_write_all(sock, body, body_len, ec);
-  }
+  if (!sock_write_all(sock, head.data(), head.size(), ec)) return false;
+  if (body_len > 0 && body) return sock_write_all(sock, body, body_len, ec);
+  return true;
 }
 
 bool expects_100_continue(const std::unordered_map<std::string, std::string>& headers) {
@@ -399,27 +402,42 @@ void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
 
 // Stream a regular file to an already-connected TCP socket. Prefer sendfile
 // (no userspace bounce); fall back to read+send. Avoids iostreams on the hot path.
-bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t size,
+bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t file_offset, std::uint64_t size,
                     boost::system::error_code& ec) {
   const int out_fd = static_cast<int>(sock.native_handle());
   std::uint64_t sent = 0;
 
+  auto wait_writable = [&]() -> bool {
+    pollfd pfd{};
+    pfd.fd = out_fd;
+    pfd.events = POLLOUT;
+    const int pr = ::poll(&pfd, 1, 1000);
+    if (pr < 0) {
+      if (errno == EINTR) return true;
+      return false;
+    }
+    return pr > 0;
+  };
+
 #if defined(__APPLE__)
   while (sent < size) {
     off_t len = static_cast<off_t>(size - sent);
-    const off_t offset = static_cast<off_t>(sent);
+    const off_t offset = static_cast<off_t>(file_offset + sent);
     if (::sendfile(in_fd, out_fd, offset, &len, nullptr, 0) == 0) {
       if (len <= 0) break;
       sent += static_cast<std::uint64_t>(len);
       continue;
     }
     if (errno == EINTR) continue;
-    if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (!wait_writable()) break;
+      continue;
+    }
     break;  // fall back for the remainder
   }
 #elif defined(__linux__)
   while (sent < size) {
-    off_t offset = static_cast<off_t>(sent);
+    off_t offset = static_cast<off_t>(file_offset + sent);
     const auto n = ::sendfile(out_fd, in_fd, &offset,
                               static_cast<std::size_t>(size - sent));
     if (n > 0) {
@@ -427,7 +445,10 @@ bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t size,
       continue;
     }
     if (n < 0 && errno == EINTR) continue;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      if (!wait_writable()) break;
+      continue;
+    }
     break;
   }
 #endif
@@ -438,7 +459,7 @@ bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t size,
   }
 
   // Remaining bytes (or full body if sendfile unavailable/unsupported).
-  if (sent > 0 && ::lseek(in_fd, static_cast<off_t>(sent), SEEK_SET) < 0) {
+  if (::lseek(in_fd, static_cast<off_t>(file_offset + sent), SEEK_SET) < 0) {
     ec = boost::system::error_code(errno, boost::system::system_category());
     return false;
   }
@@ -462,8 +483,8 @@ bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t size,
 
 bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
                      std::unordered_map<std::string, std::string> headers,
-                     const std::string& path, std::uint64_t size, bool head_only,
-                     bool keep_alive) {
+                     const std::string& path, std::uint64_t file_offset, std::uint64_t size,
+                     bool head_only, bool keep_alive) {
   headers["Content-Length"] = std::to_string(size);
   headers["Connection"] = keep_alive ? "keep-alive" : "close";
   std::ostringstream oss;
@@ -482,10 +503,86 @@ bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
 
   const int in_fd = ::open(path.c_str(), O_RDONLY);
   if (in_fd < 0) return false;
-  const bool ok = sock_send_file(sock, in_fd, size, ec);
+  const bool ok = sock_send_file(sock, in_fd, file_offset, size, ec);
   ::close(in_fd);
   return ok;
 }
+
+// One worker thread for the whole large PUT so HTTP read overlaps StageData
+// without spawning a thread per 1 MiB chunk.
+struct PipelineStager {
+  ObjectService& objects;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool stop{false};
+  bool busy{false};
+  bool failed{false};
+  ApiResult last;
+  std::string oid;
+  std::uint64_t off{0};
+  const std::uint8_t* data{nullptr};
+  std::size_t n{0};
+  std::thread th;
+
+  explicit PipelineStager(ObjectService& o) : objects(o) {
+    th = std::thread([this] { run(); });
+  }
+  PipelineStager(const PipelineStager&) = delete;
+  PipelineStager& operator=(const PipelineStager&) = delete;
+  ~PipelineStager() { finish(); }
+
+  void run() {
+    for (;;) {
+      std::unique_lock lk(mu);
+      cv.wait(lk, [&] { return stop || data != nullptr; });
+      if (data == nullptr) {
+        busy = false;
+        cv.notify_all();
+        return;
+      }
+      const auto local_oid = oid;
+      const auto local_off = off;
+      const auto* local_data = data;
+      const auto local_n = n;
+      data = nullptr;
+      lk.unlock();
+      auto r = objects.api_put_pipeline_data(local_oid, local_off, local_data, local_n);
+      lk.lock();
+      last = std::move(r);
+      if (!last.ok) failed = true;
+      busy = false;
+      cv.notify_all();
+      if (stop) return;
+    }
+  }
+
+  bool wait() {
+    std::unique_lock lk(mu);
+    cv.wait(lk, [&] { return !busy; });
+    return !failed;
+  }
+
+  bool submit(std::string oid_, std::uint64_t off_, const std::uint8_t* d, std::size_t nn) {
+    if (!wait()) return false;
+    std::unique_lock lk(mu);
+    oid = std::move(oid_);
+    off = off_;
+    data = d;
+    n = nn;
+    busy = true;
+    cv.notify_all();
+    return true;
+  }
+
+  void finish() {
+    {
+      std::lock_guard lk(mu);
+      stop = true;
+      cv.notify_all();
+    }
+    if (th.joinable()) th.join();
+  }
+};
 
 void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& path_q,
                      bool keep_alive) {
@@ -920,20 +1017,39 @@ HttpServer::DetachedGuard::~DetachedGuard() {
   if (server) server->detached_end();
 }
 
-void HttpServer::close_sessions() {
-  boost::system::error_code ec;
-  acceptor_.close(ec);
+namespace {
+
+void force_close_http_socket(tcp::socket& s) {
+  boost::system::error_code ignored;
+  if (s.is_open()) {
+    const int fd = static_cast<int>(s.native_handle());
+    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+  }
+  s.cancel(ignored);
+  s.shutdown(tcp::socket::shutdown_both, ignored);
+  s.close(ignored);
+}
+
+}  // namespace
+
+void HttpServer::kick_sessions() {
   std::unordered_set<std::shared_ptr<tcp::socket>> socks;
   {
     std::lock_guard lock(sessions_mu_);
-    socks.swap(sessions_);
+    socks = sessions_;
   }
   for (const auto& s : socks) {
-    boost::system::error_code ignored;
-    s->cancel(ignored);
-    s->shutdown(tcp::socket::shutdown_both, ignored);
-    s->close(ignored);
+    if (!s || !s->is_open()) continue;
+    const int fd = static_cast<int>(s->native_handle());
+    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
   }
+}
+
+void HttpServer::close_sessions() {
+  closing_.store(true, std::memory_order_release);
+  boost::system::error_code ec;
+  acceptor_.close(ec);
+  kick_sessions();
   // Detached long polls are no longer in sessions_, so closing sockets does not
   // reach them: release their waiters explicitly, then wait. They hold a raw
   // ObjectService pointer that is destroyed shortly after this returns.
@@ -947,33 +1063,54 @@ void HttpServer::close_sessions() {
 
 HttpServer::~HttpServer() {
   close_sessions();
+  std::atomic<bool> joining{true};
+  std::thread waker([this, &joining] {
+    while (joining.load(std::memory_order_acquire)) {
+      kick_sessions();
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  });
+  {
+    std::lock_guard lock(sessions_mu_);
+  }
   workers_.stop();
   workers_.join();
+  joining.store(false, std::memory_order_release);
+  waker.join();
 }
 
 void HttpServer::start() { do_accept(); }
 
 void HttpServer::do_accept() {
-  if (!acceptor_.is_open()) return;
+  if (closing_.load(std::memory_order_acquire) || !acceptor_.is_open()) return;
   auto sock = std::make_shared<tcp::socket>(ioc_);
   acceptor_.async_accept(*sock, [this, sock](boost::system::error_code ec) {
     if (!ec) {
+      bool drop = false;
       {
         std::lock_guard lock(sessions_mu_);
-        sessions_.insert(sock);
+        if (closing_.load(std::memory_order_acquire)) {
+          drop = true;
+        } else {
+          sessions_.insert(sock);
+          set_session_timeouts(*sock, cfg_.http_idle_timeout_ms);
+          {
+            boost::system::error_code nec;
+            sock->set_option(tcp::no_delay(true), nec);
+          }
+          // Session I/O is synchronous; run off ioc_ so parallel browser connections
+          // (HTML + CSS + JS) are not stalled by keep-alive reads.
+          boost::asio::post(workers_, [this, sock] {
+            handle_session(sock);
+            std::lock_guard lock(sessions_mu_);
+            sessions_.erase(sock);
+          });
+        }
       }
-      set_session_timeouts(*sock, cfg_.http_idle_timeout_ms);
-      {
-        boost::system::error_code nec;
-        sock->set_option(tcp::no_delay(true), nec);
+      if (drop) {
+        force_close_http_socket(*sock);
+        return;
       }
-      // Session I/O is synchronous; run off ioc_ so parallel browser connections
-      // (HTML + CSS + JS) are not stalled by keep-alive reads.
-      boost::asio::post(workers_, [this, sock] {
-        handle_session(sock);
-        std::lock_guard lock(sessions_mu_);
-        sessions_.erase(sock);
-      });
       do_accept();
     } else if (ec != boost::asio::error::operation_aborted) {
       AIOS_LOG_WARN("http accept: ", ec.message());
@@ -986,6 +1123,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
   bool keep_alive = true;
 
   while (keep_alive) {
+    if (closing_.load(std::memory_order_acquire)) return;
     std::string req_line;
     if (!read_line(*sock, req_line, ec) || req_line.empty()) return;
 
@@ -1046,6 +1184,41 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (version == "HTTP/1.0") keep_alive = (conn == "keep-alive");
     else keep_alive = (conn != "close");
 
+    std::string path = target;
+    std::string query;
+    auto qpos = target.find('?');
+    if (qpos != std::string::npos) {
+      path = target.substr(0, qpos);
+      query = target.substr(qpos + 1);
+    }
+    auto qmap = parse_query(query);
+
+    const bool metrics_public =
+        cfg_.admin && cfg_.admin_metrics_public && method == "GET" && path == "/metrics";
+    const bool admin_static = cfg_.admin && method == "GET" && is_admin_static_path(path);
+    const bool admin_login = cfg_.admin && method == "POST" && path == "/admin/login";
+    const bool admin_logout = cfg_.admin && method == "POST" && path == "/admin/logout";
+    const bool admin_api = path.rfind("/admin/api/", 0) == 0;
+    const bool skip_hmac = metrics_public || admin_static || admin_login || admin_logout;
+
+    auto write_unauth = [&](const std::string& err) {
+      write_json(*sock, 401, "Unauthorized", {{"error", err}}, false);
+    };
+    auto try_auth = [&](const std::string& payload_hash, std::string& err_out) -> bool {
+      if (skip_hmac) return true;
+      auto auth = http_auth_verify(method, target, headers, payload_hash, cfg_.cluster_key,
+                                   cfg_.auth_skew_ms);
+      if (auth.ok) return true;
+      if (admin_api && cfg_.admin) {
+        const auto tok = cookie_get(headers, kAdminCookie);
+        if (!tok.empty() && verify_admin_session(tok, cfg_.cluster_key)) return true;
+        err_out = auth.error.empty() ? "login required" : auth.error;
+        return false;
+      }
+      err_out = auth.error;
+      return false;
+    };
+
     const bool want_continue = expects_100_continue(headers);
     constexpr std::size_t kMemThreshold = 256u * 1024u;
     std::vector<std::uint8_t> body;
@@ -1053,17 +1226,45 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     std::uint32_t upload_crc = 0;
     bool upload_pipeline = false;
     std::string upload_pipeline_oid;
+    bool authed = skip_hmac;
+
+    auto cleanup_upload = [&] {
+      if (upload_pipeline) {
+        objects_.api_put_pipeline_abort(upload_pipeline_oid);
+        upload_pipeline = false;
+        upload_pipeline_oid.clear();
+      }
+      if (!upload_path.empty()) {
+        std::error_code rec;
+        fs::remove(upload_path, rec);
+        upload_path.clear();
+      }
+    };
+
+    if (content_length > 0 && content_length > kMemThreshold && !skip_hmac) {
+      if (header_get(headers, "x-aios-content-sha256") != "UNSIGNED-PAYLOAD") {
+        write_json(*sock, 400, "Bad Request",
+                   {{"error", "streamed PUT requires x-aios-content-sha256: UNSIGNED-PAYLOAD"},
+                    {"code", "unsigned_payload_required"}},
+                   false);
+        return;
+      }
+      std::string aerr;
+      if (!try_auth("UNSIGNED-PAYLOAD", aerr)) {
+        write_unauth(aerr);
+        return;
+      }
+      authed = true;
+    }
+
     if (content_length > 0 && content_length > kMemThreshold) {
       // Prefer store-local staging for plain PUT /o/{oid} so place() is a rename,
       // not a cross-volume copy out of the process temp directory.
       // With Expect: 100-continue, reject non-primary before the client sends the body.
       // Pipelined puts overlap peer StageData with the HTTP body read when supported.
       if (method == "PUT") {
-        std::string path_only = target;
-        const auto qpos = path_only.find('?');
-        if (qpos != std::string::npos) path_only.resize(qpos);
-        if (path_only.rfind("/o/", 0) == 0) {
-          const std::string rest = path_only.substr(3);
+        if (path.rfind("/o/", 0) == 0) {
+          const std::string rest = path.substr(3);
           const auto slash = rest.find('/');
           if (slash == std::string::npos) {
             const std::string oid = url_decode(rest);
@@ -1120,7 +1321,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
       }
       if (want_continue && !write_100_continue(*sock)) {
-        if (upload_pipeline) objects_.api_put_pipeline_abort(upload_pipeline_oid);
+        cleanup_upload();
         return;
       }
       if (upload_pipeline) {
@@ -1132,17 +1333,17 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         std::size_t left = content_length;
         std::uint64_t offset = 0;
         bool write_ok = true;
-        std::future<ApiResult> inflight;
+        PipelineStager stager(objects_);
         std::size_t inflight_n = 0;
+        bool have_inflight = false;
         while (left > 0) {
           const auto n = std::min(left, fill->size());
           if (!sock_read_exact(*sock, fill->data(), n, ec)) {
             write_ok = false;
             break;
           }
-          if (inflight.valid()) {
-            auto dr = inflight.get();
-            if (!dr.ok) {
+          if (have_inflight) {
+            if (!stager.wait()) {
               write_ok = false;
               break;
             }
@@ -1150,25 +1351,23 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
           std::swap(fill, send);
           inflight_n = n;
-          const std::uint64_t chunk_off = offset;
-          const std::string oid = upload_pipeline_oid;
-          auto* payload = send;
-          inflight = std::async(std::launch::async, [this, oid, chunk_off, payload, n] {
-            return objects_.api_put_pipeline_data(oid, chunk_off, payload->data(), n);
-          });
+          if (!stager.submit(upload_pipeline_oid, offset, send->data(), n)) {
+            write_ok = false;
+            break;
+          }
+          have_inflight = true;
           left -= n;
         }
-        if (write_ok && inflight.valid()) {
-          auto dr = inflight.get();
-          if (!dr.ok) write_ok = false;
+        if (write_ok && have_inflight) {
+          if (!stager.wait()) write_ok = false;
           else offset += inflight_n;
-        } else if (inflight.valid()) {
-          inflight.wait();
+        } else if (have_inflight) {
+          stager.wait();
         }
         if (!write_ok || left != 0 || offset != content_length) {
-          objects_.api_put_pipeline_abort(upload_pipeline_oid);
-          upload_pipeline = false;
-          upload_pipeline_oid.clear();
+          cleanup_upload();
+          write_json(*sock, 500, "Error",
+                     {{"error", "upload failed"}, {"code", "upload_failed"}}, false);
           return;
         }
       } else {
@@ -1220,8 +1419,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         ::close(tmp_fd);
         if (!write_ok || left != 0) {
-          fs::remove(upload_path);
-          upload_path.clear();
+          cleanup_upload();
+          write_json(*sock, 500, "Error",
+                     {{"error", "upload failed"}, {"code", "upload_failed"}}, false);
           return;
         }
         upload_crc = crc;
@@ -1232,21 +1432,13 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (!sock_read_exact(*sock, body.data(), body.size(), ec)) return;
     }
 
-    std::string path = target;
-    std::string query;
-    auto qpos = target.find('?');
-    if (qpos != std::string::npos) {
-      path = target.substr(0, qpos);
-      query = target.substr(qpos + 1);
-    }
-    auto qmap = parse_query(query);
-
     // Optional client workload label (for OPS / future QoS).
     std::string app_label;
     {
       const auto raw = header_get(headers, kAppLabelHeader);
       std::string lerr;
       if (!normalize_app_label(raw, app_label, lerr)) {
+        cleanup_upload();
         write_json(*sock, 400, "Bad Request", {{"error", lerr}, {"code", "bad_request"}},
                    keep_alive);
         continue;
@@ -1255,36 +1447,18 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     AppLabelScope label_scope(app_label);
     objects_.ops().note_http_request();
 
-    const bool metrics_public =
-        cfg_.admin && cfg_.admin_metrics_public && method == "GET" && path == "/metrics";
-    const bool admin_static = cfg_.admin && method == "GET" && is_admin_static_path(path);
-    const bool admin_login = cfg_.admin && method == "POST" && path == "/admin/login";
-    const bool admin_logout = cfg_.admin && method == "POST" && path == "/admin/logout";
-    const bool admin_api = path.rfind("/admin/api/", 0) == 0;
-    const bool skip_hmac = metrics_public || admin_static || admin_login || admin_logout;
-
-    bool authed = skip_hmac;
-    if (!skip_hmac) {
+    if (!authed) {
       const bool unsigned_payload =
           header_get(headers, "x-aios-content-sha256") == "UNSIGNED-PAYLOAD";
       const std::string payload_hash =
           unsigned_payload ? "UNSIGNED-PAYLOAD" : sha256_hex(body.data(), body.size());
-      auto auth = http_auth_verify(method, target, headers, payload_hash, cfg_.cluster_key,
-                                   cfg_.auth_skew_ms);
-      if (auth.ok) {
-        authed = true;
-      } else if (admin_api && cfg_.admin) {
-        const auto tok = cookie_get(headers, kAdminCookie);
-        if (!tok.empty() && verify_admin_session(tok, cfg_.cluster_key)) authed = true;
-        else {
-          write_json(*sock, 401, "Unauthorized",
-                     {{"error", auth.error.empty() ? "login required" : auth.error}}, keep_alive);
-          continue;
-        }
-      } else {
-        write_json(*sock, 401, "Unauthorized", {{"error", auth.error}}, keep_alive);
+      std::string aerr;
+      if (!try_auth(payload_hash, aerr)) {
+        cleanup_upload();
+        write_json(*sock, 401, "Unauthorized", {{"error", aerr}}, keep_alive);
         continue;
       }
+      authed = true;
     }
     (void)authed;
 
@@ -3057,7 +3231,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           off = start;
           end = end_opt;
         }
-        auto r = objects_.api_get(oid, off, end, preds, ver);
+        auto r = objects_.api_get(oid, off, end, preds, ver, method == "HEAD");
         if (!r.ok) {
           write_api_error(*sock, r, target, keep_alive);
           continue;
@@ -3089,26 +3263,38 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           rh["x-aios-attr-" + k] = v;
         }
 
-        if (off.has_value() && r.info && r.data) {
+        auto send_ok = true;
+        if (off.has_value() && r.info) {
+          std::uint64_t n = 0;
+          if (r.data) n = r.data->size();
+          else if (r.body_length > 0) n = r.body_length;
+          else if (r.info->size > *off) n = r.info->size - *off;
           const auto start = *off;
-          const auto end_v = start + r.data->size() - 1;
+          const auto end_v = n == 0 ? start : start + n - 1;
           rh["Content-Range"] = "bytes " + std::to_string(start) + "-" +
                                 std::to_string(end_v) + "/" + std::to_string(r.info->size);
           if (method == "HEAD") {
-            write_response(*sock, 206, "Partial Content", rh, nullptr, r.data->size(),
-                           keep_alive);
+            send_ok = write_response(*sock, 206, "Partial Content", rh, nullptr, n, keep_alive);
+          } else if (!r.body_path.empty()) {
+            send_ok = write_file_body(*sock, 206, "Partial Content", rh, r.body_path,
+                                      r.body_offset, n, false, keep_alive);
+          } else if (r.data) {
+            send_ok = write_response(*sock, 206, "Partial Content", rh, r.data->data(),
+                                     r.data->size(), keep_alive);
           } else {
-            write_response(*sock, 206, "Partial Content", rh, r.data->data(), r.data->size(),
-                           keep_alive);
+            send_ok = write_response(*sock, 206, "Partial Content", rh, nullptr, 0, keep_alive);
           }
         } else if (!r.body_path.empty() && r.info) {
-          write_file_body(*sock, 200, "OK", rh, r.body_path, r.info->size, method == "HEAD",
-                          keep_alive);
+          const auto n = r.body_length > 0 ? r.body_length : r.info->size;
+          send_ok = write_file_body(*sock, 200, "OK", rh, r.body_path, r.body_offset, n,
+                                    method == "HEAD", keep_alive);
         } else {
           const auto* p = (method == "HEAD" || !r.data) ? nullptr : r.data->data();
-          const auto n = r.data ? r.data->size() : 0;
-          write_response(*sock, 200, "OK", rh, p, n, keep_alive);
+          const auto n = r.data ? r.data->size() : (r.info ? r.info->size : 0);
+          send_ok = write_response(*sock, 200, "OK", rh, p, method == "HEAD" ? n : (p ? n : 0),
+                                  keep_alive);
         }
+        if (!send_ok) return;
         continue;
       }
 

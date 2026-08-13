@@ -5,8 +5,11 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <mutex>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace aios {
@@ -70,6 +73,61 @@ std::vector<VNode> build_ring(const std::vector<StorageTarget>& targets,
   return ring;
 }
 
+std::uint64_t ring_fingerprint(const ClusterMap& map, const std::string& sc) {
+  std::string fp;
+  fp += std::to_string(map.epoch);
+  fp += '|';
+  fp += sc;
+  fp += '|';
+  fp += std::to_string(map.placement.vnodes_per_target);
+  fp += '|';
+  fp += std::to_string(map.placement.min_vnodes);
+  fp += '|';
+  fp += std::to_string(map.placement.max_vnodes);
+  fp += '|';
+  for (const auto& t : map.targets_for_class(sc)) {
+    fp += target_key(t);
+    fp += ':';
+    fp += std::to_string(t.weight);
+    fp += ':';
+    fp += std::to_string(static_cast<int>(t.state));
+    fp += ';';
+  }
+  return sha256_u64(fp);
+}
+
+struct RingSlot {
+  std::uint64_t fingerprint{0};
+  std::vector<StorageTarget> pool;
+  std::vector<VNode> ring;
+};
+
+constexpr std::size_t kRingCacheSlots = 8;
+std::mutex g_ring_mu;
+std::array<RingSlot, kRingCacheSlots> g_rings;
+std::size_t g_ring_next{0};
+
+// Cached vnode ring + Up pool. Keyed by epoch, class, vnode knobs, and the
+// actual target list so tests/maps that share epoch 0 do not collide.
+std::pair<std::vector<StorageTarget>, std::vector<VNode>> cached_ring(
+    const ClusterMap& map, const std::string& storage_class) {
+  const auto fp = ring_fingerprint(map, storage_class);
+  std::lock_guard lock(g_ring_mu);
+  for (const auto& s : g_rings) {
+    if (s.fingerprint == fp) return {s.pool, s.ring};
+  }
+  std::vector<StorageTarget> pool;
+  for (const auto& t : map.targets_for_class(storage_class)) {
+    if (t.state == LifecycleState::Up) pool.push_back(t);
+  }
+  auto ring = build_ring(pool, map.placement);
+  auto& slot = g_rings[g_ring_next++ % kRingCacheSlots];
+  slot.fingerprint = fp;
+  slot.pool = pool;
+  slot.ring = ring;
+  return {std::move(pool), std::move(ring)};
+}
+
 }  // namespace
 
 Placement place(const std::string& oid, const ClusterMap& map, int n,
@@ -79,14 +137,8 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
   p.storage_class = storage_class;
   if (map.targets.empty() || n < 1 || storage_class.empty()) return p;
 
-  // New placement uses only up targets; drain stays on the map for reads/evacuate.
-  std::vector<StorageTarget> pool;
-  for (const auto& t : map.targets_for_class(storage_class)) {
-    if (t.state == LifecycleState::Up) pool.push_back(t);
-  }
+  auto [pool, ring] = cached_ring(map, storage_class);
   if (static_cast<std::size_t>(n) > pool.size()) return p;
-
-  const auto ring = build_ring(pool, map.placement);
   if (ring.empty()) return p;
 
   const std::uint64_t oid_hash = sha256_u64(oid);
