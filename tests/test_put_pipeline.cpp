@@ -419,6 +419,49 @@ TEST(PutPipeline, EcNotSupported) {
   EXPECT_EQ(br.code, "not_supported");
 }
 
+TEST(PutPipeline, StagingFileIsOnStoreVolume) {
+  using namespace aios;
+  DualStoreFixture fx("aios-pipe-stagevol");
+  std::string staging;
+  auto br = fx.svc->api_begin_put_staging("pipe/stage-vol", {}, staging);
+  ASSERT_TRUE(br.ok) << br.code << " " << br.error;
+  EXPECT_TRUE(staging.find(fx.p1) != std::string::npos ||
+              staging.find(fx.p2) != std::string::npos)
+      << staging;
+  EXPECT_EQ(staging.find("aios-upload-"), std::string::npos);
+  std::error_code ec;
+  std::filesystem::remove(staging, ec);
+}
+
+TEST(PutPipeline, LocalThenRemotePhases) {
+  using namespace aios;
+  MiniCluster cluster(3, 3, 2);
+  const std::string oid = "pipe/phases-1";
+  auto* primary = cluster.primary_for(oid);
+  ASSERT_NE(primary, nullptr);
+  const auto payload = make_payload(192 * 1024, 0x22);
+  const auto crc = crc32c(payload.data(), payload.size());
+
+  std::string staging;
+  ASSERT_TRUE(primary->svc->api_begin_put_pipeline(oid, {}, payload.size(), staging).ok);
+
+  constexpr std::size_t kChunk = 64 * 1024;
+  for (std::size_t off = 0; off < payload.size(); off += kChunk) {
+    const auto n = std::min(kChunk, payload.size() - off);
+    auto loc = primary->svc->api_put_pipeline_data(oid, off, payload.data() + off, n,
+                                                   ObjectService::PipelineDataKind::Local);
+    ASSERT_TRUE(loc.ok) << loc.code << " " << loc.error;
+    auto rem = primary->svc->api_put_pipeline_data(oid, off, payload.data() + off, n,
+                                                   ObjectService::PipelineDataKind::Remote);
+    ASSERT_TRUE(rem.ok) << rem.code << " " << rem.error;
+  }
+  auto fin = primary->svc->api_put_pipeline_finish(oid, {}, true, {}, crc);
+  ASSERT_TRUE(fin.ok) << fin.code << " " << fin.error;
+  auto got = primary->svc->api_get(oid, std::nullopt, std::nullopt, {});
+  ASSERT_TRUE(got.ok);
+  if (got.data) EXPECT_EQ(*got.data, payload);
+}
+
 TEST(PutPipeline, MiniClusterRemotePeers) {
   using namespace aios;
   MiniCluster cluster(3, 3, 2);

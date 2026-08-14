@@ -81,15 +81,34 @@ bool table_exists(sqlite3* db, const char* name, std::string& err) {
   return false;
 }
 
-bool load_attrs_for_seq(sqlite3* db, const std::string& oid, std::uint64_t seq,
-                        std::unordered_map<std::string, std::string>& out, std::string& err) {
-  out.clear();
-  sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(db, "SELECT key, value FROM version_attrs WHERE oid=?1 AND seq=?2;", -1,
-                         &stmt, nullptr) != SQLITE_OK) {
-    err = sqlite3_errmsg(db);
-    return false;
+sqlite3_stmt* cached_prepare(sqlite3* db, sqlite3_stmt*& slot, const char* sql, std::string& err) {
+  if (slot) {
+    sqlite3_reset(slot);
+    sqlite3_clear_bindings(slot);
+    return slot;
   }
+  if (sqlite3_prepare_v2(db, sql, -1, &slot, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(db);
+    slot = nullptr;
+    return nullptr;
+  }
+  return slot;
+}
+
+void finalize_cached(sqlite3_stmt*& slot) {
+  if (slot) {
+    sqlite3_finalize(slot);
+    slot = nullptr;
+  }
+}
+
+bool load_attrs_for_seq(sqlite3* db, sqlite3_stmt*& slot, const std::string& oid,
+                        std::uint64_t seq, std::unordered_map<std::string, std::string>& out,
+                        std::string& err) {
+  out.clear();
+  sqlite3_stmt* stmt =
+      cached_prepare(db, slot, "SELECT key, value FROM version_attrs WHERE oid=?1 AND seq=?2;", err);
+  if (!stmt) return false;
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(seq));
   while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -102,7 +121,6 @@ bool load_attrs_for_seq(sqlite3* db, const std::string& oid, std::uint64_t seq,
     }
     if (k) out.emplace(k, std::move(v));
   }
-  sqlite3_finalize(stmt);
   return true;
 }
 
@@ -152,7 +170,13 @@ ObjectStore::~ObjectStore() { close(); }
 
 void ObjectStore::close() {
   for (auto& s : shards_) {
-    if (s && s->db) {
+    if (!s) continue;
+    finalize_cached(s->stmt_tip_seq);
+    finalize_cached(s->stmt_max_seq);
+    finalize_cached(s->stmt_load_version);
+    finalize_cached(s->stmt_load_attrs);
+    finalize_cached(s->stmt_get_inline);
+    if (s->db) {
       sqlite3_close(s->db);
       s->db = nullptr;
     }
@@ -730,20 +754,15 @@ bool ObjectStore::crc_after_range_update(Shard& shard, const std::string& relpat
 bool ObjectStore::tip_seq_locked(Shard& s, const std::string& oid, std::uint64_t& tip,
                                  std::string& err) {
   tip = 0;
-  sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(s.db, "SELECT tip_seq FROM object_tips WHERE oid=?1;", -1, &stmt,
-                         nullptr) != SQLITE_OK) {
-    err = sqlite3_errmsg(s.db);
-    return false;
-  }
+  sqlite3_stmt* stmt =
+      cached_prepare(s.db, s.stmt_tip_seq, "SELECT tip_seq FROM object_tips WHERE oid=?1;", err);
+  if (!stmt) return false;
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   const int rc = sqlite3_step(stmt);
   if (rc == SQLITE_ROW) {
     tip = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
-    sqlite3_finalize(stmt);
     return true;
   }
-  sqlite3_finalize(stmt);
   if (rc == SQLITE_DONE) return true;
   err = sqlite3_errmsg(s.db);
   return false;
@@ -755,23 +774,18 @@ bool ObjectStore::next_seq_locked(Shard& s, const std::string& oid, std::uint64_
   if (!tip_seq_locked(s, oid, tip, err)) return false;
   // PRIMARY KEY (oid, seq) makes this an index probe, not a history scan.
   std::uint64_t max_seq = 0;
-  sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(s.db,
-                         "SELECT seq FROM object_versions WHERE oid=?1 ORDER BY seq DESC LIMIT 1;",
-                         -1, &stmt, nullptr) != SQLITE_OK) {
-    err = sqlite3_errmsg(s.db);
-    return false;
-  }
+  sqlite3_stmt* stmt = cached_prepare(
+      s.db, s.stmt_max_seq,
+      "SELECT seq FROM object_versions WHERE oid=?1 ORDER BY seq DESC LIMIT 1;", err);
+  if (!stmt) return false;
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   const int rc = sqlite3_step(stmt);
   if (rc == SQLITE_ROW) {
     max_seq = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
   } else if (rc != SQLITE_DONE) {
     err = sqlite3_errmsg(s.db);
-    sqlite3_finalize(stmt);
     return false;
   }
-  sqlite3_finalize(stmt);
   seq = std::max(max_seq, tip) + 1;
   return true;
 }
@@ -847,25 +861,21 @@ bool ObjectStore::insert_version_locked(
 
 bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uint64_t seq,
                                       ObjectInfo& out, std::string& err) {
-  sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(s.db,
-                         "SELECT size, inline, fs_path, crc32c, is_delete, ctime_ms, "
-                         "redirect_oid FROM object_versions WHERE oid=?1 AND seq=?2;",
-                         -1, &stmt, nullptr) != SQLITE_OK) {
-    err = sqlite3_errmsg(s.db);
-    return false;
-  }
+  sqlite3_stmt* stmt = cached_prepare(
+      s.db, s.stmt_load_version,
+      "SELECT size, inline, fs_path, crc32c, is_delete, ctime_ms, "
+      "redirect_oid FROM object_versions WHERE oid=?1 AND seq=?2;",
+      err);
+  if (!stmt) return false;
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(seq));
   const int rc = sqlite3_step(stmt);
   if (rc == SQLITE_DONE) {
-    sqlite3_finalize(stmt);
     err = "object not found";
     return false;
   }
   if (rc != SQLITE_ROW) {
     err = sqlite3_errmsg(s.db);
-    sqlite3_finalize(stmt);
     return false;
   }
   out = ObjectInfo{};
@@ -886,7 +896,6 @@ bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uin
   const auto* redir = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
   if (redir) out.redirect_oid = redir;
   if (!out.fs_path.empty()) out.inline_body = false;
-  sqlite3_finalize(stmt);
   return true;
 }
 
@@ -1023,7 +1032,7 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
     ObjectInfo tip_info;
     std::string lerr;
     if (load_version_locked(s, oid, tip, tip_info, lerr) && !tip_info.is_delete) {
-      if (!load_attrs_for_seq(s.db, oid, tip, merged, err)) {
+      if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, oid, tip, merged, err)) {
         rollback(s);
         return false;
       }
@@ -1299,7 +1308,7 @@ bool ObjectStore::prepare_put_file_at_seq(
     ObjectInfo tip_info;
     std::string lerr;
     if (load_version_locked(s, oid, tip, tip_info, lerr) && !tip_info.is_delete) {
-      if (!load_attrs_for_seq(s.db, oid, tip, merged, err)) {
+      if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, oid, tip, merged, err)) {
         rollback(s);
         return false;
       }
@@ -1387,11 +1396,10 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
       tip_live = true;
       old_size = tip_info.size;
       if (tip_info.inline_body) {
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(s.db,
-                               "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;",
-                               -1, &stmt, nullptr) != SQLITE_OK) {
-          err = sqlite3_errmsg(s.db);
+        sqlite3_stmt* stmt = cached_prepare(
+            s.db, s.stmt_get_inline, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;",
+            err);
+        if (!stmt) {
           rollback(s);
           return false;
         }
@@ -1405,7 +1413,6 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
                               reinterpret_cast<const std::uint8_t*>(blob) + n);
           }
         }
-        sqlite3_finalize(stmt);
       }
     }
   }
@@ -1414,7 +1421,7 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
   if (tip_live) {
     if (!replace_attrs) {
       std::unordered_map<std::string, std::string> tip_attrs;
-      if (!load_attrs_for_seq(s.db, oid, tip, tip_attrs, err)) {
+      if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, oid, tip, tip_attrs, err)) {
         rollback(s);
         return false;
       }
@@ -1625,7 +1632,7 @@ bool ObjectStore::prepare_redirect(const std::string& oid, const std::string& ta
     ObjectInfo tip_info;
     std::string lerr;
     if (load_version_locked(s, oid, tip, tip_info, lerr) && !tip_info.is_delete) {
-      if (!load_attrs_for_seq(s.db, oid, tip, merged, err)) {
+      if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, oid, tip, merged, err)) {
         rollback(s);
         return false;
       }
@@ -1715,7 +1722,7 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
       return false;
     }
     std::unordered_map<std::string, std::string> existing_attrs;
-    if (!load_attrs_for_seq(s.db, v.oid, v.seq, existing_attrs, err)) {
+    if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, v.oid, v.seq, existing_attrs, err)) {
       rollback(s);
       return false;
     }
@@ -2093,32 +2100,26 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get(const std::string& oid
     return out;
   }
 
-  sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(s.db, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;",
-                         -1, &stmt, nullptr) != SQLITE_OK) {
-    err = sqlite3_errmsg(s.db);
-    return std::nullopt;
-  }
+  sqlite3_stmt* stmt = cached_prepare(
+      s.db, s.stmt_get_inline, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;", err);
+  if (!stmt) return std::nullopt;
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(info->seq));
   const int rc = sqlite3_step(stmt);
   if (rc != SQLITE_ROW) {
     err = rc == SQLITE_DONE ? "object not found" : sqlite3_errmsg(s.db);
-    sqlite3_finalize(stmt);
     return std::nullopt;
   }
   const void* blob = sqlite3_column_blob(stmt, 0);
   const int blob_len = sqlite3_column_bytes(stmt, 0);
   if (static_cast<std::uint64_t>(blob_len) != info->size) {
     err = "inline size mismatch";
-    sqlite3_finalize(stmt);
     return std::nullopt;
   }
   std::vector<std::uint8_t> out(static_cast<std::size_t>(blob_len));
   if (blob_len > 0 && blob) {
     std::memcpy(out.data(), blob, static_cast<std::size_t>(blob_len));
   }
-  sqlite3_finalize(stmt);
   return out;
 }
 
@@ -2241,7 +2242,7 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
   }
 
   std::unordered_map<std::string, std::string> attrs;
-  if (!load_attrs_for_seq(s.db, oid, tip, attrs, err)) {
+  if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, oid, tip, attrs, err)) {
     rollback(s);
     return false;
   }
@@ -2264,10 +2265,10 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
   std::vector<std::uint8_t> inline_copy;
   if (tip_info.inline_body) {
     pv.inline_body = true;
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(s.db, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;",
-                           -1, &stmt, nullptr) != SQLITE_OK) {
-      err = sqlite3_errmsg(s.db);
+    sqlite3_stmt* stmt = cached_prepare(
+        s.db, s.stmt_get_inline, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;",
+        err);
+    if (!stmt) {
       rollback(s);
       return false;
     }
@@ -2275,7 +2276,6 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
     sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(tip));
     if (sqlite3_step(stmt) != SQLITE_ROW) {
       err = "tip inline missing";
-      sqlite3_finalize(stmt);
       rollback(s);
       return false;
     }
@@ -2285,7 +2285,6 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
       inline_copy.assign(reinterpret_cast<const std::uint8_t*>(blob),
                          reinterpret_cast<const std::uint8_t*>(blob) + n);
     }
-    sqlite3_finalize(stmt);
   } else {
     pv.inline_body = false;
     pv.fs_path = version_relpath(oid, seq);
@@ -2376,7 +2375,7 @@ std::unordered_map<std::string, std::string> ObjectStore::list_attrs(const std::
     return out;
   }
   std::lock_guard<std::recursive_mutex> guard(sp->mu);
-  if (!load_attrs_for_seq(sp->db, oid, info->seq, out, err)) return {};
+  if (!load_attrs_for_seq(sp->db, sp->stmt_load_attrs, oid, info->seq, out, err)) return {};
   return out;
 }
 

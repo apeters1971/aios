@@ -11,6 +11,7 @@
 #include "object/repair.hpp"
 #include "store/local_stores.hpp"
 #include "util/base64.hpp"
+#include "util/crc32c.hpp"
 
 #include <filesystem>
 #include <iostream>
@@ -109,6 +110,32 @@ TEST(ObjectRpc, Basic) {
   auto data = aios::test::rpc_payload(get_reply);
   EXPECT_TRUE((get_reply.flags & aios::kFlagRawBody) != 0) << "get uses raw body";
   EXPECT_TRUE(std::string(data.begin(), data.end()) == "payload-data") << "get data";
+
+  Frame raw_put;
+  raw_put.type = MsgType::ObjectPut;
+  raw_put.flags = kFlagRawBody;
+  const std::string raw_payload = "raw-put-payload";
+  raw_put.raw.assign(raw_payload.begin(), raw_payload.end());
+  raw_put.body = {
+      {"epoch", map.epoch},
+      {"aios_path", primary.aios_path},
+      {"oid", "raw-oid"},
+      {"size", raw_payload.size()},
+      {"crc32c", crc32c(reinterpret_cast<const std::uint8_t*>(raw_payload.data()),
+                        raw_payload.size())},
+      {"role", "primary"},
+  };
+  EXPECT_TRUE(!raw_put.body.contains("data_b64")) << "raw put has no data_b64";
+  auto raw_reply = svc.handle(raw_put);
+  EXPECT_TRUE(raw_reply.body.value("ok", false)) << "raw put ok";
+  Frame raw_get;
+  raw_get.type = MsgType::ObjectGet;
+  raw_get.body = {{"epoch", map.epoch}, {"aios_path", primary.aios_path}, {"oid", "raw-oid"}};
+  auto raw_got = svc.handle(raw_get);
+  auto raw_data = aios::test::rpc_payload(raw_got);
+  EXPECT_TRUE(raw_got.body.value("ok", false) &&
+              std::string(raw_data.begin(), raw_data.end()) == raw_payload)
+      << "raw put roundtrip";
 
   Frame st;
   st.type = MsgType::ObjectStat;

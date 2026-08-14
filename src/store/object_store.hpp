@@ -9,6 +9,7 @@
 #include <vector>
 
 struct sqlite3;
+struct sqlite3_stmt;
 
 namespace aios {
 
@@ -262,6 +263,11 @@ class ObjectStore {
     std::string dir;
     sqlite3* db{nullptr};
     mutable std::recursive_mutex mu;
+    sqlite3_stmt* stmt_tip_seq{nullptr};
+    sqlite3_stmt* stmt_max_seq{nullptr};
+    sqlite3_stmt* stmt_load_version{nullptr};
+    sqlite3_stmt* stmt_load_attrs{nullptr};
+    sqlite3_stmt* stmt_get_inline{nullptr};
   };
 
   Shard* shard_for(const std::string& oid);

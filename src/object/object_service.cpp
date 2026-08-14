@@ -570,7 +570,7 @@ Frame ObjectService::handle(const Frame& req) {
   // keep the mutex held and reintroduce multi-node PUT/publish deadlocks under load.
   switch (req.type) {
     case MsgType::ObjectPut:
-      return handle_put(req.body);
+      return handle_put(req);
     case MsgType::ObjectPutRange:
       return handle_put_range(req);
     case MsgType::ObjectGet:
@@ -644,8 +644,9 @@ static std::vector<AttrPrecondition> parse_preds_json(const nlohmann::json& body
   return preds;
 }
 
-Frame ObjectService::handle_put(const nlohmann::json& body) {
+Frame ObjectService::handle_put(const Frame& req) {
   Frame errf;
+  const auto& body = req.body;
   if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
 
   const std::string oid = body.value("oid", "");
@@ -660,10 +661,15 @@ Frame ObjectService::handle_put(const nlohmann::json& body) {
   const std::string redirect_oid = body.value("redirect", "");
   const bool is_redirect = !redirect_oid.empty();
   if (!is_delete && !is_redirect) {
-    std::string derr;
-    if (!body.contains("data_b64") || !body["data_b64"].is_string() ||
-        !base64_decode(body["data_b64"].get<std::string>(), data, derr)) {
-      return reply_err(map_.epoch, "bad_request", "invalid data_b64: " + derr);
+    if (!req.raw_empty()) {
+      data.assign(req.raw_data(), req.raw_data() + req.raw_size());
+    } else if (body.contains("data_b64") && body["data_b64"].is_string()) {
+      std::string derr;
+      if (!base64_decode(body["data_b64"].get<std::string>(), data, derr)) {
+        return reply_err(map_.epoch, "bad_request", "invalid data_b64: " + derr);
+      }
+    } else if (body.value("size", static_cast<std::uint64_t>(0)) != 0) {
+      return reply_err(map_.epoch, "bad_request", "missing put body");
     }
   }
 
@@ -1264,7 +1270,8 @@ ApiResult ObjectService::commit_ec_put(
 
 ApiResult ObjectService::reconstruct_ec_object(
     const Placement& placement, const std::string& oid, std::optional<std::uint64_t> seq,
-    const std::unordered_map<std::string, std::string>& tip_attrs) {
+    const std::unordered_map<std::string, std::string>& tip_attrs,
+    std::optional<std::uint64_t> range_off, std::optional<std::uint64_t> range_end) {
   auto meta = parse_ec_attrs(tip_attrs);
   if (!meta) return fail("store_error", "missing ec attrs");
   std::string err;
@@ -1275,8 +1282,11 @@ ApiResult ObjectService::reconstruct_ec_object(
   }
 
   const auto shard_count = static_cast<std::size_t>(codec->shard_count());
-  // Shard identity is the stored aios.ec.i attr; the acting-set position it happens
-  // to occupy changes whenever place() reorders the set for a topology change.
+  const auto k = static_cast<std::size_t>(codec->k());
+  const auto full_size = static_cast<std::size_t>(meta->full_size);
+  const std::size_t shard_len =
+      full_size == 0 ? 0 : (full_size + k - 1) / k;
+
   auto shard_index_for = [&](const StorageTarget& t, std::size_t fallback) -> std::size_t {
     std::unordered_map<std::string, std::string> a;
     if (t.node_id == cfg_.node_id) {
@@ -1298,51 +1308,105 @@ ApiResult ObjectService::reconstruct_ec_object(
   };
 
   std::vector<std::optional<std::vector<std::uint8_t>>> shards(shard_count);
-  int got = 0;
+  std::mutex shard_mu;
+  std::atomic<int> got{0};
+  std::vector<std::thread> workers;
+  workers.reserve(placement.acting_set.size());
   for (std::size_t ti = 0; ti < placement.acting_set.size(); ++ti) {
-    const auto& t = placement.acting_set[ti];
-    const auto i = shard_index_for(t, ti);
-    if (i >= shard_count || shards[i]) continue;
-    if (t.node_id == cfg_.node_id) {
-      auto* s = stores_.get(t.aios_path);
-      if (!s) continue;
-      auto data = s->get(oid, seq, err);
-      if (!data) continue;
-      shards[i] = std::move(*data);
-      ++got;
-    } else {
-      ObjectRpcResult r;
-      if (seq.has_value()) {
-        // Versioned remote get via ranged full read when seq set.
+    workers.emplace_back([&, ti] {
+      const auto& t = placement.acting_set[ti];
+      const auto i = shard_index_for(t, ti);
+      if (i >= shard_count) return;
+      std::vector<std::uint8_t> data;
+      std::string e;
+      if (t.node_id == cfg_.node_id) {
+        auto* s = stores_.get(t.aios_path);
+        if (!s) return;
+        auto got_data = s->get(oid, seq, e);
+        if (!got_data) return;
+        data = std::move(*got_data);
+      } else if (seq.has_value()) {
         auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
                                      cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
-        if (!st.ok) continue;
-        r = object_get_range_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                    cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid, 0,
-                                    static_cast<std::size_t>(st.size), seq);
-        if (r.ok && !r.raw.empty()) {
-          shards[i] = std::move(r.raw);
-          ++got;
-        } else if (r.ok && r.data) {
-          shards[i] = std::move(*r.data);
-          ++got;
-        }
+        if (!st.ok) return;
+        auto r = object_get_range_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                         cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid, 0,
+                                         static_cast<std::size_t>(st.size), seq);
+        if (r.ok && !r.raw.empty()) data = std::move(r.raw);
+        else if (r.ok && r.data) data = std::move(*r.data);
+        else return;
       } else {
-        r = object_get_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                              cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
-        if (!r.ok || !r.data) continue;
-        shards[i] = std::move(*r.data);
-        ++got;
+        auto r = object_get_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                   cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+        if (!r.ok || !r.data) return;
+        data = std::move(*r.data);
       }
-    }
+      std::lock_guard lock(shard_mu);
+      if (shards[i]) return;
+      shards[i] = std::move(data);
+      got.fetch_add(1, std::memory_order_relaxed);
+    });
   }
-  if (got < meta->k) return fail("quorum_failed", "not enough ec shards to reconstruct");
+  for (auto& w : workers) w.join();
+  if (got.load() < meta->k) return fail("quorum_failed", "not enough ec shards to reconstruct");
 
-  std::vector<std::uint8_t> full;
-  if (!codec->decode(shards, static_cast<std::size_t>(meta->full_size), full, err)) {
-    return fail("store_error", err);
+  const bool ranged = range_off.has_value() || range_end.has_value();
+  const std::uint64_t lo = range_off.value_or(0);
+  if (ranged && lo >= meta->full_size) {
+    return fail("range_unsatisfiable", "range unsatisfiable");
   }
-  if (meta->full_crc_known && crc32c(full.data(), full.size()) != meta->full_crc) {
+  std::uint64_t hi = range_end.value_or(full_size == 0 ? 0 : full_size - 1);
+  if (full_size == 0) {
+    hi = 0;
+  } else if (hi >= full_size) {
+    hi = full_size - 1;
+  }
+  if (full_size > 0 && hi < lo) return fail("range_unsatisfiable", "range unsatisfiable");
+
+  auto slice_from_data_shards = [&](std::vector<std::uint8_t>& out) -> bool {
+    if (full_size == 0) {
+      out.clear();
+      return true;
+    }
+    if (shard_len == 0) return false;
+    const auto i0 = static_cast<std::size_t>(lo / shard_len);
+    const auto i1 = static_cast<std::size_t>(hi / shard_len);
+    if (i1 >= k) return false;
+    for (auto i = i0; i <= i1; ++i) {
+      if (!shards[i]) return false;
+    }
+    out.resize(static_cast<std::size_t>(hi - lo + 1));
+    std::size_t w = 0;
+    for (auto i = i0; i <= i1; ++i) {
+      const std::uint64_t shard_base = static_cast<std::uint64_t>(i) * shard_len;
+      const std::uint64_t copy_lo = std::max(lo, shard_base);
+      const std::uint64_t copy_hi = std::min(hi, shard_base + shard_len - 1);
+      const auto src = static_cast<std::size_t>(copy_lo - shard_base);
+      const auto n = static_cast<std::size_t>(copy_hi - copy_lo + 1);
+      if (src + n > shards[i]->size()) return false;
+      std::memcpy(out.data() + w, shards[i]->data() + src, n);
+      w += n;
+    }
+    return w == out.size();
+  };
+
+  std::vector<std::uint8_t> out;
+  if (!slice_from_data_shards(out)) {
+    std::vector<std::uint8_t> full;
+    if (!codec->decode(shards, full_size, full, err)) {
+      return fail("store_error", err);
+    }
+    if (meta->full_crc_known && crc32c(full.data(), full.size()) != meta->full_crc) {
+      return fail("crc_mismatch", "reconstructed object crc mismatch");
+    }
+    if (full_size == 0) {
+      out.clear();
+    } else {
+      out.assign(full.begin() + static_cast<std::ptrdiff_t>(lo),
+                 full.begin() + static_cast<std::ptrdiff_t>(hi + 1));
+    }
+  } else if (out.size() == full_size && meta->full_crc_known &&
+             crc32c(out.data(), out.size()) != meta->full_crc) {
     return fail("crc_mismatch", "reconstructed object crc mismatch");
   }
 
@@ -1351,7 +1415,7 @@ ApiResult ObjectService::reconstruct_ec_object(
   r.epoch = map_.epoch;
   r.placement = placement;
   r.attrs = tip_attrs;
-  r.data = std::move(full);
+  r.data = std::move(out);
   r.info = ObjectInfo{};
   r.info->oid = oid;
   r.info->size = meta->full_size;
@@ -1632,7 +1696,8 @@ ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
 }
 
 ApiResult ObjectService::api_put_pipeline_data(const std::string& oid, std::uint64_t offset,
-                                              const std::uint8_t* data, std::size_t len) {
+                                              const std::uint8_t* data, std::size_t len,
+                                              PipelineDataKind kind) {
   std::shared_ptr<PutPipeline> pl;
   {
     std::lock_guard lock(mu_);
@@ -1640,62 +1705,73 @@ ApiResult ObjectService::api_put_pipeline_data(const std::string& oid, std::uint
     if (it == pipelines_.end()) return fail("not_found", "no pipelined put for oid");
     pl = it->second;
   }
-  std::lock_guard plock(pl->mu);
-  if (pl->fd < 0) return fail("store_error", "pipeline staging closed");
-  if (offset != pl->bytes) {
-    return fail("bad_request", "pipeline offset mismatch");
-  }
-  if (pl->expected_size > 0 && offset + len > pl->expected_size) {
-    return fail("bad_request", "pipeline exceeds expected size");
-  }
   if (len > 0 && data == nullptr) return fail("bad_request", "null pipeline chunk");
 
-  std::size_t done = 0;
-  while (done < len) {
-    const ssize_t n =
-        ::pwrite(pl->fd, data + done, len - done, static_cast<off_t>(offset + done));
-    if (n < 0) {
-      return fail("store_error", std::string("pwrite: ") + std::strerror(errno));
+  if (kind == PipelineDataKind::Local || kind == PipelineDataKind::All) {
+    std::lock_guard plock(pl->mu);
+    if (pl->fd < 0) return fail("store_error", "pipeline staging closed");
+    if (offset != pl->bytes) {
+      return fail("bad_request", "pipeline offset mismatch");
     }
-    if (n == 0) return fail("store_error", "pwrite short write");
-    done += static_cast<std::size_t>(n);
-  }
-  for (auto& lp : pl->local_peers) {
-    done = 0;
+    if (pl->expected_size > 0 && offset + len > pl->expected_size) {
+      return fail("bad_request", "pipeline exceeds expected size");
+    }
+
+    std::size_t done = 0;
     while (done < len) {
       const ssize_t n =
-          ::pwrite(lp.fd, data + done, len - done, static_cast<off_t>(offset + done));
+          ::pwrite(pl->fd, data + done, len - done, static_cast<off_t>(offset + done));
       if (n < 0) {
-        return fail("store_error", std::string("local peer pwrite: ") + std::strerror(errno));
+        return fail("store_error", std::string("pwrite: ") + std::strerror(errno));
       }
-      if (n == 0) return fail("store_error", "local peer pwrite short write");
+      if (n == 0) return fail("store_error", "pwrite short write");
       done += static_cast<std::size_t>(n);
     }
-    lp.crc = crc32c_update(lp.crc, data, len);
-    lp.bytes += len;
-  }
-
-  std::atomic<int> fail_count{0};
-  std::string peer_err;
-  std::mutex err_mu;
-  std::vector<std::thread> workers;
-  workers.reserve(pl->remote_peers.size());
-  for (std::size_t i = 0; i < pl->remote_peers.size(); ++i) {
-    workers.emplace_back([&, i] {
-      if (!pl->remote_peers[i].data(offset, data, len)) {
-        fail_count.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard elock(err_mu);
-        if (peer_err.empty()) peer_err = pl->remote_peers[i].error();
+    for (auto& lp : pl->local_peers) {
+      done = 0;
+      while (done < len) {
+        const ssize_t n =
+            ::pwrite(lp.fd, data + done, len - done, static_cast<off_t>(offset + done));
+        if (n < 0) {
+          return fail("store_error", std::string("local peer pwrite: ") + std::strerror(errno));
+        }
+        if (n == 0) return fail("store_error", "local peer pwrite short write");
+        done += static_cast<std::size_t>(n);
       }
-    });
-  }
-  for (auto& w : workers) w.join();
-  if (fail_count.load() > 0) {
-    return fail("quorum_failed", "stage data failed: " + peer_err);
+      lp.crc = crc32c_update(lp.crc, data, len);
+      lp.bytes += len;
+    }
+    pl->crc = crc32c_update(pl->crc, data, len);
+    pl->bytes += len;
   }
 
-  pl->crc = crc32c_update(pl->crc, data, len);
-  pl->bytes += len;
+  if (kind == PipelineDataKind::Remote || kind == PipelineDataKind::All) {
+    // Fan-out without pl->mu so the next Local pwrite can run while peers ingest.
+    std::size_t npeers = 0;
+    {
+      std::lock_guard plock(pl->mu);
+      npeers = pl->remote_peers.size();
+    }
+    std::atomic<int> fail_count{0};
+    std::string peer_err;
+    std::mutex err_mu;
+    std::vector<std::thread> workers;
+    workers.reserve(npeers);
+    for (std::size_t i = 0; i < npeers; ++i) {
+      workers.emplace_back([&, i] {
+        if (!pl->remote_peers[i].data(offset, data, len)) {
+          fail_count.fetch_add(1, std::memory_order_relaxed);
+          std::lock_guard elock(err_mu);
+          if (peer_err.empty()) peer_err = pl->remote_peers[i].error();
+        }
+      });
+    }
+    for (auto& w : workers) w.join();
+    if (fail_count.load() > 0) {
+      return fail("quorum_failed", "stage data failed: " + peer_err);
+    }
+  }
+
   ApiResult r;
   r.ok = true;
   r.epoch = map_.epoch;
@@ -2468,10 +2544,13 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
       if (!prev.empty()) placement = place(oid, map_, en, prev);
     }
     if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+    const bool compressed = attrs_are_compressed(attrs);
     ApiResult rec;
     {
       UnlockForRpc unlock(mu_);
-      rec = reconstruct_ec_object(placement, oid, seq, attrs);
+      // Compressed EC bodies must be reconstructed in full before zstd can run.
+      rec = compressed ? reconstruct_ec_object(placement, oid, seq, attrs)
+                       : reconstruct_ec_object(placement, oid, seq, attrs, offset, end_inclusive);
     }
     if (!rec.ok) return rec;
     rec.info->seq = info->seq;
@@ -2479,18 +2558,16 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     rec.info->ctime_ms = info->ctime_ms;
     rec.attrs = attrs;
     if (!decompress_api_result(rec, err, cfg_.max_object_bytes)) return fail("store_error", err);
-    if (!offset.has_value()) {
-      note_get(rec);
-      return rec;
+    if (compressed && offset.has_value()) {
+      if (!rec.data) return fail("store_error", "ec reconstruct produced no data");
+      if (*offset >= rec.data->size()) return fail("range_unsatisfiable", "range unsatisfiable");
+      std::uint64_t end = end_inclusive.value_or(rec.data->size() - 1);
+      if (end >= rec.data->size()) end = rec.data->size() - 1;
+      if (end < *offset) return fail("range_unsatisfiable", "range unsatisfiable");
+      rec.data = std::vector<std::uint8_t>(
+          rec.data->begin() + static_cast<std::ptrdiff_t>(*offset),
+          rec.data->begin() + static_cast<std::ptrdiff_t>(end + 1));
     }
-    if (!rec.data) return fail("store_error", "ec reconstruct produced no data");
-    if (*offset >= rec.data->size()) return fail("range_unsatisfiable", "range unsatisfiable");
-    std::uint64_t end = end_inclusive.value_or(rec.data->size() - 1);
-    if (end >= rec.data->size()) end = rec.data->size() - 1;
-    if (end < *offset) return fail("range_unsatisfiable", "range unsatisfiable");
-    std::vector<std::uint8_t> slice(rec.data->begin() + static_cast<std::ptrdiff_t>(*offset),
-                                    rec.data->begin() + static_cast<std::ptrdiff_t>(end + 1));
-    rec.data = std::move(slice);
     note_get(rec);
     return rec;
   }

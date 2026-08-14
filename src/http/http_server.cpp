@@ -508,8 +508,8 @@ bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
   return ok;
 }
 
-// One worker thread for the whole large PUT so HTTP read overlaps StageData
-// without spawning a thread per 1 MiB chunk.
+// Local pwrite runs on the HTTP thread. One worker fans out StageData so the
+// next local write can overlap peer ingest without a thread per chunk.
 struct PipelineStager {
   ObjectService& objects;
   std::mutex mu;
@@ -546,7 +546,8 @@ struct PipelineStager {
       const auto local_n = n;
       data = nullptr;
       lk.unlock();
-      auto r = objects.api_put_pipeline_data(local_oid, local_off, local_data, local_n);
+      auto r = objects.api_put_pipeline_data(local_oid, local_off, local_data, local_n,
+                                             ObjectService::PipelineDataKind::Remote);
       lk.lock();
       last = std::move(r);
       if (!last.ok) failed = true;
@@ -562,7 +563,20 @@ struct PipelineStager {
     return !failed;
   }
 
-  bool submit(std::string oid_, std::uint64_t off_, const std::uint8_t* d, std::size_t nn) {
+  bool submit_local(const std::string& oid_, std::uint64_t off_, const std::uint8_t* d,
+                    std::size_t nn) {
+    auto r = objects.api_put_pipeline_data(oid_, off_, d, nn,
+                                           ObjectService::PipelineDataKind::Local);
+    if (!r.ok) {
+      std::lock_guard lk(mu);
+      failed = true;
+      last = std::move(r);
+      return false;
+    }
+    return true;
+  }
+
+  bool submit_remote(std::string oid_, std::uint64_t off_, const std::uint8_t* d, std::size_t nn) {
     if (!wait()) return false;
     std::unique_lock lk(mu);
     oid = std::move(oid_);
@@ -1270,37 +1284,23 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             const std::string oid = url_decode(rest);
             const bool ranged = !header_get(headers, "content-range").empty();
             const bool is_redirect = !header_get(headers, "x-aios-redirect").empty();
-            if (!oid.empty() && !ranged && !is_redirect) {
+            if (!oid.empty() && !is_redirect) {
               const LayoutRequest layout_req = layout_request_from_headers(headers);
               std::string staging;
-              auto br = objects_.api_begin_put_pipeline(oid, layout_req, content_length,
-                                                       staging);
-              if (br.ok) {
-                upload_pipeline = true;
-                upload_pipeline_oid = oid;
-              } else if (br.code == "not_supported") {
-                br = objects_.api_begin_put_staging(oid, layout_req, staging);
-                if (br.ok) upload_path = std::move(staging);
-              } else if (br.code == "not_primary" || br.code == "not_local") {
-                if (!want_continue) {
-                  // Legacy clients already put the body on the wire; drain so keep-alive
-                  // stays usable. Prefer Expect: 100-continue to skip this path.
-                  std::vector<std::uint8_t> drain(
-                      std::min(content_length, std::size_t{256 * 1024}));
-                  std::size_t left = content_length;
-                  while (left > 0) {
-                    const auto n = std::min(left, drain.size());
-                    if (!sock_read_exact(*sock, drain.data(), n, ec)) return;
-                    left -= n;
-                  }
+              ApiResult br;
+              br.ok = false;
+              if (!ranged) {
+                br = objects_.api_begin_put_pipeline(oid, layout_req, content_length,
+                                                     staging);
+                if (br.ok) {
+                  upload_pipeline = true;
+                  upload_pipeline_oid = oid;
                 }
-                // Expect clients never send the body after a 307, so keep-alive is safe.
-                write_api_error(*sock, br, target, keep_alive);
-                continue;
-              } else {
-                // Pipeline failed for another reason; try non-pipelined staging.
-                br = objects_.api_begin_put_staging(oid, layout_req, staging);
-                if (!br.ok && (br.code == "not_primary" || br.code == "not_local")) {
+              }
+              if (!upload_pipeline) {
+                // EC, zstd, ranged, or pipeline miss: stage on the store volume
+                // so commit is a rename, not a /tmp → data-dir copy.
+                if (br.code == "not_primary" || br.code == "not_local") {
                   if (!want_continue) {
                     std::vector<std::uint8_t> drain(
                         std::min(content_length, std::size_t{256 * 1024}));
@@ -1314,7 +1314,23 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                   write_api_error(*sock, br, target, keep_alive);
                   continue;
                 }
-                if (br.ok) upload_path = std::move(staging);
+                br = objects_.api_begin_put_staging(oid, layout_req, staging);
+                if (br.ok) {
+                  upload_path = std::move(staging);
+                } else if (br.code == "not_primary" || br.code == "not_local") {
+                  if (!want_continue) {
+                    std::vector<std::uint8_t> drain(
+                        std::min(content_length, std::size_t{256 * 1024}));
+                    std::size_t left = content_length;
+                    while (left > 0) {
+                      const auto n = std::min(left, drain.size());
+                      if (!sock_read_exact(*sock, drain.data(), n, ec)) return;
+                      left -= n;
+                    }
+                  }
+                  write_api_error(*sock, br, target, keep_alive);
+                  continue;
+                }
               }
             }
           }
@@ -1334,34 +1350,34 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         std::uint64_t offset = 0;
         bool write_ok = true;
         PipelineStager stager(objects_);
-        std::size_t inflight_n = 0;
-        bool have_inflight = false;
+        bool have_remote = false;
         while (left > 0) {
           const auto n = std::min(left, fill->size());
           if (!sock_read_exact(*sock, fill->data(), n, ec)) {
             write_ok = false;
             break;
           }
-          if (have_inflight) {
-            if (!stager.wait()) {
-              write_ok = false;
-              break;
-            }
-            offset += inflight_n;
-          }
-          std::swap(fill, send);
-          inflight_n = n;
-          if (!stager.submit(upload_pipeline_oid, offset, send->data(), n)) {
+          // Local pwrite of this chunk while the previous chunk's remotes run.
+          if (!stager.submit_local(upload_pipeline_oid, offset, fill->data(), n)) {
             write_ok = false;
             break;
           }
-          have_inflight = true;
+          if (have_remote && !stager.wait()) {
+            write_ok = false;
+            break;
+          }
+          std::swap(fill, send);
+          if (!stager.submit_remote(upload_pipeline_oid, offset, send->data(), n)) {
+            write_ok = false;
+            break;
+          }
+          have_remote = true;
+          offset += n;
           left -= n;
         }
-        if (write_ok && have_inflight) {
+        if (write_ok && have_remote) {
           if (!stager.wait()) write_ok = false;
-          else offset += inflight_n;
-        } else if (have_inflight) {
+        } else if (have_remote) {
           stager.wait();
         }
         if (!write_ok || left != 0 || offset != content_length) {

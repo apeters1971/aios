@@ -344,9 +344,12 @@ std::string url_encode_oid(const std::string& oid) { return aios::http_url_encod
 struct HttpResp {
   int status{-1};
   std::string body;
+  std::size_t body_n{0};
   std::string error;
   std::string location;
 };
+
+enum class BodyMode { Store, Discard };
 
 bool parse_http_location(const std::string& loc, std::string& host, std::string& port,
                          std::string& path) {
@@ -420,7 +423,8 @@ class HttpSession {
 
   HttpResp request(const std::string& method, const std::string& target,
                    const std::uint8_t* body, std::size_t body_len,
-                   const std::unordered_map<std::string, std::string>& extra_headers) {
+                   const std::unordered_map<std::string, std::string>& extra_headers,
+                   BodyMode body_mode = BodyMode::Store) {
     std::string path = target;
     HttpResp resp;
     for (int hop = 0; hop <= 5; ++hop) {
@@ -432,7 +436,7 @@ class HttpSession {
           close();
           continue;
         }
-        resp = do_request(method, path, body, body_len, extra_headers);
+        resp = do_request(method, path, body, body_len, extra_headers, body_mode);
         if (resp.status >= 0) break;
         close();
       }
@@ -534,7 +538,7 @@ class HttpSession {
   // final error/redirect) before sending the payload.
   static constexpr std::size_t kExpectContinueBytes = 256u * 1024u;
 
-  HttpResp read_http_message(asio::streambuf& buf) {
+  HttpResp read_http_message(asio::streambuf& buf, BodyMode body_mode = BodyMode::Store) {
     HttpResp resp;
     boost::system::error_code ec;
     asio::read_until(sock_, buf, "\r\n\r\n", ec);
@@ -586,23 +590,48 @@ class HttpSession {
       return resp;
     }
 
-    resp.body.resize(content_length);
+    resp.body_n = content_length;
     std::size_t have = buf.size();
     if (have > content_length) have = content_length;
-    if (have > 0) {
-      is.read(resp.body.data(), static_cast<std::streamsize>(have));
-    }
-    std::size_t need = content_length - have;
-    while (need > 0) {
-      const auto n = asio::read(sock_, asio::buffer(resp.body.data() + (content_length - need), need),
-                                asio::transfer_at_least(1), ec);
-      if (ec) {
-        resp.status = -1;
-        resp.error = "read body: " + ec.message();
-        close();
-        return resp;
+    if (body_mode == BodyMode::Discard) {
+      char scratch[65536];
+      std::size_t from_buf = have;
+      while (from_buf > 0) {
+        const auto n = std::min(from_buf, sizeof(scratch));
+        is.read(scratch, static_cast<std::streamsize>(n));
+        from_buf -= n;
       }
-      need -= n;
+      std::size_t need = content_length - have;
+      while (need > 0) {
+        const auto chunk = std::min(need, sizeof(scratch));
+        const auto n = asio::read(sock_, asio::buffer(scratch, chunk), asio::transfer_at_least(1),
+                                  ec);
+        if (ec) {
+          resp.status = -1;
+          resp.error = "read body: " + ec.message();
+          close();
+          return resp;
+        }
+        need -= n;
+      }
+    } else {
+      resp.body.resize(content_length);
+      if (have > 0) {
+        is.read(resp.body.data(), static_cast<std::streamsize>(have));
+      }
+      std::size_t need = content_length - have;
+      while (need > 0) {
+        const auto n =
+            asio::read(sock_, asio::buffer(resp.body.data() + (content_length - need), need),
+                       asio::transfer_at_least(1), ec);
+        if (ec) {
+          resp.status = -1;
+          resp.error = "read body: " + ec.message();
+          close();
+          return resp;
+        }
+        need -= n;
+      }
     }
 
     if (close_conn || ec == asio::error::eof) close();
@@ -611,7 +640,8 @@ class HttpSession {
 
   HttpResp do_request(const std::string& method, const std::string& target,
                       const std::uint8_t* body, std::size_t body_len,
-                      const std::unordered_map<std::string, std::string>& extra_headers) {
+                      const std::unordered_map<std::string, std::string>& extra_headers,
+                      BodyMode body_mode = BodyMode::Store) {
     HttpResp resp;
     std::unordered_map<std::string, std::string> headers = extra_headers;
     headers.erase("authorization");
@@ -642,7 +672,7 @@ class HttpSession {
 
     if (use_continue) {
       asio::streambuf buf;
-      resp = read_http_message(buf);
+      resp = read_http_message(buf, BodyMode::Store);
       if (resp.status < 0) return resp;
       if (resp.status != 100) {
         // 307/4xx/5xx before the body — do not upload.
@@ -661,7 +691,7 @@ class HttpSession {
     }
 
     asio::streambuf buf;
-    return read_http_message(buf);
+    return read_http_message(buf, body_mode);
   }
 
   std::string host_;
@@ -730,6 +760,14 @@ PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::str
   std::atomic<std::size_t> err{0};
   std::atomic<std::uint64_t> bytes{0};
 
+  std::vector<std::vector<std::uint8_t>> thread_bufs(nthreads);
+  for (std::size_t t = 0; t < nthreads; ++t) {
+    thread_bufs[t].resize(size);
+    for (std::size_t i = 0; i < size; ++i) {
+      thread_bufs[t][i] = static_cast<std::uint8_t>((i + t) & 0xff);
+    }
+  }
+
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<std::thread> workers;
   workers.reserve(nthreads);
@@ -737,10 +775,7 @@ PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::str
   for (std::size_t t = 0; t < nthreads; ++t) {
     workers.emplace_back([&, t]() {
       HttpSession sess(host, port, a.cluster_key);
-      std::vector<std::uint8_t> buf(size);
-      for (std::size_t i = 0; i < size; ++i) {
-        buf[i] = static_cast<std::uint8_t>((i + t) & 0xff);
-      }
+      auto& buf = thread_bufs[t];
 
       for (;;) {
         const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
@@ -765,7 +800,7 @@ PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::str
         } else if (op == OpKind::Put) {
           resp = sess.request("PUT", target, buf.data(), buf.size(), layout_headers(a));
         } else if (op == OpKind::Read) {
-          resp = sess.request("GET", target, nullptr, 0, {});
+          resp = sess.request("GET", target, nullptr, 0, {}, BodyMode::Discard);
         } else {
           resp = sess.request("DELETE", target, nullptr, 0, {});
         }
@@ -777,7 +812,7 @@ PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::str
         if (op == OpKind::Create || op == OpKind::Update || op == OpKind::Put) {
           success = (resp.status == 204);
         } else if (op == OpKind::Read) {
-          success = (resp.status == 200 && resp.body.size() == size);
+          success = (resp.status == 200 && resp.body_n == size);
         } else {
           success = (resp.status == 204 || resp.status == 404);
         }

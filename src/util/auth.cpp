@@ -6,11 +6,11 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 
+#include <array>
 #include <cstdlib>
 #include <deque>
-#include <iomanip>
+#include <functional>
 #include <mutex>
-#include <sstream>
 #include <unordered_set>
 
 namespace aios {
@@ -29,21 +29,46 @@ bool const_time_eq(const std::string& a, const std::string& b) {
 // unique nonce so identical legitimate payloads in the same millisecond (hellos,
 // empty acks) do not collide. Cache key is type+ts+nonce+sig.
 constexpr std::size_t kReplayCacheCap = 4096;
+constexpr std::size_t kReplayShards = 16;
+constexpr std::size_t kReplayShardCap = kReplayCacheCap / kReplayShards;
 
-std::mutex g_replay_mu;
-std::deque<std::string> g_replay_order;
-std::unordered_set<std::string> g_replay_seen;
+struct ReplayShard {
+  std::mutex mu;
+  std::deque<std::string> order;
+  std::unordered_set<std::string> seen;
+};
+
+std::array<ReplayShard, kReplayShards> g_replay;
 
 bool replay_mark(const std::string& digest) {
-  std::lock_guard lock(g_replay_mu);
-  if (g_replay_seen.count(digest)) return false;
-  if (g_replay_order.size() >= kReplayCacheCap) {
-    g_replay_seen.erase(g_replay_order.front());
-    g_replay_order.pop_front();
+  auto& shard = g_replay[std::hash<std::string>{}(digest) % kReplayShards];
+  std::lock_guard lock(shard.mu);
+  if (shard.seen.count(digest)) return false;
+  if (shard.order.size() >= kReplayShardCap) {
+    shard.seen.erase(shard.order.front());
+    shard.order.pop_front();
   }
-  g_replay_order.push_back(digest);
-  g_replay_seen.insert(digest);
+  shard.order.push_back(digest);
+  shard.seen.insert(digest);
   return true;
+}
+
+void append_hex_lower(std::string& out, const unsigned char* p, std::size_t n) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  const auto at = out.size();
+  out.resize(at + n * 2);
+  char* w = out.data() + at;
+  for (std::size_t i = 0; i < n; ++i) {
+    w[i * 2] = kHex[p[i] >> 4];
+    w[i * 2 + 1] = kHex[p[i] & 0x0f];
+  }
+}
+
+std::string to_hex_lower(const unsigned char* p, std::size_t n) {
+  std::string out;
+  out.reserve(n * 2);
+  append_hex_lower(out, p, n);
+  return out;
 }
 
 std::string random_nonce_hex() {
@@ -54,14 +79,14 @@ std::string random_nonce_hex() {
     static std::uint64_t n = 0;
     std::lock_guard lock(mu);
     ++n;
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0') << std::setw(16) << n << std::setw(16) << n;
-    return oss.str();
+    unsigned char fb[16]{};
+    for (int i = 0; i < 8; ++i) {
+      fb[i] = static_cast<unsigned char>((n >> ((7 - i) * 8)) & 0xff);
+      fb[8 + i] = fb[i];
+    }
+    return to_hex_lower(fb, sizeof(fb));
   }
-  std::ostringstream oss;
-  oss << std::hex << std::setfill('0');
-  for (unsigned char c : raw) oss << std::setw(2) << static_cast<unsigned>(c);
-  return oss.str();
+  return to_hex_lower(raw, sizeof(raw));
 }
 
 }  // namespace
@@ -80,12 +105,7 @@ std::string hmac_sha256_raw(const std::string& key, const std::string& data) {
 std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
   const auto raw = hmac_sha256_raw(key, data);
   if (raw.empty()) return {};
-  std::ostringstream oss;
-  oss << std::hex << std::setfill('0');
-  for (unsigned char c : raw) {
-    oss << std::setw(2) << static_cast<unsigned>(c);
-  }
-  return oss.str();
+  return to_hex_lower(reinterpret_cast<const unsigned char*>(raw.data()), raw.size());
 }
 
 std::string sha256_hex(const std::string& data) {
@@ -94,12 +114,7 @@ std::string sha256_hex(const std::string& data) {
   if (EVP_Digest(data.data(), data.size(), md, &md_len, EVP_sha256(), nullptr) != 1) {
     return {};
   }
-  std::ostringstream oss;
-  oss << std::hex << std::setfill('0');
-  for (unsigned int i = 0; i < md_len; ++i) {
-    oss << std::setw(2) << static_cast<unsigned>(md[i]);
-  }
-  return oss.str();
+  return to_hex_lower(md, md_len);
 }
 
 std::string auth_canonical(MsgType type, std::int64_t ts, const nlohmann::json& body) {

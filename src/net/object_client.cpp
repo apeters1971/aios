@@ -299,14 +299,16 @@ ObjectRpcResult object_put_remote(const std::string& peer_addr,
       {"epoch", epoch},
       {"aios_path", aios_path},
       {"oid", oid},
-      {"data_b64", base64_encode(data, len)},
+      {"size", len},
       {"attrs", attrs_j},
       {"crc32c", crc32c(data, len)},
       {"role", as_replica ? "replica" : "primary"},
   };
   apply_layout_request_to_json(body, layout);
+  std::vector<std::uint8_t> raw;
+  if (data && len > 0) raw.assign(data, data + len);
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
-                    MsgType::ObjectPut, std::move(body));
+                    MsgType::ObjectPut, std::move(body), std::move(raw));
 }
 
 ObjectRpcResult object_get_remote(const std::string& peer_addr,
@@ -402,11 +404,12 @@ ObjectRpcResult object_install_remote(
       {"role", "replica"},
   };
   if (!v.redirect_oid.empty()) body["redirect"] = v.redirect_oid;
-  if (!v.is_delete && v.redirect_oid.empty()) {
-    body["data_b64"] = base64_encode(data, len);
+  std::vector<std::uint8_t> raw;
+  if (!v.is_delete && v.redirect_oid.empty() && data && len > 0) {
+    raw.assign(data, data + len);
   }
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
-                    MsgType::ObjectPut, std::move(body));
+                    MsgType::ObjectPut, std::move(body), std::move(raw));
 }
 
 ObjectRpcResult object_publish_tip_remote(const std::string& peer_addr,
@@ -752,7 +755,7 @@ ObjectRpcResult object_prepare_put_remote(
       {"epoch", epoch},
       {"aios_path", aios_path},
       {"oid", oid},
-      {"data_b64", base64_encode(data, len)},
+      {"size", len},
       {"attrs", attrs_j},
       {"crc32c", crc32c(data, len)},
       {"role", "primary"},
@@ -760,8 +763,10 @@ ObjectRpcResult object_prepare_put_remote(
   };
   if (!preds.empty()) body["preconditions"] = preds_to_json(preds);
   if (lock_token) body["lock_token"] = *lock_token;
+  std::vector<std::uint8_t> raw;
+  if (data && len > 0) raw.assign(data, data + len);
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
-                    MsgType::ObjectPut, std::move(body));
+                    MsgType::ObjectPut, std::move(body), std::move(raw));
 }
 
 ObjectRpcResult object_prepare_delete_remote(

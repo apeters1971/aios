@@ -84,8 +84,12 @@ class ObjectService {
   // the HTTP body arrives. Unsupported for EC / compression (returns not_supported).
   ApiResult api_begin_put_pipeline(const std::string& oid, const LayoutRequest& layout,
                                    std::uint64_t expected_size, std::string& staging_abs_out);
+  // Local writes the chunk under the pipeline lock; Remote fans out to peers
+  // without holding it so the next local pwrite can overlap. All does both.
+  enum class PipelineDataKind { All, Local, Remote };
   ApiResult api_put_pipeline_data(const std::string& oid, std::uint64_t offset,
-                                  const std::uint8_t* data, std::size_t len);
+                                  const std::uint8_t* data, std::size_t len,
+                                  PipelineDataKind kind = PipelineDataKind::All);
   ApiResult api_put_pipeline_finish(const std::string& oid,
                                     const std::unordered_map<std::string, std::string>& attrs,
                                     bool replace_attrs,
@@ -221,7 +225,7 @@ class ObjectService {
   Frame reply_ok(std::uint64_t epoch) const;
   Frame reply_err(std::uint64_t epoch, const std::string& code,
                   const std::string& error) const;
-  Frame handle_put(const nlohmann::json& body);
+  Frame handle_put(const Frame& req);
   Frame handle_put_range(const Frame& req);
   Frame handle_get(const nlohmann::json& body);
   Frame handle_del(const nlohmann::json& body);
@@ -283,7 +287,9 @@ class ObjectService {
   // Gather shards from acting set and decode (any node with cluster access).
   ApiResult reconstruct_ec_object(const Placement& placement, const std::string& oid,
                                   std::optional<std::uint64_t> seq,
-                                  const std::unordered_map<std::string, std::string>& tip_attrs);
+                                  const std::unordered_map<std::string, std::string>& tip_attrs,
+                                  std::optional<std::uint64_t> range_off = std::nullopt,
+                                  std::optional<std::uint64_t> range_end = std::nullopt);
 
   ApiResult require_txn_primary(const std::string& txn_id, nlohmann::json& state_out);
   ApiResult save_txn_state(const std::string& txn_id, const nlohmann::json& state);

@@ -403,4 +403,46 @@ using namespace aios;
 
   }
 
+TEST(Ec, SystematicRangeAssemblesWithoutMissingDataShard) {
+  using namespace aios;
+  TripleStoreFixture fx;
+  // k=2: 32-byte object → shard_len 16. Bytes [0,15] live only in data shard 0.
+  const std::string payload = "0123456789abcdefABCDEFGHIJKLMNOP";
+  const auto* body = reinterpret_cast<const std::uint8_t*>(payload.data());
+  const std::string oid = "ec/range-slice";
+  auto put = fx.svc->api_put(oid, body, payload.size(), {}, true, {});
+  ASSERT_TRUE(put.ok);
+
+  auto pl = place(oid, fx.map, "nvme");
+  ASSERT_GE(static_cast<int>(pl.acting_set.size()), 3);
+  ObjectStore* shard1 = nullptr;
+  for (const auto& t : pl.acting_set) {
+    auto* s = fx.stores.get(t.aios_path);
+    ASSERT_TRUE(s);
+    std::string err;
+    auto attrs = s->list_attrs(oid, err);
+    auto meta = parse_ec_attrs(attrs);
+    if (meta && meta->shard_i == 1) shard1 = s;
+  }
+  ASSERT_TRUE(shard1);
+  ASSERT_TRUE(purge_shard_tip(shard1, oid));
+
+  auto in_shard0 = fx.svc->api_get(oid, 0, 7, {});
+  ASSERT_TRUE(in_shard0.ok && in_shard0.data);
+  EXPECT_EQ(std::string(in_shard0.data->begin(), in_shard0.data->end()), payload.substr(0, 8));
+
+  auto spans_missing = fx.svc->api_get(oid, 12, 20, {});
+  ASSERT_TRUE(spans_missing.ok && spans_missing.data);
+  EXPECT_EQ(std::string(spans_missing.data->begin(), spans_missing.data->end()),
+            payload.substr(12, 9));
+
+  auto full = fx.svc->api_get(oid, std::nullopt, std::nullopt, {});
+  ASSERT_TRUE(full.ok && full.data);
+  EXPECT_EQ(std::string(full.data->begin(), full.data->end()), payload);
+
+  auto past_end = fx.svc->api_get(oid, payload.size(), std::nullopt, {});
+  EXPECT_FALSE(past_end.ok);
+  EXPECT_EQ(past_end.code, "range_unsatisfiable");
+}
+
 
