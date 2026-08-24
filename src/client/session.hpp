@@ -17,7 +17,8 @@ struct SessionConfig {
   std::string cluster_key;
   // Optional workload label sent as x-aios-app-label on every request.
   std::string app_label{};
-  // Per-socket read/write deadline (SO_RCVTIMEO / SO_SNDTIMEO).
+  // Per-socket read/write deadline. Applied as SO_RCVTIMEO / SO_SNDTIMEO on a
+  // blocking native fd; I/O uses recv/send so Asio cannot swallow the timeout.
   int socket_timeout_ms{30000};
   // Extra host:port values absolute 307/301/302 Location targets may use.
   // The configured endpoint is always allowed. Relative Locations stay on the

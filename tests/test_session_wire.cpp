@@ -28,6 +28,7 @@ struct StubServer {
   std::thread th;
   std::string port;
   std::atomic<bool> ready{false};
+  std::atomic<bool> stop{false};
   std::string last_request;
 
   explicit StubServer(std::function<std::string(const std::string&)> handler, int accepts = 1)
@@ -76,7 +77,9 @@ struct StubServer {
           last_request = req.substr(0, hdr_end + 4) + body;
         }
 
+        if (stop.load()) return;
         const std::string resp = handler(last_request);
+        if (stop.load()) return;
         boost::asio::write(sock, boost::asio::buffer(resp), ec);
         sock.close(ec);
       }
@@ -85,6 +88,7 @@ struct StubServer {
   }
 
   ~StubServer() {
+    stop.store(true);
     boost::system::error_code ec;
     acc.close(ec);
     if (th.joinable()) th.join();
@@ -168,13 +172,9 @@ TEST(SessionWireC7b, NegativeContentLengthIsRejected) {
 
 TEST(SessionWireC6, SocketTimeoutSurfacesAsHttpError) {
   using namespace aios;
-#if defined(__APPLE__)
-  // boost::asio::read_until does not reliably surface SO_RCVTIMEO on macOS; the
-  // session still installs the sockopts (C6), but this probe is Linux-oriented.
-  GTEST_SKIP() << "SO_RCVTIMEO not reliably honored by asio on macOS";
-#endif
-  StubServer stub([](const std::string&) {
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+  std::atomic<bool> hang{true};
+  StubServer stub([&](const std::string&) {
+    while (hang.load()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     return http_response(200, "late");
   });
 
@@ -190,7 +190,9 @@ TEST(SessionWireC6, SocketTimeoutSurfacesAsHttpError) {
     FAIL() << "expected timeout";
   } catch (const client_error& e) {
     EXPECT_EQ(e.code(), "http");
+    EXPECT_NE(std::string(e.what()).find("timeout"), std::string::npos) << e.what();
   }
+  hang.store(false);
   const auto ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
           .count();

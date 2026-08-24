@@ -13,8 +13,11 @@
 #include <utility>
 
 #ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 #endif
 
 namespace aios {
@@ -49,6 +52,110 @@ bool parse_location(const std::string& loc, std::string& host, std::string& port
 std::string ascii_lower(std::string s) {
   for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return s;
+}
+
+// Asio sync read/write treat SO_*TIMEO EAGAIN as "not ready" and poll forever.
+// Force a blocking fd and use recv/send so the sockopt is actually observed
+// (same approach as HttpServer::sock_read_exact).
+void apply_socket_deadlines(tcp::socket& sock, int timeout_ms) {
+#ifndef _WIN32
+  const int fd = static_cast<int>(sock.native_handle());
+  const int fl = ::fcntl(fd, F_GETFL, 0);
+  if (fl >= 0 && (fl & O_NONBLOCK)) ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+  if (timeout_ms > 0) {
+    struct timeval tv {};
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
+#else
+  (void)sock;
+  (void)timeout_ms;
+#endif
+}
+
+[[noreturn]] void throw_sock(const char* what, const boost::system::error_code& ec) {
+#ifndef _WIN32
+  if (ec.value() == EAGAIN || ec.value() == EWOULDBLOCK || ec.value() == ETIMEDOUT) {
+    throw client_error("http", std::string(what) + ": timeout");
+  }
+#endif
+  throw client_error("http", std::string(what) + ": " + ec.message());
+}
+
+bool timed_write(tcp::socket& sock, const void* in, std::size_t n,
+                 boost::system::error_code& ec) {
+#ifndef _WIN32
+  const int fd = static_cast<int>(sock.native_handle());
+  const auto* p = static_cast<const char*>(in);
+  std::size_t done = 0;
+  while (done < n) {
+#ifdef MSG_NOSIGNAL
+    const auto r = ::send(fd, p + done, n - done, MSG_NOSIGNAL);
+#else
+    const auto r = ::send(fd, p + done, n - done, 0);
+#endif
+    if (r > 0) {
+      done += static_cast<std::size_t>(r);
+      continue;
+    }
+    if (r < 0 && errno == EINTR) continue;
+    ec = boost::system::error_code(r == 0 ? EPIPE : errno, boost::system::system_category());
+    return false;
+  }
+  ec = {};
+  return true;
+#else
+  boost::asio::write(sock, boost::asio::buffer(in, n), ec);
+  return !ec;
+#endif
+}
+
+bool timed_read_some(tcp::socket& sock, void* out, std::size_t n, std::size_t& got,
+                     boost::system::error_code& ec) {
+  got = 0;
+#ifndef _WIN32
+  const int fd = static_cast<int>(sock.native_handle());
+  const auto r = ::recv(fd, out, n, 0);
+  if (r > 0) {
+    got = static_cast<std::size_t>(r);
+    ec = {};
+    return true;
+  }
+  if (r == 0) {
+    ec = boost::asio::error::eof;
+    return false;
+  }
+  if (errno == EINTR) {
+    ec = {};
+    return true;
+  }
+  ec = boost::system::error_code(errno, boost::system::system_category());
+  return false;
+#else
+  got = sock.read_some(boost::asio::buffer(out, n), ec);
+  return !ec && got > 0;
+#endif
+}
+
+constexpr std::size_t kMaxHeaderBytes = 64u * 1024u;
+
+bool timed_read_until(tcp::socket& sock, std::string& acc, const char* delim,
+                      boost::system::error_code& ec) {
+  const std::size_t delim_len = std::char_traits<char>::length(delim);
+  char tmp[4096];
+  while (acc.size() < delim_len || acc.find(delim) == std::string::npos) {
+    if (acc.size() > kMaxHeaderBytes) {
+      ec = boost::asio::error::message_size;
+      return false;
+    }
+    std::size_t got = 0;
+    if (!timed_read_some(sock, tmp, sizeof(tmp), got, ec)) return false;
+    if (got > 0) acc.append(tmp, tmp + got);
+  }
+  ec = {};
+  return true;
 }
 
 void throw_http(const HttpResponse& resp, const std::string& what) {
@@ -151,17 +258,7 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
   tcp::socket sock(ioc);
   boost::asio::connect(sock, endpoints, ec);
   if (ec) throw client_error("http", "connect: " + ec.message());
-
-#ifndef _WIN32
-  if (cfg_.socket_timeout_ms > 0) {
-    struct timeval tv {};
-    tv.tv_sec = cfg_.socket_timeout_ms / 1000;
-    tv.tv_usec = (cfg_.socket_timeout_ms % 1000) * 1000;
-    const int fd = sock.native_handle();
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-  }
-#endif
+  apply_socket_deadlines(sock, cfg_.socket_timeout_ms);
 
   std::ostringstream req;
   req << "GET " << path << " HTTP/1.1\r\n";
@@ -169,14 +266,13 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
   req << "Connection: close\r\n";
   for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
   req << "\r\n";
-  boost::asio::write(sock, boost::asio::buffer(req.str()), ec);
-  if (ec) throw client_error("http", "write: " + ec.message());
+  const auto head = req.str();
+  if (!timed_write(sock, head.data(), head.size(), ec)) throw_sock("write", ec);
 
-  boost::asio::streambuf buf;
-  boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
-  if (ec) throw client_error("http", "read headers: " + ec.message());
-
-  std::istream is(&buf);
+  std::string wire;
+  if (!timed_read_until(sock, wire, "\r\n\r\n", ec)) throw_sock("read headers", ec);
+  const auto hdr_end = wire.find("\r\n\r\n");
+  std::istringstream is(wire.substr(0, hdr_end + 4));
   std::string status_line;
   std::getline(is, status_line);
   HttpResponse resp;
@@ -208,13 +304,16 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
       }
     }
   }
-  std::string already(std::istreambuf_iterator<char>(is), {});
-  resp.body = std::move(already);
+  resp.body = hdr_end == std::string::npos ? std::string{} : wire.substr(hdr_end + 4);
   while (resp.body.size() < content_length) {
     char tmp[4096];
-    const auto n = sock.read_some(boost::asio::buffer(tmp), ec);
+    std::size_t n = 0;
+    if (!timed_read_some(sock, tmp, sizeof(tmp), n, ec)) {
+      if (n > 0) resp.body.append(tmp, tmp + n);
+      if (ec == boost::asio::error::eof) break;
+      throw_sock("read body", ec);
+    }
     if (n > 0) resp.body.append(tmp, tmp + n);
-    if (ec) break;
   }
   if (content_length > 0 && resp.body.size() > content_length) resp.body.resize(content_length);
   return resp;
@@ -308,17 +407,7 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     tcp::socket sock(ioc);
     boost::asio::connect(sock, endpoints, ec);
     if (ec) throw client_error("http", "connect: " + ec.message());
-
-#ifndef _WIN32
-    if (cfg_.socket_timeout_ms > 0) {
-      struct timeval tv {};
-      tv.tv_sec = cfg_.socket_timeout_ms / 1000;
-      tv.tv_usec = (cfg_.socket_timeout_ms % 1000) * 1000;
-      const int fd = sock.native_handle();
-      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    }
-#endif
+    apply_socket_deadlines(sock, cfg_.socket_timeout_ms);
 
     std::ostringstream req;
     req << method << ' ' << path << " HTTP/1.1\r\n";
@@ -326,16 +415,16 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     req << "Connection: close\r\n";
     for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
     req << "\r\n";
-    auto head = req.str();
-    boost::asio::write(sock, boost::asio::buffer(head), ec);
-    if (!ec && !body.empty()) boost::asio::write(sock, boost::asio::buffer(body), ec);
-    if (ec) throw client_error("http", "write: " + ec.message());
+    const auto head = req.str();
+    if (!timed_write(sock, head.data(), head.size(), ec)) throw_sock("write", ec);
+    if (!body.empty() && !timed_write(sock, body.data(), body.size(), ec)) {
+      throw_sock("write", ec);
+    }
 
-    boost::asio::streambuf buf;
-    boost::asio::read_until(sock, buf, "\r\n\r\n", ec);
-    if (ec) throw client_error("http", "read headers: " + ec.message());
-
-    std::istream is(&buf);
+    std::string wire;
+    if (!timed_read_until(sock, wire, "\r\n\r\n", ec)) throw_sock("read headers", ec);
+    const auto hdr_end = wire.find("\r\n\r\n");
+    std::istringstream is(wire.substr(0, hdr_end + 4));
     std::string status_line;
     std::getline(is, status_line);
     resp = HttpResponse{};
@@ -375,13 +464,16 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
         }
       }
     }
-    std::string already(std::istreambuf_iterator<char>(is), {});
-    resp.body = already;
+    resp.body = hdr_end == std::string::npos ? std::string{} : wire.substr(hdr_end + 4);
     while (resp.body.size() < content_length) {
       char tmp[4096];
-      const auto n = sock.read_some(boost::asio::buffer(tmp), ec);
+      std::size_t n = 0;
+      if (!timed_read_some(sock, tmp, sizeof(tmp), n, ec)) {
+        if (n > 0) resp.body.append(tmp, tmp + n);
+        if (ec == boost::asio::error::eof) break;
+        throw_sock("read body", ec);
+      }
       if (n > 0) resp.body.append(tmp, tmp + n);
-      if (ec) break;
     }
     if (content_length > 0 && resp.body.size() > content_length) resp.body.resize(content_length);
     if (have_content_length && method != "HEAD" && resp.status != 204 &&
