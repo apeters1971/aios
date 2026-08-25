@@ -200,25 +200,15 @@ int aios_http_fill_posix_cas(struct aios_http_client *c, const char *oid, u64 ex
 		return -EINVAL;
 	*new_cas_out = new_cas;
 	if (expected_cas == 0) {
-		u64 existing_cas = 0;
-		int he = aios_http_head(c, oid, NULL, &existing_cas);
-
-		if (he == -ENOENT) {
-			n = snprintf(out, out_len,
-				     "If-None-Match: *\r\n"
-				     "x-aios-attr-aios.posix.cas: %llu\r\n",
-				     (unsigned long long)new_cas);
-		} else if (he == 0 && existing_cas == 0) {
-			n = snprintf(out, out_len,
-				     "If-Match: *\r\n"
-				     "x-aios-if-attr-absent: aios.posix.cas\r\n"
-				     "x-aios-attr-aios.posix.cas: %llu\r\n",
-				     (unsigned long long)new_cas);
-		} else if (he == 0) {
-			return -EAGAIN;
-		} else {
-			return he;
-		}
+		/*
+		 * Do not HEAD first. A 404/307 JSON body on keep-alive is often
+		 * left unread (HEAD has no resp_body), and the following PUT
+		 * then parses leftover bytes as headers → -EIO.
+		 */
+		n = snprintf(out, out_len,
+			     "If-None-Match: *\r\n"
+			     "x-aios-attr-aios.posix.cas: %llu\r\n",
+			     (unsigned long long)new_cas);
 	} else {
 		n = snprintf(out, out_len,
 			     "If-Match: *\r\n"
@@ -480,11 +470,15 @@ int aios_http_put(struct aios_http_client *c, const char *oid, const void *body,
 		return -EOVERFLOW;
 
 	err = request_with_hdrs(c, "PUT", path, all, body, len, &status, NULL, NULL, 0);
-	if (err)
+	if (err) {
+		pr_err("aios_http: PUT %s transport err=%d\n", path, err);
 		return err;
+	}
 	err = aios_http_map_status(status);
-	if (err)
+	if (err) {
+		pr_err("aios_http: PUT %s HTTP %d\n", path, status);
 		return err;
+	}
 	if (cas_inout)
 		*cas_inout = new_cas;
 	return 0;

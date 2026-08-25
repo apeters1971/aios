@@ -436,6 +436,13 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 		memcpy(resp_body->data, body_start + 4, already);
 		resp_body->len = already;
 		keep = false; /* ambiguous framing */
+	} else if (content_length > already) {
+		/*
+		 * Payload still on the socket (ignored error body, or HEAD
+		 * where the server sent a body anyway). Drop keep-alive so
+		 * the next request does not parse leftover bytes as headers.
+		 */
+		keep = false;
 	}
 
 	if (!keep)
