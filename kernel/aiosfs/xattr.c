@@ -162,7 +162,7 @@ int aios_setxattr(struct inode *inode, const char *name, const void *buf, size_t
 	return upcall_setxattr(inode, name, buf, size, kflags);
 }
 
-int aios_listxattr(struct dentry *dentry, char *list, size_t size)
+ssize_t aios_listxattr(struct dentry *dentry, char *list, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
@@ -189,11 +189,13 @@ static int aios_xattr_get(const struct xattr_handler *handler, struct dentry *de
 	return aios_getxattr(inode, full, buffer, size);
 }
 
-static int aios_xattr_set(const struct xattr_handler *handler, struct user_namespace *mnt_userns,
+static int aios_xattr_set(const struct xattr_handler *handler, AIOS_IDMAP *mnt_userns,
 			  struct dentry *dentry, struct inode *inode, const char *name,
 			  const void *buffer, size_t size, int flags)
 {
 	const char *full = xattr_full_name(handler, name);
+
+	(void)mnt_userns;
 
 	if (!buffer && size == 0)
 		return aios_removexattr(inode, full);

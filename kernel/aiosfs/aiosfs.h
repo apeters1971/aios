@@ -8,10 +8,50 @@
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
 #include <linux/uio.h>
+#include <linux/uidgid.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 #include <linux/xattr.h>
+#if __has_include(<linux/filelock.h>)
+#include <linux/filelock.h>
+#endif
+#ifdef nop_mnt_idmap
+#include <linux/mnt_idmap.h>
+#define AIOS_IDMAP struct mnt_idmap
+#else
+#define AIOS_IDMAP struct user_namespace
+#endif
+
+static inline void aios_fillattr(AIOS_IDMAP *idmap, struct inode *inode, struct kstat *stat)
+{
+#ifdef nop_mnt_idmap
+	generic_fillattr(idmap, inode, stat);
+#else
+	(void)idmap;
+	generic_fillattr(inode, stat);
+#endif
+}
+
+static inline uid_t aios_iattr_uid(AIOS_IDMAP *idmap, const struct iattr *attr)
+{
+#ifdef nop_mnt_idmap
+	(void)idmap;
+	return from_kuid(&init_user_ns, attr->ia_uid);
+#else
+	return from_kuid(idmap, attr->ia_uid);
+#endif
+}
+
+static inline gid_t aios_iattr_gid(AIOS_IDMAP *idmap, const struct iattr *attr)
+{
+#ifdef nop_mnt_idmap
+	(void)idmap;
+	return from_kgid(&init_user_ns, attr->ia_gid);
+#else
+	return from_kgid(idmap, attr->ia_gid);
+#endif
+}
 
 #include "../aios_kabi.h"
 
@@ -103,7 +143,7 @@ int aios_http_removexattr(struct inode *inode, const char *name);
 /* xattrs (dispatch + VFS handlers for 5.14) */
 int aios_getxattr(struct inode *inode, const char *name, void *buf, size_t size);
 int aios_setxattr(struct inode *inode, const char *name, const void *buf, size_t size, int flags);
-int aios_listxattr(struct dentry *dentry, char *list, size_t size);
+ssize_t aios_listxattr(struct dentry *dentry, char *list, size_t size);
 int aios_removexattr(struct inode *inode, const char *name);
 extern const struct xattr_handler *aios_xattr_handlers[];
 

@@ -114,7 +114,7 @@ static struct dentry *aios_lookup(struct inode *dir, struct dentry *dentry,
 	return d_splice_alias(inode, dentry);
 }
 
-static int aios_create(struct user_namespace *mnt_userns, struct inode *dir,
+static int aios_create(AIOS_IDMAP *mnt_userns, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, bool excl)
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
@@ -147,7 +147,7 @@ static int aios_create(struct user_namespace *mnt_userns, struct inode *dir,
 	return 0;
 }
 
-static int aios_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
+static int aios_mkdir(AIOS_IDMAP *mnt_userns, struct inode *dir,
 		      struct dentry *dentry, umode_t mode)
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
@@ -222,7 +222,7 @@ static int aios_rmdir(struct inode *dir, struct dentry *dentry)
 	return err;
 }
 
-static int aios_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
+static int aios_rename(AIOS_IDMAP *mnt_userns, struct inode *old_dir,
 		       struct dentry *old_dentry, struct inode *new_dir,
 		       struct dentry *new_dentry, unsigned int flags)
 {
@@ -290,7 +290,7 @@ static int aios_link(struct dentry *old_dentry, struct inode *dir, struct dentry
 	return err;
 }
 
-static int aios_getattr(struct user_namespace *mnt_userns, const struct path *path,
+static int aios_getattr(AIOS_IDMAP *mnt_userns, const struct path *path,
 			struct kstat *stat, u32 request_mask, unsigned int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
@@ -298,11 +298,11 @@ static int aios_getattr(struct user_namespace *mnt_userns, const struct path *pa
 
 	if (err)
 		return err;
-	generic_fillattr(inode, stat);
+	aios_fillattr(mnt_userns, inode, stat);
 	return 0;
 }
 
-static int aios_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
+static int aios_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 			struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -320,11 +320,11 @@ static int aios_setattr(struct user_namespace *mnt_userns, struct dentry *dentry
 	}
 	if (attr->ia_valid & ATTR_UID) {
 		in.to_set |= AIOS_KABI_SET_UID;
-		in.st.uid = from_kuid(mnt_userns, attr->ia_uid);
+		in.st.uid = aios_iattr_uid(mnt_userns, attr);
 	}
 	if (attr->ia_valid & ATTR_GID) {
 		in.to_set |= AIOS_KABI_SET_GID;
-		in.st.gid = from_kgid(mnt_userns, attr->ia_gid);
+		in.st.gid = aios_iattr_gid(mnt_userns, attr);
 	}
 	if (attr->ia_valid & ATTR_SIZE) {
 		in.to_set |= AIOS_KABI_SET_SIZE;

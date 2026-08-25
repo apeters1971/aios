@@ -1473,13 +1473,13 @@ out:
 	return err;
 }
 
-static int http_create(struct user_namespace *mnt_userns, struct inode *dir,
+static int http_create(AIOS_IDMAP *mnt_userns, struct inode *dir,
 		       struct dentry *dentry, umode_t mode, bool excl)
 {
 	return http_create_common(dir, dentry, mode, false);
 }
 
-static int http_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
+static int http_mkdir(AIOS_IDMAP *mnt_userns, struct inode *dir,
 		      struct dentry *dentry, umode_t mode)
 {
 	return http_create_common(dir, dentry, mode, true);
@@ -2020,7 +2020,7 @@ out:
 	return err;
 }
 
-static int http_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
+static int http_rename(AIOS_IDMAP *mnt_userns, struct inode *old_dir,
 		       struct dentry *old_dentry, struct inode *new_dir,
 		       struct dentry *new_dentry, unsigned int flags)
 {
@@ -2051,7 +2051,7 @@ static int http_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
 	return err;
 }
 
-static int http_getattr(struct user_namespace *mnt_userns, const struct path *path,
+static int http_getattr(AIOS_IDMAP *mnt_userns, const struct path *path,
 			struct kstat *stat, u32 request_mask, unsigned int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
@@ -2059,7 +2059,7 @@ static int http_getattr(struct user_namespace *mnt_userns, const struct path *pa
 
 	if (err)
 		return err;
-	generic_fillattr(inode, stat);
+	aios_fillattr(mnt_userns, inode, stat);
 	return 0;
 }
 
@@ -2102,7 +2102,7 @@ static int truncate_file(struct aios_sb_info *info, struct aios_inode_meta *m, u
 	return store_inode(info, m);
 }
 
-static int http_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
+static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 			struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -2121,9 +2121,9 @@ static int http_setattr(struct user_namespace *mnt_userns, struct dentry *dentry
 	if (attr->ia_valid & ATTR_MODE)
 		m.mode = (m.mode & S_IFMT) | (attr->ia_mode & 07777);
 	if (attr->ia_valid & ATTR_UID)
-		m.uid = from_kuid(mnt_userns, attr->ia_uid);
+		m.uid = aios_iattr_uid(mnt_userns, attr);
 	if (attr->ia_valid & ATTR_GID)
-		m.gid = from_kgid(mnt_userns, attr->ia_gid);
+		m.gid = aios_iattr_gid(mnt_userns, attr);
 	if (attr->ia_valid & ATTR_SIZE) {
 		err = truncate_file(info, &m, attr->ia_size);
 		if (err)
