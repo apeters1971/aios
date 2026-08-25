@@ -227,7 +227,7 @@ int aios_http_parse_location(const char *loc, char *host, size_t host_len, char 
 	colon = strrchr(host, ':');
 	if (colon) {
 		strscpy(port, colon + 1, port_len);
-		*colon = '\0';
+		host[colon - host] = '\0';
 	} else {
 		strscpy(port, "80", port_len);
 	}

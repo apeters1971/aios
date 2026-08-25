@@ -42,7 +42,7 @@ int aios_http_get(struct aios_http_client *c, const char *oid, struct aios_http_
 int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u64 *cas_out);
 int aios_http_put(struct aios_http_client *c, const char *oid, const void *body, size_t len,
 		  const char *extra_hdrs, u64 *cas_inout /* NULL=unconditional; else CAS */);
-/* Partial PUT via Content-Range: bytes start-end/* (inclusive end). */
+/* Partial PUT via Content-Range (bytes start-end inclusive, '*' for total). */
 int aios_http_put_range(struct aios_http_client *c, const char *oid, u64 offset,
 			const void *data, size_t len, u64 *cas_inout);
 int aios_http_delete(struct aios_http_client *c, const char *oid);
