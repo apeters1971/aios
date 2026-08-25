@@ -359,7 +359,11 @@ int aiosvd_resize(struct aiosvd_resize_arg *arg)
 	dev->header_cas = cas;
 	dev->size = new_size;
 	if (dev->disk)
+#ifdef AIOSVD_OLD_MQ
 		set_capacity_revalidate_and_notify(dev->disk, new_size >> SECTOR_SHIFT, true);
+#else
+		set_capacity_and_notify(dev->disk, new_size >> SECTOR_SHIFT);
+#endif
 	mutex_unlock(&aiosvd_devs_mu);
 
 	if (new_size < old_size) {

@@ -51,20 +51,36 @@ static const struct blk_mq_ops aiosvd_mq_ops = {
 	.queue_rq = aiosvd_queue_rq,
 };
 
+#ifdef AIOSVD_BLK_MODE_OPEN
+static int aiosvd_open(struct gendisk *disk, blk_mode_t mode)
+{
+	struct aiosvd_device *dev = disk->private_data;
+
+	(void)mode;
+#else
 static int aiosvd_open(struct block_device *bdev, fmode_t mode)
 {
 	struct aiosvd_device *dev = bdev->bd_disk->private_data;
 
+	(void)mode;
+#endif
 	mutex_lock(&dev->open_mu);
 	dev->open_count++;
 	mutex_unlock(&dev->open_mu);
 	return 0;
 }
 
+#ifdef AIOSVD_BLK_MODE_OPEN
+static void aiosvd_release(struct gendisk *disk)
+#else
 static void aiosvd_release(struct gendisk *disk, fmode_t mode)
+#endif
 {
 	struct aiosvd_device *dev = disk->private_data;
 
+#ifndef AIOSVD_BLK_MODE_OPEN
+	(void)mode;
+#endif
 	mutex_lock(&dev->open_mu);
 	if (dev->open_count > 0)
 		dev->open_count--;
@@ -128,7 +144,11 @@ static void aiosvd_destroy_disk(struct aiosvd_device *dev)
 	if (!dev->disk)
 		return;
 	del_gendisk(dev->disk);
+#ifdef AIOSVD_OLD_MQ
 	blk_cleanup_disk(dev->disk);
+#else
+	put_disk(dev->disk);
+#endif
 	dev->disk = NULL;
 	blk_mq_free_tag_set(&dev->tag_set);
 	if (dev->stripe_wq) {
@@ -184,12 +204,21 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 		qd = 1024;
 	dev->queue_depth = qd;
 
+	/* Multi-object I/O: up to 16 objects per request where safe. */
+	max_sectors = (dev->obj_size >> SECTOR_SHIFT) * 16;
+	if (max_sectors < (dev->obj_size >> SECTOR_SHIFT))
+		max_sectors = dev->obj_size >> SECTOR_SHIFT;
+
 	memset(&dev->tag_set, 0, sizeof(dev->tag_set));
 	dev->tag_set.ops = &aiosvd_mq_ops;
 	dev->tag_set.nr_hw_queues = hwqs;
 	dev->tag_set.queue_depth = qd;
 	dev->tag_set.numa_node = NUMA_NO_NODE;
+#ifdef AIOSVD_OLD_MQ
 	dev->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+#else
+	dev->tag_set.flags = 0;
+#endif
 	dev->tag_set.cmd_size = 0;
 	dev->tag_set.driver_data = dev;
 
@@ -197,7 +226,26 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 	if (err)
 		goto err_stripe_wq;
 
+#ifdef AIOSVD_OLD_MQ
 	disk = blk_mq_alloc_disk(&dev->tag_set, dev);
+#else
+	{
+		struct queue_limits lim = {
+			.logical_block_size = 4096,
+			.physical_block_size = 4096,
+			.io_min = 4096,
+			.io_opt = dev->obj_size,
+			.max_hw_sectors = max_sectors,
+			.max_segments = 256,
+			.max_hw_discard_sectors = max_sectors,
+			.max_write_zeroes_sectors = max_sectors,
+			.discard_granularity = 4096,
+			.features = BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA,
+		};
+
+		disk = blk_mq_alloc_disk(&dev->tag_set, &lim, dev);
+	}
+#endif
 	if (IS_ERR(disk)) {
 		err = PTR_ERR(disk);
 		goto err_tag;
@@ -210,15 +258,11 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 	disk->private_data = dev;
 	snprintf(disk->disk_name, DISK_NAME_LEN, "%s%d", AIOSVD_DISK_PREFIX, dev->id);
 	set_capacity(disk, dev->size >> SECTOR_SHIFT);
+#ifdef AIOSVD_OLD_MQ
 	blk_queue_logical_block_size(disk->queue, 4096);
 	blk_queue_physical_block_size(disk->queue, 4096);
 	blk_queue_io_min(disk->queue, 4096);
 	blk_queue_io_opt(disk->queue, dev->obj_size);
-
-	/* Multi-object I/O: up to 16 objects per request where safe. */
-	max_sectors = (dev->obj_size >> SECTOR_SHIFT) * 16;
-	if (max_sectors < (dev->obj_size >> SECTOR_SHIFT))
-		max_sectors = dev->obj_size >> SECTOR_SHIFT;
 	blk_queue_max_hw_sectors(disk->queue, max_sectors);
 	blk_queue_max_segments(disk->queue, 256);
 	blk_queue_max_discard_sectors(disk->queue, max_sectors);
@@ -243,6 +287,24 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 
 	dev->disk = disk;
 	add_disk(disk);
+#else
+	/* Non-rotational and no entropy contribution are the 6.9+ defaults. */
+	if (disk->bdi) {
+		unsigned long ra_pages = (2UL * dev->obj_size) / PAGE_SIZE;
+
+		if (ra_pages < 128)
+			ra_pages = 128;
+		disk->bdi->ra_pages = ra_pages;
+	}
+
+	dev->disk = disk;
+	err = add_disk(disk);
+	if (err) {
+		put_disk(disk);
+		dev->disk = NULL;
+		goto err_tag;
+	}
+#endif
 	dev_set_drvdata(disk_to_dev(disk), dev);
 
 	if (sysfs_create_groups(&disk_to_dev(disk)->kobj, aiosvd_attr_groups))

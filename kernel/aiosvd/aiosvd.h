@@ -11,6 +11,18 @@
 #include "../aios_http/aios_http_api.h"
 #include "../aiosvd_uapi.h"
 
+/*
+ * Alma 9.8 backported the 6.9+ block layer onto 5.14: gendisk open,
+ * 3-arg blk_mq_alloc_disk(set, lim, queuedata), and queue_limits
+ * features. BLK_MQ_F_SHOULD_MERGE / BLK_OPEN_READ are real macros.
+ */
+#ifdef BLK_MQ_F_SHOULD_MERGE
+#define AIOSVD_OLD_MQ 1
+#endif
+#ifdef BLK_OPEN_READ
+#define AIOSVD_BLK_MODE_OPEN 1
+#endif
+
 #define AIOSVD_MIN_OBJ_ORDER 16 /* 64 KiB */
 #define AIOSVD_MAX_OBJ_ORDER 24 /* 16 MiB (aios_http body cap) */
 #define AIOSVD_MAX_CLIENTS 8
