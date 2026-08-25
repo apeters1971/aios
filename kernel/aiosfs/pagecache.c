@@ -25,6 +25,7 @@ static int aios_readpage(struct file *file, struct page *page)
 	size_t got = 0;
 	int err = 0;
 
+	(void)file;
 	kaddr = kmap(page);
 	if (pos < i_size) {
 		size_t len = min_t(loff_t, PAGE_SIZE, i_size - pos);
@@ -50,6 +51,13 @@ static int aios_readpage(struct file *file, struct page *page)
 	unlock_page(page);
 	return err;
 }
+
+#ifdef AIOS_HAS_FOLIO_AOPS
+static int aios_read_folio(struct file *file, struct folio *folio)
+{
+	return aios_readpage(file, folio_page(folio, 0));
+}
+#endif
 
 static int aios_write_page_data(struct page *page)
 {
@@ -90,10 +98,19 @@ static int aios_writepage(struct page *page, struct writeback_control *wbc)
 	return 0;
 }
 
+#ifdef AIOS_HAS_FOLIO_AOPS
+static int aios_writepages_cb(struct folio *folio, struct writeback_control *wbc, void *data)
+{
+	(void)data;
+	return aios_writepage(folio_page(folio, 0), wbc);
+}
+#else
 static int aios_writepages_cb(struct page *page, struct writeback_control *wbc, void *data)
 {
+	(void)data;
 	return aios_writepage(page, wbc);
 }
+#endif
 
 static int aios_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
@@ -105,14 +122,25 @@ static int aios_writepages(struct address_space *mapping, struct writeback_contr
 	return write_cache_pages(mapping, wbc, aios_writepages_cb, NULL);
 }
 
+#ifdef AIOS_HAS_FOLIO_AOPS
+static int aios_write_begin(struct file *file, struct address_space *mapping, loff_t pos,
+			    unsigned len, struct page **pagep, void **fsdata)
+#else
 static int aios_write_begin(struct file *file, struct address_space *mapping, loff_t pos,
 			    unsigned len, unsigned flags, struct page **pagep, void **fsdata)
+#endif
 {
 	pgoff_t index = pos >> PAGE_SHIFT;
 	struct page *page;
 	int err;
 
+	(void)file;
+	(void)fsdata;
+#ifdef AIOS_HAS_FOLIO_AOPS
+	page = grab_cache_page_write_begin(mapping, index);
+#else
 	page = grab_cache_page_write_begin(mapping, index, flags);
+#endif
 	if (!page)
 		return -ENOMEM;
 
@@ -177,10 +205,17 @@ static int aios_write_end(struct file *file, struct address_space *mapping, loff
 }
 
 const struct address_space_operations aios_aops = {
+#ifdef AIOS_HAS_FOLIO_AOPS
+	.read_folio = aios_read_folio,
+	.writepage = aios_writepage,
+	.writepages = aios_writepages,
+	.dirty_folio = filemap_dirty_folio,
+#else
 	.readpage = aios_readpage,
 	.writepage = aios_writepage,
 	.writepages = aios_writepages,
 	.set_page_dirty = __set_page_dirty_nobuffers,
+#endif
 	.write_begin = aios_write_begin,
 	.write_end = aios_write_end,
 };
@@ -248,7 +283,6 @@ ssize_t aios_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		struct inode *inode = file_inode(iocb->ki_filp);
-		struct file *file = iocb->ki_filp;
 		loff_t size = i_size_read(inode);
 		size_t count = iov_iter_count(to);
 		loff_t end;

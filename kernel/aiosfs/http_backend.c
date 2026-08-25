@@ -2431,8 +2431,14 @@ static void aios_http_wb_chunk_work(struct work_struct *work)
 	complete(&cw->done);
 }
 
+#ifdef AIOS_HAS_FOLIO_AOPS
+static int aios_http_wb_collect(struct folio *folio, struct writeback_control *wbc, void *data)
+{
+	struct page *page = folio_page(folio, 0);
+#else
 static int aios_http_wb_collect(struct page *page, struct writeback_control *wbc, void *data)
 {
+#endif
 	struct aios_http_wb_page **pp = data;
 	struct aios_http_wb_page *batch = *pp;
 	struct inode *inode = page->mapping->host;

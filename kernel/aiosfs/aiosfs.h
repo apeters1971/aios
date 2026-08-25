@@ -31,6 +31,14 @@
 #else
 #define AIOS_IDMAP struct user_namespace
 #endif
+/*
+ * Alma 9.8 backported folio aops onto 5.14: write_cache_pages takes a
+ * folio callback, readpage/set_page_dirty are gone, write_begin dropped
+ * flags. Define AIOS_AOPS_PAGE for a tree that still uses page aops.
+ */
+#ifndef AIOS_AOPS_PAGE
+#define AIOS_HAS_FOLIO_AOPS 1
+#endif
 
 static inline void aios_fillattr(AIOS_IDMAP *idmap, struct inode *inode, struct kstat *stat)
 {
