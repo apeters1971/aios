@@ -16,9 +16,16 @@
 #if __has_include(<linux/filelock.h>)
 #include <linux/filelock.h>
 #endif
-/* nop_mnt_idmap is an extern, not a macro — do not #ifdef it. */
 #if __has_include(<linux/mnt_idmap.h>)
 #include <linux/mnt_idmap.h>
+#endif
+/*
+ * Alma 9.8 / current RHEL 9 kernels expose struct mnt_idmap from fs.h
+ * without shipping linux/mnt_idmap.h, so __has_include is the wrong
+ * probe. Default to the 6.3-style idmap VFS. Define AIOS_VFS_USERNS
+ * when building against a 5.14-era tree that still uses user_namespace.
+ */
+#ifndef AIOS_VFS_USERNS
 #define AIOS_HAS_MNT_IDMAP 1
 #define AIOS_IDMAP struct mnt_idmap
 #else

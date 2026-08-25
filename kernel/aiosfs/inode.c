@@ -451,6 +451,12 @@ int aios_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 	return err;
 }
 
+static int aios_file_lock(struct file *file, int cmd, struct file_lock *fl)
+{
+	(void)cmd;
+	return locks_lock_file_wait(file, fl);
+}
+
 const struct file_operations aios_file_ops = {
 	.owner = THIS_MODULE,
 	.llseek = generic_file_llseek,
@@ -459,8 +465,8 @@ const struct file_operations aios_file_ops = {
 	.mmap = generic_file_mmap,
 	.fsync = aios_file_fsync,
 	.fallocate = aios_fallocate,
-	.lock = locks_lock_file_wait,
-	.flock = locks_lock_file_wait,
+	.lock = aios_file_lock,
+	.flock = aios_file_lock,
 	.splice_read = generic_file_splice_read,
 	.open = generic_file_open,
 };
