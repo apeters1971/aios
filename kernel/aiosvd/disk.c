@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "aiosvd.h"
 
+#include <linux/backing-dev.h>
 #include <linux/blk-mq.h>
 #include <linux/module.h>
 #include <linux/sched/mm.h>
