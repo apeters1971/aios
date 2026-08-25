@@ -16,8 +16,10 @@
 #if __has_include(<linux/filelock.h>)
 #include <linux/filelock.h>
 #endif
-#ifdef nop_mnt_idmap
+/* nop_mnt_idmap is an extern, not a macro — do not #ifdef it. */
+#if __has_include(<linux/mnt_idmap.h>)
 #include <linux/mnt_idmap.h>
+#define AIOS_HAS_MNT_IDMAP 1
 #define AIOS_IDMAP struct mnt_idmap
 #else
 #define AIOS_IDMAP struct user_namespace
@@ -25,7 +27,7 @@
 
 static inline void aios_fillattr(AIOS_IDMAP *idmap, struct inode *inode, struct kstat *stat)
 {
-#ifdef nop_mnt_idmap
+#ifdef AIOS_HAS_MNT_IDMAP
 	generic_fillattr(idmap, inode, stat);
 #else
 	(void)idmap;
@@ -35,7 +37,7 @@ static inline void aios_fillattr(AIOS_IDMAP *idmap, struct inode *inode, struct 
 
 static inline uid_t aios_iattr_uid(AIOS_IDMAP *idmap, const struct iattr *attr)
 {
-#ifdef nop_mnt_idmap
+#ifdef AIOS_HAS_MNT_IDMAP
 	(void)idmap;
 	return from_kuid(&init_user_ns, attr->ia_uid);
 #else
@@ -45,7 +47,7 @@ static inline uid_t aios_iattr_uid(AIOS_IDMAP *idmap, const struct iattr *attr)
 
 static inline gid_t aios_iattr_gid(AIOS_IDMAP *idmap, const struct iattr *attr)
 {
-#ifdef nop_mnt_idmap
+#ifdef AIOS_HAS_MNT_IDMAP
 	(void)idmap;
 	return from_kgid(&init_user_ns, attr->ia_gid);
 #else
