@@ -153,6 +153,8 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 				return err;
 			}
 		} else if (err) {
+			pr_err("aiosvd: map create PUT %s failed: %d (endpoint=%s)\n",
+			       header_oid, err, arg->endpoint);
 			aios_http_client_destroy(probe);
 			return err;
 		} else {
@@ -161,6 +163,8 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 	} else {
 		err = aios_http_get(probe, header_oid, &body, &header_cas);
 		if (err) {
+			pr_err("aiosvd: map GET %s failed: %d (endpoint=%s)\n",
+			       header_oid, err, arg->endpoint);
 			aios_http_client_destroy(probe);
 			return err;
 		}
@@ -210,11 +214,14 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 	nclients = default_nclients(arg->max_clients);
 	err = aiosvd_clients_create(dev, arg->endpoint, arg->cluster_key, arg->app_label,
 				    nclients);
-	if (err)
+	if (err) {
+		pr_err("aiosvd: clients_create failed: %d\n", err);
 		goto fail_slot;
+	}
 
 	err = aiosvd_create_disk(dev);
 	if (err) {
+		pr_err("aiosvd: create_disk failed: %d\n", err);
 		aiosvd_clients_destroy(dev);
 		goto fail_slot;
 	}

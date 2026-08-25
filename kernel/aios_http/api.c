@@ -160,6 +160,8 @@ int aios_http_map_status(int status)
 		return -EFBIG;
 	if (status == 400)
 		return -EINVAL;
+	if (status == 401 || status == 403)
+		return -EACCES;
 	return -EIO;
 }
 

@@ -249,6 +249,7 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 #endif
 	if (IS_ERR(disk)) {
 		err = PTR_ERR(disk);
+		pr_err("aiosvd: blk_mq_alloc_disk failed: %d\n", err);
 		goto err_tag;
 	}
 
@@ -259,6 +260,16 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 	disk->private_data = dev;
 	snprintf(disk->disk_name, DISK_NAME_LEN, "%s%d", AIOSVD_DISK_PREFIX, dev->id);
 	set_capacity(disk, dev->size >> SECTOR_SHIFT);
+	/*
+	 * add_disk() on 6.x-style kernels reads the device to scan
+	 * partitions unless this is set. A new volume has no data
+	 * objects yet; that probe I/O surfaces as -EIO on map.
+	 */
+#ifdef GENHD_FL_NO_PART
+	disk->flags |= GENHD_FL_NO_PART;
+#elif defined(GENHD_FL_NO_PART_SCAN)
+	disk->flags |= GENHD_FL_NO_PART_SCAN;
+#endif
 #ifdef AIOSVD_OLD_MQ
 	blk_queue_logical_block_size(disk->queue, 4096);
 	blk_queue_physical_block_size(disk->queue, 4096);
@@ -301,6 +312,7 @@ int aiosvd_create_disk(struct aiosvd_device *dev)
 	dev->disk = disk;
 	err = add_disk(disk);
 	if (err) {
+		pr_err("aiosvd: add_disk %s failed: %d\n", disk->disk_name, err);
 		put_disk(disk);
 		dev->disk = NULL;
 		goto err_tag;
