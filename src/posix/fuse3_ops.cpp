@@ -589,12 +589,6 @@ int posix_flock(const char* path, struct fuse_file_info* fi, int op) {
   });
 }
 
-unsigned aios_fuse_max_io(const aios_posix_fs* fs) {
-  uint64_t su = aios_posix_stripe_unit(fs);
-  if (su == 0 || su > 1024ull * 1024ull) su = 1024ull * 1024ull;
-  return static_cast<unsigned>(su);
-}
-
 void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
   auto* ctx = fuse_get_context();
   auto* fs = ctx ? static_cast<aios_posix_fs*>(ctx->private_data) : nullptr;
@@ -623,6 +617,12 @@ void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
 }
 
 }  // namespace
+
+unsigned aios_fuse_max_io(const aios_posix_fs* fs) {
+  uint64_t su = aios_posix_stripe_unit(fs);
+  if (su == 0 || su > 1024ull * 1024ull) su = 1024ull * 1024ull;
+  return static_cast<unsigned>(su);
+}
 
 fuse_operations aios_fuse_operations() {
   fuse_operations ops{};
