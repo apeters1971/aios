@@ -50,9 +50,7 @@ out_tfm:
 int aios_http_build_auth(const struct aios_http_client *c, const char *method,
 			 const char *path, char *auth_hdrs, size_t auth_hdrs_len)
 {
-	/* Canonical: method\npath\ndate\nx-aios-content-sha256:...\nx-aios-date:...\n
-	 * SignedHeaders\nUNSIGNED-PAYLOAD
-	 * Signed header names are sorted alphabetically for the body lines. */
+	/* Canonical: method\npath\ndate\nSignedHeaders:\nSignedHeaders\nUNSIGNED-PAYLOAD */
 	char date[32];
 	char canon[2048];
 	char sig[65];
@@ -63,13 +61,18 @@ int aios_http_build_auth(const struct aios_http_client *c, const char *method,
 	ms = ktime_to_ms(ktime_get_real());
 	snprintf(date, sizeof(date), "%lld", (long long)ms);
 
+	/*
+	 * Must match src/http/http_auth.cpp http_canonical(). SignedHeaders is
+	 * split on commas only, so "x-aios-content-sha256;x-aios-date" is one
+	 * header name and that line's value is empty. Expanding into two
+	 * name:value lines (AWS-style) produces a 401 bad signature.
+	 */
 	n = snprintf(canon, sizeof(canon),
 		     "%s\n%s\n%s\n"
-		     "x-aios-content-sha256:UNSIGNED-PAYLOAD\n"
-		     "x-aios-date:%s\n"
+		     "x-aios-content-sha256;x-aios-date:\n"
 		     "x-aios-content-sha256;x-aios-date\n"
 		     "UNSIGNED-PAYLOAD",
-		     method, path, date, date);
+		     method, path, date);
 	if (n < 0 || n >= (int)sizeof(canon))
 		return -EOVERFLOW;
 

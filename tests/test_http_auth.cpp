@@ -79,6 +79,27 @@ TEST(HttpAuth, Basic) {
 
   }
 
+// Pin the wire canonical the kernel HTTP client must emit. SignedHeaders uses
+// ';' and http_canonical splits only on ',', so the header block is one empty
+// value. Expanding into two AWS-style name:value lines 401s (bad signature).
+TEST(HttpAuth, CanonicalMatchesKernelClient) {
+  using namespace aios;
+  const std::string date = "1700000000000";
+  const std::string sh = "x-aios-content-sha256;x-aios-date";
+  std::unordered_map<std::string, std::string> headers = {
+      {"x-aios-date", date},
+      {"x-aios-content-sha256", "UNSIGNED-PAYLOAD"},
+  };
+  EXPECT_EQ(http_canonical("PUT", "/o/vd%2Fdefault%2Fdisk1%2Fheader", date, sh, headers,
+                           "UNSIGNED-PAYLOAD"),
+            "PUT\n"
+            "/o/vd%2Fdefault%2Fdisk1%2Fheader\n"
+            "1700000000000\n"
+            "x-aios-content-sha256;x-aios-date:\n"
+            "x-aios-content-sha256;x-aios-date\n"
+            "UNSIGNED-PAYLOAD");
+}
+
 // CLI/Session historically diverged: leaving '/' raw made PUT /o/demo/hello look
 // like oid "demo" + unknown sub "hello" → 404. Shared encoder must escape it.
 TEST(HttpAuth, UrlEncodeOidEscapesSlash) {

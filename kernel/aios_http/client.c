@@ -178,8 +178,10 @@ u64 aios_http_attr_u64(const char *hdrs, const char *attr_name)
 
 static int parse_status_line(const char *hdrs, int *status_out)
 {
-	/* HTTP/1.1 200 OK */
+	/* HTTP/1.1 200 OK — kstrtouint rejects trailing reason-phrase. */
 	const char *p = hdrs;
+	char num[8];
+	size_t n = 0;
 	unsigned int code = 0;
 
 	while (*p && *p != ' ')
@@ -187,7 +189,12 @@ static int parse_status_line(const char *hdrs, int *status_out)
 	if (!*p)
 		return -EIO;
 	p++;
-	if (kstrtouint(p, 10, &code))
+	while (*p >= '0' && *p <= '9' && n + 1 < sizeof(num))
+		num[n++] = *p++;
+	if (!n)
+		return -EIO;
+	num[n] = '\0';
+	if (kstrtouint(num, 10, &code))
 		return -EIO;
 	*status_out = (int)code;
 	return 0;

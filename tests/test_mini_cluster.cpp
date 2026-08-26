@@ -399,7 +399,9 @@ TEST(MiniCluster, Basic) {
       auto* store = shard2->stores.get(placement.acting_set[2].aios_path);
       EXPECT_TRUE(store != nullptr) << "restarted store";
       auto st = store->stat(oid, err);
-      if (st) EXPECT_TRUE(store->purge_version(oid, st->seq, true, err)) << "clear shard2 tip";
+      if (st) {
+        EXPECT_TRUE(store->purge_version(oid, st->seq, true, err)) << "clear shard2 tip";
+      }
       EXPECT_TRUE(!store->stat(oid, err)) << "shard2 empty before repair";
     }
     auto stats =

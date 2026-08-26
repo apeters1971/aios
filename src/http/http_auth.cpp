@@ -88,6 +88,7 @@ std::string http_canonical(const std::string& method, const std::string& path_wi
                            const std::string& payload_hash_hex) {
   std::ostringstream oss;
   oss << method << '\n' << path_with_query << '\n' << date << '\n';
+  /* Comma-split only. "a;b" is one name — kernel/aios_http/auth.c matches this. */
   auto names = split_csv(signed_headers);
   for (auto& n : names) n = lower(n);
   std::sort(names.begin(), names.end());

@@ -459,7 +459,9 @@ TEST(PutPipeline, LocalThenRemotePhases) {
   ASSERT_TRUE(fin.ok) << fin.code << " " << fin.error;
   auto got = primary->svc->api_get(oid, std::nullopt, std::nullopt, {});
   ASSERT_TRUE(got.ok);
-  if (got.data) EXPECT_EQ(*got.data, payload);
+  if (got.data) {
+    EXPECT_EQ(*got.data, payload);
+  }
 }
 
 TEST(PutPipeline, MiniClusterRemotePeers) {
@@ -550,7 +552,9 @@ TEST(PutPipeline, HttpUnauthorizedDoesNotLeakPipeline) {
   auto br = fx.svc->api_begin_put_pipeline("pipe-401", {}, payload.size(), staging);
   EXPECT_TRUE(br.ok) << br.code << " " << br.error
                     << " (401 must abort so a new pipeline can start)";
-  if (br.ok) ASSERT_TRUE(fx.svc->api_put_pipeline_abort("pipe-401").ok);
+  if (br.ok) {
+    ASSERT_TRUE(fx.svc->api_put_pipeline_abort("pipe-401").ok);
+  }
 
   ioc.stop();
   if (th.joinable()) th.join();
@@ -603,7 +607,9 @@ TEST(PutPipeline, HttpStreamedPutRequiresUnsignedPayload) {
   std::string staging;
   auto br = fx.svc->api_begin_put_pipeline("pipe-signed", {}, payload.size(), staging);
   EXPECT_TRUE(br.ok) << br.code << " " << br.error;
-  if (br.ok) ASSERT_TRUE(fx.svc->api_put_pipeline_abort("pipe-signed").ok);
+  if (br.ok) {
+    ASSERT_TRUE(fx.svc->api_put_pipeline_abort("pipe-signed").ok);
+  }
 
   ioc.stop();
   if (th.joinable()) th.join();
