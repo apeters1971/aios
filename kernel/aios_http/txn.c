@@ -11,55 +11,75 @@
 int aios_http_lock_acquire(struct aios_http_client *c, const char *oid, int ttl_ms,
 			   char *token_out, size_t token_len)
 {
-	char enc[1024];
-	char path[1100];
-	char extra[64];
+	struct {
+		char enc[1024];
+		char path[AIOS_HTTP_PATH_MAX];
+		char extra[64];
+	} *b;
 	struct aios_http_buf body = { 0 };
 	int status = 0;
 	int err;
 
-	if (!token_out || token_len < 8)
+	if (!c || !token_out || token_len < 8)
 		return -EINVAL;
-	err = aios_http_encode_oid(oid, enc, sizeof(enc));
+	b = kmalloc(sizeof(*b), c->gfp);
+	if (!b)
+		return -ENOMEM;
+	err = aios_http_encode_oid(oid, b->enc, sizeof(b->enc));
 	if (err)
-		return err;
-	if (snprintf(path, sizeof(path), "/o/%s/lock", enc) >= (int)sizeof(path))
-		return -ENAMETOOLONG;
-	snprintf(extra, sizeof(extra), "x-aios-lock-ttl-ms: %d\r\n", ttl_ms > 0 ? ttl_ms : 30000);
+		goto out;
+	if (snprintf(b->path, sizeof(b->path), "/o/%s/lock", b->enc) >= (int)sizeof(b->path)) {
+		err = -ENAMETOOLONG;
+		goto out;
+	}
+	snprintf(b->extra, sizeof(b->extra), "x-aios-lock-ttl-ms: %d\r\n",
+		 ttl_ms > 0 ? ttl_ms : 30000);
 
-	err = aios_http_request(c, "POST", path, extra, NULL, 0, &status, &body);
+	err = aios_http_request(c, "POST", b->path, b->extra, NULL, 0, &status, &body);
 	if (err)
-		return err;
+		goto out;
 	if (status != 201) {
 		aios_http_buf_free(&body);
-		return aios_http_map_status(status);
+		err = aios_http_map_status(status);
+		goto out;
 	}
 	err = aios_http_json_string(body.data, body.len, "token", token_out, token_len);
 	aios_http_buf_free(&body);
+out:
+	kfree(b);
 	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_lock_acquire);
 
 int aios_http_lock_release(struct aios_http_client *c, const char *oid, const char *token)
 {
-	char enc[1024];
-	char path[1100];
-	char extra[192];
+	struct {
+		char enc[1024];
+		char path[AIOS_HTTP_PATH_MAX];
+		char extra[192];
+	} *b;
 	int status = 0;
 	int err;
 
-	if (!token || !*token)
+	if (!c || !token || !*token)
 		return -EINVAL;
-	err = aios_http_encode_oid(oid, enc, sizeof(enc));
+	b = kmalloc(sizeof(*b), c->gfp);
+	if (!b)
+		return -ENOMEM;
+	err = aios_http_encode_oid(oid, b->enc, sizeof(b->enc));
 	if (err)
-		return err;
-	if (snprintf(path, sizeof(path), "/o/%s/lock", enc) >= (int)sizeof(path))
-		return -ENAMETOOLONG;
-	snprintf(extra, sizeof(extra), "x-aios-lock-token: %s\r\n", token);
-	err = aios_http_request(c, "DELETE", path, extra, NULL, 0, &status, NULL);
-	if (err)
-		return err;
-	return aios_http_map_status(status);
+		goto out;
+	if (snprintf(b->path, sizeof(b->path), "/o/%s/lock", b->enc) >= (int)sizeof(b->path)) {
+		err = -ENAMETOOLONG;
+		goto out;
+	}
+	snprintf(b->extra, sizeof(b->extra), "x-aios-lock-token: %s\r\n", token);
+	err = aios_http_request(c, "DELETE", b->path, b->extra, NULL, 0, &status, NULL);
+	if (!err)
+		err = aios_http_map_status(status);
+out:
+	kfree(b);
+	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_lock_release);
 
@@ -86,84 +106,113 @@ EXPORT_SYMBOL_GPL(aios_http_txn_begin);
 
 static int txn_oid_path(const char *txn_id, const char *oid, char *path, size_t path_len)
 {
-	char tenc[256];
-	char oenc[1024];
+	struct {
+		char tenc[256];
+		char oenc[1024];
+	} *enc;
 	int err;
 
-	err = aios_http_encode_oid(txn_id, tenc, sizeof(tenc));
+	enc = kmalloc(sizeof(*enc), GFP_KERNEL);
+	if (!enc)
+		return -ENOMEM;
+	err = aios_http_encode_oid(txn_id, enc->tenc, sizeof(enc->tenc));
 	if (err)
-		return err;
-	err = aios_http_encode_oid(oid, oenc, sizeof(oenc));
+		goto out;
+	err = aios_http_encode_oid(oid, enc->oenc, sizeof(enc->oenc));
 	if (err)
-		return err;
-	if (snprintf(path, path_len, "/txn/%s/o/%s", tenc, oenc) >= (int)path_len)
-		return -ENAMETOOLONG;
-	return 0;
+		goto out;
+	if (snprintf(path, path_len, "/txn/%s/o/%s", enc->tenc, enc->oenc) >= (int)path_len)
+		err = -ENAMETOOLONG;
+	else
+		err = 0;
+out:
+	kfree(enc);
+	return err;
 }
 
 int aios_http_txn_prepare_put(struct aios_http_client *c, const char *txn_id, const char *oid,
 			      const void *body, size_t len, const char *lock_token,
 			      u64 *cas_inout)
 {
-	char path[1200];
-	char cas_hdrs[512] = "";
-	char lock_hdr[192] = "";
-	char all[900];
+	struct {
+		char path[AIOS_HTTP_TXN_PATH_MAX];
+		char cas_hdrs[512];
+		char lock_hdr[192];
+		char all[900];
+	} *b;
 	int status = 0;
 	int err;
 	u64 new_cas = 0;
 
-	if (!txn_id || !*txn_id || !oid || !*oid)
+	if (!c || !txn_id || !*txn_id || !oid || !*oid)
 		return -EINVAL;
 	if (len > AIOS_HTTP_MAX_BODY)
 		return -EFBIG;
-	err = txn_oid_path(txn_id, oid, path, sizeof(path));
+	b = kmalloc(sizeof(*b), c->gfp);
+	if (!b)
+		return -ENOMEM;
+	b->cas_hdrs[0] = '\0';
+	b->lock_hdr[0] = '\0';
+	err = txn_oid_path(txn_id, oid, b->path, sizeof(b->path));
 	if (err)
-		return err;
+		goto out;
 
 	if (cas_inout) {
-		err = aios_http_fill_posix_cas(c, oid, *cas_inout, cas_hdrs, sizeof(cas_hdrs),
-					       &new_cas);
+		err = aios_http_fill_posix_cas(c, oid, *cas_inout, b->cas_hdrs,
+					       sizeof(b->cas_hdrs), &new_cas);
 		if (err)
-			return err;
+			goto out;
 	}
 	if (lock_token && *lock_token)
-		snprintf(lock_hdr, sizeof(lock_hdr), "x-aios-lock-token: %s\r\n", lock_token);
+		snprintf(b->lock_hdr, sizeof(b->lock_hdr), "x-aios-lock-token: %s\r\n",
+			 lock_token);
 
-	snprintf(all, sizeof(all), "Content-Type: application/octet-stream\r\n%s%s", cas_hdrs,
-		 lock_hdr);
-	err = aios_http_request(c, "PUT", path, all, body, len, &status, NULL);
+	snprintf(b->all, sizeof(b->all), "Content-Type: application/octet-stream\r\n%s%s",
+		 b->cas_hdrs, b->lock_hdr);
+	err = aios_http_request(c, "PUT", b->path, b->all, body, len, &status, NULL);
 	if (err)
-		return err;
+		goto out;
 	err = aios_http_map_status(status);
 	if (err)
-		return err;
+		goto out;
 	if (cas_inout)
 		*cas_inout = new_cas;
-	return 0;
+	err = 0;
+out:
+	kfree(b);
+	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_txn_prepare_put);
 
 int aios_http_txn_prepare_delete(struct aios_http_client *c, const char *txn_id, const char *oid,
 				 const char *lock_token)
 {
-	char path[1200];
-	char lock_hdr[192] = "";
+	struct {
+		char path[AIOS_HTTP_TXN_PATH_MAX];
+		char lock_hdr[192];
+	} *b;
 	int status = 0;
 	int err;
 
-	if (!txn_id || !*txn_id || !oid || !*oid)
+	if (!c || !txn_id || !*txn_id || !oid || !*oid)
 		return -EINVAL;
-	err = txn_oid_path(txn_id, oid, path, sizeof(path));
+	b = kmalloc(sizeof(*b), c->gfp);
+	if (!b)
+		return -ENOMEM;
+	b->lock_hdr[0] = '\0';
+	err = txn_oid_path(txn_id, oid, b->path, sizeof(b->path));
 	if (err)
-		return err;
+		goto out;
 	if (lock_token && *lock_token)
-		snprintf(lock_hdr, sizeof(lock_hdr), "x-aios-lock-token: %s\r\n", lock_token);
-	err = aios_http_request(c, "DELETE", path, lock_hdr[0] ? lock_hdr : NULL, NULL, 0,
-				&status, NULL);
-	if (err)
-		return err;
-	return aios_http_map_status(status);
+		snprintf(b->lock_hdr, sizeof(b->lock_hdr), "x-aios-lock-token: %s\r\n",
+			 lock_token);
+	err = aios_http_request(c, "DELETE", b->path, b->lock_hdr[0] ? b->lock_hdr : NULL, NULL,
+				0, &status, NULL);
+	if (!err)
+		err = aios_http_map_status(status);
+out:
+	kfree(b);
+	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_txn_prepare_delete);
 

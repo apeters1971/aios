@@ -52,14 +52,21 @@ int aios_http_build_auth(const struct aios_http_client *c, const char *method,
 {
 	/* Canonical: method\npath\ndate\nSignedHeaders:\nSignedHeaders\nUNSIGNED-PAYLOAD */
 	char date[32];
-	char canon[2048];
+	char *canon;
 	char sig[65];
 	s64 ms;
 	int n;
 	int err;
 
+	if (!c || !method || !path || !auth_hdrs)
+		return -EINVAL;
+
 	ms = ktime_to_ms(ktime_get_real());
 	snprintf(date, sizeof(date), "%lld", (long long)ms);
+
+	canon = kmalloc(AIOS_HTTP_CANON_MAX, c->gfp);
+	if (!canon)
+		return -ENOMEM;
 
 	/*
 	 * Must match src/http/http_auth.cpp http_canonical(). SignedHeaders is
@@ -67,17 +74,20 @@ int aios_http_build_auth(const struct aios_http_client *c, const char *method,
 	 * header name and that line's value is empty. Expanding into two
 	 * name:value lines (AWS-style) produces a 401 bad signature.
 	 */
-	n = snprintf(canon, sizeof(canon),
+	n = snprintf(canon, AIOS_HTTP_CANON_MAX,
 		     "%s\n%s\n%s\n"
 		     "x-aios-content-sha256;x-aios-date:\n"
 		     "x-aios-content-sha256;x-aios-date\n"
 		     "UNSIGNED-PAYLOAD",
 		     method, path, date);
-	if (n < 0 || n >= (int)sizeof(canon))
+	if (n < 0 || n >= (int)AIOS_HTTP_CANON_MAX) {
+		kfree(canon);
 		return -EOVERFLOW;
+	}
 
 	err = aios_http_hmac_sha256_hex(c->cluster_key, strlen(c->cluster_key), canon,
 					strlen(canon), sig);
+	kfree(canon);
 	if (err)
 		return err;
 
