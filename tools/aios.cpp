@@ -1633,6 +1633,21 @@ bool http_ready(const std::string& host, const std::string& port, const std::str
   return r.status == 200 || r.status == 401 || r.status == 403;
 }
 
+// ClusterMap::build only counts usable targets on Online members. place() then
+// needs at least replica_count (default 3) Up targets in the storage class.
+int map_target_count(const std::string& host, const std::string& port,
+                     const std::string& key) {
+  auto r = http_exchange(host, port, "GET", "/map", {}, {}, nullptr, key, 0);
+  if (r.status != 200) return -1;
+  try {
+    const auto j = nlohmann::json::parse(r.body);
+    if (!j.contains("targets") || !j["targets"].is_array()) return 0;
+    return static_cast<int>(j["targets"].size());
+  } catch (...) {
+    return -1;
+  }
+}
+
 int cmd_testbed(const std::string& cluster_key, const char* argv0, bool no_fsync) {
   const fs::path root(kTestbedRoot);
   std::string err;
@@ -1680,12 +1695,6 @@ int cmd_testbed(const std::string& cluster_key, const char* argv0, bool no_fsync
         node.string(),
         "--status-file",
         (node / "status.json").string(),
-        // Default aiosd replica_count is 3; a local testbed often has only one
-        // usable target in the map (scan/gossip lag or a single live node).
-        "--replica-count",
-        "1",
-        "--write-quorum",
-        "1",
     };
     if (i == 0) {
       args.push_back("--admin");
@@ -1723,10 +1732,27 @@ int cmd_testbed(const std::string& cluster_key, const char* argv0, bool no_fsync
     }
   }
 
+  // Node 00 is HTTP-ready with only its own disk until peers gossip in.
+  // Default replica_count is 3, so a PUT before that returns 503 no_targets.
+  constexpr int kReplicaCount = 3;
+  int targets = -1;
+  for (int t = 0; t < 100 && !g_testbed_stop.load(); ++t) {
+    targets = map_target_count("127.0.0.1", std::to_string(kTestbedHttpBase), cluster_key);
+    if (targets >= kTestbedNodes) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (targets < kReplicaCount && !g_testbed_stop.load()) {
+    std::cerr << "warning: cluster map has " << targets << " target(s); need "
+              << kReplicaCount << " for default replica_count (PUTs will 503 no_targets)\n"
+              << "  check " << root << "/*/aiosd.log for 'fs scan' / 'target unusable'\n";
+  }
+
   std::cout << "\ntestbed root:  " << root << "\n"
             << "cluster_key:   " << cluster_key << "\n"
             << "data_fsync:    " << (no_fsync ? "off (--no-fsync)" : "on") << "\n"
-            << "replicas:      1 (local testbed)\n"
+            << "nodes:         " << kTestbedNodes << "\n"
+            << "replicas:      " << kReplicaCount << " (aiosd default)\n"
+            << "map_targets:   " << targets << "\n"
             << "admin UI:      http://127.0.0.1:" << kTestbedHttpBase << "/admin/\n"
             << "client example:\n"
             << "  aios --endpoint 127.0.0.1:" << kTestbedHttpBase << " --cluster-key " << cluster_key
