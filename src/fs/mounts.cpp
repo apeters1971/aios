@@ -21,8 +21,12 @@ bool is_virtual_fstype(const std::string& fstype) {
       "devtmpfs",  "cgroup",    "cgroup2",   "pstore",    "securityfs",
       "debugfs",   "tracefs",   "configfs",  "fusectl",   "mqueue",
       "hugetlbfs", "binfmt_misc", "autofs",  "rpc_pipefs", "bpf",
-      "overlay",   "nsfs",      "ramfs",     "none",
+      "overlay",   "nsfs",      "ramfs",     "none",      "fuse",
+      "fuseblk",   "aios",
   };
+  /* fuse.aios-fuse, fuse.sshfs, … — never stat these for .aios; that LOOKUP
+   * deadlocks when the FUSE daemon's HTTP client is this same aiosd. */
+  if (fstype.rfind("fuse.", 0) == 0 || fstype.rfind("fuseblk.", 0) == 0) return true;
   return kVirtual.count(fstype) > 0;
 }
 

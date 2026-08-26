@@ -130,14 +130,15 @@ int resolve_parent(aios_posix_fs* fs, const char* path, uint64_t* parent_out,
 }
 
 #ifdef __APPLE__
-int posix_readdir(const char* path, void* buf, fuse_darwin_fill_dir_t filler, off_t offset,
+int posix_readdir(const char* path, void* buf, fuse_darwin_fill_dir_t filler, off_t /*offset*/,
                   struct fuse_file_info* /*fi*/, enum fuse_readdir_flags /*flags*/) {
   return guard([&] {
     auto* fs = fs_handle();
     aios_posix_stat st{};
     int rc = lookup_path(fs, path, &st);
     if (rc) return rc;
-    uint64_t off = static_cast<uint64_t>(offset);
+    /* Offset 0: one-shot directory (libfuse mode 1). Non-zero cookies hang ls. */
+    uint64_t off = 0;
     aios_posix_dirent ents[64];
     while (true) {
       int n = aios_posix_readdir(fs, st.ino, &off, ents, 64);
@@ -147,24 +148,21 @@ int posix_readdir(const char* path, void* buf, fuse_darwin_fill_dir_t filler, of
         fuse_darwin_attr e{};
         e.ino = ents[i].ino;
         e.mode = ents[i].mode;
-        const off_t cookie = static_cast<off_t>(off - static_cast<uint64_t>(n) + i + 1);
-        if (filler(buf, ents[i].name, &e, cookie, static_cast<fuse_fill_dir_flags>(0))) {
-          return 0;
-        }
+        if (filler(buf, ents[i].name, &e, 0, static_cast<fuse_fill_dir_flags>(0))) return 0;
       }
     }
     return 0;
   });
 }
 #else
-int posix_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset,
+int posix_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t /*offset*/,
                   struct fuse_file_info* /*fi*/, enum fuse_readdir_flags /*flags*/) {
   return guard([&] {
     auto* fs = fs_handle();
     aios_posix_stat st{};
     int rc = lookup_path(fs, path, &st);
     if (rc) return rc;
-    uint64_t off = static_cast<uint64_t>(offset);
+    uint64_t off = 0;
     aios_posix_dirent ents[64];
     while (true) {
       int n = aios_posix_readdir(fs, st.ino, &off, ents, 64);
@@ -174,10 +172,7 @@ int posix_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t off
         struct stat e{};
         e.st_ino = ents[i].ino;
         e.st_mode = ents[i].mode;
-        const off_t cookie = static_cast<off_t>(off - static_cast<uint64_t>(n) + i + 1);
-        if (filler(buf, ents[i].name, &e, cookie, static_cast<fuse_fill_dir_flags>(0))) {
-          return 0;
-        }
+        if (filler(buf, ents[i].name, &e, 0, static_cast<fuse_fill_dir_flags>(0))) return 0;
       }
     }
     return 0;
