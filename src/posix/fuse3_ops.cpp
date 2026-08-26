@@ -7,6 +7,7 @@
 #include <string>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __APPLE__
@@ -47,6 +48,9 @@ int lookup_path(aios_posix_fs* fs, const char* path, aios_posix_stat* st_out) {
     while (*p && *p != '/') component.push_back(*p++);
     while (*p == '/') ++p;
     if (component.empty()) continue;
+    /* Cluster .aios markers live on real disks. Stating one on this mount
+     * from aiosd's scanner deadlocks (FUSE HTTP → same process). */
+    if (component == ".aios") return -ENOENT;
     aios_posix_stat cur{};
     int rc = aios_posix_lookup(fs, ino, component.c_str(), &cur);
     if (rc) return rc;
@@ -358,6 +362,44 @@ int posix_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* /
   });
 }
 
+int posix_utimens(const char* path, const struct timespec tv[2], struct fuse_file_info* /*fi*/) {
+  return guard([&] {
+    auto* fs = fs_handle();
+    aios_posix_stat st{};
+    int rc = lookup_path(fs, path, &st);
+    if (rc) return rc;
+    aios_posix_stat ps{};
+    uint32_t set = 0;
+    struct timespec now_ts {};
+    if (::clock_gettime(CLOCK_REALTIME, &now_ts) != 0) {
+      now_ts.tv_sec = ::time(nullptr);
+      now_ts.tv_nsec = 0;
+    }
+    const uint64_t now = static_cast<uint64_t>(now_ts.tv_sec) * 1000000000ull +
+                         static_cast<uint64_t>(now_ts.tv_nsec);
+    auto apply = [&](const struct timespec* ts, uint64_t* out_ns, uint32_t bit) {
+      if (!ts || ts->tv_nsec == UTIME_NOW) {
+        *out_ns = now;
+        set |= bit;
+      } else if (ts->tv_nsec != UTIME_OMIT) {
+        *out_ns = static_cast<uint64_t>(ts->tv_sec) * 1000000000ull +
+                  static_cast<uint64_t>(ts->tv_nsec);
+        set |= bit;
+      }
+    };
+    if (!tv) {
+      ps.atime_ns = now;
+      ps.mtime_ns = now;
+      set = AIOS_POSIX_SET_ATIME | AIOS_POSIX_SET_MTIME;
+    } else {
+      apply(&tv[0], &ps.atime_ns, AIOS_POSIX_SET_ATIME);
+      apply(&tv[1], &ps.mtime_ns, AIOS_POSIX_SET_MTIME);
+    }
+    if (!set) return 0;
+    return aios_posix_setattr(fs, st.ino, &ps, set);
+  });
+}
+
 #ifdef __APPLE__
 // High-level Darwin setattr uses the same bit mask as fuse_lowlevel.h.
 #ifndef FUSE_SET_ATTR_MODE
@@ -560,6 +602,7 @@ fuse_operations aios_fuse_operations() {
   ops.fsync = posix_fsync;
   ops.chmod = posix_chmod;
   ops.chown = posix_chown;
+  ops.utimens = posix_utimens;
   ops.statfs = posix_statfs;
   ops.setxattr = posix_setxattr;
   ops.getxattr = posix_getxattr;

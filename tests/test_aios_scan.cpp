@@ -1,6 +1,7 @@
 #include "cluster/weight.hpp"
 #include <gtest/gtest.h>
 #include "fs/aios_scan.hpp"
+#include "fs/mounts.hpp"
 #include "util/uid.hpp"
 
 #include <filesystem>
@@ -131,6 +132,13 @@ TEST(AiosScan, Basic) {
     }
     EXPECT_TRUE(hit) << "scan_roots discovers non-mount .aios";
   }
+
+  EXPECT_TRUE(is_virtual_fstype("fuse"));
+  EXPECT_TRUE(is_virtual_fstype("fuseblk"));
+  EXPECT_TRUE(is_virtual_fstype("fuse.aios-fuse"));
+  EXPECT_TRUE(is_virtual_fstype("aios"));
+  EXPECT_TRUE(!is_virtual_fstype("xfs"));
+  EXPECT_TRUE(!is_virtual_fstype("ext4"));
 
   fs::remove_all(base);
   }
