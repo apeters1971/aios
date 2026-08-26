@@ -205,7 +205,10 @@ int posix_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     aios_posix_stat st{};
     rc = aios_posix_create(fs, parent, name.c_str(), static_cast<uint32_t>(mode), &st);
     if (rc) return rc;
-    if (fi) fi->fh = st.ino;
+    if (fi) {
+      fi->fh = st.ino;
+      fi->keep_cache = 1;
+    }
     return 0;
   });
 }
@@ -277,7 +280,10 @@ int posix_open(const char* path, struct fuse_file_info* fi) {
       rc = aios_posix_access(fs, st.ino, amode);
       if (rc) return rc;
     }
-    if (fi) fi->fh = st.ino;
+    if (fi) {
+      fi->fh = st.ino;
+      fi->keep_cache = 1;
+    }
     return 0;
   });
 }
@@ -583,10 +589,44 @@ int posix_flock(const char* path, struct fuse_file_info* fi, int op) {
   });
 }
 
+void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
+  auto* ctx = fuse_get_context();
+  auto* fs = ctx ? static_cast<aios_posix_fs*>(ctx->private_data) : nullptr;
+  unsigned io = 1024u * 1024u;
+  if (fs) {
+    aios_posix_stat st{};
+    if (aios_posix_getattr(fs, 1, &st) == 0 && st.stripe_unit > 0 &&
+        st.stripe_unit <= 1024ull * 1024ull) {
+      io = static_cast<unsigned>(st.stripe_unit);
+    }
+  }
+  if (conn) {
+    conn->max_write = io;
+    conn->max_read = io;
+    conn->max_readahead = io * 4;
+#ifdef FUSE_CAP_WRITEBACK_CACHE
+    if (conn->capable & FUSE_CAP_WRITEBACK_CACHE) conn->want |= FUSE_CAP_WRITEBACK_CACHE;
+#endif
+#ifdef FUSE_CAP_ASYNC_READ
+    if (conn->capable & FUSE_CAP_ASYNC_READ) conn->want |= FUSE_CAP_ASYNC_READ;
+#endif
+#ifdef FUSE_CAP_MAX_PAGES
+    if (conn->capable & FUSE_CAP_MAX_PAGES) conn->want |= FUSE_CAP_MAX_PAGES;
+#endif
+  }
+  if (cfg) {
+    cfg->kernel_cache = 1;
+    cfg->attr_timeout = 1.0;
+    cfg->entry_timeout = 1.0;
+  }
+  return fs;
+}
+
 }  // namespace
 
 fuse_operations aios_fuse_operations() {
   fuse_operations ops{};
+  ops.init = posix_init;
   ops.getattr = posix_getattr;
   ops.readdir = posix_readdir;
   ops.mkdir = posix_mkdir;

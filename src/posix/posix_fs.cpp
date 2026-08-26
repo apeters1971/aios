@@ -68,6 +68,7 @@ void delete_orphan_inode(FsState& st, uint64_t ino) {
   }
   std::lock_guard lock(st.mu);
   st.inode_cache.erase(ino);
+  st.chunk_cache.drop(ino);
 }
 
 namespace {
@@ -76,6 +77,7 @@ void delete_file_chunks(FsState& st, uint64_t ino, uint64_t size, uint64_t strip
                         uint32_t project_id, uint32_t uid, uint32_t gid) {
   const uint64_t unit = stripe_unit ? stripe_unit : st.stripe_unit;
   const uint64_t nchunk = size == 0 ? 0 : (size + unit - 1) / unit;
+  st.chunk_cache.drop(ino);
   for (uint64_t c = 0; c < nchunk; ++c) {
     try {
       st.session.delete_object(chunk_oid(st.volume, ino, c));
@@ -1073,11 +1075,20 @@ int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len,
     const uint64_t chunk_end = std::min(end, (chunk + 1) * unit);
     const size_t n = static_cast<size_t>(chunk_end - pos);
     try {
-      auto snap = st.session.get_object(chunk_oid(st.volume, ino, chunk));
-      if (snap.exists && chunk_off < snap.body.size()) {
-        const size_t avail = static_cast<size_t>(snap.body.size() - chunk_off);
+      std::string body;
+      uint64_t cas = 0;
+      if (!st.chunk_cache.lookup(ino, chunk, body, cas)) {
+        auto snap = st.session.get_object(chunk_oid(st.volume, ino, chunk));
+        if (snap.exists) {
+          body = std::move(snap.body);
+          cas = cas_from_attrs(snap.attrs);
+          st.chunk_cache.store(ino, chunk, body, cas);
+        }
+      }
+      if (chunk_off < body.size()) {
+        const size_t avail = static_cast<size_t>(body.size() - chunk_off);
         const size_t take = std::min(n, avail);
-        std::memcpy(out + written, snap.body.data() + chunk_off, take);
+        std::memcpy(out + written, body.data() + chunk_off, take);
       }
     } catch (const client_error& e) {
       return map_error(e);
@@ -1107,66 +1118,41 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
   const auto* in = static_cast<const uint8_t*>(buf);
   uint64_t pos = offset;
   size_t done = 0;
-  const uint32_t width = meta.stripe_width ? meta.stripe_width : st.stripe_width;
   const auto data_layout = data_layout_for_ino(st, ino);
 
   while (done < len) {
-    struct Job {
-      uint64_t chunk;
-      uint64_t chunk_off;
-      size_t n;
-      const uint8_t* data;
-    };
-    std::vector<Job> jobs;
-    while (done < len && jobs.size() < width) {
-      const uint64_t chunk = pos / unit;
-      const uint64_t chunk_off = pos % unit;
-      const size_t n = std::min(static_cast<size_t>(unit - chunk_off), len - done);
-      jobs.push_back(Job{chunk, chunk_off, n, in + done});
-      pos += n;
-      done += n;
-    }
-    std::vector<std::thread> threads;
-    std::atomic<int> err{0};
-    try {
-      for (const auto& job : jobs) {
-        threads.emplace_back([&st, ino, job, &err, data_layout] {
-          const std::string oid = chunk_oid(st.volume, ino, job.chunk);
-          for (int attempt = 0; attempt < 8; ++attempt) {
-            try {
-              std::string body;
-              uint64_t cas = 0;
-              auto existing = st.session.get_object(oid);
-              if (existing.exists) {
-                body = std::move(existing.body);
-                cas = cas_from_attrs(existing.attrs);
-              }
-              if (body.size() < job.chunk_off + job.n) {
-                body.resize(job.chunk_off + job.n, '\0');
-              }
-              std::memcpy(body.data() + job.chunk_off, job.data, job.n);
-              st.session.put_bytes(oid, body, {}, cas, std::nullopt, data_layout);
-              return;
-            } catch (const client_error& e) {
-              if (e.code() == "conflict") continue;
-              err.store(map_error(e));
-              return;
-            } catch (...) {
-              err.store(-EIO);
-              return;
-            }
+    const uint64_t chunk = pos / unit;
+    const uint64_t chunk_off = pos % unit;
+    const size_t n = std::min(static_cast<size_t>(unit - chunk_off), len - done);
+    const std::string oid = chunk_oid(st.volume, ino, chunk);
+    int chunk_rc = -EAGAIN;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      try {
+        std::string body;
+        uint64_t cas = 0;
+        if (!st.chunk_cache.lookup(ino, chunk, body, cas)) {
+          auto existing = st.session.get_object(oid);
+          if (existing.exists) {
+            body = std::move(existing.body);
+            cas = cas_from_attrs(existing.attrs);
           }
-          err.store(-EAGAIN);
-        });
+        }
+        if (body.size() < chunk_off + n) body.resize(chunk_off + n, '\0');
+        std::memcpy(body.data() + chunk_off, in + done, n);
+        const uint64_t new_cas =
+            st.session.put_bytes(oid, body, {}, cas, std::nullopt, data_layout);
+        st.chunk_cache.store(ino, chunk, std::move(body), new_cas);
+        chunk_rc = 0;
+        break;
+      } catch (const client_error& e) {
+        st.chunk_cache.drop(ino, chunk);
+        if (e.code() == "conflict") continue;
+        return map_error(e);
       }
-    } catch (...) {
-      for (auto& t : threads) {
-        if (t.joinable()) t.join();
-      }
-      return -EIO;
     }
-    for (auto& t : threads) t.join();
-    if (err.load() != 0) return err.load();
+    if (chunk_rc) return chunk_rc;
+    pos += n;
+    done += n;
   }
 
   const uint64_t old_size = meta.size;
@@ -1205,6 +1191,7 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
   if (size < meta.size) {
     const uint64_t first_drop = (size + unit - 1) / unit;
     const uint64_t old_chunks = (meta.size + unit - 1) / unit;
+    st.chunk_cache.drop(ino);
     for (uint64_t c = first_drop; c < old_chunks; ++c) {
       try {
         st.session.delete_object(chunk_oid(st.volume, ino, c));

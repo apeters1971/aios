@@ -7,10 +7,12 @@
 #include "posix/qos_controller.hpp"
 #include "posix/quota_ledger.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,6 +29,73 @@ inline constexpr uint64_t kRootIno = 1;
 inline constexpr uint64_t kDefaultStripeUnit = 1024ull * 1024ull;
 inline constexpr uint32_t kDefaultStripeWidth = 4;
 inline constexpr const char* kCasAttr = "aios.posix.cas";
+inline constexpr size_t kChunkCacheSlots = 8;
+
+// Last-N stripe bodies so 128 KiB FUSE I/O does not re-GET the same 1 MiB chunk.
+struct ChunkCache {
+  struct Slot {
+    uint64_t ino{0};
+    uint64_t chunk{std::numeric_limits<uint64_t>::max()};
+    uint64_t cas{0};
+    uint64_t lru{0};
+    std::string body;
+  };
+
+  bool lookup(uint64_t ino, uint64_t chunk, std::string& body, uint64_t& cas) {
+    std::lock_guard lock(mu);
+    for (auto& e : slots) {
+      if (e.ino == ino && e.chunk == chunk) {
+        e.lru = ++clock;
+        body = e.body;
+        cas = e.cas;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void store(uint64_t ino, uint64_t chunk, std::string body, uint64_t cas) {
+    std::lock_guard lock(mu);
+    Slot* victim = nullptr;
+    uint64_t oldest = std::numeric_limits<uint64_t>::max();
+    for (auto& e : slots) {
+      if (e.ino == ino && e.chunk == chunk) {
+        e.body = std::move(body);
+        e.cas = cas;
+        e.lru = ++clock;
+        return;
+      }
+      if (e.chunk == std::numeric_limits<uint64_t>::max()) {
+        victim = &e;
+        break;
+      }
+      if (e.lru < oldest) {
+        oldest = e.lru;
+        victim = &e;
+      }
+    }
+    if (!victim) victim = &slots[0];
+    victim->ino = ino;
+    victim->chunk = chunk;
+    victim->cas = cas;
+    victim->body = std::move(body);
+    victim->lru = ++clock;
+  }
+
+  void drop(uint64_t ino, std::optional<uint64_t> chunk = std::nullopt) {
+    std::lock_guard lock(mu);
+    for (auto& e : slots) {
+      if (e.ino != ino) continue;
+      if (chunk && e.chunk != *chunk) continue;
+      e = {};
+      e.chunk = std::numeric_limits<uint64_t>::max();
+    }
+  }
+
+  std::mutex mu;
+  uint64_t clock{0};
+  std::array<Slot, kChunkCacheSlots> slots{};
+};
 
 struct InodeMeta {
   uint64_t ino{0};
@@ -155,6 +224,7 @@ struct FsState {
   std::chrono::steady_clock::time_point layout_rules_loaded{};
   std::unique_ptr<QuotaLedger> quota;
   std::unique_ptr<QosController> qos;
+  ChunkCache chunk_cache;
 
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}

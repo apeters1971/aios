@@ -124,6 +124,20 @@ TEST(PosixFs, Basic) {
   EXPECT_TRUE(aios_posix_read(fs, file_ino, 0, rbuf.data(), rbuf.size(), &got) == 0) << "big read";
   EXPECT_TRUE(got == big.size() && std::string(rbuf.data(), got) == big) << "big data";
 
+  // Sub-chunk sequential writes (FUSE often issues 128 KiB into a 1 MiB stripe).
+  std::string seq(4096, '\0');
+  for (int i = 0; i < 8; ++i) {
+    const std::string piece(512, static_cast<char>('A' + i));
+    EXPECT_TRUE(aios_posix_write(fs, file_ino, static_cast<uint64_t>(i * 512), piece.data(),
+                                 piece.size(), &wrote) == 0)
+        << "seq write " << i;
+    seq.replace(static_cast<size_t>(i * 512), 512, piece);
+  }
+  std::vector<char> seqbuf(4096);
+  EXPECT_TRUE(aios_posix_read(fs, file_ino, 0, seqbuf.data(), seqbuf.size(), &got) == 0)
+      << "seq read";
+  EXPECT_TRUE(got == 4096 && std::string(seqbuf.data(), got) == seq) << "seq data";
+
   EXPECT_TRUE(aios_posix_truncate(fs, file_ino, 3) == 0) << "truncate";
   EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.size == 3) << "trunc size";
 
