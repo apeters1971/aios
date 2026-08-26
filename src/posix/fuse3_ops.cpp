@@ -589,20 +589,20 @@ int posix_flock(const char* path, struct fuse_file_info* fi, int op) {
   });
 }
 
+unsigned aios_fuse_max_io(const aios_posix_fs* fs) {
+  uint64_t su = aios_posix_stripe_unit(fs);
+  if (su == 0 || su > 1024ull * 1024ull) su = 1024ull * 1024ull;
+  return static_cast<unsigned>(su);
+}
+
 void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
   auto* ctx = fuse_get_context();
   auto* fs = ctx ? static_cast<aios_posix_fs*>(ctx->private_data) : nullptr;
-  unsigned io = 1024u * 1024u;
-  if (fs) {
-    aios_posix_stat st{};
-    if (aios_posix_getattr(fs, 1, &st) == 0 && st.stripe_unit > 0 &&
-        st.stripe_unit <= 1024ull * 1024ull) {
-      io = static_cast<unsigned>(st.stripe_unit);
-    }
-  }
+  const unsigned io = aios_fuse_max_io(fs);
   if (conn) {
     conn->max_write = io;
-    /* libfuse 3.10: max_read must match fuse_session_new (-o max_read=). */
+    /* libfuse 3.10: must equal fuse_session_new's -o max_read (see aios-fuse). */
+    conn->max_read = io;
     conn->max_readahead = io * 4;
 #ifdef FUSE_CAP_WRITEBACK_CACHE
     if (conn->capable & FUSE_CAP_WRITEBACK_CACHE) conn->want |= FUSE_CAP_WRITEBACK_CACHE;

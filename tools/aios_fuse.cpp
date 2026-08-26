@@ -90,22 +90,6 @@ int main(int argc, char** argv) {
     fuse_args.emplace_back(argv[i]);
   }
 
-  /* libfuse 3.10 takes max_read from fuse_session_new only; init() cannot change it. */
-  bool have_max_read = false;
-  for (const auto& s : fuse_args) {
-    if (s.find("max_read=") != std::string::npos) have_max_read = true;
-  }
-  if (!have_max_read) {
-    const uint64_t stripe = opt.stripe_unit ? opt.stripe_unit : (1024ull * 1024ull);
-    const uint64_t io = stripe > (1024ull * 1024ull) ? (1024ull * 1024ull) : stripe;
-    fuse_args.emplace_back("-o");
-    fuse_args.push_back("max_read=" + std::to_string(io));
-  }
-
-  std::vector<char*> fuse_argv;
-  fuse_argv.reserve(fuse_args.size() + 1);
-  for (auto& s : fuse_args) fuse_argv.push_back(s.data());
-
   if (opt.cluster_key.empty()) {
     usage(argv[0]);
     std::fprintf(stderr, "cluster_key required (-o cluster_key=... or AIOS_CLUSTER_KEY)\n");
@@ -131,8 +115,22 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto ops = aios_fuse_operations();
+  /* libfuse 3.10: session_new and init() must request the same max_read. */
+  bool have_max_read = false;
+  for (const auto& s : fuse_args) {
+    if (s.find("max_read=") != std::string::npos) have_max_read = true;
+  }
+  if (!have_max_read) {
+    fuse_args.emplace_back("-o");
+    fuse_args.push_back("max_read=" + std::to_string(aios_fuse_max_io(fs)));
+  }
+
+  std::vector<char*> fuse_argv;
+  fuse_argv.reserve(fuse_args.size() + 1);
+  for (auto& s : fuse_args) fuse_argv.push_back(s.data());
   fuse_argv.push_back(nullptr);
+
+  auto ops = aios_fuse_operations();
   const int rc = fuse_main(static_cast<int>(fuse_argv.size() - 1), fuse_argv.data(), &ops, fs);
   aios_posix_unmount(fs);
   return rc;

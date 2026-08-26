@@ -57,6 +57,7 @@ typedef struct aios_posix_dirent {
 
 aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out);
 void aios_posix_unmount(aios_posix_fs* fs);
+uint64_t aios_posix_stripe_unit(const aios_posix_fs* fs);
 
 /* Recompute dirty recursive directory stats (aios.r*). Also runs on the
  * rstat timer and on unmount when rstat_interval_ms > 0. */

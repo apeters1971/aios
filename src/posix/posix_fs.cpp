@@ -1370,6 +1370,10 @@ void aios_posix_unmount(aios_posix_fs* fs) {
   delete fs;
 }
 
+uint64_t aios_posix_stripe_unit(const aios_posix_fs* fs) {
+  return (fs && fs->st) ? fs->st->stripe_unit : 0;
+}
+
 void aios_posix_flush_rstats(aios_posix_fs* fs) {
   if (!fs || !fs->st) return;
   try {
