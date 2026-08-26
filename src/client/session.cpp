@@ -364,7 +364,8 @@ void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
                        const std::string& body) const {
   const std::string date = std::to_string(now_ms());
   headers["x-aios-date"] = date;
-  const std::string payload_hash = sha256_hex(body);
+  const std::string payload_hash =
+      body.size() > kHttpStreamBodyBytes ? std::string("UNSIGNED-PAYLOAD") : sha256_hex(body);
   headers["x-aios-content-sha256"] = payload_hash;
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
   const auto canon =

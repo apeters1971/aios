@@ -7,6 +7,10 @@
 
 namespace aios {
 
+// Bodies larger than this are streamed on the server (no in-memory HMAC).
+// Clients must sign those requests as UNSIGNED-PAYLOAD (proto/http.md).
+inline constexpr std::size_t kHttpStreamBodyBytes = 256u * 1024u;
+
 // Build canonical string and HMAC for AIOS-HMAC-SHA256.
 std::string http_canonical(const std::string& method, const std::string& path_with_query,
                            const std::string& date, const std::string& signed_headers,

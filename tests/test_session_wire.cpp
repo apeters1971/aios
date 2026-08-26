@@ -3,6 +3,7 @@
 
 #include "client/error.hpp"
 #include "client/session.hpp"
+#include "http/http_auth.hpp"
 #include "util/auth.hpp"
 
 #include <boost/asio.hpp>
@@ -218,6 +219,25 @@ TEST(SessionWireC8, RequestBodyIsContentSha256Hashed) {
   const auto expect = sha256_hex(body);
   EXPECT_NE(stub.last_request.find(expect), std::string::npos)
       << "request missing x-aios-content-sha256=" << expect;
+}
+
+TEST(SessionWireC8, StreamedRequestBodyUsesUnsignedPayload) {
+  using namespace aios;
+  StubServer stub([](const std::string&) { return http_response(200, "ok"); });
+
+  SessionConfig cfg;
+  cfg.endpoint = "127.0.0.1:" + stub.port;
+  cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
+  cfg.socket_timeout_ms = 2000;
+  Session s(cfg);
+
+  const std::string body(kHttpStreamBodyBytes + 1, 'A');
+  s.request("PUT", "/o/1M", {}, body);
+
+  auto lower = stub.last_request;
+  for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  EXPECT_NE(lower.find("x-aios-content-sha256: unsigned-payload"), std::string::npos)
+      << stub.last_request.substr(0, 800);
 }
 
 TEST(SessionWireC8, AbsoluteRedirectToUnknownHostIsRejected) {

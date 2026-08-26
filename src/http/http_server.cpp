@@ -1243,7 +1243,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     };
 
     const bool want_continue = expects_100_continue(headers);
-    constexpr std::size_t kMemThreshold = 256u * 1024u;
+    constexpr std::size_t kMemThreshold = kHttpStreamBodyBytes;
     std::vector<std::uint8_t> body;
     std::string upload_path;
     std::uint32_t upload_crc = 0;
