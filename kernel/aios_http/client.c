@@ -10,6 +10,7 @@
 #include <linux/tcp.h>
 #include <linux/time.h>
 #include <net/sock.h>
+#include <net/tcp.h>
 
 #ifdef CONFIG_DNS_RESOLVER
 #include <linux/dns_resolver.h>
@@ -252,6 +253,11 @@ static int connect_sock(struct aios_http_client *c)
 	if (err)
 		return err;
 
+	/* ioctl/kworker sends must not use current->task_frag; that path
+	 * returns 0/-EIO on RHEL 9.8's backported TCP stack. */
+	sock->sk->sk_allocation = GFP_KERNEL;
+	sock->sk->sk_use_task_frag = false;
+	tcp_sock_set_nodelay(sock->sk);
 	apply_sock_timeouts(c, sock);
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(port_n);
@@ -260,8 +266,15 @@ static int connect_sock(struct aios_http_client *c)
 	if (err) {
 		if (err == -EAGAIN || err == -EWOULDBLOCK || err == -ETIMEDOUT)
 			atomic64_inc(&c->timeouts);
+		pr_err("aios_http: connect %s:%s err=%d\n", c->host, c->port, err);
 		sock_release(sock);
 		return (err == -EAGAIN || err == -EWOULDBLOCK) ? -ETIMEDOUT : err;
+	}
+	if (sock->sk->sk_state != TCP_ESTABLISHED) {
+		pr_err("aios_http: connect %s:%s state=%u\n", c->host, c->port,
+		       sock->sk->sk_state);
+		sock_release(sock);
+		return -EIO;
 	}
 	c->sock = sock;
 	return 0;
@@ -355,17 +368,24 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 	sock = c->sock;
 
 	err = sock_send_all(c, sock, req, n);
-	if (err)
+	if (err) {
+		pr_err("aios_http: send %s %s hdr err=%d len=%d\n", method, path, err, n);
 		goto fail_sock;
+	}
 	if (body_len && body) {
 		err = sock_send_all(c, sock, body, body_len);
-		if (err)
+		if (err) {
+			pr_err("aios_http: send %s %s body err=%d len=%zu\n", method, path, err,
+			       body_len);
 			goto fail_sock;
+		}
 	}
 
 	err = sock_recv_until(c, sock, hdrbuf, AIOS_HTTP_MAX_HDR, "\r\n\r\n", &have);
-	if (err)
+	if (err) {
+		pr_err("aios_http: recv %s %s err=%d have=%zu\n", method, path, err, have);
 		goto fail_sock;
+	}
 
 	body_start = strnstr(hdrbuf, "\r\n\r\n", have);
 	if (!body_start) {
