@@ -90,6 +90,18 @@ int main(int argc, char** argv) {
     fuse_args.emplace_back(argv[i]);
   }
 
+  /* libfuse 3.10 takes max_read from fuse_session_new only; init() cannot change it. */
+  bool have_max_read = false;
+  for (const auto& s : fuse_args) {
+    if (s.find("max_read=") != std::string::npos) have_max_read = true;
+  }
+  if (!have_max_read) {
+    const uint64_t stripe = opt.stripe_unit ? opt.stripe_unit : (1024ull * 1024ull);
+    const uint64_t io = stripe > (1024ull * 1024ull) ? (1024ull * 1024ull) : stripe;
+    fuse_args.emplace_back("-o");
+    fuse_args.push_back("max_read=" + std::to_string(io));
+  }
+
   std::vector<char*> fuse_argv;
   fuse_argv.reserve(fuse_args.size() + 1);
   for (auto& s : fuse_args) fuse_argv.push_back(s.data());

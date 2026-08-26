@@ -602,7 +602,7 @@ void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
   }
   if (conn) {
     conn->max_write = io;
-    conn->max_read = io;
+    /* libfuse 3.10: max_read must match fuse_session_new (-o max_read=). */
     conn->max_readahead = io * 4;
 #ifdef FUSE_CAP_WRITEBACK_CACHE
     if (conn->capable & FUSE_CAP_WRITEBACK_CACHE) conn->want |= FUSE_CAP_WRITEBACK_CACHE;
