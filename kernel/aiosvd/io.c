@@ -30,7 +30,18 @@ static bool json_get_u64(const char *json, const char *key, u64 *out)
 	p += n;
 	while (*p == ' ' || *p == '\t')
 		p++;
-	return kstrtou64(p, 10, out) == 0;
+	/* kstrtou64 rejects trailing JSON (",\"obj_order\":…"). Copy digits only. */
+	{
+		char num[24];
+		size_t i = 0;
+
+		while (*p >= '0' && *p <= '9' && i + 1 < sizeof(num))
+			num[i++] = *p++;
+		if (!i)
+			return false;
+		num[i] = '\0';
+		return kstrtou64(num, 10, out) == 0;
+	}
 }
 
 static bool json_get_u32(const char *json, const char *key, u32 *out)

@@ -173,6 +173,7 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 					  key_id, sizeof(key_id));
 		aios_http_buf_free(&body);
 		if (err) {
+			pr_err("aiosvd: map header parse %s failed: %d\n", header_oid, err);
 			aios_http_client_destroy(probe);
 			return err;
 		}
