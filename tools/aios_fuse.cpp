@@ -26,29 +26,41 @@ void usage(const char* argv0) {
                argv0);
 }
 
-bool parse_kv(const std::string& s, Options& opt) {
-  // comma-separated key=value
+bool is_aios_opt(const std::string& k) {
+  return k == "endpoint" || k == "cluster_key" || k == "volume" || k == "app_label" ||
+         k == "stripe_unit" || k == "stripe_width";
+}
+
+void apply_aios_opt(const std::string& k, const std::string& v, Options& opt) {
+  if (k == "endpoint") opt.endpoint = v;
+  else if (k == "cluster_key") opt.cluster_key = v;
+  else if (k == "volume") opt.volume = v;
+  else if (k == "app_label") opt.app_label = v;
+  else if (k == "stripe_unit") opt.stripe_unit = std::stoull(v);
+  else if (k == "stripe_width") opt.stripe_width = static_cast<uint32_t>(std::stoul(v));
+}
+
+/* Consume AIOS keys from a comma-separated -o list. Return leftover FUSE keys. */
+std::string take_aios_opts(const std::string& s, Options& opt) {
+  std::string rest;
   size_t i = 0;
   while (i < s.size()) {
-    size_t comma = s.find(',', i);
-    std::string part = s.substr(i, comma == std::string::npos ? std::string::npos : comma - i);
-    auto eq = part.find('=');
-    if (eq == std::string::npos) return false;
-    std::string k = part.substr(0, eq);
-    std::string v = part.substr(eq + 1);
-    if (k == "endpoint") opt.endpoint = v;
-    else if (k == "cluster_key") opt.cluster_key = v;
-    else if (k == "volume") opt.volume = v;
-    else if (k == "app_label") opt.app_label = v;
-    else if (k == "stripe_unit") opt.stripe_unit = std::stoull(v);
-    else if (k == "stripe_width") opt.stripe_width = static_cast<uint32_t>(std::stoul(v));
-    else {
-      // unknown keys left for FUSE
+    const size_t comma = s.find(',', i);
+    const std::string part =
+        s.substr(i, comma == std::string::npos ? std::string::npos : comma - i);
+    const auto eq = part.find('=');
+    const std::string k = eq == std::string::npos ? part : part.substr(0, eq);
+    const std::string v = eq == std::string::npos ? std::string() : part.substr(eq + 1);
+    if (is_aios_opt(k)) {
+      apply_aios_opt(k, v, opt);
+    } else if (!part.empty()) {
+      if (!rest.empty()) rest.push_back(',');
+      rest += part;
     }
     if (comma == std::string::npos) break;
     i = comma + 1;
   }
-  return true;
+  return rest;
 }
 
 }  // namespace
@@ -58,24 +70,29 @@ int main(int argc, char** argv) {
   if (const char* env = std::getenv("AIOS_CLUSTER_KEY")) opt.cluster_key = env;
   if (const char* env = std::getenv("AIOS_ENDPOINT")) opt.endpoint = env;
 
-  // Extract our -o options before fuse_main; pass the rest through.
-  std::vector<char*> fuse_argv;
-  fuse_argv.push_back(argv[0]);
+  /* libfuse rejects unknown -o keys. Peel ours off; forward only FUSE leftovers. */
+  std::vector<std::string> fuse_args;
+  fuse_args.emplace_back(argv[0]);
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-      parse_kv(argv[i + 1], opt);
-      // Still forward to FUSE (it ignores unknown keys if we strip ours... keep simple: forward all)
-      fuse_argv.push_back(argv[i]);
-      fuse_argv.push_back(argv[++i]);
+      const std::string rest = take_aios_opts(argv[++i], opt);
+      if (!rest.empty()) {
+        fuse_args.emplace_back("-o");
+        fuse_args.push_back(rest);
+      }
       continue;
     }
     if (std::strncmp(argv[i], "-o", 2) == 0 && argv[i][2] != '\0') {
-      parse_kv(argv[i] + 2, opt);
-      fuse_argv.push_back(argv[i]);
+      const std::string rest = take_aios_opts(argv[i] + 2, opt);
+      if (!rest.empty()) fuse_args.push_back(std::string("-o") + rest);
       continue;
     }
-    fuse_argv.push_back(argv[i]);
+    fuse_args.emplace_back(argv[i]);
   }
+
+  std::vector<char*> fuse_argv;
+  fuse_argv.reserve(fuse_args.size() + 1);
+  for (auto& s : fuse_args) fuse_argv.push_back(s.data());
 
   if (opt.cluster_key.empty()) {
     usage(argv[0]);
