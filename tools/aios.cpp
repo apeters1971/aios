@@ -1680,6 +1680,12 @@ int cmd_testbed(const std::string& cluster_key, const char* argv0, bool no_fsync
         node.string(),
         "--status-file",
         (node / "status.json").string(),
+        // Default aiosd replica_count is 3; a local testbed often has only one
+        // usable target in the map (scan/gossip lag or a single live node).
+        "--replica-count",
+        "1",
+        "--write-quorum",
+        "1",
     };
     if (i == 0) {
       args.push_back("--admin");
@@ -1720,6 +1726,7 @@ int cmd_testbed(const std::string& cluster_key, const char* argv0, bool no_fsync
   std::cout << "\ntestbed root:  " << root << "\n"
             << "cluster_key:   " << cluster_key << "\n"
             << "data_fsync:    " << (no_fsync ? "off (--no-fsync)" : "on") << "\n"
+            << "replicas:      1 (local testbed)\n"
             << "admin UI:      http://127.0.0.1:" << kTestbedHttpBase << "/admin/\n"
             << "client example:\n"
             << "  aios --endpoint 127.0.0.1:" << kTestbedHttpBase << " --cluster-key " << cluster_key
