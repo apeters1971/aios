@@ -72,6 +72,7 @@ static int sock_send_all(struct aios_http_client *c, struct socket *sock, const 
 		iov.iov_base = (void *)buf + sent;
 		iov.iov_len = len - sent;
 		memset(&msg, 0, sizeof(msg));
+		msg.msg_flags = MSG_NOSIGNAL;
 		n = kernel_sendmsg(sock, &msg, &iov, 1, iov.iov_len);
 		if (n == -EAGAIN || n == -EWOULDBLOCK || n == -ETIMEDOUT) {
 			atomic64_inc(&c->timeouts);
@@ -291,6 +292,30 @@ static int ensure_sock(struct aios_http_client *c, bool force_new)
 	return connect_sock(c);
 }
 
+/* First "http_addr":"host:port" in a not_primary JSON body → http://host:port<path>. */
+static int location_from_acting_json(const char *js, size_t js_len, const char *path,
+				     char *out, size_t out_len)
+{
+	const char *p, *q;
+	size_t hlen;
+
+	if (!js || !js_len || !path || !out || out_len < 16)
+		return -EINVAL;
+	p = strnstr(js, "\"http_addr\":\"", js_len);
+	if (!p)
+		return -ENOENT;
+	p += strlen("\"http_addr\":\"");
+	q = memchr(p, '"', js + js_len - p);
+	if (!q || q == p)
+		return -ENOENT;
+	hlen = q - p;
+	if (hlen >= 256)
+		return -EINVAL;
+	if (snprintf(out, out_len, "http://%.*s%s", (int)hlen, p, path) >= (int)out_len)
+		return -EOVERFLOW;
+	return 0;
+}
+
 static bool response_wants_close(const char *hdrs)
 {
 	char conn[64];
@@ -401,15 +426,21 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 	}
 
 	err = parse_status_line(hdrbuf, status_out);
-	if (err)
+	if (err) {
+		pr_err("aios_http: parse status %s %s err=%d have=%zu prefix=%.80s\n", method,
+		       path, err, have, hdrbuf);
 		goto fail_sock;
+	}
 
 	if (!aios_http_header_get(hdrbuf, "Content-Length", clen, sizeof(clen))) {
 		if (kstrtoul(clen, 10, &content_length))
 			content_length = 0;
 	}
-	if (location_out && location_len)
+	if (location_out && location_len) {
 		aios_http_header_get(hdrbuf, "Location", location_out, location_len);
+		if (!location_out[0])
+			location_from_acting_json(hdrbuf, have, path, location_out, location_len);
+	}
 
 	if (response_wants_close(hdrbuf))
 		keep = false;
@@ -456,13 +487,44 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 		memcpy(resp_body->data, body_start + 4, already);
 		resp_body->len = already;
 		keep = false; /* ambiguous framing */
-	} else if (content_length > already) {
+	} else if (content_length > 0) {
 		/*
-		 * Payload still on the socket (ignored error body, or HEAD
-		 * where the server sent a body anyway). Drop keep-alive so
-		 * the next request does not parse leftover bytes as headers.
+		 * Caller ignored the body (PUT/HEAD). Drain it so a 307 JSON
+		 * body cannot be parsed as the next response, and so we can
+		 * recover Location from acting_set when the header is missing.
 		 */
-		keep = false;
+		size_t take = min(already, (size_t)content_length);
+		size_t need = content_length - take;
+		char *drain = NULL;
+
+		if (content_length <= 65536) {
+			drain = kvmalloc(content_length + 1, GFP_KERNEL);
+			if (drain) {
+				if (take)
+					memcpy(drain, body_start + 4, take);
+				while (take < content_length) {
+					int got = sock_recv_some(c, sock, drain + take,
+								 content_length - take);
+					if (got <= 0) {
+						kvfree(drain);
+						err = got ? got : -EIO;
+						goto fail_sock;
+					}
+					take += got;
+				}
+				drain[content_length] = '\0';
+				if (location_out && location_len && !location_out[0] &&
+				    (*status_out == 307 || *status_out == 301 ||
+				     *status_out == 302)) {
+					location_from_acting_json(drain, content_length, path,
+								  location_out, location_len);
+				}
+				kvfree(drain);
+				need = 0;
+			}
+		}
+		if (need)
+			keep = false;
 	}
 
 	if (!keep)

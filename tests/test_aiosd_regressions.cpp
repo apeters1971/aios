@@ -263,6 +263,28 @@ TEST(FsTableRegression, OffTargetIsAdvertisedAsTombstone) {
 // last_seen_ms freezes when a node stops answering, so every peer holds the same
 // value while each ages it at a different moment. Accepting a tie let a peer that
 // had not aged yet overwrite the Offline we had just derived.
+TEST(MembershipRegression, HelloHttpAddrSurvivesSameTimestampMerge) {
+  using namespace aios;
+  MembershipTable table;
+  table.set_local("node-a", "127.0.0.1:7400", "127.0.0.1:7480");
+  const std::int64_t t0 = now_ms();
+  table.mark_alive("node-b", "127.0.0.1:7401", t0, "127.0.0.1:7481");
+  Member gossiped;
+  gossiped.node_id = "node-b";
+  gossiped.addr = "127.0.0.1:7401";
+  gossiped.state = MemberState::Online;
+  gossiped.last_seen_ms = t0;
+  table.merge({gossiped}, t0);
+  bool saw = false;
+  for (const auto& m : table.snapshot()) {
+    if (m.node_id != "node-b") continue;
+    saw = true;
+    EXPECT_EQ(m.http_addr, "127.0.0.1:7481")
+        << "Hello http_addr must survive a same-timestamp merge";
+  }
+  EXPECT_TRUE(saw);
+}
+
 TEST(MembershipRegression, EqualTimestampGossipDoesNotResurrectDeadNode) {
   using namespace aios;
   MembershipTable table;

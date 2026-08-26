@@ -30,8 +30,10 @@ struct RpcHandlers {
   int auth_skew_ms{60000};
 
   // Merge inbound gossip; return outbound Gossip frame.
+  // peer_http_addr is the Hello advertisement (may be empty).
   std::function<std::optional<Frame>(const std::string& peer_node_id,
                                      const std::string& peer_listen,
+                                     const std::string& peer_http_addr,
                                      const Frame& gossip_req)>
       on_gossip;
 

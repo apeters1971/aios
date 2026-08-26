@@ -311,6 +311,7 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
   }
   const std::string peer_id = hello.body.value("node_id", "");
   const std::string peer_listen = hello.body.value("listen", "");
+  const std::string peer_http = hello.body.value("http_addr", "");
 
   Frame hello_reply;
   hello_reply.type = MsgType::Hello;
@@ -345,7 +346,7 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         AIOS_LOG_WARN("reject gossip auth from ", peer_id, ": ", err);
         return;
       }
-      auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, req);
+      auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, peer_http, req);
       if (!gossip_reply) return;
       auth_sign(gossip_reply->body, MsgType::Gossip, handlers_.cluster_key);
       write_frame(*sock, *gossip_reply, err, ec);

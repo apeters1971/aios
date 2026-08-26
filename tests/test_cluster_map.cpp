@@ -36,7 +36,7 @@ TEST(ClusterMap, Build) {
 
   MembershipTable membership;
   membership.set_local("node-a", "127.0.0.1:7400");
-  membership.mark_alive("node-b", "127.0.0.1:7401", 1000);
+  membership.mark_alive("node-b", "127.0.0.1:7401", 1000, "127.0.0.1:7481");
 
   FsTable fs;
   std::vector<AiosTarget> local;
@@ -82,6 +82,15 @@ TEST(ClusterMap, Build) {
 
   auto map = ClusterMap::build(membership, fs, 3, pc);
   EXPECT_TRUE(map.targets.size() == 3) << "three usable targets";
+  {
+    bool saw_b = false;
+    for (const auto& t : map.targets) {
+      if (t.node_id != "node-b") continue;
+      saw_b = true;
+      EXPECT_TRUE(t.http_addr == "127.0.0.1:7481") << "peer http_addr in map";
+    }
+    EXPECT_TRUE(saw_b) << "node-b in map";
+  }
   EXPECT_TRUE(map.replica_count == 3) << "replica_count";
   EXPECT_TRUE(map.epoch != 0) << "non-zero epoch";
 

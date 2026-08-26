@@ -146,8 +146,9 @@ void GossipEngine::start() {
   handlers.cluster_key = cfg_.cluster_key;
   handlers.auth_skew_ms = cfg_.auth_skew_ms;
   handlers.on_gossip = [this](const std::string& peer_id, const std::string& peer_listen,
-                              const Frame& req) -> std::optional<Frame> {
-    return handle_inbound_gossip(peer_id, peer_listen, req);
+                              const std::string& peer_http, const Frame& req)
+      -> std::optional<Frame> {
+    return handle_inbound_gossip(peer_id, peer_listen, peer_http, req);
   };
   handlers.on_object = [this](const Frame& req) { return object_service_->handle(req); };
 
@@ -275,11 +276,13 @@ void GossipEngine::stop() {
 
 Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
                                           const std::string& peer_listen,
+                                          const std::string& peer_http_addr,
                                           const Frame& req) {
   const auto now = now_ms();
   if (!peer_node_id.empty()) {
     membership_.mark_alive(peer_node_id,
-                           peer_listen.empty() ? std::string{} : peer_listen, now);
+                           peer_listen.empty() ? std::string{} : peer_listen, now,
+                           peer_http_addr);
   }
   if (req.body.contains("membership")) {
     membership_.merge(MembershipTable::from_json(req.body["membership"]), now);

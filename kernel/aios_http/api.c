@@ -272,9 +272,13 @@ int aios_http_request(struct aios_http_client *c, const char *method, const char
 		*status_out = status;
 		if (status == 307 || status == 301 || status == 302) {
 			if (!location[0]) {
+				pr_err("aios_http: %s %s HTTP %d no Location\n", method, cur_path,
+				       status);
 				err = -EIO;
 				break;
 			}
+			pr_info("aios_http: %s %s HTTP %d -> %s\n", method, cur_path, status,
+				location);
 			err = apply_redirect(c, location, cur_path, sizeof(cur_path));
 			if (err)
 				break;
@@ -316,12 +320,18 @@ static int request_with_hdrs(struct aios_http_client *c, const char *method, con
 		*status_out = status;
 		if (status == 307 || status == 301 || status == 302) {
 			if (!location[0]) {
+				pr_err("aios_http: %s %s HTTP %d no Location\n", method, cur_path,
+				       status);
 				err = -EIO;
 				break;
 			}
+			pr_info("aios_http: %s %s HTTP %d -> %s\n", method, cur_path, status,
+				location);
 			err = apply_redirect(c, location, cur_path, sizeof(cur_path));
-			if (err)
+			if (err) {
+				pr_err("aios_http: redirect %s failed: %d\n", location, err);
 				break;
+			}
 			continue;
 		}
 		err = 0;

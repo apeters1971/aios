@@ -60,7 +60,8 @@ class GossipEngine {
   void sync_local_stores();
   void write_status();
   Frame handle_inbound_gossip(const std::string& peer_node_id,
-                              const std::string& peer_listen, const Frame& req);
+                              const std::string& peer_listen,
+                              const std::string& peer_http_addr, const Frame& req);
 
   std::string advertise_addr() const;
 

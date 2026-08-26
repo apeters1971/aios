@@ -380,6 +380,16 @@ void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
                         {"aios_path", t.aios_path}});
     }
   }
+  if (location.empty()) {
+    // A 307 with no Location made the kernel client treat the hop as -EIO.
+    write_json(sock, 503, "Service Unavailable",
+               {{"error", "primary has no http address"},
+                {"code", "no_http_addr"},
+                {"epoch", r.epoch},
+                {"acting_set", acting}},
+               keep_alive);
+    return;
+  }
   nlohmann::json body = {{"error", r.error},
                          {"code", r.code},
                          {"epoch", r.epoch},
@@ -387,13 +397,11 @@ void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
   const auto body_s = body.dump();
   std::unordered_map<std::string, std::string> headers = {
       {"Content-Type", "application/json"},
+      {"Location", location},
       {"x-aios-acting-set", acting.dump()},
   };
-  if (!location.empty()) {
-    headers["Location"] = location;
-    if (!r.placement.acting_set.empty()) {
-      headers["x-aios-primary"] = r.placement.acting_set[0].node_id;
-    }
+  if (!r.placement.acting_set.empty()) {
+    headers["x-aios-primary"] = r.placement.acting_set[0].node_id;
   }
   write_response(sock, 307, "Temporary Redirect", headers,
                  reinterpret_cast<const std::uint8_t*>(body_s.data()), body_s.size(),
