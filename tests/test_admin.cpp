@@ -169,6 +169,8 @@ using namespace aios;
       auto j = nlohmann::json::parse(st.body);
       EXPECT_TRUE(j.value("admin", false)) << "status.admin";
       EXPECT_TRUE(j.contains("ops") && j["ops"].value("put", 0ull) >= 1) << "ops.put >= 1";
+      EXPECT_TRUE(j.contains("map_targets")) << "status.map_targets";
+      EXPECT_TRUE(j.value("replica_count", 0) == fx.cfg.replica_count) << "status.replica_count";
     } catch (...) {
       EXPECT_TRUE(false) << "status json";
     }

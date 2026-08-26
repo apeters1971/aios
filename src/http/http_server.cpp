@@ -914,6 +914,7 @@ nlohmann::json HttpServer::admin_status_json() const {
       {"admin_metrics_public", cfg_.admin_metrics_public},
       {"map_epoch", objects_.map().epoch},
       {"map_targets", objects_.map().targets.size()},
+      {"replica_count", cfg_.replica_count},
       {"members", members.size()},
       {"members_alive", alive},
       {"membership", membership_.to_json()},

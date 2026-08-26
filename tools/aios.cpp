@@ -438,7 +438,8 @@ int cmd_admin_status(std::string host, std::string port, const std::string& key)
               << "http_listen:    " << j.value("http_listen", "") << "\n"
               << "admin:          " << (j.value("admin", false) ? "true" : "false") << "\n"
               << "map_epoch:      " << j.value("map_epoch", 0) << "\n"
-              << "map_targets:    " << j.value("map_targets", 0) << "\n"
+              << "map_targets:    " << j.value("map_targets", 0)
+              << " (replica_count " << j.value("replica_count", 0) << ")\n"
               << "members:        " << j.value("members", 0)
               << " (alive " << j.value("members_alive", 0) << ")\n";
     if (j.contains("ops")) print_ops_table(j["ops"], "ops:");

@@ -262,13 +262,101 @@
     return badge(s, kind);
   }
 
+  function membersFromStatus(status) {
+    const m = status && status.membership;
+    if (Array.isArray(m)) return m;
+    if (m && Array.isArray(m.members)) return m.members;
+    return [];
+  }
+
+  function mapTargetsFromStatus(status) {
+    const cm = status && status.cluster_map;
+    return cm && Array.isArray(cm.targets) ? cm.targets : [];
+  }
+
+  function replicaNeed(status, config) {
+    if (typeof status?.replica_count === "number" && status.replica_count > 0) {
+      return status.replica_count;
+    }
+    if (typeof config?.replica_count === "number" && config.replica_count > 0) {
+      return config.replica_count;
+    }
+    const cm = status && status.cluster_map && status.cluster_map.replica_count;
+    return typeof cm === "number" && cm > 0 ? cm : 3;
+  }
+
+  function upTargetCount(targets) {
+    return targets.filter((t) => String(t.state || "up").toLowerCase() === "up").length;
+  }
+
+  function targetsByNode(targets) {
+    const out = new Map();
+    for (const t of targets) {
+      const id = t.node_id || "";
+      if (!out.has(id)) out.set(id, []);
+      out.get(id).push(t);
+    }
+    return out;
+  }
+
+  function diskKind(nodeTargets) {
+    if (!nodeTargets || !nodeTargets.length) return { label: "no disk", kind: "off" };
+    const states = nodeTargets.map((t) => String(t.state || "up").toLowerCase());
+    if (states.includes("up")) return { label: "disk", kind: "up" };
+    if (states.includes("drain")) return { label: "drain", kind: "drain" };
+    return { label: "off", kind: "off" };
+  }
+
+  function renderPlacement(status, config) {
+    const members = membersFromStatus(status);
+    const targets = mapTargetsFromStatus(status);
+    const byNode = targetsByNode(targets);
+    const need = replicaNeed(status, config);
+    const up = upTargetCount(targets);
+    const banner = document.getElementById("placement-banner");
+    const chips = document.getElementById("node-targets");
+    if (banner) {
+      if (up < need) {
+        banner.classList.remove("hidden");
+        banner.className = "callout warn";
+        banner.textContent =
+          `${up} of ${need} storage targets — PUTs return 503 (no_targets). ` +
+          `A node with no disk usually means .aios was not scanned or aios/ is not writable.`;
+      } else {
+        banner.className = "callout warn hidden";
+        banner.textContent = "";
+      }
+    }
+    if (chips) {
+      const ids = members.map((m) => m.node_id).filter(Boolean);
+      for (const t of targets) {
+        if (t.node_id && !ids.includes(t.node_id)) ids.push(t.node_id);
+      }
+      ids.sort();
+      chips.innerHTML =
+        ids
+          .map((id) => {
+            const d = diskKind(byNode.get(id));
+            const mem = members.find((m) => m.node_id === id);
+            const memState = String((mem && mem.state) || "").toLowerCase();
+            const cls = memState === "offline" ? "off" : d.kind;
+            return `<span class="node-chip ${cls}"><span class="dot"></span>${id} · ${d.label}</span>`;
+          })
+          .join("") || `<span class="muted">No members yet</span>`;
+    }
+  }
+
   let lastMapEpoch = null;
 
-  function renderCards(status) {
+  function renderCards(status, config) {
     const ops = status.ops || {};
     lastMapEpoch = status.map_epoch;
     const epochEl = document.getElementById("map-epoch-value");
     if (epochEl) epochEl.textContent = fmt(lastMapEpoch);
+
+    const need = replicaNeed(status, config);
+    const up = upTargetCount(mapTargetsFromStatus(status));
+    const storageClass = up < need ? " warn" : " ok";
 
     const cards = [
       ["Node", status.node_id || "—"],
@@ -282,6 +370,8 @@
     const cardsHtml =
       `<div class="card"><span class="label">Map epoch</span>` +
       `<button type="button" class="btn card-action" id="show-map-epoch">Show</button></div>` +
+      `<div class="card${storageClass}"><span class="label">Storage targets</span>` +
+      `<div class="value">${up} / ${need}</div></div>` +
       cards
         .map(
           ([label, value]) =>
@@ -357,19 +447,29 @@
     sampleIoCharts(opsPayload);
   }
 
-  function renderCluster(cluster) {
+  function renderCluster(cluster, status) {
+    const st = (cluster && cluster.status) || status || {};
+    const members = membersFromStatus(st);
+    const byNode = targetsByNode(mapTargetsFromStatus(st));
     const peers = (cluster && cluster.admin_peers) || [];
-    const rows = peers
-      .map(
-        (p) =>
-          `<tr><td>${p.node_id || ""}${p.self ? badge("self", "self") : ""}</td><td>${
-            p.addr || ""
-          }</td><td>${p.http_addr || ""}</td></tr>`
-      )
+    const peerById = Object.fromEntries(peers.map((p) => [p.node_id, p]));
+    const rows = members
+      .map((m) => {
+        const p = peerById[m.node_id] || {};
+        const d = diskKind(byNode.get(m.node_id));
+        const self = p.self || m.node_id === st.node_id;
+        return `<tr>
+          <td>${m.node_id || ""}${self ? badge("self", "self") : ""}</td>
+          <td>${stateBadge(m.state)}</td>
+          <td>${badge(d.label, d.kind)}</td>
+          <td>${m.addr || p.addr || ""}</td>
+          <td>${m.http_addr || p.http_addr || ""}</td>
+        </tr>`;
+      })
       .join("");
     document.getElementById("cluster-table").innerHTML =
-      `<table><thead><tr><th>Node</th><th>Gossip</th><th>HTTP</th></tr></thead><tbody>${
-        rows || emptyRow(3, "No peers with http_addr")
+      `<table><thead><tr><th>Node</th><th>Member</th><th>Disk</th><th>Gossip</th><th>HTTP</th></tr></thead><tbody>${
+        rows || emptyRow(5, "No members")
       }</tbody></table>`;
   }
 
@@ -413,9 +513,10 @@
       return;
     }
     if (!st.res.ok) throw new Error((st.json && st.json.error) || "status failed");
-    renderCards(st.json || {});
+    renderPlacement(st.json || {}, (cfg.res.ok && cfg.json) || {});
+    renderCards(st.json || {}, (cfg.res.ok && cfg.json) || {});
     if (ops.res.ok) renderOps(ops.json);
-    if (cl.res.ok) renderCluster(cl.json);
+    if (cl.res.ok) renderCluster(cl.json, st.json);
     if (cfg.res.ok) {
       document.getElementById("config-json").textContent = JSON.stringify(cfg.json, null, 2);
       const mp = document.getElementById("metrics-public");

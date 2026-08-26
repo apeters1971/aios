@@ -53,6 +53,8 @@
     </header>
 
     <main class="main">
+      <div id="placement-banner" class="callout warn hidden" role="status"></div>
+      <div id="node-targets" class="node-targets" aria-label="Node storage targets"></div>
       <section id="tab-overview" class="panel">
         <h2>Overview</h2>
         <p class="note section-head">Live node status, compression, frontend IO, and object counters.</p>
@@ -95,7 +97,7 @@
 
       <section id="tab-cluster" class="panel hidden">
         <h2>Cluster</h2>
-        <p class="note section-head">Online members advertising an HTTP address.</p>
+        <p class="note section-head">Members, gossip liveness, and whether each node has a usable storage target in the map.</p>
         <div id="cluster-table" class="table-wrap"></div>
       </section>
 

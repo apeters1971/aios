@@ -411,6 +411,59 @@ textarea.code-block:focus {
   color: var(--ink);
 }
 
+.card.warn {
+  border-color: rgba(154, 107, 31, 0.4);
+}
+
+.card.ok {
+  border-color: rgba(47, 107, 79, 0.28);
+}
+
+.callout {
+  margin: 0 0 0.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.callout.warn {
+  background: rgba(154, 107, 31, 0.12);
+  border-color: rgba(154, 107, 31, 0.3);
+  color: var(--warn);
+}
+
+.node-targets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0 0 1.15rem;
+}
+
+.node-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.28rem 0.65rem;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  font-size: 0.78rem;
+  font-weight: 560;
+}
+
+.node-chip .dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.node-chip.up .dot { background: var(--ok); }
+.node-chip.drain .dot { background: var(--warn); }
+.node-chip.off .dot { background: var(--danger); }
+
 /* —— Modal —— */
 
 .modal {
