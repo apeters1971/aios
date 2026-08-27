@@ -299,4 +299,70 @@ TEST(PosixFs, Basic) {
   EXPECT_TRUE(aios_posix_rmdir(fs, 1, "cold") == 0) << "rmdir cold";
 
   aios_posix_unmount(fs);
-  }
+}
+
+TEST(PosixFs, DirCacheDeferredSizeRenameSymlink) {
+  HttpFixture http("aios-posix-review16");
+
+  aios_posix_config cfg{};
+  const std::string ep = http.endpoint();
+  cfg.endpoint = ep.c_str();
+  cfg.cluster_key = http.fx.cfg.cluster_key.c_str();
+  cfg.volume = "vreview";
+  cfg.stripe_unit = 4096;
+  cfg.stripe_width = 2;
+  cfg.uid = 1000;
+  cfg.gid = 1000;
+
+  int err = 0;
+  aios_posix_fs* fs = aios_posix_mount(&cfg, &err);
+  ASSERT_NE(fs, nullptr);
+
+  aios_posix_stat st{};
+  EXPECT_EQ(aios_posix_create(fs, 1, "a.txt", 0644, &st), 0);
+  const uint64_t a_ino = st.ino;
+  EXPECT_EQ(aios_posix_create(fs, 1, "b.txt", 0644, &st), 0);
+
+  // Dir cache: create is visible immediately; unlink must not serve a stale hit.
+  EXPECT_EQ(aios_posix_lookup(fs, 1, "a.txt", &st), 0);
+  EXPECT_EQ(st.ino, a_ino);
+  EXPECT_EQ(aios_posix_unlink(fs, 1, "b.txt"), 0);
+  EXPECT_EQ(aios_posix_lookup(fs, 1, "b.txt", &st), -ENOENT);
+
+  // Deferred inode size is visible to getattr before fsync.
+  const char payload[] = "deferred-size";
+  size_t wrote = 0;
+  EXPECT_EQ(aios_posix_write(fs, a_ino, 0, payload, sizeof(payload) - 1, &wrote), 0);
+  EXPECT_EQ(wrote, sizeof(payload) - 1);
+  EXPECT_EQ(aios_posix_getattr(fs, a_ino, &st), 0);
+  EXPECT_EQ(st.size, sizeof(payload) - 1);
+  EXPECT_EQ(aios_posix_fsync(fs, a_ino), 0);
+
+  // Remount sees the flushed size.
+  aios_posix_unmount(fs);
+  fs = aios_posix_mount(&cfg, &err);
+  ASSERT_NE(fs, nullptr);
+  EXPECT_EQ(aios_posix_lookup(fs, 1, "a.txt", &st), 0);
+  EXPECT_EQ(st.size, sizeof(payload) - 1);
+  EXPECT_EQ(st.ino, a_ino);
+
+  EXPECT_EQ(aios_posix_create(fs, 1, "dst.txt", 0644, &st), 0);
+  EXPECT_EQ(aios_posix_rename2(fs, 1, "a.txt", 1, "dst.txt", AIOS_POSIX_RENAME_NOREPLACE),
+            -EEXIST);
+  EXPECT_EQ(aios_posix_rename2(fs, 1, "a.txt", 1, "dst.txt", AIOS_POSIX_RENAME_EXCHANGE),
+            -EINVAL);
+  EXPECT_EQ(aios_posix_rename2(fs, 1, "a.txt", 1, "renamed.txt", 0), 0);
+
+  EXPECT_EQ(aios_posix_symlink(fs, 1, "link", "renamed.txt", &st), 0);
+  EXPECT_TRUE(S_ISLNK(st.mode));
+  EXPECT_EQ(st.size, std::strlen("renamed.txt"));
+  char lbuf[64]{};
+  int ln = aios_posix_readlink(fs, st.ino, lbuf, sizeof(lbuf));
+  EXPECT_EQ(ln, static_cast<int>(std::strlen("renamed.txt")));
+  EXPECT_STREQ(lbuf, "renamed.txt");
+  EXPECT_EQ(aios_posix_unlink(fs, 1, "link"), 0);
+  EXPECT_EQ(aios_posix_unlink(fs, 1, "renamed.txt"), 0);
+  EXPECT_EQ(aios_posix_unlink(fs, 1, "dst.txt"), 0);
+
+  aios_posix_unmount(fs);
+}

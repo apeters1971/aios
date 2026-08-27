@@ -7,6 +7,7 @@
 #include <string>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -65,6 +66,10 @@ void fill_times(uint64_t ns, time_t* sec, long* nsec) {
   *nsec = static_cast<long>(ns % 1000000000ull);
 }
 
+blkcnt_t posix_st_blocks(uint64_t size) {
+  return static_cast<blkcnt_t>((size + 511ull) / 512ull);
+}
+
 #ifdef __APPLE__
 void copy_stat(const aios_posix_stat& st, fuse_darwin_attr* out) {
   std::memset(out, 0, sizeof(*out));
@@ -74,6 +79,8 @@ void copy_stat(const aios_posix_stat& st, fuse_darwin_attr* out) {
   out->uid = st.uid;
   out->gid = st.gid;
   out->size = static_cast<off_t>(st.size);
+  out->blksize = static_cast<blksize_t>(st.stripe_unit ? st.stripe_unit : 4096);
+  out->blocks = posix_st_blocks(st.size);
   fill_times(st.atime_ns, &out->atimespec.tv_sec, &out->atimespec.tv_nsec);
   fill_times(st.mtime_ns, &out->mtimespec.tv_sec, &out->mtimespec.tv_nsec);
   fill_times(st.ctime_ns, &out->ctimespec.tv_sec, &out->ctimespec.tv_nsec);
@@ -100,6 +107,8 @@ void copy_stat(const aios_posix_stat& st, struct stat* stbuf) {
   stbuf->st_uid = st.uid;
   stbuf->st_gid = st.gid;
   stbuf->st_size = static_cast<off_t>(st.size);
+  stbuf->st_blksize = static_cast<blksize_t>(st.stripe_unit ? st.stripe_unit : 4096);
+  stbuf->st_blocks = posix_st_blocks(st.size);
   fill_times(st.atime_ns, &stbuf->st_atim.tv_sec, &stbuf->st_atim.tv_nsec);
   fill_times(st.mtime_ns, &stbuf->st_mtim.tv_sec, &stbuf->st_mtim.tv_nsec);
   fill_times(st.ctime_ns, &stbuf->st_ctim.tv_sec, &stbuf->st_ctim.tv_nsec);
@@ -184,6 +193,12 @@ int posix_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t /*o
 }
 #endif
 
+mode_t apply_umask(mode_t mode) {
+  auto* ctx = fuse_get_context();
+  const mode_t mask = ctx ? ctx->umask : 0;
+  return static_cast<mode_t>(mode & ~mask);
+}
+
 int posix_mkdir(const char* path, mode_t mode) {
   return guard([&] {
     auto* fs = fs_handle();
@@ -191,7 +206,8 @@ int posix_mkdir(const char* path, mode_t mode) {
     std::string name;
     int rc = resolve_parent(fs, path, &parent, &name);
     if (rc) return rc;
-    return aios_posix_mkdir(fs, parent, name.c_str(), static_cast<uint32_t>(mode), nullptr);
+    return aios_posix_mkdir(fs, parent, name.c_str(), static_cast<uint32_t>(apply_umask(mode)),
+                            nullptr);
   });
 }
 
@@ -203,7 +219,8 @@ int posix_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     int rc = resolve_parent(fs, path, &parent, &name);
     if (rc) return rc;
     aios_posix_stat st{};
-    rc = aios_posix_create(fs, parent, name.c_str(), static_cast<uint32_t>(mode), &st);
+    rc = aios_posix_create(fs, parent, name.c_str(), static_cast<uint32_t>(apply_umask(mode)),
+                           &st);
     if (rc) return rc;
     if (fi) {
       fi->fh = st.ino;
@@ -235,7 +252,17 @@ int posix_rmdir(const char* path) {
   });
 }
 
-int posix_rename(const char* from, const char* to, unsigned int /*flags*/) {
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE AIOS_POSIX_RENAME_NOREPLACE
+#endif
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE AIOS_POSIX_RENAME_EXCHANGE
+#endif
+#ifndef RENAME_WHITEOUT
+#define RENAME_WHITEOUT AIOS_POSIX_RENAME_WHITEOUT
+#endif
+
+int posix_rename(const char* from, const char* to, unsigned int flags) {
   return guard([&] {
     auto* fs = fs_handle();
     uint64_t op = 0, np = 0;
@@ -244,7 +271,11 @@ int posix_rename(const char* from, const char* to, unsigned int /*flags*/) {
     if (rc) return rc;
     rc = resolve_parent(fs, to, &np, &nn);
     if (rc) return rc;
-    return aios_posix_rename(fs, op, on.c_str(), np, nn.c_str());
+    unsigned mapped = 0;
+    if (flags & RENAME_NOREPLACE) mapped |= AIOS_POSIX_RENAME_NOREPLACE;
+    if (flags & RENAME_EXCHANGE) mapped |= AIOS_POSIX_RENAME_EXCHANGE;
+    if (flags & RENAME_WHITEOUT) mapped |= AIOS_POSIX_RENAME_WHITEOUT;
+    return aios_posix_rename2(fs, op, on.c_str(), np, nn.c_str(), mapped);
   });
 }
 
@@ -267,6 +298,7 @@ int posix_open(const char* path, struct fuse_file_info* fi) {
     aios_posix_stat st{};
     int rc = lookup_path(fs, path, &st);
     if (rc) return rc;
+    if (S_ISLNK(st.mode)) return -ELOOP;
     if (!S_ISREG(st.mode)) return -EISDIR;
     int amode = 0;
     if (fi) {
@@ -333,6 +365,45 @@ int posix_fsync(const char* /*path*/, int /*datasync*/, struct fuse_file_info* f
     auto* fs = fs_handle();
     if (!fi) return -EIO;
     return aios_posix_fsync(fs, fi->fh);
+  });
+}
+
+int posix_flush(const char* /*path*/, struct fuse_file_info* fi) {
+  return posix_fsync(nullptr, 0, fi);
+}
+
+int posix_release(const char* /*path*/, struct fuse_file_info* fi) {
+  return guard([&] {
+    auto* fs = fs_handle();
+    if (!fi) return -EIO;
+    int rc = aios_posix_fsync(fs, fi->fh);
+    (void)aios_posix_flock(fs, fi->fh, LOCK_UN);
+    return rc;
+  });
+}
+
+int posix_symlink(const char* target, const char* path) {
+  return guard([&] {
+    auto* fs = fs_handle();
+    if (!target) return -EINVAL;
+    uint64_t parent = 0;
+    std::string name;
+    int rc = resolve_parent(fs, path, &parent, &name);
+    if (rc) return rc;
+    return aios_posix_symlink(fs, parent, name.c_str(), target, nullptr);
+  });
+}
+
+int posix_readlink(const char* path, char* buf, size_t size) {
+  return guard([&] {
+    auto* fs = fs_handle();
+    if (!buf || size == 0) return -EINVAL;
+    aios_posix_stat st{};
+    int rc = lookup_path(fs, path, &st);
+    if (rc) return rc;
+    rc = aios_posix_readlink(fs, st.ino, buf, size);
+    if (rc < 0) return rc;
+    return 0;
   });
 }
 
@@ -635,11 +706,15 @@ fuse_operations aios_fuse_operations() {
   ops.rmdir = posix_rmdir;
   ops.rename = posix_rename;
   ops.link = posix_link;
+  ops.symlink = posix_symlink;
+  ops.readlink = posix_readlink;
   ops.open = posix_open;
   ops.read = posix_read;
   ops.write = posix_write;
   ops.truncate = posix_truncate;
   ops.fsync = posix_fsync;
+  ops.flush = posix_flush;
+  ops.release = posix_release;
   ops.chmod = posix_chmod;
   ops.chown = posix_chown;
   ops.utimens = posix_utimens;

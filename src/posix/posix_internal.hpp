@@ -30,6 +30,10 @@ inline constexpr uint64_t kDefaultStripeUnit = 1024ull * 1024ull;
 inline constexpr uint32_t kDefaultStripeWidth = 4;
 inline constexpr const char* kCasAttr = "aios.posix.cas";
 inline constexpr size_t kChunkCacheSlots = 8;
+inline constexpr auto kDirCacheTtl = std::chrono::milliseconds(250);
+inline constexpr uint64_t kDirtyFlushBytes = 4ull * 1024ull * 1024ull;
+inline constexpr auto kDirtyFlushAge = std::chrono::milliseconds(100);
+inline constexpr size_t kMaxSymlinkBytes = 4095;
 
 // Last-N stripe bodies so 128 KiB FUSE I/O does not re-GET the same 1 MiB chunk.
 struct ChunkCache {
@@ -119,6 +123,24 @@ struct InodeMeta {
   uint64_t cas{0};
   bool exists{false};
   std::unordered_map<std::string, std::string> xattrs;  // name → raw bytes
+  std::string symlink;                                  // target when S_IFLNK
+};
+
+struct DirCacheEnt {
+  std::unordered_map<std::string, uint64_t> entries;
+  uint64_t meta_cas{0};
+  uint64_t next_op{1};
+  uint64_t log_bytes{0};
+  uint64_t snapshot_op{0};
+  std::chrono::steady_clock::time_point loaded{};
+};
+
+struct DirtySize {
+  uint64_t size{0};
+  uint64_t mtime_ns{0};
+  uint64_t ctime_ns{0};
+  uint64_t dirty_bytes{0};
+  std::chrono::steady_clock::time_point since{};
 };
 
 struct SuperMeta {
@@ -154,12 +176,14 @@ int check_access(const aios_posix_cred& cred, const InodeMeta& m, int want);
 int check_sticky_unlink(const aios_posix_cred& cred, const InodeMeta& parent,
                         const InodeMeta& victim);
 
+struct FsState;
+
 // Directory name → ino map loaded from changelog.
 class DirTable {
  public:
-  explicit DirTable(Session& session, std::string vol, uint64_t ino);
+  explicit DirTable(Session& session, std::string vol, uint64_t ino, FsState* cache = nullptr);
 
-  void load();
+  void load(bool allow_cache = true);
   const std::unordered_map<std::string, uint64_t>& entries() const { return entries_; }
 
   void link(const std::string& name, uint64_t child);
@@ -170,6 +194,7 @@ class DirTable {
   void rename_same(const std::string& old_name, const std::string& new_name);
   void compact_if_needed();
   void set_put_layout(PutLayout layout) { put_layout_ = std::move(layout); }
+  void publish() { publish_cache(); }
 
   // Mutable entry map for planning a transactional compact rewrite.
   std::unordered_map<std::string, uint64_t>& mutable_entries() { return entries_; }
@@ -184,6 +209,7 @@ class DirTable {
 
  private:
   Session& session_;
+  FsState* cache_{nullptr};
   std::string vol_;
   uint64_t ino_;
   std::string meta_oid_;
@@ -199,6 +225,7 @@ class DirTable {
   void store_meta();
   void apply_record(uint64_t op_id, uint32_t op, const std::vector<std::string>& args);
   void append_ops(const std::vector<std::pair<uint32_t, std::vector<std::string>>>& ops);
+  void publish_cache();
 };
 
 struct FsState {
@@ -209,7 +236,7 @@ struct FsState {
   uint32_t default_uid{0};
   uint32_t default_gid{0};
   std::string frontend_label{"fs"};  // s3 | fs | custom (for IO monitoring)
-  std::mutex mu;                     // guards super, inode_cache, flock_tokens, rstat_dirty
+  std::mutex mu;  // super, inode_cache, flock_tokens, rstat_dirty, dir_cache, dirty_sizes
   SuperMeta super;
   std::unordered_map<uint64_t, InodeMeta> inode_cache;
   std::unordered_map<uint64_t, std::string> flock_tokens;  // ino → lock token
@@ -225,6 +252,8 @@ struct FsState {
   std::unique_ptr<QuotaLedger> quota;
   std::unique_ptr<QosController> qos;
   ChunkCache chunk_cache;
+  std::unordered_map<uint64_t, DirCacheEnt> dir_cache;
+  std::unordered_map<uint64_t, DirtySize> dirty_sizes;
 
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}
@@ -237,6 +266,13 @@ struct FsState {
   FsState(const FsState&) = delete;
   FsState& operator=(const FsState&) = delete;
 };
+
+inline DirTable make_dir(FsState& st, uint64_t ino) {
+  return DirTable(st.session, st.volume, ino, &st);
+}
+
+void flush_dirty_inode(FsState& st, uint64_t ino);
+void flush_all_dirty_inodes(FsState& st);
 
 // Cross-directory rename via /txn (compact rewrite of both dir tips under locks).
 int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_name,

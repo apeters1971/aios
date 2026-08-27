@@ -92,10 +92,25 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name);
 int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                     uint64_t new_parent, const char* new_name);
 
+/* rename flags (linux renameat2). EXCHANGE/WHITEOUT are rejected (-EINVAL). */
+enum {
+  AIOS_POSIX_RENAME_NOREPLACE = 1u,
+  AIOS_POSIX_RENAME_EXCHANGE = 2u,
+  AIOS_POSIX_RENAME_WHITEOUT = 4u,
+};
+
 /* Cross-directory rename uses a multi-object /txn compact rewrite of both
  * directory tips (see proto/posix_fuse.md). Same-directory rename is one changelog op. */
 int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                       uint64_t new_parent, const char* new_name);
+int aios_posix_rename2(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
+                       uint64_t new_parent, const char* new_name, unsigned flags);
+
+int aios_posix_symlink(aios_posix_fs* fs, uint64_t parent, const char* name, const char* target,
+                       aios_posix_stat* st_out);
+/* Writes a NUL-terminated target. size==0 returns needed bytes including NUL.
+ * Otherwise returns bytes excluding NUL, or -ERANGE / -errno. */
+int aios_posix_readlink(aios_posix_fs* fs, uint64_t ino, char* buf, size_t size);
 
 int aios_posix_read(aios_posix_fs* fs, uint64_t ino, uint64_t offset, void* buf,
                     size_t len, size_t* out_len);

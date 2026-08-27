@@ -55,8 +55,8 @@ int validate_dentry_name(const char* name) {
 }
 
 bool verify_dir_link(FsState& st, uint64_t parent, const char* name, uint64_t expected_ino) {
-  DirTable verify(st.session, st.volume, parent);
-  verify.load();
+  DirTable verify = make_dir(st, parent);
+  verify.load(false);
   auto it = verify.entries().find(name);
   return it != verify.entries().end() && it->second == expected_ino;
 }
@@ -68,6 +68,7 @@ void delete_orphan_inode(FsState& st, uint64_t ino) {
   }
   std::lock_guard lock(st.mu);
   st.inode_cache.erase(ino);
+  st.dirty_sizes.erase(ino);
   st.chunk_cache.drop(ino);
 }
 
@@ -209,6 +210,7 @@ InodeMeta inode_from_json(const std::string& body, uint64_t cas_hint) {
   m.rdirs = j.value("rdirs", static_cast<uint64_t>(0));
   m.rtime_ns = j.value("rtime_ns", static_cast<uint64_t>(0));
   m.cas = cas_hint;
+  m.symlink = j.value("symlink", std::string{});
   if (j.contains("xattrs") && j["xattrs"].is_object()) {
     for (auto it = j["xattrs"].begin(); it != j["xattrs"].end(); ++it) {
       if (!it.value().is_string()) continue;
@@ -240,6 +242,7 @@ std::string inode_to_json(const InodeMeta& m) {
                    {"rfiles", m.rfiles},
                    {"rdirs", m.rdirs},
                    {"rtime_ns", m.rtime_ns}};
+  if (!m.symlink.empty()) j["symlink"] = m.symlink;
   if (!m.xattrs.empty()) {
     nlohmann::json xa = nlohmann::json::object();
     for (const auto& [k, v] : m.xattrs) {
@@ -319,8 +322,9 @@ void txn_put_dir(Session& session, const std::string& txn_id, DirTable& dir,
 
 }  // namespace
 
-DirTable::DirTable(Session& session, std::string vol, uint64_t ino)
+DirTable::DirTable(Session& session, std::string vol, uint64_t ino, FsState* cache)
     : session_(session),
+      cache_(cache),
       vol_(std::move(vol)),
       ino_(ino),
       meta_oid_(dir_meta_oid(vol_, ino_)),
@@ -342,7 +346,34 @@ void DirTable::apply_record(uint64_t /*op_id*/, uint32_t op, const std::vector<s
   }
 }
 
-void DirTable::load() {
+void DirTable::publish_cache() {
+  if (!cache_) return;
+  DirCacheEnt e;
+  e.entries = entries_;
+  e.meta_cas = meta_cas_;
+  e.next_op = next_op_;
+  e.log_bytes = log_bytes_;
+  e.snapshot_op = snapshot_op_;
+  e.loaded = std::chrono::steady_clock::now();
+  std::lock_guard lock(cache_->mu);
+  cache_->dir_cache[ino_] = std::move(e);
+}
+
+void DirTable::load(bool allow_cache) {
+  if (allow_cache && cache_) {
+    std::lock_guard lock(cache_->mu);
+    auto it = cache_->dir_cache.find(ino_);
+    if (it != cache_->dir_cache.end() &&
+        std::chrono::steady_clock::now() - it->second.loaded < kDirCacheTtl) {
+      entries_ = it->second.entries;
+      meta_cas_ = it->second.meta_cas;
+      next_op_ = it->second.next_op;
+      log_bytes_ = it->second.log_bytes;
+      snapshot_op_ = it->second.snapshot_op;
+      return;
+    }
+  }
+
   entries_.clear();
   next_op_ = 1;
   log_bytes_ = 0;
@@ -378,6 +409,7 @@ void DirTable::load() {
     if (r.op_id <= snapshot_op_) continue;
     apply_record(r.op_id, static_cast<uint32_t>(r.op), r.args);
   }
+  if (allow_cache) publish_cache();
 }
 
 void DirTable::store_meta() {
@@ -393,7 +425,7 @@ void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std:
   if (ops.empty()) return;
   // Reserve op ids via CAS on meta.
   for (int attempt = 0; attempt < 8; ++attempt) {
-    load();
+    load(false);
     const uint64_t start = next_op_;
     std::string batch;
     uint64_t op = start;
@@ -411,6 +443,7 @@ void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std:
       store_meta();
       for (const auto& [code, args] : ops) apply_record(0, code, args);
       compact_if_needed();
+      publish_cache();
       return;
     } catch (const client_error& e) {
       if (e.code() == "conflict" || e.code() == "lock_held") continue;
@@ -439,7 +472,7 @@ bool DirTable::link_if_absent(const std::string& name, uint64_t child) {
       }
       throw;
     }
-    load();
+    load(false);
     if (entries_.count(name)) return false;
 
     const uint64_t start = next_op_;
@@ -483,6 +516,7 @@ bool DirTable::link_if_absent(const std::string& name, uint64_t child) {
           // Link already committed; compaction is best-effort.
         }
       }
+      publish_cache();
       return true;
     } catch (const client_error& e) {
       if (e.code() == "conflict" || e.code() == "lock_held") continue;
@@ -512,7 +546,7 @@ void DirTable::compact_if_needed() {
       return;
     }
     // Reload under the locks so records appended during the window survive.
-    load();
+    load(false);
     if (log_bytes_ < changelog::kAutoCompactBytes) return;
     std::string txn_id;
     try {
@@ -523,6 +557,7 @@ void DirTable::compact_if_needed() {
       snapshot_op_ = next_op_ > 0 ? next_op_ - 1 : 0;
       log_bytes_ = 0;
       meta_cas_ += 1;
+      publish_cache();
       return;
     } catch (const client_error& e) {
       if (!txn_id.empty()) {
@@ -560,10 +595,10 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
   if (int rc = validate_dentry_name(new_name.c_str())) return rc;
 
   for (int attempt = 0; attempt < 8; ++attempt) {
-    DirTable old_dir(st.session, st.volume, old_parent);
-    DirTable new_dir(st.session, st.volume, new_parent);
-    old_dir.load();
-    new_dir.load();
+    DirTable old_dir = make_dir(st, old_parent);
+    DirTable new_dir = make_dir(st, new_parent);
+    old_dir.load(false);
+    new_dir.load(false);
 
     auto it = old_dir.entries().find(old_name);
     if (it == old_dir.entries().end()) return -ENOENT;
@@ -608,8 +643,8 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
     }
 
     // Reload under locks.
-    old_dir.load();
-    new_dir.load();
+    old_dir.load(false);
+    new_dir.load(false);
     it = old_dir.entries().find(old_name);
     if (it == old_dir.entries().end()) return -ENOENT;
     if (it->second != ino) continue;  // raced
@@ -724,6 +759,8 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
         } catch (...) {
         }
       }
+      old_dir.publish();
+      new_dir.publish();
       mark_rstat_dirty(st, old_parent);
       mark_rstat_dirty(st, new_parent);
       return 0;
@@ -751,8 +788,8 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
   if (old_name == new_name) return 0;
 
   for (int attempt = 0; attempt < 8; ++attempt) {
-    DirTable dir(st.session, st.volume, parent);
-    dir.load();
+    DirTable dir = make_dir(st, parent);
+    dir.load(false);
 
     auto oit = dir.entries().find(old_name);
     if (oit == dir.entries().end()) return -ENOENT;
@@ -788,7 +825,7 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
       throw;
     }
 
-    dir.load();
+    dir.load(false);
     oit = dir.entries().find(old_name);
     if (oit == dir.entries().end()) return -ENOENT;
     if (oit->second != ino) continue;
@@ -864,6 +901,7 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
         delete_file_chunks(st, victim_ino, gc_size, gc_stripe_unit, gc_project_id, gc_uid,
                            gc_gid);
       }
+      dir.publish();
       mark_rstat_dirty(st, parent);
       return 0;
     } catch (const client_error& e) {
@@ -912,6 +950,7 @@ void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& pa
       m.exists = true;
       std::lock_guard lock(st.mu);
       st.inode_cache[m.ino] = m;
+      st.dirty_sizes.erase(m.ino);
       return;
     } catch (const client_error& e) {
       if (e.code() != "conflict") throw;
@@ -931,6 +970,45 @@ void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& pa
     }
   }
   throw client_error("conflict", "inode store failed");
+}
+
+void flush_dirty_inode(FsState& st, uint64_t ino) {
+  DirtySize d;
+  {
+    std::lock_guard lock(st.mu);
+    auto it = st.dirty_sizes.find(ino);
+    if (it == st.dirty_sizes.end()) return;
+    d = it->second;
+  }
+  InodeMeta m = load_inode(st, ino);
+  if (!m.exists) {
+    std::lock_guard lock(st.mu);
+    st.dirty_sizes.erase(ino);
+    return;
+  }
+  m.size = std::max(m.size, d.size);
+  m.mtime_ns = d.mtime_ns;
+  m.ctime_ns = d.ctime_ns;
+  store_inode(st, m, std::nullopt, [d](InodeMeta& next) {
+    next.size = std::max(next.size, d.size);
+    next.mtime_ns = d.mtime_ns;
+    next.ctime_ns = d.ctime_ns;
+  });
+}
+
+void flush_all_dirty_inodes(FsState& st) {
+  std::vector<uint64_t> inos;
+  {
+    std::lock_guard lock(st.mu);
+    inos.reserve(st.dirty_sizes.size());
+    for (const auto& [ino, _] : st.dirty_sizes) inos.push_back(ino);
+  }
+  for (uint64_t ino : inos) {
+    try {
+      flush_dirty_inode(st, ino);
+    } catch (...) {
+    }
+  }
 }
 
 void ensure_super(FsState& st) {
@@ -1000,11 +1078,12 @@ void ensure_root(FsState& st) {
   root.stripe_width = st.stripe_width;
   root.cas = 0;
   store_inode(st, root);
-  DirTable dir(st.session, st.volume, kRootIno);
-  dir.load();  // creates empty on first link
+  DirTable dir = make_dir(st, kRootIno);
+  dir.load(false);  // creates empty on first link
 }
 
 void drop_nlink(FsState& st, uint64_t ino) {
+  flush_dirty_inode(st, ino);
   auto m = load_inode(st, ino);
   if (!m.exists) return;
   if (m.nlink > 1) {
@@ -1025,6 +1104,7 @@ void drop_nlink(FsState& st, uint64_t ino) {
   {
     std::lock_guard lock(st.mu);
     st.inode_cache.erase(ino);
+    st.dirty_sizes.erase(ino);
     auto fit = st.flock_tokens.find(ino);
     if (fit != st.flock_tokens.end()) {
       flock_token = std::move(fit->second);
@@ -1157,17 +1237,28 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
 
   const uint64_t old_size = meta.size;
   const uint64_t new_size = std::max(meta.size, offset + static_cast<uint64_t>(len));
-  const uint64_t write_end = offset + static_cast<uint64_t>(len);
   const uint64_t ts = now_ns();
   meta.size = new_size;
   meta.mtime_ns = meta.ctime_ns = ts;
-  try {
-    store_inode(st, meta, std::nullopt, [write_end, ts](InodeMeta& next) {
-      next.size = std::max(next.size, write_end);
-      next.mtime_ns = next.ctime_ns = ts;
-    });
-  } catch (const client_error& e) {
-    return map_error(e);
+  bool flush_now = false;
+  {
+    std::lock_guard lock(st.mu);
+    st.inode_cache[meta.ino] = meta;
+    auto& d = st.dirty_sizes[meta.ino];
+    const auto now = std::chrono::steady_clock::now();
+    if (d.dirty_bytes == 0) d.since = now;
+    d.size = meta.size;
+    d.mtime_ns = meta.mtime_ns;
+    d.ctime_ns = meta.ctime_ns;
+    d.dirty_bytes += static_cast<uint64_t>(len);
+    flush_now = d.dirty_bytes >= kDirtyFlushBytes || (now - d.since) >= kDirtyFlushAge;
+  }
+  if (flush_now) {
+    try {
+      flush_dirty_inode(st, ino);
+    } catch (const client_error& e) {
+      return map_error(e);
+    }
   }
   if (st.quota && new_size != old_size) {
     st.quota->note_delta(meta.project_id, meta.uid, meta.gid,
@@ -1364,6 +1455,7 @@ void aios_posix_unmount(aios_posix_fs* fs) {
   g_tls_callers.erase(fs);
   if (fs->st) {
     aios::posix::stop_rstat_thread(*fs->st);
+    aios::posix::flush_all_dirty_inodes(*fs->st);
     if (fs->st->quota) fs->st->quota->flush();
     aios::posix::release_all_flocks(*fs->st);
   }
@@ -1396,7 +1488,7 @@ int aios_posix_lookup(aios_posix_fs* fs, uint64_t parent, const char* name,
     if (!pmeta.exists) return -ENOENT;
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
     if (int ac = aios::posix::check_access(effective_caller(fs), pmeta, kWantX)) return ac;
-    aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    auto dir = aios::posix::make_dir(*fs->st, parent);
     dir.load();
     auto it = dir.entries().find(name);
     if (it == dir.entries().end()) return -ENOENT;
@@ -1428,7 +1520,7 @@ int aios_posix_readdir(aios_posix_fs* fs, uint64_t ino, uint64_t* offset,
     if (!m.exists) return -ENOENT;
     if (!S_ISDIR(m.mode)) return -ENOTDIR;
     if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
-    aios::posix::DirTable dir(fs->st->session, fs->st->volume, ino);
+    auto dir = aios::posix::make_dir(*fs->st, ino);
     dir.load();
     std::vector<std::pair<std::string, uint64_t>> items;
     items.emplace_back(".", ino);
@@ -1467,7 +1559,7 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
-    aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    auto dir = aios::posix::make_dir(*fs->st, parent);
     dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     if (dir.entries().count(name)) return -EEXIST;
@@ -1520,7 +1612,7 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
-    aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    auto dir = aios::posix::make_dir(*fs->st, parent);
     dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     if (dir.entries().count(name)) return -EEXIST;
@@ -1560,6 +1652,80 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
   AIOS_POSIX_CATCH_ALL
 }
 
+int aios_posix_symlink(aios_posix_fs* fs, uint64_t parent, const char* name, const char* target,
+                       aios_posix_stat* st_out) {
+  if (!fs || !name || !target) return -EINVAL;
+  if (int rc = aios::posix::validate_dentry_name(name)) return rc;
+  const size_t tlen = std::strlen(target);
+  if (tlen == 0 || tlen > aios::posix::kMaxSymlinkBytes) return -ENAMETOOLONG;
+  try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
+    auto pmeta = aios::posix::load_inode(*fs->st, parent);
+    if (!pmeta.exists) return -ENOENT;
+    if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
+    const auto cred = effective_caller(fs);
+    if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
+    auto dir = aios::posix::make_dir(*fs->st, parent);
+    dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
+    dir.load();
+    if (dir.entries().count(name)) return -EEXIST;
+    const uint64_t ino = aios::posix::alloc_ino(*fs->st);
+    const uint64_t ts = aios::posix::now_ns();
+    aios::posix::InodeMeta m;
+    m.ino = ino;
+    m.mode = S_IFLNK | 0777;
+    m.nlink = 1;
+    m.uid = cred.uid;
+    m.gid = cred.gid;
+    m.project_id = pmeta.project_id;
+    m.parent_ino = parent;
+    m.size = static_cast<uint64_t>(tlen);
+    m.symlink.assign(target, tlen);
+    m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
+    m.stripe_unit = fs->st->stripe_unit;
+    m.stripe_width = fs->st->stripe_width;
+    {
+      const std::string parent_path = aios::posix::path_of_ino(*fs->st, parent);
+      const std::string child_path =
+          parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
+      aios::posix::store_inode(*fs->st, m, child_path);
+    }
+    if (!dir.link_if_absent(name, ino)) {
+      aios::posix::delete_orphan_inode(*fs->st, ino);
+      return -EEXIST;
+    }
+    pmeta.mtime_ns = pmeta.ctime_ns = ts;
+    aios::posix::store_inode(*fs->st, pmeta, std::nullopt, [ts](aios::posix::InodeMeta& next) {
+      next.mtime_ns = next.ctime_ns = ts;
+    });
+    aios::posix::mark_rstat_dirty(*fs->st, parent);
+    if (st_out) aios::posix::fill_stat(m, st_out);
+    return 0;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+  AIOS_POSIX_CATCH_ALL
+}
+
+int aios_posix_readlink(aios_posix_fs* fs, uint64_t ino, char* buf, size_t size) {
+  if (!fs) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (!S_ISLNK(m.mode)) return -EINVAL;
+    const size_t need = m.symlink.size() + 1;
+    if (size == 0) return static_cast<int>(need);
+    if (!buf) return -EINVAL;
+    if (size < need) return -ERANGE;
+    std::memcpy(buf, m.symlink.data(), m.symlink.size());
+    buf[m.symlink.size()] = '\0';
+    return static_cast<int>(m.symlink.size());
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+  AIOS_POSIX_CATCH_ALL
+}
+
 int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
   if (!fs || !name) return -EINVAL;
   if (int rc = aios::posix::validate_dentry_name(name)) return rc;
@@ -1570,7 +1736,7 @@ int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
-    aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    auto dir = aios::posix::make_dir(*fs->st, parent);
     dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     auto it = dir.entries().find(name);
@@ -1607,7 +1773,7 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
     if (!op.exists) return -ENOENT;
     if (!S_ISDIR(op.mode)) return -ENOTDIR;
     if (int ac = aios::posix::check_access(cred, op, kWantX)) return ac;
-    aios::posix::DirTable old_dir(fs->st->session, fs->st->volume, old_parent);
+    auto old_dir = aios::posix::make_dir(*fs->st, old_parent);
     old_dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, old_parent));
     old_dir.load();
     auto it = old_dir.entries().find(old_name);
@@ -1617,7 +1783,7 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
     if (!m.exists) return -ENOENT;
     if (S_ISDIR(m.mode)) return -EPERM;
 
-    aios::posix::DirTable new_dir(fs->st->session, fs->st->volume, new_parent);
+    auto new_dir = aios::posix::make_dir(*fs->st, new_parent);
     new_dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, new_parent));
     new_dir.load();
     if (new_dir.entries().count(new_name)) return -EEXIST;
@@ -1665,7 +1831,7 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     if (!S_ISDIR(pmeta.mode)) return -ENOTDIR;
     const auto cred = effective_caller(fs);
     if (int ac = aios::posix::check_access(cred, pmeta, kWantW | kWantX)) return ac;
-    aios::posix::DirTable dir(fs->st->session, fs->st->volume, parent);
+    auto dir = aios::posix::make_dir(*fs->st, parent);
     dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, parent));
     dir.load();
     auto it = dir.entries().find(name);
@@ -1674,7 +1840,7 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     auto m = aios::posix::load_inode(*fs->st, ino);
     if (!m.exists || !S_ISDIR(m.mode)) return -ENOTDIR;
     if (int ac = aios::posix::check_sticky_unlink(cred, pmeta, m)) return ac;
-    aios::posix::DirTable child(fs->st->session, fs->st->volume, ino);
+    auto child = aios::posix::make_dir(*fs->st, ino);
     child.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, ino));
     child.load();
     if (!child.entries().empty()) return -ENOTEMPTY;
@@ -1691,6 +1857,7 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     {
       std::lock_guard lock(fs->st->mu);
       fs->st->inode_cache.erase(ino);
+      fs->st->dir_cache.erase(ino);
     }
     aios::posix::mark_rstat_dirty(*fs->st, parent);
     return 0;
@@ -1702,7 +1869,13 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
 
 int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                       uint64_t new_parent, const char* new_name) {
+  return aios_posix_rename2(fs, old_parent, old_name, new_parent, new_name, 0);
+}
+
+int aios_posix_rename2(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
+                       uint64_t new_parent, const char* new_name, unsigned flags) {
   if (!fs || !old_name || !new_name) return -EINVAL;
+  if (flags & (AIOS_POSIX_RENAME_EXCHANGE | AIOS_POSIX_RENAME_WHITEOUT)) return -EINVAL;
   if (int fr = ensure_not_frozen(fs)) return fr;
   try {
     const auto cred = effective_caller(fs);
@@ -1729,7 +1902,7 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
     }
 
     if (old_parent == new_parent) {
-      aios::posix::DirTable dir(fs->st->session, fs->st->volume, old_parent);
+      auto dir = aios::posix::make_dir(*fs->st, old_parent);
       dir.load();
       auto oit = dir.entries().find(old_name);
       if (oit == dir.entries().end()) return -ENOENT;
@@ -1738,6 +1911,7 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
         if (int ac = aios::posix::check_sticky_unlink(cred, op_meta, src)) return ac;
       }
       if (dir.entries().count(new_name) && std::strcmp(old_name, new_name) != 0) {
+        if (flags & AIOS_POSIX_RENAME_NOREPLACE) return -EEXIST;
         auto tit = dir.entries().find(new_name);
         auto tm = aios::posix::load_inode(*fs->st, tit->second);
         if (tm.exists) {
@@ -1748,7 +1922,7 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
     }
     // Cross-dir: sticky checks on source and optional victim.
     {
-      aios::posix::DirTable dir(fs->st->session, fs->st->volume, old_parent);
+      auto dir = aios::posix::make_dir(*fs->st, old_parent);
       dir.load();
       auto oit = dir.entries().find(old_name);
       if (oit == dir.entries().end()) return -ENOENT;
@@ -1756,10 +1930,11 @@ int aios_posix_rename(aios_posix_fs* fs, uint64_t old_parent, const char* old_na
       if (src.exists) {
         if (int ac = aios::posix::check_sticky_unlink(cred, op_meta, src)) return ac;
       }
-      aios::posix::DirTable ndir(fs->st->session, fs->st->volume, new_parent);
+      auto ndir = aios::posix::make_dir(*fs->st, new_parent);
       ndir.load();
       auto tit = ndir.entries().find(new_name);
       if (tit != ndir.entries().end()) {
+        if (flags & AIOS_POSIX_RENAME_NOREPLACE) return -EEXIST;
         auto tm = aios::posix::load_inode(*fs->st, tit->second);
         if (tm.exists) {
           if (int ac = aios::posix::check_sticky_unlink(cred, np_meta, tm)) return ac;
@@ -1876,11 +2051,11 @@ int aios_posix_setattr(aios_posix_fs* fs, uint64_t ino, const aios_posix_stat* s
 
 int aios_posix_fsync(aios_posix_fs* fs, uint64_t ino) {
   if (!fs) return -EINVAL;
-  // Writes are committed per chunk PUT; refresh inode from server.
   try {
-    std::lock_guard lock(fs->st->mu);
-    fs->st->inode_cache.erase(ino);
+    aios::posix::flush_dirty_inode(*fs->st, ino);
     return 0;
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
   } catch (...) {
     return -EIO;
   }
@@ -1889,7 +2064,8 @@ int aios_posix_fsync(aios_posix_fs* fs, uint64_t ino) {
 int aios_posix_statfs(aios_posix_fs* fs, aios_posix_statvfs* st_out) {
   if (!fs || !st_out) return -EINVAL;
   std::memset(st_out, 0, sizeof(*st_out));
-  st_out->bsize = 4096;
+  st_out->bsize = fs->st ? static_cast<uint32_t>(fs->st->stripe_unit ? fs->st->stripe_unit : 4096)
+                         : 4096;
   st_out->blocks = 1ull << 40;
   st_out->bfree = st_out->blocks / 2;
   st_out->bavail = st_out->bfree;
@@ -2070,7 +2246,7 @@ void collect_subtree_oids_session(aios::posix::FsState& st, uint64_t root_ino,
       oids.push_back(aios::posix::dir_meta_oid(st.volume, ino));
       oids.push_back(aios::posix::dir_log_oid(st.volume, ino));
       oids.push_back(aios::posix::dir_snap_oid(st.volume, ino));
-      aios::posix::DirTable dt(st.session, st.volume, ino);
+      auto dt = aios::posix::make_dir(st, ino);
       dt.load();
       for (const auto& [name, child] : dt.entries()) {
         (void)name;
@@ -2098,6 +2274,7 @@ int aios_posix_snapshot_at(aios_posix_fs* fs, const char* path, char* snap_id_ou
   try {
     aios::posix::ensure_super(*fs->st);
     auto& st = *fs->st;
+    aios::posix::flush_all_dirty_inodes(st);
     const std::string norm = normalize_snap_path(path);
     uint64_t root_ino = aios::posix::kRootIno;
     if (norm != "/") {

@@ -4,6 +4,7 @@
 #include "client/put_layout.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -71,6 +72,9 @@ class Session {
   static constexpr std::size_t kMaxBodyBytes = 16u * 1024u * 1024u;
 
   explicit Session(SessionConfig cfg);
+  ~Session();
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
 
   const SessionConfig& config() const { return cfg_; }
   void set_app_label(std::string label) { cfg_.app_label = std::move(label); }
@@ -161,6 +165,8 @@ class Session {
   std::unordered_set<std::string> redirect_allow_;
   bool redirect_refreshed_{false};
   bool refreshing_allowlist_{false};
+  struct ConnPool;
+  std::unique_ptr<ConnPool> pool_;
 };
 
 }  // namespace aios

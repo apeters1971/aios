@@ -9,6 +9,8 @@
 #include <boost/asio.hpp>
 
 #include <cctype>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <utility>
 
@@ -202,14 +204,180 @@ std::uint64_t apply_posix_cas_headers(Session& session, const std::string& oid,
   return new_cas;
 }
 
+HttpResponse exchange_http(tcp::socket& sock, std::string& leftover, const std::string& method,
+                           const std::string& path, const std::string& host,
+                           const std::string& port,
+                           const std::unordered_map<std::string, std::string>& headers,
+                           const std::string& body, bool* close_out) {
+  std::ostringstream req;
+  req << method << ' ' << path << " HTTP/1.1\r\n";
+  req << "Host: " << host << ':' << port << "\r\n";
+  req << "Connection: keep-alive\r\n";
+  for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
+  req << "\r\n";
+  const auto head = req.str();
+  boost::system::error_code ec;
+  if (!timed_write(sock, head.data(), head.size(), ec)) throw_sock("write", ec);
+  if (!body.empty() && !timed_write(sock, body.data(), body.size(), ec)) {
+    throw_sock("write", ec);
+  }
+
+  std::string wire = std::move(leftover);
+  leftover.clear();
+  if (wire.find("\r\n\r\n") == std::string::npos) {
+    if (!timed_read_until(sock, wire, "\r\n\r\n", ec)) throw_sock("read headers", ec);
+  }
+  const auto hdr_end = wire.find("\r\n\r\n");
+  std::istringstream is(wire.substr(0, hdr_end + 4));
+  std::string status_line;
+  std::getline(is, status_line);
+  HttpResponse resp;
+  {
+    std::istringstream ss(status_line);
+    std::string ver, reason;
+    ss >> ver >> resp.status;
+  }
+  std::string line;
+  std::size_t content_length = 0;
+  bool have_content_length = false;
+  bool close_conn = false;
+  while (std::getline(is, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) break;
+    auto colon = line.find(':');
+    if (colon == std::string::npos) continue;
+    auto name = line.substr(0, colon);
+    auto value = line.substr(colon + 1);
+    while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    resp.headers[name] = value;
+    if (name == "content-length") {
+      have_content_length = true;
+      if (value.empty() || value.front() == '-') {
+        throw client_error("http", "invalid Content-Length");
+      }
+      try {
+        const auto n = std::stoull(value);
+        if (n > Session::kMaxBodyBytes) {
+          throw client_error("payload_too_large", "response body exceeds 16 MiB");
+        }
+        content_length = static_cast<std::size_t>(n);
+      } catch (const client_error&) {
+        throw;
+      } catch (...) {
+        throw client_error("http", "invalid Content-Length");
+      }
+    } else if (name == "connection") {
+      for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (value == "close") close_conn = true;
+    }
+  }
+  resp.body = hdr_end == std::string::npos ? std::string{} : wire.substr(hdr_end + 4);
+  const bool informational = resp.status >= 100 && resp.status < 200;
+  const bool no_entity =
+      method == "HEAD" || resp.status == 204 || resp.status == 304 || informational;
+  if (no_entity) {
+    // HEAD 2xx advertises the entity size but sends no body. HEAD 4xx/5xx from
+    // this server still writes a JSON error body — drain that so keep-alive stays aligned.
+    if (method == "HEAD" && have_content_length && resp.status >= 400 &&
+        content_length <= kMaxHeaderBytes) {
+      while (resp.body.size() < content_length) {
+        char tmp[4096];
+        std::size_t n = 0;
+        if (!timed_read_some(sock, tmp, sizeof(tmp), n, ec)) {
+          if (n > 0) resp.body.append(tmp, tmp + n);
+          if (ec == boost::asio::error::eof) break;
+          throw_sock("read body", ec);
+        }
+        if (n > 0) resp.body.append(tmp, tmp + n);
+      }
+    }
+    leftover.clear();
+    resp.body.clear();
+  } else {
+    while (resp.body.size() < content_length) {
+      char tmp[4096];
+      std::size_t n = 0;
+      if (!timed_read_some(sock, tmp, sizeof(tmp), n, ec)) {
+        if (n > 0) resp.body.append(tmp, tmp + n);
+        if (ec == boost::asio::error::eof) break;
+        throw_sock("read body", ec);
+      }
+      if (n > 0) resp.body.append(tmp, tmp + n);
+    }
+    if (resp.body.size() > content_length) {
+      leftover = resp.body.substr(content_length);
+      resp.body.resize(content_length);
+    }
+    if (have_content_length && resp.body.size() != content_length) {
+      throw client_error("http", "short response body");
+    }
+  }
+  if (close_out) *close_out = close_conn;
+  return resp;
+}
+
 }  // namespace
 
-Session::Session(SessionConfig cfg) : cfg_(std::move(cfg)) {
+struct Session::ConnPool {
+  static constexpr std::size_t kMaxIdle = 8;
+  std::mutex mu;
+  struct Conn {
+    Conn() : sock(ioc) {}
+    boost::asio::io_context ioc;
+    boost::asio::ip::tcp::socket sock;
+    std::string host;
+    std::string port;
+    std::string leftover;
+    bool open{false};
+  };
+  std::vector<std::unique_ptr<Conn>> idle;
+
+  std::unique_ptr<Conn> take(const std::string& host, const std::string& port, int timeout_ms,
+                             bool* reused) {
+    std::unique_ptr<Conn> c;
+    {
+      std::lock_guard lock(mu);
+      for (auto it = idle.begin(); it != idle.end(); ++it) {
+        if ((*it)->open && (*it)->host == host && (*it)->port == port) {
+          c = std::move(*it);
+          idle.erase(it);
+          if (reused) *reused = true;
+          return c;
+        }
+      }
+    }
+    if (reused) *reused = false;
+    c = std::make_unique<Conn>();
+    boost::system::error_code ec;
+    boost::asio::ip::tcp::resolver resolver(c->ioc);
+    auto endpoints = resolver.resolve(host, port, ec);
+    if (ec) throw client_error("http", "resolve: " + ec.message());
+    boost::asio::connect(c->sock, endpoints, ec);
+    if (ec) throw client_error("http", "connect: " + ec.message());
+    apply_socket_deadlines(c->sock, timeout_ms);
+    c->host = host;
+    c->port = port;
+    c->open = true;
+    return c;
+  }
+
+  void put(std::unique_ptr<Conn> c, bool reuse) {
+    if (!c || !reuse || !c->open) return;
+    std::lock_guard lock(mu);
+    if (idle.size() >= kMaxIdle) return;
+    idle.push_back(std::move(c));
+  }
+};
+
+Session::Session(SessionConfig cfg) : cfg_(std::move(cfg)), pool_(std::make_unique<ConnPool>()) {
   if (cfg_.cluster_key.empty()) throw client_error("bad_request", "cluster_key required");
   parse_endpoint();
   allow_redirect_peer(host_ + ":" + port_);
   for (const auto& p : cfg_.redirect_peers) allow_redirect_peer(p);
 }
+
+Session::~Session() = default;
 
 void Session::parse_endpoint() {
   auto colon = cfg_.endpoint.rfind(':');
@@ -249,74 +417,37 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
   headers["content-length"] = "0";
   add_auth(headers, "GET", path, {});
 
-  boost::asio::io_context ioc;
-  boost::system::error_code ec;
-  tcp::resolver resolver(ioc);
-  auto endpoints = resolver.resolve(host_, port_, ec);
-  if (ec) throw client_error("http", "resolve: " + ec.message());
-
-  tcp::socket sock(ioc);
-  boost::asio::connect(sock, endpoints, ec);
-  if (ec) throw client_error("http", "connect: " + ec.message());
-  apply_socket_deadlines(sock, cfg_.socket_timeout_ms);
-
-  std::ostringstream req;
-  req << "GET " << path << " HTTP/1.1\r\n";
-  req << "Host: " << host_ << ':' << port_ << "\r\n";
-  req << "Connection: close\r\n";
-  for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
-  req << "\r\n";
-  const auto head = req.str();
-  if (!timed_write(sock, head.data(), head.size(), ec)) throw_sock("write", ec);
-
-  std::string wire;
-  if (!timed_read_until(sock, wire, "\r\n\r\n", ec)) throw_sock("read headers", ec);
-  const auto hdr_end = wire.find("\r\n\r\n");
-  std::istringstream is(wire.substr(0, hdr_end + 4));
-  std::string status_line;
-  std::getline(is, status_line);
-  HttpResponse resp;
-  {
-    std::istringstream ss(status_line);
-    std::string ver, reason;
-    ss >> ver >> resp.status;
-  }
-  std::string line;
-  std::size_t content_length = 0;
-  while (std::getline(is, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line.empty()) break;
-    auto colon = line.find(':');
-    if (colon == std::string::npos) continue;
-    auto name = line.substr(0, colon);
-    auto value = line.substr(colon + 1);
-    while (!value.empty() && value.front() == ' ') value.erase(value.begin());
-    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    resp.headers[name] = value;
-    if (name == "content-length") {
+  auto hop = [&](bool allow_reuse) -> HttpResponse {
+    bool reused = false;
+    auto conn = pool_->take(host_, port_, cfg_.socket_timeout_ms, &reused);
+    if (!allow_reuse && reused) {
+      pool_->put(std::move(conn), false);
+      conn = pool_->take(host_, port_, cfg_.socket_timeout_ms, &reused);
+    }
+    try {
+      bool close_conn = false;
+      auto r = exchange_http(conn->sock, conn->leftover, "GET", path, host_, port_, headers, {},
+                             &close_conn);
+      pool_->put(std::move(conn), !close_conn);
+      return r;
+    } catch (const client_error&) {
+      pool_->put(std::move(conn), false);
+      if (!reused) throw;
+      bool ignored = false;
+      auto fresh = pool_->take(host_, port_, cfg_.socket_timeout_ms, &ignored);
       try {
-        content_length = static_cast<std::size_t>(std::stoull(value));
+        bool close_conn = false;
+        auto r = exchange_http(fresh->sock, fresh->leftover, "GET", path, host_, port_, headers, {},
+                               &close_conn);
+        pool_->put(std::move(fresh), !close_conn);
+        return r;
       } catch (...) {
-        content_length = 0;
-      }
-      if (content_length > kMaxBodyBytes) {
-        throw client_error("payload_too_large", "response body exceeds 16 MiB");
+        pool_->put(std::move(fresh), false);
+        throw;
       }
     }
-  }
-  resp.body = hdr_end == std::string::npos ? std::string{} : wire.substr(hdr_end + 4);
-  while (resp.body.size() < content_length) {
-    char tmp[4096];
-    std::size_t n = 0;
-    if (!timed_read_some(sock, tmp, sizeof(tmp), n, ec)) {
-      if (n > 0) resp.body.append(tmp, tmp + n);
-      if (ec == boost::asio::error::eof) break;
-      throw_sock("read body", ec);
-    }
-    if (n > 0) resp.body.append(tmp, tmp + n);
-  }
-  if (content_length > 0 && resp.body.size() > content_length) resp.body.resize(content_length);
-  return resp;
+  };
+  return hop(true);
 }
 
 void Session::refresh_redirect_allowlist() {
@@ -399,88 +530,33 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     if (!cfg_.app_label.empty()) headers["x-aios-app-label"] = cfg_.app_label;
     add_auth(headers, method, path, body);
 
-    boost::asio::io_context ioc;
-    boost::system::error_code ec;
-    tcp::resolver resolver(ioc);
-    auto endpoints = resolver.resolve(host, port, ec);
-    if (ec) throw client_error("http", "resolve: " + ec.message());
-
-    tcp::socket sock(ioc);
-    boost::asio::connect(sock, endpoints, ec);
-    if (ec) throw client_error("http", "connect: " + ec.message());
-    apply_socket_deadlines(sock, cfg_.socket_timeout_ms);
-
-    std::ostringstream req;
-    req << method << ' ' << path << " HTTP/1.1\r\n";
-    req << "Host: " << host << ':' << port << "\r\n";
-    req << "Connection: close\r\n";
-    for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
-    req << "\r\n";
-    const auto head = req.str();
-    if (!timed_write(sock, head.data(), head.size(), ec)) throw_sock("write", ec);
-    if (!body.empty() && !timed_write(sock, body.data(), body.size(), ec)) {
-      throw_sock("write", ec);
-    }
-
-    std::string wire;
-    if (!timed_read_until(sock, wire, "\r\n\r\n", ec)) throw_sock("read headers", ec);
-    const auto hdr_end = wire.find("\r\n\r\n");
-    std::istringstream is(wire.substr(0, hdr_end + 4));
-    std::string status_line;
-    std::getline(is, status_line);
-    resp = HttpResponse{};
-    {
-      std::istringstream ss(status_line);
-      std::string ver, reason;
-      ss >> ver >> resp.status;
-    }
-    std::string line;
-    std::size_t content_length = 0;
-    bool have_content_length = false;
-    while (std::getline(is, line)) {
-      if (!line.empty() && line.back() == '\r') line.pop_back();
-      if (line.empty()) break;
-      auto colon = line.find(':');
-      if (colon == std::string::npos) continue;
-      auto name = line.substr(0, colon);
-      auto value = line.substr(colon + 1);
-      while (!value.empty() && value.front() == ' ') value.erase(value.begin());
-      for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      resp.headers[name] = value;
-      if (name == "content-length") {
-        have_content_length = true;
-        if (value.empty() || value.front() == '-') {
-          throw client_error("http", "invalid Content-Length");
-        }
+    auto try_hop = [&]() -> HttpResponse {
+      bool reused = false;
+      auto conn = pool_->take(host, port, cfg_.socket_timeout_ms, &reused);
+      try {
+        bool close_conn = false;
+        auto r = exchange_http(conn->sock, conn->leftover, method, path, host, port, headers, body,
+                               &close_conn);
+        pool_->put(std::move(conn), !close_conn);
+        return r;
+      } catch (const client_error&) {
+        pool_->put(std::move(conn), false);
+        if (!reused) throw;
+        bool ignored = false;
+        auto fresh = pool_->take(host, port, cfg_.socket_timeout_ms, &ignored);
         try {
-          const auto n = std::stoull(value);
-          if (n > kMaxBodyBytes) {
-            throw client_error("payload_too_large", "response body exceeds 16 MiB");
-          }
-          content_length = static_cast<std::size_t>(n);
-        } catch (const client_error&) {
-          throw;
+          bool close_conn = false;
+          auto r = exchange_http(fresh->sock, fresh->leftover, method, path, host, port, headers,
+                                 body, &close_conn);
+          pool_->put(std::move(fresh), !close_conn);
+          return r;
         } catch (...) {
-          throw client_error("http", "invalid Content-Length");
+          pool_->put(std::move(fresh), false);
+          throw;
         }
       }
-    }
-    resp.body = hdr_end == std::string::npos ? std::string{} : wire.substr(hdr_end + 4);
-    while (resp.body.size() < content_length) {
-      char tmp[4096];
-      std::size_t n = 0;
-      if (!timed_read_some(sock, tmp, sizeof(tmp), n, ec)) {
-        if (n > 0) resp.body.append(tmp, tmp + n);
-        if (ec == boost::asio::error::eof) break;
-        throw_sock("read body", ec);
-      }
-      if (n > 0) resp.body.append(tmp, tmp + n);
-    }
-    if (content_length > 0 && resp.body.size() > content_length) resp.body.resize(content_length);
-    if (have_content_length && method != "HEAD" && resp.status != 204 &&
-        resp.body.size() != content_length) {
-      throw client_error("http", "short response body");
-    }
+    };
+    resp = try_hop();
 
     if (resp.status == 307 || resp.status == 301 || resp.status == 302) {
       const auto loc = header_get(resp.headers, "location");

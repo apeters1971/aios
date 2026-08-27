@@ -25,7 +25,7 @@ bool recompute_dir_rstat(FsState& st, uint64_t dir_ino) {
   auto dir_meta = load_inode(st, dir_ino);
   if (!dir_meta.exists || !S_ISDIR(dir_meta.mode)) return false;
 
-  DirTable dt(st.session, st.volume, dir_ino);
+  DirTable dt = make_dir(st, dir_ino);
   dt.load();
 
   uint64_t rbytes = 0;
@@ -54,7 +54,7 @@ bool recompute_dir_rstat(FsState& st, uint64_t dir_ino) {
       rdirs += child.rdirs;
       rtime = std::max(rtime, child.rtime_ns);
       rtime = std::max(rtime, child.mtime_ns);
-    } else if (S_ISREG(child.mode)) {
+    } else if (S_ISREG(child.mode) || S_ISLNK(child.mode)) {
       ++rfiles;
       rbytes += child.size;
       rtime = std::max(rtime, child.mtime_ns);

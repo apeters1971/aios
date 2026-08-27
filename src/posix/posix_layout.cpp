@@ -75,7 +75,7 @@ std::string path_of_ino(FsState& st, uint64_t ino) {
     if (!m.exists) break;
     uint64_t parent = m.parent_ino;
     if (parent == 0) parent = kRootIno;
-    DirTable dt(st.session, st.volume, parent);
+    DirTable dt = make_dir(st, parent);
     dt.load();
     std::string name;
     for (const auto& [n, child] : dt.entries()) {
