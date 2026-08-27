@@ -4,6 +4,7 @@
 
 #include <linux/fs.h>
 #include <linux/fs_context.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
@@ -91,7 +92,16 @@ struct aios_inode_aux {
 	u64 cas;
 	u64 stripe_unit;
 	u32 stripe_width;
+	u64 dirty_bytes;
+	unsigned long dirty_since; /* jiffies; 0 if size/mtime is clean */
+	char *xattrs_obj; /* heap `"xattrs"` object `{...}`, or NULL */
+	char *symlink;
+	bool extras_valid;
 };
+
+struct aios_dir_cache;
+
+#define AIOS_DENTRY_TTL_MS 250
 
 struct aios_sb_info {
 	enum aios_backend backend;
@@ -102,6 +112,7 @@ struct aios_sb_info {
 	 * allocate, so on the reclaim path they need a rescuer to make progress. */
 	struct workqueue_struct *wb_wq;
 	struct mutex http_mu;
+	struct aios_dir_cache *dir_cache;
 	int mount_id;
 	char endpoint[256];
 	char cluster_key[256];
@@ -176,6 +187,7 @@ long aios_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 
 extern const struct inode_operations aios_dir_inode_ops;
 extern const struct inode_operations aios_file_inode_ops;
+extern const struct inode_operations aios_symlink_inode_ops;
 extern const struct file_operations aios_dir_ops;
 extern const struct file_operations aios_file_ops;
 extern const struct super_operations aios_super_ops;
@@ -183,8 +195,22 @@ extern const struct dentry_operations aios_dentry_ops;
 
 extern const struct inode_operations aios_http_dir_inode_ops;
 extern const struct inode_operations aios_http_file_inode_ops;
+extern const struct inode_operations aios_http_symlink_inode_ops;
 extern const struct file_operations aios_http_dir_ops;
 
 void aios_stat_to_inode(struct inode *inode, const struct aios_kabi_stat *st);
+void aios_set_inode_blocks(struct inode *inode);
+
+static inline void aios_d_mark_fresh(struct dentry *dentry)
+{
+	if (dentry)
+		dentry->d_time = jiffies;
+}
+
+static inline bool aios_d_is_fresh(const struct dentry *dentry)
+{
+	return dentry && time_before(jiffies, dentry->d_time +
+						     msecs_to_jiffies(AIOS_DENTRY_TTL_MS));
+}
 
 #endif /* AIOSFS_H */

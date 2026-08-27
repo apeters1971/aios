@@ -149,7 +149,12 @@ static int aios_statfs(struct dentry *dentry, struct kstatfs *buf)
 	}
 	st = out;
 	buf->f_type = AIOSFS_MAGIC;
-	buf->f_bsize = st->bsize ? st->bsize : 4096;
+	if (st->bsize)
+		buf->f_bsize = st->bsize;
+	else if (info->stripe_unit)
+		buf->f_bsize = info->stripe_unit;
+	else
+		buf->f_bsize = 4096;
 	buf->f_blocks = st->blocks;
 	buf->f_bfree = st->bfree;
 	buf->f_bavail = st->bavail;

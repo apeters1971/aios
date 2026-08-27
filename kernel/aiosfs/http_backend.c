@@ -8,6 +8,8 @@
 #include "../aios_http/aios_http_api.h"
 
 #include <linux/completion.h>
+#include <linux/cred.h>
+#include <linux/delayed_call.h>
 #include <linux/ctype.h>
 #include <linux/delay.h>
 #include <linux/mm.h>
@@ -32,13 +34,14 @@
 #define AIOS_HTTP_OP_RENAME 3
 #define AIOS_HTTP_MAX_XATTRS 128
 #define AIOS_HTTP_MAX_XATTR_VALUE AIOS_KABI_XATTR_VALUE_MAX
+#define AIOS_DIR_CACHE_SLOTS 16
+#define AIOS_DIR_CACHE_TTL_MS 250
+#define AIOS_DIRTY_FLUSH_BYTES (4ull * 1024 * 1024)
+#define AIOS_DIRTY_FLUSH_MS 100
 
-struct aios_iinfo {
-	u64 last_synced_size;
-	u64 cas;
-	u64 stripe_unit;
-	u32 stripe_width;
-};
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1U << 0)
+#endif
 
 struct aios_dir_ent {
 	char name[AIOS_KABI_NAME_MAX + 1];
@@ -48,6 +51,7 @@ struct aios_dir_ent {
 struct aios_dir_table {
 	struct aios_dir_ent *ents;
 	unsigned int count;
+	u64 ino;
 	u64 next_op;
 	u64 log_bytes;
 	u64 snapshot_op;
@@ -55,6 +59,21 @@ struct aios_dir_table {
 	char meta_oid[160];
 	char log_oid[160];
 	char snap_oid[160];
+};
+
+struct aios_dir_cache_slot {
+	u64 ino;
+	struct aios_dir_ent *ents;
+	unsigned int count;
+	u64 next_op;
+	u64 log_bytes;
+	u64 snapshot_op;
+	u64 meta_cas;
+	unsigned long loaded;
+};
+
+struct aios_dir_cache {
+	struct aios_dir_cache_slot slots[AIOS_DIR_CACHE_SLOTS];
 };
 
 struct aios_inode_meta {
@@ -71,6 +90,9 @@ struct aios_inode_meta {
 	u32 stripe_width;
 	u64 cas;
 	bool exists;
+	bool extras_loaded;
+	char *xattrs_obj;
+	char *symlink;
 };
 
 static u64 now_ns(void)
@@ -463,6 +485,7 @@ static int dir_table_init(struct aios_dir_table *dt, const char *vol, u64 ino)
 	dt->ents = kcalloc(AIOS_HTTP_MAX_DIR_ENTS, sizeof(*dt->ents), GFP_KERNEL);
 	if (!dt->ents)
 		return -ENOMEM;
+	dt->ino = ino;
 	dt->next_op = 1;
 	oid_dir_meta(vol, ino, dt->meta_oid, sizeof(dt->meta_oid));
 	oid_dir_log(vol, ino, dt->log_oid, sizeof(dt->log_oid));
@@ -476,10 +499,93 @@ static void dir_table_free(struct aios_dir_table *dt)
 	dt->ents = NULL;
 }
 
-static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt)
+static void dir_cache_free_all(struct aios_sb_info *info)
+{
+	unsigned int i;
+
+	if (!info->dir_cache)
+		return;
+	for (i = 0; i < AIOS_DIR_CACHE_SLOTS; i++)
+		kfree(info->dir_cache->slots[i].ents);
+	kfree(info->dir_cache);
+	info->dir_cache = NULL;
+}
+
+static void dir_cache_publish(struct aios_sb_info *info, const struct aios_dir_table *dt)
+{
+	struct aios_dir_cache_slot *slot;
+	struct aios_dir_ent *copy = NULL;
+	unsigned int i, victim = 0;
+	unsigned long oldest;
+
+	if (!info->dir_cache || !dt->ents)
+		return;
+	oldest = info->dir_cache->slots[0].loaded;
+	for (i = 0; i < AIOS_DIR_CACHE_SLOTS; i++) {
+		slot = &info->dir_cache->slots[i];
+		if (slot->ino == dt->ino) {
+			victim = i;
+			break;
+		}
+		if (!slot->ino) {
+			victim = i;
+			break;
+		}
+		if (time_before(slot->loaded, oldest)) {
+			oldest = slot->loaded;
+			victim = i;
+		}
+	}
+	if (dt->count) {
+		copy = kmemdup(dt->ents, dt->count * sizeof(*dt->ents), GFP_KERNEL);
+		if (!copy)
+			return;
+	}
+	slot = &info->dir_cache->slots[victim];
+	kfree(slot->ents);
+	slot->ino = dt->ino;
+	slot->ents = copy;
+	slot->count = dt->count;
+	slot->next_op = dt->next_op;
+	slot->log_bytes = dt->log_bytes;
+	slot->snapshot_op = dt->snapshot_op;
+	slot->meta_cas = dt->meta_cas;
+	slot->loaded = jiffies;
+}
+
+static bool dir_cache_lookup(struct aios_sb_info *info, struct aios_dir_table *dt)
+{
+	unsigned int i;
+
+	if (!info->dir_cache)
+		return false;
+	for (i = 0; i < AIOS_DIR_CACHE_SLOTS; i++) {
+		struct aios_dir_cache_slot *slot = &info->dir_cache->slots[i];
+
+		if (!slot->ino || slot->ino != dt->ino)
+			continue;
+		if (!time_before(jiffies, slot->loaded + msecs_to_jiffies(AIOS_DIR_CACHE_TTL_MS)))
+			continue;
+		if (slot->count > AIOS_HTTP_MAX_DIR_ENTS)
+			return false;
+		memcpy(dt->ents, slot->ents, slot->count * sizeof(*slot->ents));
+		dt->count = slot->count;
+		dt->next_op = slot->next_op;
+		dt->log_bytes = slot->log_bytes;
+		dt->snapshot_op = slot->snapshot_op;
+		dt->meta_cas = slot->meta_cas;
+		return true;
+	}
+	return false;
+}
+
+static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt, bool allow_cache)
 {
 	struct aios_http_buf body = { 0 };
 	int err;
+
+	if (allow_cache && dir_cache_lookup(info, dt))
+		return 0;
 
 	dt->count = 0;
 	dt->next_op = 1;
@@ -488,8 +594,11 @@ static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt)
 	dt->meta_cas = 0;
 
 	err = aios_http_get(info->http, dt->meta_oid, &body, &dt->meta_cas);
-	if (err == -ENOENT)
+	if (err == -ENOENT) {
+		if (allow_cache)
+			dir_cache_publish(info, dt);
 		return 0;
+	}
 	if (err)
 		return err;
 	{
@@ -531,15 +640,23 @@ static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt)
 		}
 	}
 
-	if (dt->log_bytes == 0)
+	if (dt->log_bytes == 0) {
+		if (allow_cache)
+			dir_cache_publish(info, dt);
 		return 0;
+	}
 	err = aios_http_get_range(info->http, dt->log_oid, 0, dt->log_bytes - 1, &body);
-	if (err == -ENOENT)
+	if (err == -ENOENT) {
+		if (allow_cache)
+			dir_cache_publish(info, dt);
 		return 0;
+	}
 	if (err)
 		return err;
 	err = decode_and_apply_log(dt, body.data, body.len, dt->snapshot_op);
 	aios_http_buf_free(&body);
+	if (!err && allow_cache)
+		dir_cache_publish(info, dt);
 	return err;
 }
 
@@ -616,8 +733,10 @@ static int dir_store_compact(struct aios_sb_info *info, struct aios_dir_table *d
 		goto out;
 	cas = dt->meta_cas;
 	err = aios_http_put(info->http, dt->meta_oid, meta, strlen(meta), NULL, &cas);
-	if (!err)
+	if (!err) {
 		dt->meta_cas = cas;
+		dir_cache_publish(info, dt);
+	}
 out:
 	kfree(snap);
 	kfree(meta);
@@ -729,9 +848,52 @@ static int dir_find(struct aios_dir_table *dt, const char *name, u64 *ino_out)
 	return -ENOENT;
 }
 
+static void inode_meta_reset(struct aios_inode_meta *m)
+{
+	if (!m)
+		return;
+	kfree(m->xattrs_obj);
+	kfree(m->symlink);
+	memset(m, 0, sizeof(*m));
+}
+
+static int json_get_quoted(const char *js, const char *key, char *out, size_t cap)
+{
+	char pat[64];
+	const char *p;
+	const char *end;
+	int n;
+
+	n = snprintf(pat, sizeof(pat), "\"%s\":", key);
+	if (n < 0 || n >= (int)sizeof(pat))
+		return -EINVAL;
+	p = strstr(js, pat);
+	if (!p)
+		return -ENOENT;
+	p += n;
+	while (*p == ' ' || *p == '\t')
+		p++;
+	end = js + strlen(js);
+	return parse_json_quoted(&p, end, out, cap);
+}
+
+static int inode_load_extras(const char *js, struct aios_inode_meta *m)
+{
+	char tmp[AIOS_KABI_SYMLINK_MAX + 1];
+
+	kfree(m->xattrs_obj);
+	kfree(m->symlink);
+	m->xattrs_obj = extract_xattrs_object(js);
+	m->symlink = NULL;
+	if (json_get_quoted(js, "symlink", tmp, sizeof(tmp)) == 0 && tmp[0])
+		m->symlink = kstrdup(tmp, GFP_KERNEL);
+	m->extras_loaded = true;
+	return 0;
+}
+
 static int inode_from_json(const char *js, u64 cas, struct aios_inode_meta *m)
 {
-	memset(m, 0, sizeof(*m));
+	inode_meta_reset(m);
 	m->exists = true;
 	m->cas = cas;
 	m->nlink = 1;
@@ -1038,41 +1200,98 @@ static int build_xattrs_object(struct aios_xa_ent *ents, unsigned int n, char **
 	return 0;
 }
 
-/* Build full inode JSON, preserving xattrs from the cluster object when present. */
+static int inode_json_merge_symlink(const char *base, const char *target, char **out)
+{
+	char *esc;
+	size_t epos = 0;
+	size_t blen = strlen(base);
+	size_t esc_cap = AIOS_KABI_SYMLINK_MAX * 6 + 8;
+	size_t n;
+	char *s;
+	int err;
+
+	if (!target || !target[0]) {
+		s = kstrdup(base, GFP_KERNEL);
+		if (!s)
+			return -ENOMEM;
+		*out = s;
+		return 0;
+	}
+	if (blen < 2 || base[blen - 1] != '}')
+		return -EINVAL;
+	esc = kmalloc(esc_cap, GFP_KERNEL);
+	if (!esc)
+		return -ENOMEM;
+	err = json_escape_append(esc, esc_cap, &epos, target);
+	if (err) {
+		kfree(esc);
+		return err;
+	}
+	esc[epos] = '\0';
+	n = blen + epos + sizeof(",\"symlink\":\"\"}");
+	s = kmalloc(n, GFP_KERNEL);
+	if (!s) {
+		kfree(esc);
+		return -ENOMEM;
+	}
+	memcpy(s, base, blen - 1);
+	scnprintf(s + blen - 1, n - (blen - 1), ",\"symlink\":\"%s\"}", esc);
+	kfree(esc);
+	*out = s;
+	return 0;
+}
+
+/* Build full inode JSON. Uses in-memory xattrs/symlink when extras_loaded. */
 static int inode_to_json_full(struct aios_sb_info *info, struct aios_inode_meta *m, char **out,
 			      size_t *out_len)
 {
 	char base[512];
-	char oid[160];
-	struct aios_http_buf body = { 0 };
+	char *with_sym = NULL;
 	char *xattrs = NULL;
+	bool xattrs_owned = false;
 	char *js = NULL;
 	int err;
 
 	err = inode_to_json(m, base, sizeof(base));
 	if (err)
 		return err;
-	oid_ino(info->volume, m->ino, oid, sizeof(oid));
-	err = aios_http_get(info->http, oid, &body, NULL);
-	if (!err && body.len) {
-		char *tmp = kmalloc(body.len + 1, GFP_KERNEL);
-
-		if (!tmp) {
-			aios_http_buf_free(&body);
-			return -ENOMEM;
-		}
-		memcpy(tmp, body.data, body.len);
-		tmp[body.len] = '\0';
-		xattrs = extract_xattrs_object(tmp);
-		kfree(tmp);
-	} else if (err == -ENOENT) {
-		err = 0;
-	}
-	aios_http_buf_free(&body);
+	err = inode_json_merge_symlink(base, m->symlink, &with_sym);
 	if (err)
 		return err;
-	err = inode_json_merge_xattrs(base, xattrs, &js, out_len);
-	kfree(xattrs);
+	if (m->extras_loaded) {
+		xattrs = m->xattrs_obj;
+	} else {
+		char oid[160];
+		struct aios_http_buf body = { 0 };
+
+		oid_ino(info->volume, m->ino, oid, sizeof(oid));
+		err = aios_http_get(info->http, oid, &body, NULL);
+		if (!err && body.len) {
+			char *tmp = kmalloc(body.len + 1, GFP_KERNEL);
+
+			if (!tmp) {
+				aios_http_buf_free(&body);
+				kfree(with_sym);
+				return -ENOMEM;
+			}
+			memcpy(tmp, body.data, body.len);
+			tmp[body.len] = '\0';
+			xattrs = extract_xattrs_object(tmp);
+			xattrs_owned = true;
+			kfree(tmp);
+		} else if (err == -ENOENT) {
+			err = 0;
+		}
+		aios_http_buf_free(&body);
+		if (err) {
+			kfree(with_sym);
+			return err;
+		}
+	}
+	err = inode_json_merge_xattrs(with_sym, xattrs, &js, out_len);
+	if (xattrs_owned)
+		kfree(xattrs);
+	kfree(with_sym);
 	if (err)
 		return err;
 	*out = js;
@@ -1090,7 +1309,7 @@ static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta
 	oid_ino(info->volume, ino, oid, sizeof(oid));
 	err = aios_http_get(info->http, oid, &body, &cas);
 	if (err == -ENOENT) {
-		memset(m, 0, sizeof(*m));
+		inode_meta_reset(m);
 		return -ENOENT;
 	}
 	if (err)
@@ -1103,6 +1322,7 @@ static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta
 	memcpy(js, body.data, body.len);
 	js[body.len] = '\0';
 	inode_from_json(js, cas, m);
+	inode_load_extras(js, m);
 	kfree(js);
 	aios_http_buf_free(&body);
 	return 0;
@@ -1140,18 +1360,26 @@ static void meta_to_stat(const struct aios_inode_meta *m, struct aios_kabi_stat 
 
 static void attach_iinfo(struct inode *inode, const struct aios_inode_meta *m)
 {
-	struct aios_iinfo *ii = inode->i_private;
+	struct aios_inode_aux *ii = inode->i_private;
+	bool fresh = !ii;
 
 	if (!ii) {
 		ii = kzalloc(sizeof(*ii), GFP_KERNEL);
 		inode->i_private = ii;
 	}
-	if (ii) {
-		ii->cas = m->cas;
-		ii->stripe_unit = m->stripe_unit;
-		ii->stripe_width = m->stripe_width;
-		if (!ii->last_synced_size)
-			ii->last_synced_size = m->size;
+	if (!ii)
+		return;
+	ii->cas = m->cas;
+	ii->stripe_unit = m->stripe_unit;
+	ii->stripe_width = m->stripe_width;
+	if (fresh)
+		ii->last_synced_size = m->size;
+	if (m->extras_loaded) {
+		kfree(ii->xattrs_obj);
+		kfree(ii->symlink);
+		ii->xattrs_obj = m->xattrs_obj ? kstrdup(m->xattrs_obj, GFP_KERNEL) : NULL;
+		ii->symlink = m->symlink ? kstrdup(m->symlink, GFP_KERNEL) : NULL;
+		ii->extras_valid = true;
 	}
 }
 
@@ -1174,6 +1402,8 @@ static struct inode *aios_http_iget(struct super_block *sb, const struct aios_in
 	if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &aios_http_dir_inode_ops;
 		inode->i_fop = &aios_http_dir_ops;
+	} else if (S_ISLNK(inode->i_mode)) {
+		inode->i_op = &aios_http_symlink_inode_ops;
 	} else {
 		inode->i_op = &aios_http_file_inode_ops;
 		aios_setup_file_inode(inode);
@@ -1259,7 +1489,7 @@ static int alloc_ino(struct aios_sb_info *info, u64 *ino_out)
 
 static int ensure_root(struct aios_sb_info *info)
 {
-	struct aios_inode_meta root;
+	struct aios_inode_meta root = { 0 };
 	int err;
 
 	err = load_inode(info, AIOS_HTTP_ROOT_INO, &root);
@@ -1282,6 +1512,7 @@ static int ensure_root(struct aios_sb_info *info)
 		root.stripe_width =
 			info->stripe_width ? info->stripe_width : AIOS_HTTP_DEFAULT_STRIPE_WIDTH;
 		root.cas = 0;
+		root.extras_loaded = true;
 		err = store_inode(info, &root);
 	}
 	return err;
@@ -1289,7 +1520,7 @@ static int ensure_root(struct aios_sb_info *info)
 
 static int aios_http_drop_link(struct aios_sb_info *info, u64 ino)
 {
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	int err;
 
 	err = load_inode(info, ino, &m);
@@ -1300,7 +1531,9 @@ static int aios_http_drop_link(struct aios_sb_info *info, u64 ino)
 	if (m.nlink > 1) {
 		m.nlink -= 1;
 		m.ctime_ns = now_ns();
-		return store_inode(info, &m);
+		err = store_inode(info, &m);
+		inode_meta_reset(&m);
+		return err;
 	}
 	if (S_ISREG(m.mode) && m.size) {
 		u64 unit = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
@@ -1319,13 +1552,14 @@ static int aios_http_drop_link(struct aios_sb_info *info, u64 ino)
 		oid_ino(info->volume, ino, oid, sizeof(oid));
 		aios_http_delete(info->http, oid);
 	}
+	inode_meta_reset(&m);
 	return 0;
 }
 
 static int http_refresh(struct inode *inode)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	struct aios_kabi_stat st;
 	int err;
 
@@ -1335,6 +1569,7 @@ static int http_refresh(struct inode *inode)
 	meta_to_stat(&m, &st);
 	aios_stat_to_inode(inode, &st);
 	attach_iinfo(inode, &m);
+	inode_meta_reset(&m);
 	return 0;
 }
 
@@ -1342,7 +1577,7 @@ static struct dentry *http_lookup(struct inode *dir, struct dentry *dentry, unsi
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
 	struct aios_dir_table dt;
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	struct inode *inode = NULL;
 	char name[AIOS_KABI_NAME_MAX + 1];
 	u64 child;
@@ -1357,12 +1592,13 @@ static struct dentry *http_lookup(struct inode *dir, struct dentry *dentry, unsi
 	err = dir_table_init(&dt, info->volume, dir->i_ino);
 	if (err)
 		goto out;
-	err = dir_load(info, &dt);
+	err = dir_load(info, &dt, true);
 	if (err)
 		goto out_dt;
 	err = dir_find(&dt, name, &child);
 	if (err) {
 		d_add(dentry, NULL);
+		aios_d_mark_fresh(dentry);
 		err = 0;
 		inode = NULL;
 		goto out_dt;
@@ -1377,20 +1613,28 @@ static struct dentry *http_lookup(struct inode *dir, struct dentry *dentry, unsi
 	}
 out_dt:
 	dir_table_free(&dt);
+	inode_meta_reset(&m);
 out:
 	mutex_unlock(&info->http_mu);
 	if (err)
 		return ERR_PTR(err);
 	if (!inode)
 		return NULL;
-	return d_splice_alias(inode, dentry);
+	{
+		struct dentry *res = d_splice_alias(inode, dentry);
+
+		aios_d_mark_fresh(dentry);
+		if (res && !IS_ERR(res))
+			aios_d_mark_fresh(res);
+		return res;
+	}
 }
 
 static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t mode, bool is_dir)
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
 	struct aios_dir_table dt;
-	struct aios_inode_meta pmeta, m;
+	struct aios_inode_meta pmeta = { 0 }, m = { 0 };
 	struct inode *inode;
 	char name[AIOS_KABI_NAME_MAX + 1];
 	char inos[32];
@@ -1415,7 +1659,7 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 	err = dir_table_init(&dt, info->volume, dir->i_ino);
 	if (err)
 		goto out;
-	err = dir_load(info, &dt);
+	err = dir_load(info, &dt, false);
 	if (err)
 		goto out_dt;
 	if (!dir_find(&dt, name, NULL)) {
@@ -1430,12 +1674,13 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 	m.ino = ino;
 	m.mode = is_dir ? (S_IFDIR | (mode & 0777)) : (S_IFREG | (mode & 0777));
 	m.nlink = is_dir ? 2 : 1;
-	m.uid = info->uid;
-	m.gid = info->gid;
+	m.uid = from_kuid(&init_user_ns, current_fsuid());
+	m.gid = from_kgid(&init_user_ns, current_fsgid());
 	m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
 	m.stripe_unit = info->stripe_unit ? info->stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
 	m.stripe_width = info->stripe_width ? info->stripe_width : AIOS_HTTP_DEFAULT_STRIPE_WIDTH;
 	m.cas = 0;
+	m.extras_loaded = true;
 	err = store_inode(info, &m);
 	if (err)
 		goto out_dt;
@@ -1458,6 +1703,7 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 		goto out_dt;
 	}
 	d_instantiate(dentry, inode);
+	aios_d_mark_fresh(dentry);
 	if (is_dir)
 		inc_nlink(dir);
 	{
@@ -1469,6 +1715,8 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 out_dt:
 	dir_table_free(&dt);
 out:
+	inode_meta_reset(&pmeta);
+	inode_meta_reset(&m);
 	mutex_unlock(&info->http_mu);
 	return err;
 }
@@ -1489,7 +1737,7 @@ static int http_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
 	struct aios_dir_table dt;
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	char name[AIOS_KABI_NAME_MAX + 1];
 	u64 child;
 	int err;
@@ -1503,7 +1751,7 @@ static int http_unlink(struct inode *dir, struct dentry *dentry)
 	err = dir_table_init(&dt, info->volume, dir->i_ino);
 	if (err)
 		goto out;
-	err = dir_load(info, &dt);
+	err = dir_load(info, &dt, false);
 	if (err)
 		goto out_dt;
 	err = dir_find(&dt, name, &child);
@@ -1525,6 +1773,7 @@ static int http_unlink(struct inode *dir, struct dentry *dentry)
 	d_drop(dentry);
 out_dt:
 	dir_table_free(&dt);
+	inode_meta_reset(&m);
 out:
 	mutex_unlock(&info->http_mu);
 	return err;
@@ -1534,7 +1783,7 @@ static int http_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
 	struct aios_dir_table dt, child_dt;
-	struct aios_inode_meta m, pmeta;
+	struct aios_inode_meta m = { 0 }, pmeta = { 0 };
 	char name[AIOS_KABI_NAME_MAX + 1];
 	u64 child;
 	int err;
@@ -1548,7 +1797,7 @@ static int http_rmdir(struct inode *dir, struct dentry *dentry)
 	err = dir_table_init(&dt, info->volume, dir->i_ino);
 	if (err)
 		goto out;
-	err = dir_load(info, &dt);
+	err = dir_load(info, &dt, false);
 	if (err)
 		goto out_dt;
 	err = dir_find(&dt, name, &child);
@@ -1564,7 +1813,7 @@ static int http_rmdir(struct inode *dir, struct dentry *dentry)
 	err = dir_table_init(&child_dt, info->volume, child);
 	if (err)
 		goto out_dt;
-	err = dir_load(info, &child_dt);
+	err = dir_load(info, &child_dt, false);
 	if (err) {
 		dir_table_free(&child_dt);
 		goto out_dt;
@@ -1607,23 +1856,25 @@ static int http_rmdir(struct inode *dir, struct dentry *dentry)
 	err = 0;
 out_dt:
 	dir_table_free(&dt);
+	inode_meta_reset(&m);
+	inode_meta_reset(&pmeta);
 out:
 	mutex_unlock(&info->http_mu);
 	return err;
 }
 
 static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const char *old_name,
-				const char *new_name)
+				const char *new_name, bool noreplace)
 {
 	struct aios_dir_table dt;
-	struct aios_inode_meta victim;
+	struct aios_inode_meta victim = { 0 };
 	u64 victim_ino = 0;
 	int err;
 
 	err = dir_table_init(&dt, info->volume, parent);
 	if (err)
 		return err;
-	err = dir_load(info, &dt);
+	err = dir_load(info, &dt, false);
 	if (err)
 		goto out;
 	if (dir_find(&dt, old_name, NULL)) {
@@ -1631,6 +1882,10 @@ static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const cha
 		goto out;
 	}
 	if (!dir_find(&dt, new_name, &victim_ino)) {
+		if (noreplace) {
+			err = -EEXIST;
+			goto out;
+		}
 		err = load_inode(info, victim_ino, &victim);
 		if (err)
 			goto out;
@@ -1640,7 +1895,7 @@ static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const cha
 			err = dir_table_init(&child_dt, info->volume, victim_ino);
 			if (err)
 				goto out;
-			err = dir_load(info, &child_dt);
+			err = dir_load(info, &child_dt, false);
 			if (!err && child_dt.count) {
 				dir_table_free(&child_dt);
 				err = -ENOTEMPTY;
@@ -1659,18 +1914,19 @@ static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const cha
 		aios_http_drop_link(info, victim_ino);
 out:
 	dir_table_free(&dt);
+	inode_meta_reset(&victim);
 	return err;
 }
 
 static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, const char *old_name,
-				 u64 new_parent, const char *new_name)
+				 u64 new_parent, const char *new_name, bool noreplace)
 {
 	int attempt;
 	int err = -EAGAIN;
 
 	for (attempt = 0; attempt < 8; attempt++) {
 		struct aios_dir_table old_dir, new_dir;
-		struct aios_inode_meta moved, victim, old_p, new_p;
+		struct aios_inode_meta moved = { 0 }, victim = { 0 }, old_p = { 0 }, new_p = { 0 };
 		struct aios_held_lock locks[4];
 		char txn_id[128];
 		char oid[160];
@@ -1682,7 +1938,6 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 		bool victim_exists = false;
 		unsigned int nlocks = 4;
 
-		memset(&victim, 0, sizeof(victim));
 		err = dir_table_init(&old_dir, info->volume, old_parent);
 		if (err)
 			return err;
@@ -1691,10 +1946,10 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 			dir_table_free(&old_dir);
 			return err;
 		}
-		err = dir_load(info, &old_dir);
+		err = dir_load(info, &old_dir, false);
 		if (err)
 			goto next;
-		err = dir_load(info, &new_dir);
+		err = dir_load(info, &new_dir, false);
 		if (err)
 			goto next;
 
@@ -1710,6 +1965,10 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 			goto next;
 
 		if (!dir_find(&new_dir, new_name, &victim_ino)) {
+			if (noreplace && victim_ino != ino) {
+				err = -EEXIST;
+				goto next;
+			}
 			if (victim_ino != ino) {
 				err = load_inode(info, victim_ino, &victim);
 				if (err && err != -ENOENT)
@@ -1751,6 +2010,10 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 		if (err == -EAGAIN) {
 			dir_table_free(&old_dir);
 			dir_table_free(&new_dir);
+			inode_meta_reset(&moved);
+			inode_meta_reset(&victim);
+			inode_meta_reset(&old_p);
+			inode_meta_reset(&new_p);
 			msleep(20);
 			continue;
 		}
@@ -1758,10 +2021,10 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 			goto next;
 
 		/* Reload under locks. */
-		err = dir_load(info, &old_dir);
+		err = dir_load(info, &old_dir, false);
 		if (err)
 			goto unlock;
-		err = dir_load(info, &new_dir);
+		err = dir_load(info, &new_dir, false);
 		if (err)
 			goto unlock;
 		{
@@ -1774,6 +2037,10 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 				release_held_locks(info, locks, nlocks);
 				dir_table_free(&old_dir);
 				dir_table_free(&new_dir);
+				inode_meta_reset(&moved);
+				inode_meta_reset(&victim);
+				inode_meta_reset(&old_p);
+				inode_meta_reset(&new_p);
 				continue;
 			}
 		}
@@ -1786,12 +2053,20 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 					release_held_locks(info, locks, nlocks);
 					dir_table_free(&old_dir);
 					dir_table_free(&new_dir);
+					inode_meta_reset(&moved);
+					inode_meta_reset(&victim);
+					inode_meta_reset(&old_p);
+					inode_meta_reset(&new_p);
 					continue;
 				}
 			} else if (victim_ino && victim_ino != ino) {
 				release_held_locks(info, locks, nlocks);
 				dir_table_free(&old_dir);
 				dir_table_free(&new_dir);
+				inode_meta_reset(&moved);
+				inode_meta_reset(&victim);
+				inode_meta_reset(&old_p);
+				inode_meta_reset(&new_p);
 				continue;
 			}
 		}
@@ -1906,10 +2181,16 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 		if (err)
 			goto abort;
 		txn_id[0] = '\0';
+		dir_cache_publish(info, &old_dir);
+		dir_cache_publish(info, &new_dir);
 
 		release_held_locks(info, locks, nlocks);
 		dir_table_free(&old_dir);
 		dir_table_free(&new_dir);
+		inode_meta_reset(&moved);
+		inode_meta_reset(&victim);
+		inode_meta_reset(&old_p);
+		inode_meta_reset(&new_p);
 
 		if (delete_victim && victim_ino && victim_size) {
 			u64 chunks = (victim_size + victim_unit - 1) / victim_unit;
@@ -1930,7 +2211,12 @@ unlock:
 next:
 		dir_table_free(&old_dir);
 		dir_table_free(&new_dir);
-		if (err == -ENOENT || err == -EINVAL || err == -EISDIR || err == -ENOTDIR)
+		inode_meta_reset(&moved);
+		inode_meta_reset(&victim);
+		inode_meta_reset(&old_p);
+		inode_meta_reset(&new_p);
+		if (err == -ENOENT || err == -EINVAL || err == -EISDIR || err == -ENOTDIR ||
+		    err == -EEXIST)
 			return err;
 		if (err == -EAGAIN) {
 			msleep(20);
@@ -1946,7 +2232,7 @@ static int http_link(struct dentry *old_dentry, struct inode *dir, struct dentry
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
 	struct aios_dir_table new_dt;
-	struct aios_inode_meta m, np;
+	struct aios_inode_meta m = { 0 }, np = { 0 };
 	struct inode *inode = d_inode(old_dentry);
 	char new_name[AIOS_KABI_NAME_MAX + 1];
 	char inos[32];
@@ -1980,7 +2266,7 @@ static int http_link(struct dentry *old_dentry, struct inode *dir, struct dentry
 	err = dir_table_init(&new_dt, info->volume, dir->i_ino);
 	if (err)
 		goto out;
-	err = dir_load(info, &new_dt);
+	err = dir_load(info, &new_dt, false);
 	if (err)
 		goto out_dt;
 	if (!dir_find(&new_dt, new_name, NULL)) {
@@ -2013,9 +2299,12 @@ static int http_link(struct dentry *old_dentry, struct inode *dir, struct dentry
 	}
 	ihold(inode);
 	d_instantiate(dentry, inode);
+	aios_d_mark_fresh(dentry);
 out_dt:
 	dir_table_free(&new_dt);
 out:
+	inode_meta_reset(&m);
+	inode_meta_reset(&np);
 	mutex_unlock(&info->http_mu);
 	return err;
 }
@@ -2029,7 +2318,7 @@ static int http_rename(AIOS_IDMAP *mnt_userns, struct inode *old_dir,
 	char new_name[AIOS_KABI_NAME_MAX + 1];
 	int err;
 
-	if (flags)
+	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 	if (old_dentry->d_name.len > AIOS_KABI_NAME_MAX ||
 	    new_dentry->d_name.len > AIOS_KABI_NAME_MAX)
@@ -2043,10 +2332,11 @@ static int http_rename(AIOS_IDMAP *mnt_userns, struct inode *old_dir,
 
 	mutex_lock(&info->http_mu);
 	if (old_dir->i_ino == new_dir->i_ino)
-		err = http_rename_same_dir(info, old_dir->i_ino, old_name, new_name);
+		err = http_rename_same_dir(info, old_dir->i_ino, old_name, new_name,
+					   flags & RENAME_NOREPLACE);
 	else
 		err = http_rename_cross_dir(info, old_dir->i_ino, old_name, new_dir->i_ino,
-					    new_name);
+					    new_name, flags & RENAME_NOREPLACE);
 	mutex_unlock(&info->http_mu);
 	return err;
 }
@@ -2055,10 +2345,13 @@ static int http_getattr(AIOS_IDMAP *mnt_userns, const struct path *path,
 			struct kstat *stat, u32 request_mask, unsigned int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
-	int err = http_refresh(inode);
 
-	if (err)
-		return err;
+	if (!aios_d_is_fresh(path->dentry)) {
+		int err = http_refresh(inode);
+
+		if (err)
+			return err;
+	}
 	aios_fillattr(mnt_userns, inode, stat);
 	return 0;
 }
@@ -2107,7 +2400,7 @@ static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 {
 	struct inode *inode = d_inode(dentry);
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	int err;
 
 	err = setattr_prepare(mnt_userns, dentry, attr);
@@ -2153,8 +2446,151 @@ static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 	setattr_copy(mnt_userns, inode, attr);
 	mark_inode_dirty(inode);
 out:
+	inode_meta_reset(&m);
 	mutex_unlock(&info->http_mu);
 	return err;
+}
+
+static void http_kfree_link(void *p)
+{
+	kfree(p);
+}
+
+static int http_symlink(AIOS_IDMAP *mnt_userns, struct inode *dir, struct dentry *dentry,
+			const char *target)
+{
+	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
+	struct aios_dir_table dt;
+	struct aios_inode_meta pmeta = { 0 }, m = { 0 };
+	struct inode *inode;
+	char name[AIOS_KABI_NAME_MAX + 1];
+	char inos[32];
+	size_t tlen;
+	u64 ino, ts;
+	int err;
+
+	(void)mnt_userns;
+	tlen = target ? strlen(target) : 0;
+	if (!tlen || tlen > AIOS_KABI_SYMLINK_MAX)
+		return -ENAMETOOLONG;
+	if (dentry->d_name.len > AIOS_KABI_NAME_MAX)
+		return -ENAMETOOLONG;
+	memcpy(name, dentry->d_name.name, dentry->d_name.len);
+	name[dentry->d_name.len] = '\0';
+	if (strchr(name, '/'))
+		return -EINVAL;
+
+	mutex_lock(&info->http_mu);
+	err = load_inode(info, dir->i_ino, &pmeta);
+	if (err)
+		goto out;
+	if (!S_ISDIR(pmeta.mode)) {
+		err = -ENOTDIR;
+		goto out;
+	}
+	err = dir_table_init(&dt, info->volume, dir->i_ino);
+	if (err)
+		goto out;
+	err = dir_load(info, &dt, false);
+	if (err)
+		goto out_dt;
+	if (!dir_find(&dt, name, NULL)) {
+		err = -EEXIST;
+		goto out_dt;
+	}
+	err = alloc_ino(info, &ino);
+	if (err)
+		goto out_dt;
+	ts = now_ns();
+	m.ino = ino;
+	m.mode = S_IFLNK | 0777;
+	m.nlink = 1;
+	m.uid = from_kuid(&init_user_ns, current_fsuid());
+	m.gid = from_kgid(&init_user_ns, current_fsgid());
+	m.size = tlen;
+	m.symlink = kstrdup(target, GFP_KERNEL);
+	if (!m.symlink) {
+		err = -ENOMEM;
+		goto out_dt;
+	}
+	m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
+	m.stripe_unit = info->stripe_unit ? info->stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+	m.stripe_width = info->stripe_width ? info->stripe_width : AIOS_HTTP_DEFAULT_STRIPE_WIDTH;
+	m.cas = 0;
+	m.extras_loaded = true;
+	err = store_inode(info, &m);
+	if (err)
+		goto out_dt;
+	snprintf(inos, sizeof(inos), "%llu", (unsigned long long)ino);
+	err = apply_dir_op(&dt, AIOS_HTTP_OP_LINK, name, inos);
+	if (err)
+		goto out_dt;
+	err = dir_store_compact(info, &dt);
+	if (err)
+		goto out_dt;
+	pmeta.mtime_ns = pmeta.ctime_ns = ts;
+	err = store_inode(info, &pmeta);
+	if (err)
+		goto out_dt;
+	inode = aios_http_iget(dir->i_sb, &m);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		goto out_dt;
+	}
+	d_instantiate(dentry, inode);
+	aios_d_mark_fresh(dentry);
+	{
+		struct aios_kabi_stat st;
+
+		meta_to_stat(&pmeta, &st);
+		aios_stat_to_inode(dir, &st);
+	}
+out_dt:
+	dir_table_free(&dt);
+out:
+	inode_meta_reset(&pmeta);
+	inode_meta_reset(&m);
+	mutex_unlock(&info->http_mu);
+	return err;
+}
+
+static const char *http_get_link(struct dentry *dentry, struct inode *inode,
+				 struct delayed_call *done)
+{
+	struct aios_inode_aux *aux = inode->i_private;
+	struct aios_sb_info *info;
+	struct aios_inode_meta m = { 0 };
+	char *s;
+	int err;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+	if (aux && aux->symlink) {
+		s = kstrdup(aux->symlink, GFP_KERNEL);
+		if (!s)
+			return ERR_PTR(-ENOMEM);
+		set_delayed_call(done, http_kfree_link, s);
+		return s;
+	}
+	info = AIOS_SB(inode->i_sb);
+	mutex_lock(&info->http_mu);
+	err = load_inode(info, inode->i_ino, &m);
+	mutex_unlock(&info->http_mu);
+	if (err) {
+		inode_meta_reset(&m);
+		return ERR_PTR(err);
+	}
+	if (!S_ISLNK(m.mode) || !m.symlink) {
+		inode_meta_reset(&m);
+		return ERR_PTR(-EINVAL);
+	}
+	s = kstrdup(m.symlink, GFP_KERNEL);
+	attach_iinfo(inode, &m);
+	inode_meta_reset(&m);
+	if (!s)
+		return ERR_PTR(-ENOMEM);
+	set_delayed_call(done, http_kfree_link, s);
+	return s;
 }
 
 const struct inode_operations aios_http_dir_inode_ops = {
@@ -2165,12 +2601,20 @@ const struct inode_operations aios_http_dir_inode_ops = {
 	.rmdir = http_rmdir,
 	.rename = http_rename,
 	.link = http_link,
+	.symlink = http_symlink,
 	.getattr = http_getattr,
 	.setattr = http_setattr,
 	.listxattr = aios_listxattr,
 };
 
 const struct inode_operations aios_http_file_inode_ops = {
+	.getattr = http_getattr,
+	.setattr = http_setattr,
+	.listxattr = aios_listxattr,
+};
+
+const struct inode_operations aios_http_symlink_inode_ops = {
+	.get_link = http_get_link,
 	.getattr = http_getattr,
 	.setattr = http_setattr,
 	.listxattr = aios_listxattr,
@@ -2197,14 +2641,14 @@ static int http_readdir(struct file *file, struct dir_context *ctx)
 	err = dir_table_init(&dt, info->volume, inode->i_ino);
 	if (err)
 		goto out;
-	err = dir_load(info, &dt);
+	err = dir_load(info, &dt, true);
 	if (err)
 		goto out_dt;
 
 	/* pos 0,1 are . and ..; entries start at pos 2 */
 	for (i = 0; i < dt.count; i++) {
 		loff_t pos = (loff_t)i + 2;
-		struct aios_inode_meta m;
+		struct aios_inode_meta m = { 0 };
 		unsigned char type = DT_UNKNOWN;
 
 		if (ctx->pos > pos)
@@ -2214,7 +2658,10 @@ static int http_readdir(struct file *file, struct dir_context *ctx)
 				type = DT_DIR;
 			else if (S_ISREG(m.mode))
 				type = DT_REG;
+			else if (S_ISLNK(m.mode))
+				type = DT_LNK;
 		}
+		inode_meta_reset(&m);
 		if (!dir_emit(ctx, dt.ents[i].name, strlen(dt.ents[i].name), dt.ents[i].ino,
 			      type))
 			break;
@@ -2236,8 +2683,8 @@ const struct file_operations aios_http_dir_ops = {
 int aios_http_io_read(struct inode *inode, loff_t pos, void *buf, size_t len, size_t *out_len)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m;
-	struct aios_iinfo *ii = inode->i_private;
+	struct aios_inode_meta m = { 0 };
+	struct aios_inode_aux *ii = inode->i_private;
 	u64 unit, p, end;
 	size_t written = 0;
 	int err;
@@ -2337,10 +2784,46 @@ static int http_chunk_write(struct aios_http_client *c, const char *volume, u64 
 	return 0;
 }
 
+static void mark_http_size_dirty(struct inode *inode, u64 new_size, size_t wrote)
+{
+	struct aios_inode_aux *aux = inode->i_private;
+
+	i_size_write(inode, new_size);
+	inode->i_mtime = inode->i_ctime = current_time(inode);
+	aios_set_inode_blocks(inode);
+	if (aux) {
+		if (!aux->dirty_since)
+			aux->dirty_since = jiffies;
+		aux->dirty_bytes += wrote;
+	}
+	mark_inode_dirty_sync(inode);
+}
+
+static bool http_should_flush_size(struct aios_inode_aux *aux)
+{
+	if (!aux || !aux->dirty_since)
+		return false;
+	if (aux->dirty_bytes >= AIOS_DIRTY_FLUSH_BYTES)
+		return true;
+	return time_after(jiffies, aux->dirty_since + msecs_to_jiffies(AIOS_DIRTY_FLUSH_MS));
+}
+
+static void http_clear_size_dirty(struct inode *inode, u64 size)
+{
+	struct aios_inode_aux *aux = inode->i_private;
+
+	if (!aux)
+		return;
+	aux->last_synced_size = size;
+	aux->dirty_bytes = 0;
+	aux->dirty_since = 0;
+}
+
 int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t len)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
+	struct aios_inode_aux *aux;
 	u64 unit;
 	int err;
 
@@ -2361,10 +2844,16 @@ int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t 
 		goto out;
 	m.size = max_t(u64, m.size, (u64)pos + len);
 	m.mtime_ns = m.ctime_ns = now_ns();
-	err = store_inode(info, &m);
-	if (!err)
-		attach_iinfo(inode, &m);
+	attach_iinfo(inode, &m);
+	mark_http_size_dirty(inode, m.size, len);
+	aux = inode->i_private;
+	if (http_should_flush_size(aux)) {
+		err = store_inode(info, &m);
+		if (!err)
+			http_clear_size_dirty(inode, m.size);
+	}
 out:
+	inode_meta_reset(&m);
 	mutex_unlock(&info->http_mu);
 	return err;
 }
@@ -2481,7 +2970,7 @@ static int aios_http_writepages_noio(struct address_space *mapping,
 	struct inode *inode = mapping->host;
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	struct aios_http_wb_page *batch;
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	struct aios_http_wb_chunk *chunks = NULL;
 	unsigned int n = 0, nchunks = 0, i, c;
 	u64 unit, max_end = 0;
@@ -2570,14 +3059,23 @@ static int aios_http_writepages_noio(struct address_space *mapping,
 	}
 
 	if (!err && max_end) {
+		size_t wrote = 0;
+
+		for (i = 0; i < n; i++)
+			wrote += batch[i].len;
 		mutex_lock(&info->http_mu);
 		if (!load_inode(info, inode->i_ino, &m) && S_ISREG(m.mode)) {
 			m.size = max_t(u64, m.size, max_end);
 			m.mtime_ns = m.ctime_ns = now_ns();
-			err = store_inode(info, &m);
-			if (!err)
-				attach_iinfo(inode, &m);
+			attach_iinfo(inode, &m);
+			mark_http_size_dirty(inode, m.size, wrote);
+			if (http_should_flush_size(inode->i_private)) {
+				err = store_inode(info, &m);
+				if (!err)
+					http_clear_size_dirty(inode, m.size);
+			}
 		}
+		inode_meta_reset(&m);
 		mutex_unlock(&info->http_mu);
 	}
 
@@ -2629,7 +3127,7 @@ int aios_http_writepages(struct address_space *mapping, struct writeback_control
 int aios_http_io_set_size(struct inode *inode, loff_t size)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	int err;
 
 	mutex_lock(&info->http_mu);
@@ -2645,9 +3143,12 @@ int aios_http_io_set_size(struct inode *inode, loff_t size)
 		goto out;
 	}
 	err = truncate_file(info, &m, (u64)size);
-	if (!err)
+	if (!err) {
 		attach_iinfo(inode, &m);
+		http_clear_size_dirty(inode, m.size);
+	}
 out:
+	inode_meta_reset(&m);
 	mutex_unlock(&info->http_mu);
 	return err;
 }
@@ -2656,7 +3157,7 @@ out:
 int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m;
+	struct aios_inode_meta m = { 0 };
 	u64 unit, start, end, p;
 	int err;
 
@@ -2732,6 +3233,7 @@ int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len)
 	if (!err)
 		attach_iinfo(inode, &m);
 out:
+	inode_meta_reset(&m);
 	mutex_unlock(&info->http_mu);
 	return err;
 }
@@ -2777,9 +3279,7 @@ static int http_load_xattrs(struct aios_sb_info *info, u64 ino, struct aios_xa_e
 static int http_store_xattrs(struct aios_sb_info *info, u64 ino, struct aios_xa_ent *ents,
 			     unsigned int n, u64 cas, const char *raw_js)
 {
-	struct aios_inode_meta m;
-	char base[512];
-	char *xobj = NULL;
+	struct aios_inode_meta m = { 0 };
 	char *full = NULL;
 	size_t flen = 0;
 	char oid[160];
@@ -2788,22 +3288,27 @@ static int http_store_xattrs(struct aios_sb_info *info, u64 ino, struct aios_xa_
 	err = inode_from_json(raw_js, cas, &m);
 	if (err)
 		return err;
+	inode_load_extras(raw_js, &m);
+	kfree(m.xattrs_obj);
+	m.xattrs_obj = NULL;
 	m.ctime_ns = now_ns();
-	err = inode_to_json(&m, base, sizeof(base));
-	if (err)
-		return err;
 	if (n) {
-		err = build_xattrs_object(ents, n, &xobj);
-		if (err)
+		err = build_xattrs_object(ents, n, &m.xattrs_obj);
+		if (err) {
+			inode_meta_reset(&m);
 			return err;
+		}
 	}
-	err = inode_json_merge_xattrs(base, xobj, &full, &flen);
-	kfree(xobj);
-	if (err)
+	m.extras_loaded = true;
+	err = inode_to_json_full(info, &m, &full, &flen);
+	if (err) {
+		inode_meta_reset(&m);
 		return err;
+	}
 	oid_ino(info->volume, ino, oid, sizeof(oid));
 	err = aios_http_put(info->http, oid, full, flen, NULL, &cas);
 	kfree(full);
+	inode_meta_reset(&m);
 	return err;
 }
 
@@ -2997,8 +3502,11 @@ out:
 
 static int http_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
+	struct aios_sb_info *info = AIOS_SB(dentry->d_sb);
+	u64 su = info->stripe_unit ? info->stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+
 	buf->f_type = AIOSFS_MAGIC;
-	buf->f_bsize = 4096;
+	buf->f_bsize = su;
 	buf->f_blocks = 1ull << 40;
 	buf->f_bfree = 1ull << 39;
 	buf->f_bavail = 1ull << 39;
@@ -3031,6 +3539,7 @@ static void http_put_super(struct super_block *sb)
 		aios_http_client_destroy(info->http);
 		info->http = NULL;
 	}
+	dir_cache_free_all(info);
 	kfree(info);
 	sb->s_fs_info = NULL;
 }
@@ -3047,7 +3556,7 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 {
 	struct aios_http_pool *pool;
 	struct aios_http_client *c;
-	struct aios_inode_meta root;
+	struct aios_inode_meta root = { 0 };
 	struct inode *root_inode;
 	int err;
 
@@ -3064,12 +3573,17 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	info->mount_id = -1;
 	info->conn = NULL;
 	mutex_init(&info->http_mu);
+	info->dir_cache = kzalloc(sizeof(*info->dir_cache), GFP_KERNEL);
+	if (!info->dir_cache)
+		return -ENOMEM;
 
 	pool = aios_http_pool_create(info->endpoint, info->cluster_key,
 				     info->app_label[0] ? info->app_label : NULL,
 				     AIOSFS_HTTP_POOL_SIZE, GFP_KERNEL);
-	if (IS_ERR(pool))
+	if (IS_ERR(pool)) {
+		dir_cache_free_all(info);
 		return PTR_ERR(pool);
+	}
 	aios_http_pool_set_timeout_ms(pool, 30000);
 	info->http_pool = pool;
 	/* max_active tracks the client pool: extra workers would only pile up
@@ -3079,6 +3593,7 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	if (!info->wb_wq) {
 		aios_http_pool_destroy(pool);
 		info->http_pool = NULL;
+		dir_cache_free_all(info);
 		return -ENOMEM;
 	}
 	c = aios_http_pool_get(pool);
@@ -3107,10 +3622,13 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 		err = -ENOMEM;
 		goto fail;
 	}
+	aios_d_mark_fresh(sb->s_root);
+	inode_meta_reset(&root);
 	pr_info("aiosfs: mounted with backend=http (pool=%u)\n", AIOSFS_HTTP_POOL_SIZE);
 	return 0;
 
 fail:
+	inode_meta_reset(&root);
 	if (info->wb_wq) {
 		/* Nothing can be queued yet, but destroy before the pool the work
 		 * items reach into. */
@@ -3123,5 +3641,6 @@ fail:
 	if (info->http_pool)
 		aios_http_pool_destroy(info->http_pool);
 	info->http_pool = NULL;
+	dir_cache_free_all(info);
 	return err;
 }

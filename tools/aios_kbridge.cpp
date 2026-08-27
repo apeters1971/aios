@@ -9,6 +9,7 @@
 #include "aios_kabi.h"
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -206,11 +207,46 @@ bool serve_one(int fd, const aios_kabi_req_hdr& hdr, const std::vector<uint8_t>&
       return write_reply(fd, hdr.unique, rc, nullptr, 0);
     }
     case AIOS_OP_RENAME: {
-      if (payload.size() < sizeof(aios_kabi_rename_in))
+      if (payload.size() < offsetof(aios_kabi_rename_in, flags))
         return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
       auto* in = reinterpret_cast<const aios_kabi_rename_in*>(payload.data());
-      int rc = aios_posix_rename(fs, in->old_parent, in->old_name, in->new_parent, in->new_name);
+      unsigned flags = 0;
+      if (payload.size() >= sizeof(*in)) flags = in->flags;
+      int rc = aios_posix_rename2(fs, in->old_parent, in->old_name, in->new_parent, in->new_name,
+                                  flags);
       return write_reply(fd, hdr.unique, rc, nullptr, 0);
+    }
+    case AIOS_OP_SYMLINK: {
+      if (payload.size() < sizeof(aios_kabi_symlink_in))
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      auto* in = reinterpret_cast<const aios_kabi_symlink_in*>(payload.data());
+      aios_posix_stat st{};
+      int rc = aios_posix_symlink(fs, in->parent, in->name, in->target, &st);
+      if (rc) return write_reply(fd, hdr.unique, rc, nullptr, 0);
+      aios_kabi_stat out{};
+      fill_kstat(st, &out);
+      return write_reply(fd, hdr.unique, 0, &out, sizeof(out));
+    }
+    case AIOS_OP_READLINK: {
+      if (payload.size() < sizeof(aios_kabi_readlink_in))
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      auto* in = reinterpret_cast<const aios_kabi_readlink_in*>(payload.data());
+      if (in->size == 0) {
+        int rc = aios_posix_readlink(fs, in->ino, nullptr, 0);
+        if (rc < 0) return write_reply(fd, hdr.unique, rc, nullptr, 0);
+        aios_kabi_xattr_out out{};
+        out.size = static_cast<uint32_t>(rc);
+        return write_reply(fd, hdr.unique, 0, &out, sizeof(out));
+      }
+      uint32_t n = in->size;
+      if (n > AIOS_KABI_SYMLINK_MAX + 1) n = AIOS_KABI_SYMLINK_MAX + 1;
+      std::vector<uint8_t> buf(sizeof(aios_kabi_xattr_out) + n);
+      auto* hdr_out = reinterpret_cast<aios_kabi_xattr_out*>(buf.data());
+      int rc = aios_posix_readlink(fs, in->ino, reinterpret_cast<char*>(hdr_out + 1), n);
+      if (rc < 0) return write_reply(fd, hdr.unique, rc, nullptr, 0);
+      hdr_out->size = static_cast<uint32_t>(rc);
+      return write_reply(fd, hdr.unique, 0, buf.data(),
+                         static_cast<uint32_t>(sizeof(*hdr_out) + rc));
     }
     case AIOS_OP_LINK: {
       if (payload.size() < sizeof(aios_kabi_link_in))

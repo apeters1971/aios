@@ -20,6 +20,7 @@ extern "C" {
 #define AIOS_KABI_MAGIC 0x41494F53u /* 'AIOS' */
 #define AIOS_KABI_VERSION 1
 #define AIOS_KABI_NAME_MAX 255
+#define AIOS_KABI_SYMLINK_MAX 4095
 #define AIOS_KABI_DEV_NAME "aios_bridge"
 #define AIOS_KABI_MAX_PAYLOAD (1024u * 1024u)
 
@@ -45,6 +46,8 @@ enum aios_kabi_opcode {
   AIOS_OP_GETXATTR = 19,
   AIOS_OP_LISTXATTR = 20,
   AIOS_OP_REMOVEXATTR = 21,
+  AIOS_OP_SYMLINK = 22,
+  AIOS_OP_READLINK = 23,
 };
 
 /* Wire-format inode attributes (packed, LE on the wire as host for Alma9 x86_64). */
@@ -156,6 +159,21 @@ struct aios_kabi_rename_in {
   uint64_t new_parent;
   char old_name[AIOS_KABI_NAME_MAX + 1];
   char new_name[AIOS_KABI_NAME_MAX + 1];
+  uint32_t flags; /* linux renameat2; added at end for old kbridge binaries */
+  uint32_t _pad;
+};
+
+struct aios_kabi_symlink_in {
+  uint64_t parent;
+  char name[AIOS_KABI_NAME_MAX + 1];
+  char target[AIOS_KABI_SYMLINK_MAX + 1];
+};
+
+/* AIOS_OP_READLINK: size==0 queries length (including NUL). */
+struct aios_kabi_readlink_in {
+  uint64_t ino;
+  uint32_t size;
+  uint32_t _pad;
 };
 
 struct aios_kabi_link_in {

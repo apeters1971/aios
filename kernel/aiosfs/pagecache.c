@@ -407,16 +407,27 @@ int aios_write_inode(struct inode *inode, struct writeback_control *wbc)
 	if ((u64)size < aux->last_synced_size)
 		return 0;
 	err = aios_io_set_size(inode, size);
-	if (!err)
+	if (!err) {
 		aux->last_synced_size = (u64)size;
+		aux->dirty_bytes = 0;
+		aux->dirty_since = 0;
+	}
 	return err;
 }
 
 void aios_evict_inode(struct inode *inode)
 {
+	struct aios_inode_aux *aux = inode->i_private;
+
+	if (S_ISREG(inode->i_mode) && aux && aux->dirty_since)
+		aios_io_set_size(inode, i_size_read(inode));
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
-	kfree(inode->i_private);
+	if (aux) {
+		kfree(aux->xattrs_obj);
+		kfree(aux->symlink);
+		kfree(aux);
+	}
 	inode->i_private = NULL;
 }
 
