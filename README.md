@@ -1,5 +1,7 @@
 # AIOS
 
+> **Experimental / untested.** This project is early and not a finished product. Do not use it in a production environment or with anything other than test data.
+
 <p align="center">
   <img src="web/admin/aios-icon.png" alt="AIOS" width="160" height="160" />
 </p>
