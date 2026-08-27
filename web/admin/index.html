@@ -274,52 +274,8 @@
 
       <section id="tab-lifecycle" class="panel hidden">
         <h2>Lifecycle</h2>
-        <p class="note">Operator lifecycle <code>up</code>/<code>drain</code>/<code>off</code> is separate from gossip <code>online</code>/<code>suspect</code>/<code>offline</code>. Placement prefers distinct <code>rack</code> (node YAML default, optional <code>.aios</code> override), then node, then mount. Weight: omit in <code>.aios</code> → total capacity; autotune uses free space with hysteresis.</p>
-        <h3>This node</h3>
-        <form id="lifecycle-node-form" class="s3-form">
-          <label class="field"><span>Node state</span>
-            <select id="lifecycle-node-state">
-              <option value="up">up</option>
-              <option value="drain">drain</option>
-              <option value="off">off</option>
-            </select>
-          </label>
-          <button type="submit" class="btn primary">Set node state</button>
-        </form>
-        <h3>Weight autotune</h3>
-        <form id="lifecycle-autotune-form" class="s3-form">
-          <label class="toggle">
-            <input type="checkbox" id="lifecycle-autotune-enabled" />
-            <span>Adjust weights from free space</span>
-          </label>
-          <label class="field"><span>Threshold %</span>
-            <input id="lifecycle-autotune-threshold" type="number" min="0" max="100" value="20" />
-          </label>
-          <label class="field"><span>Min delta</span>
-            <input id="lifecycle-autotune-min-delta" type="number" min="1" value="1" />
-          </label>
-          <button type="submit" class="btn primary">Save autotune</button>
-        </form>
-        <h3>Targets</h3>
+        <p class="note">Operator lifecycle <code>up</code>/<code>drain</code>/<code>off</code> is separate from gossip <code>online</code>/<code>suspect</code>/<code>offline</code>. Hosts are grouped first (this node at the top); change host or disk settings in the row and press Apply on the right. This console proxies writes to peers.</p>
         <div id="lifecycle-table" class="table-wrap"></div>
-        <h3>Set target</h3>
-        <form id="lifecycle-target-form" class="s3-form">
-          <label class="field"><span>Mount or aios path</span>
-            <input id="lifecycle-target-key" spellcheck="false" required placeholder="/mnt/disk0 or .../aios" />
-          </label>
-          <label class="field"><span>State</span>
-            <select id="lifecycle-target-state">
-              <option value="">(unchanged)</option>
-              <option value="up">up</option>
-              <option value="drain">drain</option>
-              <option value="off">off</option>
-            </select>
-          </label>
-          <label class="field"><span>Weight</span>
-            <input id="lifecycle-target-weight" type="number" min="1" placeholder="optional" />
-          </label>
-          <button type="submit" class="btn primary">Apply</button>
-        </form>
         <pre id="lifecycle-result" class="code-block small hidden"></pre>
         <p id="lifecycle-error" class="error" hidden></p>
       </section>

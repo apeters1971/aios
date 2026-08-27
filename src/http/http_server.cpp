@@ -113,6 +113,31 @@ std::string url_encode_path(const std::string& in) {
   return out;
 }
 
+bool split_http_addr(const std::string& addr, std::string& host, std::string& port) {
+  auto colon = addr.rfind(':');
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= addr.size()) return false;
+  host = addr.substr(0, colon);
+  port = addr.substr(colon + 1);
+  return !host.empty() && !port.empty();
+}
+
+std::string lookup_peer_http(const MembershipTable& membership, const std::string& node_id) {
+  for (const auto& m : membership.snapshot()) {
+    if (m.node_id == node_id) return m.http_addr;
+  }
+  return {};
+}
+
+struct PeerAdminResult {
+  int status{502};
+  nlohmann::json json;
+  std::string error;
+};
+
+PeerAdminResult peer_admin_request(const Config& cfg, const std::string& http_addr,
+                                   const std::string& method, const std::string& path,
+                                   const std::string& body);
+
 std::unordered_map<std::string, std::string> parse_query(const std::string& q) {
   std::unordered_map<std::string, std::string> out;
   std::size_t i = 0;
@@ -647,6 +672,132 @@ bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& 
   }
 }
 
+PeerAdminResult peer_admin_request(const Config& cfg, const std::string& http_addr,
+                                   const std::string& method, const std::string& path,
+                                   const std::string& body) {
+  PeerAdminResult out;
+  std::string host, port;
+  if (!split_http_addr(http_addr, host, port)) {
+    out.error = "peer has no http_addr";
+    return out;
+  }
+  std::unordered_map<std::string, std::string> headers;
+  const std::string date = std::to_string(now_ms());
+  headers["x-aios-date"] = date;
+  headers["x-aios-content-sha256"] = "UNSIGNED-PAYLOAD";
+  headers["content-type"] = "application/json";
+  headers["content-length"] = std::to_string(body.size());
+  headers["connection"] = "close";
+  const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
+  const auto canon =
+      http_canonical(method, path, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
+  const auto sig = http_sign(cfg.cluster_key, canon);
+  headers["authorization"] = "AIOS-HMAC-SHA256 Credential=admin-proxy, SignedHeaders=" +
+                             signed_headers + ", Signature=" + sig;
+
+  boost::system::error_code ec;
+  boost::asio::io_context ioc;
+  tcp::resolver res(ioc);
+  auto endpoints = res.resolve(host, port, ec);
+  if (ec) {
+    out.error = "resolve peer: " + ec.message();
+    return out;
+  }
+  tcp::socket sock(ioc);
+  boost::asio::connect(sock, endpoints, ec);
+  if (ec) {
+    out.error = "connect peer: " + ec.message();
+    return out;
+  }
+  set_session_timeouts(sock, 2500);
+
+  std::ostringstream req;
+  req << method << " " << path << " HTTP/1.1\r\nHost: " << host << ":" << port << "\r\n";
+  for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
+  req << "\r\n";
+  const auto head = req.str();
+  if (!sock_write_all(sock, head.data(), head.size(), ec)) {
+    out.error = "write peer: " + ec.message();
+    return out;
+  }
+  if (!body.empty() && !sock_write_all(sock, body.data(), body.size(), ec)) {
+    out.error = "write peer body: " + ec.message();
+    return out;
+  }
+
+  std::string status_line;
+  if (!read_line(sock, status_line, ec) || status_line.empty()) {
+    out.error = "empty peer response";
+    return out;
+  }
+  {
+    std::istringstream ls(status_line);
+    std::string ver, reason;
+    ls >> ver >> out.status;
+    if (out.status <= 0) out.status = 502;
+  }
+  std::size_t content_length = 0;
+  while (true) {
+    std::string hline;
+    if (!read_line(sock, hline, ec)) {
+      out.error = "peer headers";
+      return out;
+    }
+    if (hline.empty()) break;
+    auto colon = hline.find(':');
+    if (colon == std::string::npos) continue;
+    auto name = hline.substr(0, colon);
+    auto value = hline.substr(colon + 1);
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+      value.erase(value.begin());
+    for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (name == "content-length") {
+      try {
+        content_length = static_cast<std::size_t>(std::stoull(value));
+      } catch (...) {
+        out.error = "bad peer Content-Length";
+        return out;
+      }
+    }
+  }
+  if (content_length > 2u * 1024u * 1024u) {
+    out.error = "peer response too large";
+    return out;
+  }
+  std::string resp_body;
+  if (content_length) {
+    resp_body.resize(content_length);
+    if (!sock_read_exact(sock, resp_body.data(), content_length, ec)) {
+      out.error = "read peer body: " + ec.message();
+      return out;
+    }
+  }
+  if (!resp_body.empty()) {
+    try {
+      out.json = nlohmann::json::parse(resp_body);
+    } catch (...) {
+      out.error = "peer returned non-JSON";
+    }
+  }
+  return out;
+}
+
+void write_peer_admin(tcp::socket& sock, bool keep_alive, const PeerAdminResult& r) {
+  if (!r.error.empty() && !r.json.is_object()) {
+    write_json(sock, r.status > 0 ? r.status : 502, "Bad Gateway", {{"error", r.error}},
+               keep_alive);
+    return;
+  }
+  const int st = r.status > 0 ? r.status : 502;
+  const char* reason = (st >= 200 && st < 300) ? "OK" : "Error";
+  if (r.json.is_object() || r.json.is_array()) {
+    write_json(sock, st, reason, r.json, keep_alive);
+    return;
+  }
+  write_json(sock, st, reason, {{"error", r.error.empty() ? "peer request failed" : r.error}},
+             keep_alive);
+}
+
 constexpr std::int64_t kAdminSessionTtlMs = 12LL * 60 * 60 * 1000;
 constexpr const char* kAdminCookie = "aios_admin";
 
@@ -945,6 +1096,9 @@ nlohmann::json HttpServer::admin_lifecycle_json() const {
     };
     if (m.node_id == cfg_.node_id) {
       n["node_state"] = cfg_.node_state;
+      n["weight_autotune"] = cfg_.weight_autotune;
+      n["weight_autotune_threshold_pct"] = cfg_.weight_autotune_threshold_pct;
+      n["weight_autotune_min_delta"] = cfg_.weight_autotune_min_delta;
       if (!cfg_.rack.empty()) n["rack"] = cfg_.rack;
     }
     nodes.push_back(std::move(n));
@@ -1491,8 +1645,11 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     auto attrs = parse_attrs(headers);
 
     // Admin console API / web UI (only when node started with admin: true / --admin).
+    // Lifecycle GET/PUT is HMAC-authenticated on every node so the console can
+    // proxy host/disk settings to peers that are not running the admin UI.
+    const bool lifecycle_api = path.rfind("/admin/api/lifecycle", 0) == 0;
     if (path.rfind("/admin", 0) == 0 || path == "/metrics") {
-      if (!cfg_.admin) {
+      if (!cfg_.admin && !lifecycle_api) {
         write_json(*sock, 404, "Not Found",
                    {{"error", "admin API disabled (set admin: true)"}}, keep_alive);
         continue;
@@ -2016,6 +2173,17 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         continue;
       }
       if (method == "GET" && path == "/admin/api/lifecycle") {
+        const std::string peer = qmap.count("node_id") ? qmap.at("node_id") : "";
+        if (!peer.empty() && peer != cfg_.node_id) {
+          const auto addr = lookup_peer_http(membership_, peer);
+          if (addr.empty()) {
+            write_json(*sock, 404, "Not Found", {{"error", "unknown node_id"}}, keep_alive);
+          } else {
+            write_peer_admin(*sock, keep_alive,
+                             peer_admin_request(cfg_, addr, "GET", "/admin/api/lifecycle", ""));
+          }
+          continue;
+        }
         write_json(*sock, 200, "OK", admin_lifecycle_json(), keep_alive);
         continue;
       }
@@ -2025,6 +2193,19 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
               body.empty() ? "{}"
                            : std::string(reinterpret_cast<const char*>(body.data()), body.size());
           auto j = nlohmann::json::parse(raw);
+          const std::string peer = j.value("node_id", "");
+          if (!peer.empty() && peer != cfg_.node_id) {
+            j.erase("node_id");
+            const auto addr = lookup_peer_http(membership_, peer);
+            if (addr.empty()) {
+              write_json(*sock, 404, "Not Found", {{"error", "unknown node_id"}}, keep_alive);
+            } else {
+              write_peer_admin(*sock, keep_alive,
+                               peer_admin_request(cfg_, addr, "PUT", "/admin/api/lifecycle/node",
+                                                  j.dump()));
+            }
+            continue;
+          }
           if (!j.contains("state") || !j["state"].is_string()) {
             write_json(*sock, 400, "Bad Request", {{"error", "state required"}}, keep_alive);
             continue;
@@ -2052,6 +2233,19 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
               body.empty() ? "{}"
                            : std::string(reinterpret_cast<const char*>(body.data()), body.size());
           auto j = nlohmann::json::parse(raw);
+          const std::string peer = j.value("node_id", "");
+          if (!peer.empty() && peer != cfg_.node_id) {
+            j.erase("node_id");
+            const auto addr = lookup_peer_http(membership_, peer);
+            if (addr.empty()) {
+              write_json(*sock, 404, "Not Found", {{"error", "unknown node_id"}}, keep_alive);
+            } else {
+              write_peer_admin(
+                  *sock, keep_alive,
+                  peer_admin_request(cfg_, addr, "PUT", "/admin/api/lifecycle/autotune", j.dump()));
+            }
+            continue;
+          }
           if (j.contains("enabled")) {
             if (!j["enabled"].is_boolean()) {
               write_json(*sock, 400, "Bad Request", {{"error", "enabled must be boolean"}},
@@ -2111,6 +2305,19 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
               body.empty() ? "{}"
                            : std::string(reinterpret_cast<const char*>(body.data()), body.size());
           auto j = nlohmann::json::parse(raw);
+          const std::string peer = j.value("node_id", "");
+          if (!peer.empty() && peer != cfg_.node_id) {
+            j.erase("node_id");
+            const auto addr = lookup_peer_http(membership_, peer);
+            if (addr.empty()) {
+              write_json(*sock, 404, "Not Found", {{"error", "unknown node_id"}}, keep_alive);
+            } else {
+              write_peer_admin(
+                  *sock, keep_alive,
+                  peer_admin_request(cfg_, addr, "PUT", "/admin/api/lifecycle/target", j.dump()));
+            }
+            continue;
+          }
           std::optional<std::string> state;
           std::optional<int> weight;
           if (j.contains("state")) {

@@ -741,6 +741,164 @@ code {
 .s3-form .field { margin-bottom: 0; }
 .s3-form .btn { width: auto; justify-self: start; }
 
+/* —— Lifecycle table —— */
+
+.lifecycle-table {
+  min-width: 52rem;
+}
+
+.lifecycle-table th.apply,
+.lifecycle-table td.apply {
+  text-align: right;
+  white-space: nowrap;
+  width: 1%;
+  position: sticky;
+  right: 0;
+  background: var(--surface);
+  box-shadow: -8px 0 10px -10px rgba(28, 25, 22, 0.18);
+}
+
+.lifecycle-table th.apply {
+  background: var(--surface-2);
+}
+
+.lifecycle-table tr.host-row td {
+  background: var(--surface-2);
+  font-weight: 560;
+  border-bottom-color: rgba(28, 25, 22, 0.08);
+}
+
+.lifecycle-table tr.host-row td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.lifecycle-table tr.host-row td.apply {
+  background: var(--surface-2);
+}
+
+.lifecycle-table tr.host-row:hover td,
+.lifecycle-table tr.host-row:hover td.apply {
+  background: #efe8de;
+}
+
+.lifecycle-table tr.disk-row td {
+  background: var(--surface);
+}
+
+.lifecycle-table tr.disk-row:hover td {
+  background: rgba(184, 115, 51, 0.04);
+}
+
+.lifecycle-table tr.disk-row:hover td.apply,
+.lifecycle-table tr.disk-row td.apply {
+  background: inherit;
+}
+
+.lifecycle-table tr.host-last td {
+  border-bottom: 2px solid var(--line);
+}
+
+.lifecycle-table .host-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.15rem;
+}
+
+.lifecycle-table .host-meta {
+  margin-top: 0.2rem;
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.lifecycle-table .disk-name {
+  padding-left: 1.15rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  font-weight: 500;
+}
+
+.lifecycle-table .disk-mark {
+  flex: 0 0 auto;
+  width: 0.55rem;
+  height: 0.85rem;
+  margin-top: 0.15rem;
+  border-left: 1.5px solid rgba(28, 25, 22, 0.18);
+  border-bottom: 1.5px solid rgba(28, 25, 22, 0.18);
+}
+
+.lifecycle-table .disk-label {
+  min-width: 0;
+}
+
+.lifecycle-table .disk-path {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 0.78rem;
+  font-family: var(--mono);
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.lifecycle-table .cell-input,
+.lifecycle-table .cell-select {
+  width: 100%;
+  min-width: 5.5rem;
+  max-width: 8.5rem;
+  font: inherit;
+  font-size: 0.86rem;
+  padding: 0.32rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+}
+
+.lifecycle-table .cell-input.weight {
+  max-width: 6.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lifecycle-table .autotune {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.55rem;
+  font-weight: 400;
+  font-size: 0.82rem;
+}
+
+.lifecycle-table .autotune label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+
+.lifecycle-table .autotune input[type="number"] {
+  width: 3.6rem;
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.22rem 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.lifecycle-table .btn.apply-btn {
+  width: auto;
+  padding: 0.38rem 0.85rem;
+  font-size: 0.82rem;
+}
+
+.lifecycle-table .btn.apply-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 @media (max-width: 720px) {
   .topbar {
     align-items: flex-start;

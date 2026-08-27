@@ -247,6 +247,14 @@
     return `<tr class="empty-row"><td colspan="${cols}" class="empty">${msg}</td></tr>`;
   }
 
+  function esc(s) {
+    return String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   function badge(text, kind) {
     const k = kind ? ` ${kind}` : "";
     return `<span class="badge${k}">${text}</span>`;
@@ -528,7 +536,14 @@
     if (activeTab === "quota") await refreshQuota();
     if (activeTab === "qos") await refreshQos();
     if (activeTab === "posix-layout") await refreshPosixLayout();
-    if (activeTab === "lifecycle") await refreshLifecycle();
+    if (activeTab === "lifecycle") {
+      const ae = document.activeElement;
+      const editing =
+        ae &&
+        document.getElementById("lifecycle-table")?.contains(ae) &&
+        (ae.matches("input, select, button") || ae.closest("tr"));
+      if (!editing) await refreshLifecycle();
+    }
     if (activeTab === "actions") await refreshArchiveBackup();
   }
 
@@ -732,36 +747,129 @@
     else renderPosixLayout({ posix_layout_rules: [] });
   }
 
-  function renderLifecycle(doc) {
-    const ns = document.getElementById("lifecycle-node-state");
-    if (ns && doc && doc.node_state) ns.value = doc.node_state;
-    const en = document.getElementById("lifecycle-autotune-enabled");
-    const th = document.getElementById("lifecycle-autotune-threshold");
-    const md = document.getElementById("lifecycle-autotune-min-delta");
-    if (en && doc) en.checked = !!doc.weight_autotune;
-    if (th && doc && typeof doc.weight_autotune_threshold_pct === "number") {
-      th.value = doc.weight_autotune_threshold_pct;
-    }
-    if (md && doc && typeof doc.weight_autotune_min_delta === "number") {
-      md.value = doc.weight_autotune_min_delta;
-    }
-    const rows = ((doc && doc.targets) || [])
-      .map(
-        (t) =>
-          `<tr>
-            <td>${t.node_id || "—"}${t.self ? badge("self", "self") : ""}</td>
-            <td>${t.rack || "—"}</td>
-            <td>${t.mount || "—"}</td>
-            <td>${t.storage_class || "—"}</td>
-            <td>${t.weight ?? "—"}</td>
-            <td>${stateBadge(t.state)}</td>
-            <td class="muted">${t.aios_path || ""}</td>
-          </tr>`
-      )
+  function lifecycleStateSelect(id, value, disabled) {
+    const v = String(value || "up").toLowerCase();
+    const known = value != null && value !== "";
+    const opts = ["up", "drain", "off"]
+      .map((s) => `<option value="${s}"${known && s === v ? " selected" : ""}>${s}</option>`)
       .join("");
+    const extra = known ? "" : `<option value="" selected disabled>—</option>`;
+    return `<select class="cell-select" data-id="${esc(id)}" data-field="state"${
+      disabled ? " disabled" : ""
+    }>${extra}${opts}</select>`;
+  }
+
+  function renderLifecycle(doc) {
+    const nodes = [...((doc && doc.nodes) || [])];
+    const targets = [...((doc && doc.targets) || [])];
+    const byHost = new Map();
+    for (const n of nodes) {
+      if (!n || !n.node_id) continue;
+      byHost.set(n.node_id, { node: n, disks: [] });
+    }
+    for (const t of targets) {
+      const id = t.node_id || "unknown";
+      if (!byHost.has(id)) byHost.set(id, { node: { node_id: id, self: !!t.self }, disks: [] });
+      byHost.get(id).disks.push(t);
+    }
+    const hosts = [...byHost.values()].sort((a, b) => {
+      const as = a.node && a.node.self ? 0 : 1;
+      const bs = b.node && b.node.self ? 0 : 1;
+      if (as !== bs) return as - bs;
+      return String(a.node.node_id || "").localeCompare(String(b.node.node_id || ""));
+    });
+    for (const h of hosts) {
+      h.disks.sort((a, b) =>
+        String(a.mount || a.aios_path || "").localeCompare(String(b.mount || b.aios_path || ""))
+      );
+    }
+
+    const rows = [];
+    for (const h of hosts) {
+      const n = h.node || {};
+      const nid = n.node_id || "—";
+      const self = !!n.self;
+      const settingsOk = self || !!n.settings_ok;
+      const nodeState = settingsOk
+        ? n.node_state || (self ? doc.node_state : null)
+        : null;
+      const autoOn = settingsOk
+        ? n.weight_autotune != null
+          ? !!n.weight_autotune
+          : !!(self && doc.weight_autotune)
+        : false;
+      const autoTh = settingsOk
+        ? n.weight_autotune_threshold_pct != null
+          ? n.weight_autotune_threshold_pct
+          : self
+            ? doc.weight_autotune_threshold_pct ?? 20
+            : 20
+        : "";
+      const autoMd = settingsOk
+        ? n.weight_autotune_min_delta != null
+          ? n.weight_autotune_min_delta
+          : self
+            ? doc.weight_autotune_min_delta ?? 1
+            : 1
+        : "";
+      const gossip = n.member_state ? stateBadge(n.member_state) : "";
+      const diskLabel = `${h.disks.length} disk${h.disks.length === 1 ? "" : "s"}`;
+      const hostMeta = [n.http_addr || n.addr, diskLabel].filter(Boolean).join(" · ");
+      rows.push(`<tr class="host-row" data-node="${esc(nid)}">
+        <td><div class="host-cell">
+          <div class="host-name">${esc(nid)}${self ? badge("self", "self") : ""}${gossip}${
+            settingsOk ? "" : badge("unreachable", "warn")
+          }</div>
+          <div class="host-meta">${esc(hostMeta)}</div>
+        </div></td>
+        <td>${esc(n.rack || "—")}</td>
+        <td class="muted">host</td>
+        <td>${lifecycleStateSelect(`host-${nid}`, nodeState, !settingsOk)}</td>
+        <td class="muted">—</td>
+        <td>${
+          settingsOk
+            ? `<div class="autotune">
+            <label><input type="checkbox" data-id="${esc("auto-" + nid)}" data-field="autotune"${autoOn ? " checked" : ""} /> auto</label>
+            <label>% <input type="number" min="0" max="100" value="${esc(autoTh)}" data-id="${esc("th-" + nid)}" data-field="threshold" /></label>
+            <label>Δ <input type="number" min="1" value="${esc(autoMd)}" data-id="${esc("md-" + nid)}" data-field="mindelta" /></label>
+          </div>`
+            : `<span class="muted">settings unavailable</span>`
+        }</td>
+        <td class="apply"><button type="button" class="btn primary apply-btn" data-apply="host" data-node="${esc(nid)}"${
+          settingsOk ? "" : " disabled"
+        }>Apply</button></td>
+      </tr>`);
+      if (!h.disks.length) {
+        rows.push(
+          `<tr class="disk-row host-last"><td class="disk-name muted" colspan="7">No disks in the cluster map for this host</td></tr>`
+        );
+        continue;
+      }
+      h.disks.forEach((t, i) => {
+        const key = t.aios_path || t.mount || "";
+        const diskId = `${nid}:${key}`;
+        const last = i === h.disks.length - 1;
+        rows.push(`<tr class="disk-row${last ? " host-last" : ""}" data-node="${esc(nid)}" data-mount="${esc(t.mount || "")}" data-path="${esc(t.aios_path || "")}">
+          <td class="disk-name"><span class="disk-mark" aria-hidden="true"></span><span class="disk-label">${esc(t.mount || t.aios_path || "—")}${
+            t.aios_path && t.aios_path !== t.mount
+              ? `<span class="disk-path">${esc(t.aios_path)}</span>`
+              : ""
+          }</span></td>
+          <td>${esc(t.rack || n.rack || "—")}</td>
+          <td>${esc(t.storage_class || "—")}</td>
+          <td>${lifecycleStateSelect(diskId, t.state)}</td>
+          <td><input class="cell-input weight" type="number" min="1" value="${t.weight != null ? esc(t.weight) : ""}" placeholder="—" data-id="${esc(diskId)}" data-field="weight" /></td>
+          <td class="muted">—</td>
+          <td class="apply"><button type="button" class="btn primary apply-btn" data-apply="disk" data-node="${esc(nid)}" data-mount="${esc(t.mount || "")}" data-path="${esc(t.aios_path || "")}">Apply</button></td>
+        </tr>`);
+      });
+    }
+
     document.getElementById("lifecycle-table").innerHTML =
-      `<table><thead><tr><th>Node</th><th>Rack</th><th>Mount</th><th>Class</th><th>Weight</th><th>State</th><th>Path</th></tr></thead><tbody>${
-        rows || emptyRow(7, "No targets in map")
+      `<table class="lifecycle-table"><thead><tr>
+        <th>Host / disk</th><th>Rack</th><th>Class</th><th>State</th><th>Weight</th><th>Autotune</th><th class="apply">Apply</th>
+      </tr></thead><tbody>${
+        rows.length ? rows.join("") : emptyRow(7, "No hosts or disks in the cluster map")
       }</tbody></table>`;
   }
 
@@ -771,87 +879,111 @@
       showLogin("Session expired — sign in again.");
       return;
     }
-    if (res.ok) renderLifecycle(json);
-    else renderLifecycle({ targets: [] });
+    const doc = res.ok && json ? json : { targets: [], nodes: [] };
+    const remotes = (doc.nodes || []).filter((n) => n && n.node_id && !n.self);
+    if (remotes.length) {
+      const extras = await Promise.all(
+        remotes.map(async (n) => {
+          const r = await api("/admin/api/lifecycle?node_id=" + encodeURIComponent(n.node_id));
+          return [n.node_id, r.res.ok ? r.json : null];
+        })
+      );
+      const byId = new Map(extras);
+      doc.nodes = (doc.nodes || []).map((n) => {
+        if (n.self) return { ...n, settings_ok: true };
+        const extra = byId.get(n.node_id);
+        if (!extra) return { ...n, settings_ok: false };
+        return {
+          ...n,
+          settings_ok: true,
+          node_state: extra.node_state || n.node_state,
+          weight_autotune: extra.weight_autotune,
+          weight_autotune_threshold_pct: extra.weight_autotune_threshold_pct,
+          weight_autotune_min_delta: extra.weight_autotune_min_delta,
+        };
+      });
+    } else {
+      doc.nodes = (doc.nodes || []).map((n) => ({ ...n, settings_ok: !!n.self || n.settings_ok }));
+    }
+    renderLifecycle(doc);
   }
 
-  document.getElementById("lifecycle-node-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
+  function lifecycleMsg(ok, json, fallback) {
     const errEl = document.getElementById("lifecycle-error");
     const out = document.getElementById("lifecycle-result");
     errEl.hidden = true;
     out.classList.add("hidden");
-    const state = document.getElementById("lifecycle-node-state").value;
-    const { res, json } = await api("/admin/api/lifecycle/node", {
-      method: "PUT",
-      body: JSON.stringify({ state }),
-    });
-    if (!res.ok) {
+    if (!ok) {
       errEl.hidden = false;
-      errEl.textContent = (json && json.error) || "Set node state failed";
+      errEl.textContent = (json && json.error) || fallback;
       return;
     }
     out.classList.remove("hidden");
-    out.textContent = JSON.stringify(json, null, 2);
-    await refreshLifecycle();
-  });
+    out.textContent = typeof json === "string" ? json : JSON.stringify(json, null, 2);
+  }
 
-  document.getElementById("lifecycle-autotune-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
+  document.getElementById("lifecycle-table").addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-apply]");
+    if (!btn) return;
     const errEl = document.getElementById("lifecycle-error");
     const out = document.getElementById("lifecycle-result");
     errEl.hidden = true;
     out.classList.add("hidden");
-    const body = {
-      enabled: document.getElementById("lifecycle-autotune-enabled").checked,
-      threshold_pct: parseInt(document.getElementById("lifecycle-autotune-threshold").value, 10),
-      min_delta: parseInt(document.getElementById("lifecycle-autotune-min-delta").value, 10),
-    };
-    const { res, json } = await api("/admin/api/lifecycle/autotune", {
-      method: "PUT",
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      errEl.hidden = false;
-      errEl.textContent = (json && json.error) || "Save autotune failed";
-      return;
+    const node = btn.dataset.node || "";
+    const row = btn.closest("tr");
+    if (!row) return;
+    btn.disabled = true;
+    try {
+      if (btn.dataset.apply === "host") {
+        const state = row.querySelector('[data-field="state"]')?.value;
+        const enabled = !!row.querySelector('[data-field="autotune"]')?.checked;
+        const threshold_pct = parseInt(row.querySelector('[data-field="threshold"]')?.value, 10);
+        const min_delta = parseInt(row.querySelector('[data-field="mindelta"]')?.value, 10);
+        const nodeBody = { state, node_id: node };
+        const autoBody = { enabled, threshold_pct, min_delta, node_id: node };
+        const nres = await api("/admin/api/lifecycle/node", {
+          method: "PUT",
+          body: JSON.stringify(nodeBody),
+        });
+        if (!nres.res.ok) {
+          lifecycleMsg(false, nres.json, "Set node state failed");
+          return;
+        }
+        const ares = await api("/admin/api/lifecycle/autotune", {
+          method: "PUT",
+          body: JSON.stringify(autoBody),
+        });
+        if (!ares.res.ok) {
+          lifecycleMsg(false, ares.json, "Save autotune failed");
+          return;
+        }
+        lifecycleMsg(true, `Applied host settings on ${node}`);
+        await refreshLifecycle();
+        return;
+      }
+      if (btn.dataset.apply === "disk") {
+        const state = row.querySelector('[data-field="state"]')?.value;
+        const wraw = row.querySelector('[data-field="weight"]')?.value?.trim();
+        const body = { node_id: node };
+        if (btn.dataset.path) body.aios_path = btn.dataset.path;
+        else if (btn.dataset.mount) body.mount = btn.dataset.mount;
+        if (state) body.state = state;
+        if (wraw) body.weight = parseInt(wraw, 10);
+        if (!body.state && body.weight == null) {
+          lifecycleMsg(false, { error: "Set state and/or weight" });
+          return;
+        }
+        const { res, json } = await api("/admin/api/lifecycle/target", {
+          method: "PUT",
+          body: JSON.stringify(body),
+        });
+        const label = btn.dataset.mount || btn.dataset.path || "disk";
+        lifecycleMsg(res.ok, res.ok ? `Applied ${label} on ${node}` : json, "Set target failed");
+        if (res.ok) await refreshLifecycle();
+      }
+    } finally {
+      btn.disabled = false;
     }
-    out.classList.remove("hidden");
-    out.textContent = JSON.stringify(json, null, 2);
-    await refreshLifecycle();
-  });
-
-  document.getElementById("lifecycle-target-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const errEl = document.getElementById("lifecycle-error");
-    const out = document.getElementById("lifecycle-result");
-    errEl.hidden = true;
-    out.classList.add("hidden");
-    const key = document.getElementById("lifecycle-target-key").value.trim();
-    const state = document.getElementById("lifecycle-target-state").value;
-    const wraw = document.getElementById("lifecycle-target-weight").value.trim();
-    const body = {};
-    if (key.endsWith("/aios") || key.includes("/aios")) body.aios_path = key;
-    else body.mount = key;
-    if (state) body.state = state;
-    if (wraw) body.weight = parseInt(wraw, 10);
-    if (!body.state && body.weight == null) {
-      errEl.hidden = false;
-      errEl.textContent = "Set state and/or weight";
-      return;
-    }
-    const { res, json } = await api("/admin/api/lifecycle/target", {
-      method: "PUT",
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      errEl.hidden = false;
-      errEl.textContent = (json && json.error) || "Set target failed";
-      return;
-    }
-    out.classList.remove("hidden");
-    out.textContent = JSON.stringify(json, null, 2);
-    await refreshLifecycle();
   });
 
   document.getElementById("posix-layout-reload").addEventListener("click", () => {
