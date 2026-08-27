@@ -2407,6 +2407,43 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         continue;
       }
+      if (path.rfind("/admin/api/bench", 0) == 0) {
+        if (!bench_status_) {
+          write_json(*sock, 501, "Not Implemented", {{"error", "bench not available"}},
+                     keep_alive);
+          continue;
+        }
+        if (method == "GET" && path == "/admin/api/bench") {
+          write_json(*sock, 200, "OK", bench_status_(), keep_alive);
+          continue;
+        }
+        if (method == "GET" && path == "/admin/api/bench/defaults") {
+          write_json(*sock, 200, "OK", bench_defaults_ ? bench_defaults_() : nlohmann::json{},
+                     keep_alive);
+          continue;
+        }
+        if (method == "POST" && path == "/admin/api/bench/stop") {
+          write_json(*sock, 200, "OK", bench_stop_ ? bench_stop_() : nlohmann::json{{"ok", false}},
+                     keep_alive);
+          continue;
+        }
+        if (method == "POST" && path == "/admin/api/bench/run") {
+          try {
+            const std::string raw =
+                body.empty() ? "{}"
+                             : std::string(reinterpret_cast<const char*>(body.data()), body.size());
+            const auto j = nlohmann::json::parse(raw);
+            auto resp = bench_start_(j);
+            const int st = resp.value("ok", false) ? 200 : 400;
+            write_json(*sock, st, st == 200 ? "OK" : "Bad Request", resp, keep_alive);
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
+          }
+          continue;
+        }
+        write_json(*sock, 404, "Not Found", {{"error", "unknown bench route"}}, keep_alive);
+        continue;
+      }
       if (method == "POST" && path == "/admin/api/settings") {
         try {
           const std::string raw = body.empty()

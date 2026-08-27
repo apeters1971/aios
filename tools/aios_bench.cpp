@@ -1,62 +1,13 @@
-#include "client/stl.hpp"
-#include "http/http_auth.hpp"
-#include "util/log.hpp"
+#include "bench/http_bench.hpp"
 
-#include <nlohmann/json.hpp>
-
-#include <boost/asio.hpp>
-
-#include <sys/socket.h>
-#include <sys/time.h>
-
-#include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <chrono>
-#include <cmath>
-#include <condition_variable>
-#include <cstdint>
 #include <cstdlib>
-#include <cstring>
+#include <stdexcept>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
-#include <sstream>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-namespace asio = boost::asio;
-using tcp = asio::ip::tcp;
-
 namespace {
-
-struct BenchArgs {
-  std::string endpoint{"127.0.0.1:7480"};
-  std::string cluster_key;
-  unsigned threads{0};  // 0 = hardware_concurrency
-  std::size_t ops{200};
-  std::size_t warmup{10};
-  std::string prefix{"bench"};
-  std::vector<std::size_t> sizes;  // object bytes, or STL string bytes / entry count
-  bool sizes_set{false};
-  bool do_create{true};
-  bool do_update{true};
-  bool do_read{true};
-  bool cleanup{true};
-  bool json{false};
-  // Per-PUT layout headers (empty = cluster default). Object mode only.
-  std::string layout;  // replica | ec
-  int ec_k{0};         // 0 = omit (use server default)
-  int ec_m{0};
-  std::string ec_codec;
-  // object (raw HTTP PUT/GET) or stl (aios_client containers)
-  std::string mode{"object"};
-  std::vector<std::string> stl_types;  // empty = all
-  std::string stl_sync{"both"};       // sync | async | both
-};
 
 void usage() {
   std::cout
@@ -86,13 +37,19 @@ void usage() {
       << "Reports IOPS, bandwidth (object mode), and latency p50/p95/p99.\n";
 }
 
-std::unordered_map<std::string, std::string> layout_headers(const BenchArgs& a) {
-  std::unordered_map<std::string, std::string> h;
-  if (!a.layout.empty()) h["x-aios-layout"] = a.layout;
-  if (a.ec_k > 0) h["x-aios-ec-k"] = std::to_string(a.ec_k);
-  if (a.ec_m > 0) h["x-aios-ec-m"] = std::to_string(a.ec_m);
-  if (!a.ec_codec.empty()) h["x-aios-ec-codec"] = a.ec_codec;
-  return h;
+std::vector<std::string> split_csv(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ',') {
+      if (!cur.empty()) out.push_back(cur);
+      cur.clear();
+    } else if (c != ' ' && c != '\t') {
+      cur.push_back(c);
+    }
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
 }
 
 std::size_t parse_size(const std::string& s) {
@@ -112,39 +69,8 @@ std::size_t parse_size(const std::string& s) {
   return static_cast<std::size_t>(n * mul + 0.5);
 }
 
-std::vector<std::string> split_csv(const std::string& s) {
-  std::vector<std::string> out;
-  std::string cur;
-  for (char c : s) {
-    if (c == ',') {
-      if (!cur.empty()) out.push_back(cur);
-      cur.clear();
-    } else if (c != ' ' && c != '\t') {
-      cur.push_back(c);
-    }
-  }
-  if (!cur.empty()) out.push_back(cur);
-  return out;
-}
-
-std::string format_size(std::size_t n) {
-  const char* suf[] = {"B", "KiB", "MiB", "GiB"};
-  double v = static_cast<double>(n);
-  int i = 0;
-  while (v >= 1024.0 && i < 3) {
-    v /= 1024.0;
-    ++i;
-  }
-  std::ostringstream os;
-  if (i == 0 || std::fabs(v - std::round(v)) < 1e-9) {
-    os << static_cast<long long>(std::llround(v)) << suf[i];
-  } else {
-    os << std::fixed << std::setprecision(1) << v << suf[i];
-  }
-  return os.str();
-}
-
-bool parse_args(int argc, char** argv, BenchArgs& a) {
+bool parse_args(int argc, char** argv, aios::HttpBenchConfig& a, bool& json_out) {
+  bool sizes_set = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto need = [&](const char* name) -> const char* {
@@ -174,11 +100,6 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       const char* v = need("--mode");
       if (!v) return false;
       a.mode = v;
-      for (char& c : a.mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      if (a.mode != "object" && a.mode != "stl") {
-        std::cerr << "--mode must be object or stl\n";
-        return false;
-      }
       continue;
     }
     if (arg == "--threads") {
@@ -209,7 +130,7 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       const char* v = need("--sizes");
       if (!v) return false;
       a.sizes.clear();
-      a.sizes_set = true;
+      sizes_set = true;
       try {
         for (const auto& tok : split_csv(v)) a.sizes.push_back(parse_size(tok));
       } catch (const std::exception& e) {
@@ -237,11 +158,6 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       const char* v = need("--layout");
       if (!v) return false;
       a.layout = v;
-      for (char& c : a.layout) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      if (a.layout != "replica" && a.layout != "ec") {
-        std::cerr << "--layout must be replica or ec\n";
-        return false;
-      }
       continue;
     }
     if (arg == "--ec-k") {
@@ -265,27 +181,13 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
     if (arg == "--stl-types") {
       const char* v = need("--stl-types");
       if (!v) return false;
-      a.stl_types.clear();
-      for (const auto& tok : split_csv(v)) {
-        if (tok != "string" && tok != "map" && tok != "unordered_map" && tok != "set" &&
-            tok != "list" && tok != "deque") {
-          std::cerr << "unknown --stl-types entry: " << tok << "\n";
-          return false;
-        }
-        a.stl_types.push_back(tok);
-      }
+      a.stl_types = split_csv(v);
       continue;
     }
     if (arg == "--stl-sync") {
       const char* v = need("--stl-sync");
       if (!v) return false;
       a.stl_sync = v;
-      for (char& c : a.stl_sync)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      if (a.stl_sync != "sync" && a.stl_sync != "async" && a.stl_sync != "both") {
-        std::cerr << "--stl-sync must be sync, async, or both\n";
-        return false;
-      }
       continue;
     }
     if (arg == "--no-cleanup") {
@@ -293,1019 +195,94 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       continue;
     }
     if (arg == "--json") {
-      a.json = true;
+      json_out = true;
       continue;
     }
     std::cerr << "unknown arg: " << arg << "\n";
     return false;
   }
+  (void)sizes_set;
   if (a.cluster_key.empty()) {
     std::cerr << "--cluster-key is required\n";
     return false;
   }
-  if (!a.sizes_set) {
-    if (a.mode == "stl") {
-      a.sizes = {16, 64, 256, 1024, 4096};
-    } else {
-      a.sizes = {1024, 4096, 65536, 262144, 1048576, 4194304, 16777216};
-    }
-  }
-  if (a.sizes.empty()) {
-    std::cerr << "no sizes specified\n";
+  aios::http_bench_apply_cli_defaults(a);
+  const auto err = aios::http_bench_validate(a);
+  if (!err.empty()) {
+    std::cerr << err << "\n";
     return false;
-  }
-  if (!a.do_create && !a.do_update && !a.do_read) {
-    std::cerr << "no operations in --ops-mix\n";
-    return false;
-  }
-  if (a.stl_types.empty()) {
-    a.stl_types = {"string", "map", "unordered_map", "set", "list", "deque"};
-  }
-  if (a.threads == 0) {
-    a.threads = std::max(1u, std::thread::hardware_concurrency());
   }
   return true;
 }
 
-void parse_endpoint(const std::string& ep, std::string& host, std::string& port) {
-  auto colon = ep.rfind(':');
-  if (colon == std::string::npos || colon == 0 || colon + 1 >= ep.size()) {
-    throw std::runtime_error("endpoint must be HOST:PORT");
-  }
-  host = ep.substr(0, colon);
-  port = ep.substr(colon + 1);
-  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
-    host = host.substr(1, host.size() - 2);
-  }
-}
-
-std::string url_encode_oid(const std::string& oid) { return aios::http_url_encode_oid(oid); }
-
-struct HttpResp {
-  int status{-1};
-  std::string body;
-  std::size_t body_n{0};
-  std::string error;
-  std::string location;
-};
-
-enum class BodyMode { Store, Discard };
-
-bool parse_http_location(const std::string& loc, std::string& host, std::string& port,
-                         std::string& path) {
-  if (loc.rfind("http://", 0) == 0) {
-    auto rest = loc.substr(7);
-    auto slash = rest.find('/');
-    auto hp = slash == std::string::npos ? rest : rest.substr(0, slash);
-    path = slash == std::string::npos ? std::string("/") : rest.substr(slash);
-    auto colon = hp.rfind(':');
-    if (colon == std::string::npos) {
-      host = hp;
-      port = "80";
-    } else {
-      host = hp.substr(0, colon);
-      port = hp.substr(colon + 1);
-    }
-    return true;
-  }
-  if (!loc.empty() && loc.front() == '/') {
-    path = loc;
-    return true;
-  }
-  return false;
-}
-
-class HttpSession {
- public:
-  HttpSession(std::string host, std::string port, std::string cluster_key)
-      : host_(std::move(host)),
-        port_(std::move(port)),
-        bootstrap_host_(host_),
-        bootstrap_port_(port_),
-        cluster_key_(std::move(cluster_key)),
-        resolver_(ioc_),
-        sock_(ioc_) {
-    allow_peer(host_ + ":" + port_);
-  }
-
-  bool ensure_connected(std::string& err) {
-    if (sock_.is_open()) return true;
-    boost::system::error_code ec;
-    auto endpoints = resolver_.resolve(host_, port_, ec);
-    if (ec) {
-      err = "resolve: " + ec.message();
-      return false;
-    }
-    asio::connect(sock_, endpoints, ec);
-    if (ec) {
-      err = "connect: " + ec.message();
-      close();
-      return false;
-    }
-    // Prefer blocking + SO_*TIMEO so a wedged peer cannot stall forever. Asio may
-    // leave the socket non-blocking after some reactor paths; force blocking first.
-    sock_.non_blocking(false, ec);
-    sock_.set_option(tcp::no_delay(true), ec);
-    const int fd = static_cast<int>(sock_.native_handle());
-    timeval tv{};
-    tv.tv_sec = 30;
-    tv.tv_usec = 0;
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    return true;
-  }
-
-  void close() {
-    boost::system::error_code ec;
-    sock_.shutdown(tcp::socket::shutdown_both, ec);
-    sock_.close(ec);
-  }
-
-  HttpResp request(const std::string& method, const std::string& target,
-                   const std::uint8_t* body, std::size_t body_len,
-                   const std::unordered_map<std::string, std::string>& extra_headers,
-                   BodyMode body_mode = BodyMode::Store) {
-    std::string path = target;
-    HttpResp resp;
-    for (int hop = 0; hop <= 5; ++hop) {
-      for (int attempt = 0; attempt < 2; ++attempt) {
-        std::string err;
-        if (!ensure_connected(err)) {
-          resp.error = err;
-          resp.status = -1;
-          close();
-          continue;
-        }
-        resp = do_request(method, path, body, body_len, extra_headers, body_mode);
-        if (resp.status >= 0) break;
-        close();
-      }
-      if (resp.status < 0) return resp;
-      if (resp.status != 307 && resp.status != 301 && resp.status != 302) return resp;
-
-      std::string new_host = host_;
-      std::string new_port = port_;
-      std::string new_path;
-      if (!parse_http_location(resp.location, new_host, new_port, new_path)) {
-        resp.error = "bad redirect Location";
-        return resp;
-      }
-      if (resp.location.rfind("http://", 0) == 0) {
-        if (!redirect_allowed(new_host, new_port)) {
-          refresh_redirect_allowlist();
-          if (!redirect_allowed(new_host, new_port)) {
-            resp.error = "redirect target not in cluster";
-            return resp;
-          }
-        }
-      }
-      // Primary redirects move keep-alive to the new peer for subsequent oids.
-      if (new_host != host_ || new_port != port_) {
-        close();
-        host_ = std::move(new_host);
-        port_ = std::move(new_port);
-      }
-      path = std::move(new_path);
-    }
-    resp.error = "too many redirects";
-    resp.status = -1;
-    return resp;
-  }
-
- private:
-  static std::string norm_peer(std::string host, std::string port) {
-    for (char& c : host) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (port.empty()) port = "80";
-    return host + ":" + port;
-  }
-
-  void allow_peer(const std::string& http_addr) {
-    if (http_addr.empty()) return;
-    auto colon = http_addr.rfind(':');
-    if (colon == std::string::npos) {
-      redirect_allow_.insert(norm_peer(http_addr, "80"));
-      return;
-    }
-    redirect_allow_.insert(
-        norm_peer(http_addr.substr(0, colon), http_addr.substr(colon + 1)));
-  }
-
-  bool redirect_allowed(const std::string& host, const std::string& port) const {
-    return redirect_allow_.count(norm_peer(host, port)) > 0;
-  }
-
-  void refresh_redirect_allowlist() {
-    if (redirect_refreshed_) return;
-    redirect_refreshed_ = true;
-    // /admin/cluster is only on the admin node; always probe the bootstrap endpoint.
-    auto saved_host = host_;
-    auto saved_port = port_;
-    close();
-    host_ = bootstrap_host_;
-    port_ = bootstrap_port_;
-    std::string err;
-    HttpResp probe;
-    if (ensure_connected(err)) {
-      probe = do_request("GET", "/admin/cluster", nullptr, 0, {});
-    }
-    host_ = std::move(saved_host);
-    port_ = std::move(saved_port);
-    close();
-    if (probe.status != 200) return;
-    try {
-      auto j = nlohmann::json::parse(probe.body);
-      for (const auto& peer : j.value("admin_peers", nlohmann::json::array())) {
-        allow_peer(peer.value("http_addr", ""));
-      }
-    } catch (...) {
-    }
-  }
-
-  void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
-                const std::string& target) {
-    const std::string date = std::to_string(aios::now_ms());
-    headers["x-aios-date"] = date;
-    headers["x-aios-content-sha256"] = "UNSIGNED-PAYLOAD";
-    const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
-    const auto canon =
-        aios::http_canonical(method, target, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
-    const auto sig = aios::http_sign(cluster_key_, canon);
-    headers["authorization"] = "AIOS-HMAC-SHA256 Credential=bench, SignedHeaders=" +
-                               signed_headers + ", Signature=" + sig;
-  }
-
-  // Avoid uploading large bodies to the wrong replica: wait for 100 Continue (or a
-  // final error/redirect) before sending the payload.
-  static constexpr std::size_t kExpectContinueBytes = 256u * 1024u;
-
-  HttpResp read_http_message(asio::streambuf& buf, BodyMode body_mode = BodyMode::Store) {
-    HttpResp resp;
-    boost::system::error_code ec;
-    asio::read_until(sock_, buf, "\r\n\r\n", ec);
-    if (ec && ec != asio::error::eof) {
-      resp.status = -1;
-      resp.error = "read headers: " + ec.message();
-      close();
-      return resp;
-    }
-
-    std::istream is(&buf);
-    std::string status_line;
-    std::getline(is, status_line);
-    if (!status_line.empty() && status_line.back() == '\r') status_line.pop_back();
-    {
-      std::istringstream ss(status_line);
-      std::string http_ver, reason;
-      ss >> http_ver >> resp.status;
-      std::getline(ss, reason);
-    }
-
-    std::string line;
-    std::size_t content_length = 0;
-    bool close_conn = false;
-    while (std::getline(is, line)) {
-      if (!line.empty() && line.back() == '\r') line.pop_back();
-      if (line.empty()) break;
-      auto colon = line.find(':');
-      if (colon == std::string::npos) continue;
-      auto name = line.substr(0, colon);
-      auto value = line.substr(colon + 1);
-      while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-        value.erase(value.begin());
-      }
-      for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      if (name == "content-length") {
-        content_length = static_cast<std::size_t>(std::strtoull(value.c_str(), nullptr, 10));
-      } else if (name == "connection") {
-        for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (value == "close") close_conn = true;
-      } else if (name == "location") {
-        resp.location = value;
-      }
-    }
-
-    // 1xx responses have no body.
-    if (resp.status >= 100 && resp.status < 200) {
-      if (close_conn || ec == asio::error::eof) close();
-      return resp;
-    }
-
-    resp.body_n = content_length;
-    std::size_t have = buf.size();
-    if (have > content_length) have = content_length;
-    if (body_mode == BodyMode::Discard) {
-      char scratch[65536];
-      std::size_t from_buf = have;
-      while (from_buf > 0) {
-        const auto n = std::min(from_buf, sizeof(scratch));
-        is.read(scratch, static_cast<std::streamsize>(n));
-        from_buf -= n;
-      }
-      std::size_t need = content_length - have;
-      while (need > 0) {
-        const auto chunk = std::min(need, sizeof(scratch));
-        const auto n = asio::read(sock_, asio::buffer(scratch, chunk), asio::transfer_at_least(1),
-                                  ec);
-        if (ec) {
-          resp.status = -1;
-          resp.error = "read body: " + ec.message();
-          close();
-          return resp;
-        }
-        need -= n;
-      }
-    } else {
-      resp.body.resize(content_length);
-      if (have > 0) {
-        is.read(resp.body.data(), static_cast<std::streamsize>(have));
-      }
-      std::size_t need = content_length - have;
-      while (need > 0) {
-        const auto n =
-            asio::read(sock_, asio::buffer(resp.body.data() + (content_length - need), need),
-                       asio::transfer_at_least(1), ec);
-        if (ec) {
-          resp.status = -1;
-          resp.error = "read body: " + ec.message();
-          close();
-          return resp;
-        }
-        need -= n;
-      }
-    }
-
-    if (close_conn || ec == asio::error::eof) close();
-    return resp;
-  }
-
-  HttpResp do_request(const std::string& method, const std::string& target,
-                      const std::uint8_t* body, std::size_t body_len,
-                      const std::unordered_map<std::string, std::string>& extra_headers,
-                      BodyMode body_mode = BodyMode::Store) {
-    HttpResp resp;
-    std::unordered_map<std::string, std::string> headers = extra_headers;
-    headers.erase("authorization");
-    headers.erase("x-aios-date");
-    headers["content-length"] = std::to_string(body_len);
-    const bool use_continue = body_len > kExpectContinueBytes;
-    if (use_continue) headers["Expect"] = "100-continue";
-    add_auth(headers, method, target);
-
-    std::ostringstream req;
-    req << method << ' ' << target << " HTTP/1.1\r\n";
-    req << "Host: " << host_ << ':' << port_ << "\r\n";
-    req << "Connection: keep-alive\r\n";
-    for (const auto& [k, v] : headers) {
-      req << k << ": " << v << "\r\n";
-    }
-    req << "\r\n";
-    const auto head = req.str();
-
-    boost::system::error_code ec;
-    asio::write(sock_, asio::buffer(head), ec);
-    if (ec) {
-      resp.status = -1;
-      resp.error = "write: " + ec.message();
-      close();
-      return resp;
-    }
-
-    if (use_continue) {
-      asio::streambuf buf;
-      resp = read_http_message(buf, BodyMode::Store);
-      if (resp.status < 0) return resp;
-      if (resp.status != 100) {
-        // 307/4xx/5xx before the body — do not upload.
-        return resp;
-      }
-    }
-
-    if (body_len > 0) {
-      asio::write(sock_, asio::buffer(body, body_len), ec);
-      if (ec) {
-        resp.status = -1;
-        resp.error = "write body: " + ec.message();
-        close();
-        return resp;
-      }
-    }
-
-    asio::streambuf buf;
-    return read_http_message(buf, body_mode);
-  }
-
-  std::string host_;
-  std::string port_;
-  std::string bootstrap_host_;
-  std::string bootstrap_port_;
-  std::string cluster_key_;
-  asio::io_context ioc_;
-  tcp::resolver resolver_;
-  tcp::socket sock_;
-  std::unordered_set<std::string> redirect_allow_;
-  bool redirect_refreshed_{false};
-};
-
-enum class OpKind { Create, Update, Put, Read, Delete };
-
-const char* op_name(OpKind k) {
-  switch (k) {
-    case OpKind::Create:
-      return "create";
-    case OpKind::Update:
-      return "update";
-    case OpKind::Put:
-      return "put";
-    case OpKind::Read:
-      return "read";
-    case OpKind::Delete:
-      return "delete";
-  }
-  return "?";
-}
-
-struct Sample {
-  double ms{0};
-  bool ok{false};
-};
-
-struct PhaseStats {
-  OpKind op{OpKind::Create};
-  std::size_t size{0};
-  std::string stl_type;  // empty in object mode
-  std::string stl_sync;  // sync|async or empty
-  std::vector<double> lat_ms;
-  std::size_t ok{0};
-  std::size_t err{0};
-  std::uint64_t bytes{0};
-  double wall_s{0};
-};
-
-std::string oid_for(const BenchArgs& a, std::size_t size, std::size_t idx) {
-  return a.prefix + "/" + std::to_string(size) + "/" + std::to_string(idx);
-}
-
-PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::string& port,
-                     OpKind op, std::size_t size, std::size_t total_ops, bool measure) {
-  PhaseStats st;
-  st.op = op;
-  st.size = size;
-
-  const std::size_t nthreads = std::min<std::size_t>(a.threads, std::max<std::size_t>(1, total_ops));
-  std::atomic<std::size_t> next{0};
-  std::mutex mu;
-  std::vector<double> lats;
-  lats.reserve(total_ops);
-  std::atomic<std::size_t> ok{0};
-  std::atomic<std::size_t> err{0};
-  std::atomic<std::uint64_t> bytes{0};
-
-  std::vector<std::vector<std::uint8_t>> thread_bufs(nthreads);
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    thread_bufs[t].resize(size);
-    for (std::size_t i = 0; i < size; ++i) {
-      thread_bufs[t][i] = static_cast<std::uint8_t>((i + t) & 0xff);
-    }
-  }
-
-  const auto t0 = std::chrono::steady_clock::now();
-  std::vector<std::thread> workers;
-  workers.reserve(nthreads);
-
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    workers.emplace_back([&, t]() {
-      HttpSession sess(host, port, a.cluster_key);
-      auto& buf = thread_bufs[t];
-
-      for (;;) {
-        const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
-        if (idx >= total_ops) break;
-
-        const std::string oid = oid_for(a, size, idx);
-        const std::string target = "/o/" + url_encode_oid(oid);
-        if (!buf.empty()) {
-          buf[0] = static_cast<std::uint8_t>((idx + static_cast<std::size_t>(op)) & 0xff);
-        }
-
-        HttpResp resp;
-        const auto s0 = std::chrono::steady_clock::now();
-        if (op == OpKind::Create) {
-          auto h = layout_headers(a);
-          h["if-none-match"] = "*";
-          resp = sess.request("PUT", target, buf.data(), buf.size(), h);
-        } else if (op == OpKind::Update) {
-          auto h = layout_headers(a);
-          h["if-match"] = "*";
-          resp = sess.request("PUT", target, buf.data(), buf.size(), h);
-        } else if (op == OpKind::Put) {
-          resp = sess.request("PUT", target, buf.data(), buf.size(), layout_headers(a));
-        } else if (op == OpKind::Read) {
-          resp = sess.request("GET", target, nullptr, 0, {}, BodyMode::Discard);
-        } else {
-          resp = sess.request("DELETE", target, nullptr, 0, {});
-        }
-        const auto s1 = std::chrono::steady_clock::now();
-        const double ms =
-            std::chrono::duration<double, std::milli>(s1 - s0).count();
-
-        bool success = false;
-        if (op == OpKind::Create || op == OpKind::Update || op == OpKind::Put) {
-          success = (resp.status == 204);
-        } else if (op == OpKind::Read) {
-          success = (resp.status == 200 && resp.body_n == size);
-        } else {
-          success = (resp.status == 204 || resp.status == 404);
-        }
-
-        if (success) {
-          ok.fetch_add(1, std::memory_order_relaxed);
-          if (op == OpKind::Read) {
-            bytes.fetch_add(size, std::memory_order_relaxed);
-          } else if (op == OpKind::Create || op == OpKind::Update) {
-            bytes.fetch_add(size, std::memory_order_relaxed);
-          }
-        } else {
-          err.fetch_add(1, std::memory_order_relaxed);
-        }
-
-        if (measure) {
-          std::lock_guard<std::mutex> lock(mu);
-          lats.push_back(ms);
-        }
-      }
-      sess.close();
-    });
-  }
-
-  for (auto& w : workers) w.join();
-  const auto t1 = std::chrono::steady_clock::now();
-
-  st.ok = ok.load();
-  st.err = err.load();
-  st.bytes = bytes.load();
-  st.wall_s = std::chrono::duration<double>(t1 - t0).count();
-  st.lat_ms = std::move(lats);
-  return st;
-}
-
-struct Summary {
-  double p50{0};
-  double p95{0};
-  double p99{0};
-  double avg{0};
-  double iops{0};
-  double mib_s{0};
-};
-
-Summary summarize(const PhaseStats& st) {
-  Summary s;
-  auto lats = st.lat_ms;
-  if (!lats.empty()) {
-    std::sort(lats.begin(), lats.end());
-    auto pct = [&](double p) {
-      const double idx = p * static_cast<double>(lats.size() - 1);
-      const std::size_t lo = static_cast<std::size_t>(idx);
-      const std::size_t hi = std::min(lo + 1, lats.size() - 1);
-      const double frac = idx - static_cast<double>(lo);
-      return lats[lo] * (1.0 - frac) + lats[hi] * frac;
-    };
-    s.p50 = pct(0.50);
-    s.p95 = pct(0.95);
-    s.p99 = pct(0.99);
-    for (double x : lats) s.avg += x;
-    s.avg /= static_cast<double>(lats.size());
-  }
-  s.iops = st.wall_s > 0 ? static_cast<double>(st.ok) / st.wall_s : 0;
-  s.mib_s =
-      st.wall_s > 0 ? (static_cast<double>(st.bytes) / (1024.0 * 1024.0)) / st.wall_s : 0;
-  return s;
-}
-
-void print_human(const PhaseStats& st) {
-  const auto s = summarize(st);
-  if (!st.stl_type.empty()) {
-    std::cout << std::left << std::setw(14) << st.stl_type << std::setw(7) << st.stl_sync
-              << std::setw(8) << format_size(st.size) << std::setw(8) << op_name(st.op) << std::right
-              << std::setw(8) << st.ok << std::setw(6) << st.err << std::setw(10) << std::fixed
-              << std::setprecision(1) << s.iops << std::setw(10) << std::setprecision(3) << s.p50
-              << std::setw(10) << s.p95 << std::setw(10) << s.p99 << std::setw(10) << s.avg << "\n";
-    return;
-  }
-  std::cout << std::left << std::setw(8) << format_size(st.size) << std::setw(8) << op_name(st.op)
-            << std::right << std::setw(8) << st.ok << std::setw(6) << st.err << std::setw(10)
-            << std::fixed << std::setprecision(1) << s.iops << std::setw(10) << std::setprecision(2)
-            << s.mib_s << std::setw(10) << std::setprecision(3) << s.p50 << std::setw(10) << s.p95
-            << std::setw(10) << s.p99 << std::setw(10) << s.avg << "\n";
-}
-
-void print_json_row(std::ostream& os, const PhaseStats& st, bool first) {
-  const auto s = summarize(st);
-  if (!first) os << ",\n";
-  os << "  {\"size\":" << st.size << ",\"op\":\"" << op_name(st.op) << "\",\"ok\":" << st.ok
-     << ",\"err\":" << st.err << ",\"wall_s\":" << st.wall_s << ",\"iops\":" << s.iops
-     << ",\"mib_s\":" << s.mib_s << ",\"p50_ms\":" << s.p50 << ",\"p95_ms\":" << s.p95
-     << ",\"p99_ms\":" << s.p99 << ",\"avg_ms\":" << s.avg << ",\"bytes\":" << st.bytes;
-  if (!st.stl_type.empty()) {
-    os << ",\"stl_type\":\"" << st.stl_type << "\",\"stl_sync\":\"" << st.stl_sync << "\"";
-  }
-  os << "}";
-}
-
-std::string stl_name_for(const BenchArgs& a, const std::string& type, const std::string& sync,
-                         std::size_t size, std::size_t idx) {
-  return a.prefix + "/" + type + "/" + sync + "/" + std::to_string(size) + "/" +
-         std::to_string(idx);
-}
-
-std::string make_payload(std::size_t n, char fill) {
-  return std::string(n, fill);
-}
-
-// Populate / mutate / read one STL object. Returns approx logical bytes touched.
-std::uint64_t stl_do_op(aios::Session& sess, const std::string& type, aios::sync_mode mode,
-                        OpKind op, const std::string& name, std::size_t size) {
-  const bool async = (mode == aios::sync_mode::async);
-  if (type == "string") {
-    aios::string s(sess, name, mode, /*flush_on_destroy=*/false);
-    if (op == OpKind::Create || op == OpKind::Put) {
-      s.assign(make_payload(size, 'a'));
-      if (async) s.flush();
-    } else if (op == OpKind::Update) {
-      if (async) s.load();
-      s.assign(make_payload(size, 'b'));
-      if (async) s.flush();
-    } else if (op == OpKind::Read) {
-      if (async) s.load();
-      else
-        (void)s.size();
-    }
-    return size;
-  }
-  if (type == "map") {
-    aios::map m(sess, name, mode, false);
-    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
-      if (op == OpKind::Update && async) m.load();
-      if (op == OpKind::Update) m.clear();
-      for (std::size_t i = 0; i < size; ++i) {
-        m.insert_or_assign("k" + std::to_string(i), "v" + std::to_string(i));
-      }
-      if (async) m.flush();
-    } else if (op == OpKind::Read) {
-      if (async) m.load();
-      else
-        (void)m.size();
-    }
-    return size;
-  }
-  if (type == "unordered_map") {
-    aios::unordered_map m(sess, name, mode, false);
-    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
-      if (op == OpKind::Update && async) m.load();
-      if (op == OpKind::Update) m.clear();
-      for (std::size_t i = 0; i < size; ++i) {
-        m.insert_or_assign("k" + std::to_string(i), "v" + std::to_string(i));
-      }
-      if (async) m.flush();
-    } else if (op == OpKind::Read) {
-      if (async) m.load();
-      else
-        (void)m.size();
-    }
-    return size;
-  }
-  if (type == "set") {
-    aios::set s(sess, name, mode, false);
-    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
-      if (op == OpKind::Update && async) s.load();
-      if (op == OpKind::Update) s.clear();
-      for (std::size_t i = 0; i < size; ++i) s.insert("k" + std::to_string(i));
-      if (async) s.flush();
-    } else if (op == OpKind::Read) {
-      if (async) s.load();
-      else
-        (void)s.size();
-    }
-    return size;
-  }
-  if (type == "list") {
-    aios::list l(sess, name, mode, false);
-    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
-      if (op == OpKind::Update && async) l.load();
-      if (op == OpKind::Update) l.clear();
-      for (std::size_t i = 0; i < size; ++i) l.push_back("v" + std::to_string(i));
-      if (async) l.flush();
-    } else if (op == OpKind::Read) {
-      if (async) l.load();
-      else
-        (void)l.size();
-    }
-    return size;
-  }
-  if (type == "deque") {
-    aios::deque d(sess, name, mode, false);
-    if (op == OpKind::Create || op == OpKind::Put || op == OpKind::Update) {
-      if (op == OpKind::Update && async) d.load();
-      if (op == OpKind::Update) d.clear();
-      for (std::size_t i = 0; i < size; ++i) d.push_back("v" + std::to_string(i));
-      if (async) d.flush();
-    } else if (op == OpKind::Read) {
-      if (async) d.load();
-      else
-        (void)d.size();
-    }
-    return size;
-  }
-  throw std::runtime_error("unknown stl type: " + type);
-}
-
-void stl_delete_one(aios::Session& sess, const std::string& type, const std::string& name) {
-  const std::string oid = aios::Session::stl_oid(type, name);
-  const std::string path = "/o/" + aios::Session::url_encode_oid(oid);
-  try {
-    sess.request("DELETE", path);
-  } catch (...) {
-  }
-}
-
-PhaseStats run_stl_phase(const BenchArgs& a, const std::string& type, aios::sync_mode mode,
-                         OpKind op, std::size_t size, std::size_t total_ops, bool measure) {
-  PhaseStats st;
-  st.op = op;
-  st.size = size;
-  st.stl_type = type;
-  st.stl_sync = (mode == aios::sync_mode::sync) ? "sync" : "async";
-
-  const std::size_t nthreads = std::min<std::size_t>(a.threads, std::max<std::size_t>(1, total_ops));
-  std::atomic<std::size_t> next{0};
-  std::mutex mu;
-  std::vector<double> lats;
-  lats.reserve(total_ops);
-  std::atomic<std::size_t> ok{0};
-  std::atomic<std::size_t> err{0};
-  std::atomic<std::uint64_t> bytes{0};
-
-  aios::SessionConfig cfg{a.endpoint, a.cluster_key};
-  const auto t0 = std::chrono::steady_clock::now();
-  std::vector<std::thread> workers;
-  workers.reserve(nthreads);
-
-  for (std::size_t t = 0; t < nthreads; ++t) {
-    workers.emplace_back([&, t]() {
-      (void)t;
-      aios::Session sess(cfg);
-      for (;;) {
-        const std::size_t idx = next.fetch_add(1, std::memory_order_relaxed);
-        if (idx >= total_ops) break;
-        const std::string name = stl_name_for(a, type, st.stl_sync, size, idx);
-        const auto s0 = std::chrono::steady_clock::now();
-        bool success = false;
-        std::uint64_t touched = 0;
-        try {
-          if (op == OpKind::Delete) {
-            stl_delete_one(sess, type, name);
-            success = true;
-          } else {
-            touched = stl_do_op(sess, type, mode, op, name, size);
-            success = true;
-          }
-        } catch (...) {
-          success = false;
-        }
-        const auto s1 = std::chrono::steady_clock::now();
-        const double ms = std::chrono::duration<double, std::milli>(s1 - s0).count();
-        if (success) {
-          ok.fetch_add(1, std::memory_order_relaxed);
-          bytes.fetch_add(touched, std::memory_order_relaxed);
-        } else {
-          err.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (measure) {
-          std::lock_guard<std::mutex> lock(mu);
-          lats.push_back(ms);
-        }
-      }
-    });
-  }
-
-  for (auto& w : workers) w.join();
-  const auto t1 = std::chrono::steady_clock::now();
-  st.ok = ok.load();
-  st.err = err.load();
-  st.bytes = bytes.load();
-  st.wall_s = std::chrono::duration<double>(t1 - t0).count();
-  st.lat_ms = std::move(lats);
-  return st;
-}
-
-// Large objects dominate wall time; keep total transferred bytes roughly flat.
-std::size_t scaled_ops(std::size_t base, std::size_t size_bytes) {
-  std::size_t div = 1;
-  if (size_bytes >= 16ull * 1024 * 1024) {
-    div = 16;
-  } else if (size_bytes >= 4ull * 1024 * 1024) {
-    div = 4;
-  }
-  return std::max<std::size_t>(1, base / div);
-}
-
-int run_object_bench(const BenchArgs& args, const std::string& host, const std::string& port) {
-  if (!args.json) {
-    std::cout << "aios-bench mode=object endpoint=" << args.endpoint
-              << " threads=" << args.threads << " ops=" << args.ops << " warmup=" << args.warmup
-              << " (ops÷4 at ≥4MiB, ÷16 at ≥16MiB)\n";
-    std::cout << std::left << std::setw(8) << "size" << std::setw(8) << "op" << std::right
-              << std::setw(8) << "ok" << std::setw(6) << "err" << std::setw(10) << "iops"
-              << std::setw(10) << "MiB/s" << std::setw(10) << "p50_ms" << std::setw(10) << "p95_ms"
-              << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms" << "\n"
-              << std::flush;
-  }
-
-  std::vector<PhaseStats> results;
-  results.reserve(args.sizes.size() * 3);
-
-  for (std::size_t size : args.sizes) {
-    const std::size_t ops = scaled_ops(args.ops, size);
-    const std::size_t warmup = args.warmup > 0 ? scaled_ops(args.warmup, size) : 0;
-    if (warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
-      run_phase(args, host, port, OpKind::Put, size, warmup, false);
-      if (args.do_update) {
-        run_phase(args, host, port, OpKind::Update, size, warmup, false);
-      }
-      if (args.do_read) {
-        run_phase(args, host, port, OpKind::Read, size, warmup, false);
-      }
-      run_phase(args, host, port, OpKind::Delete, size, warmup, false);
-    }
-
-    if (args.do_create) {
-      auto st = run_phase(args, host, port, OpKind::Create, size, ops, true);
-      if (!args.json) print_human(st);
-      results.push_back(std::move(st));
-    } else if (args.do_update || args.do_read) {
-      run_phase(args, host, port, OpKind::Put, size, ops, false);
-    }
-
-    if (args.do_update) {
-      auto st = run_phase(args, host, port, OpKind::Update, size, ops, true);
-      if (!args.json) print_human(st);
-      results.push_back(std::move(st));
-    }
-
-    if (args.do_read) {
-      auto st = run_phase(args, host, port, OpKind::Read, size, ops, true);
-      if (!args.json) print_human(st);
-      results.push_back(std::move(st));
-    }
-
-    if (args.cleanup) {
-      run_phase(args, host, port, OpKind::Delete, size, ops, false);
-    }
-  }
-
-  if (args.json) {
-    std::cout << "{\n\"mode\":\"object\",\"endpoint\":\"" << args.endpoint
-              << "\",\"threads\":" << args.threads << ",\"ops\":" << args.ops << ",\"results\":[\n";
-    for (std::size_t i = 0; i < results.size(); ++i) {
-      print_json_row(std::cout, results[i], i == 0);
-    }
-    std::cout << "\n]}\n";
-  }
-
-  std::size_t total_err = 0;
-  for (const auto& r : results) total_err += r.err;
-  return total_err > 0 ? 1 : 0;
-}
-
-int run_stl_bench(const BenchArgs& args) {
-  std::vector<aios::sync_mode> modes;
-  if (args.stl_sync == "sync" || args.stl_sync == "both") modes.push_back(aios::sync_mode::sync);
-  if (args.stl_sync == "async" || args.stl_sync == "both") modes.push_back(aios::sync_mode::async);
-
-  if (!args.json) {
-    std::cout << "aios-bench mode=stl endpoint=" << args.endpoint << " threads=" << args.threads
-              << " ops=" << args.ops << " warmup=" << args.warmup
-              << " stl-sync=" << args.stl_sync << "\n";
+void print_human(const nlohmann::json& doc) {
+  const auto results = doc.value("results", nlohmann::json::array());
+  const bool stl = doc.value("mode", "") == "stl";
+  if (stl) {
+    std::cout << "aios-bench mode=stl endpoint=" << doc.value("endpoint", "")
+              << " threads=" << doc.value("threads", 0) << " ops=" << doc.value("ops", 0) << "\n";
     std::cout << std::left << std::setw(14) << "type" << std::setw(7) << "sync" << std::setw(8)
               << "size" << std::setw(8) << "op" << std::right << std::setw(8) << "ok"
               << std::setw(6) << "err" << std::setw(10) << "iops" << std::setw(10) << "p50_ms"
               << std::setw(10) << "p95_ms" << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms"
               << "\n";
-  }
-
-  std::vector<PhaseStats> results;
-
-  for (const auto& type : args.stl_types) {
-    for (aios::sync_mode mode : modes) {
-      for (std::size_t size : args.sizes) {
-        if (args.warmup > 0 && (args.do_create || args.do_update || args.do_read)) {
-          run_stl_phase(args, type, mode, OpKind::Put, size, args.warmup, false);
-          if (args.do_update) {
-            run_stl_phase(args, type, mode, OpKind::Update, size, args.warmup, false);
-          }
-          if (args.do_read) {
-            run_stl_phase(args, type, mode, OpKind::Read, size, args.warmup, false);
-          }
-          run_stl_phase(args, type, mode, OpKind::Delete, size, args.warmup, false);
-        }
-
-        if (args.do_create) {
-          auto st = run_stl_phase(args, type, mode, OpKind::Create, size, args.ops, true);
-          if (!args.json) print_human(st);
-          results.push_back(std::move(st));
-        } else if (args.do_update || args.do_read) {
-          run_stl_phase(args, type, mode, OpKind::Put, size, args.ops, false);
-        }
-
-        if (args.do_update) {
-          auto st = run_stl_phase(args, type, mode, OpKind::Update, size, args.ops, true);
-          if (!args.json) print_human(st);
-          results.push_back(std::move(st));
-        }
-
-        if (args.do_read) {
-          auto st = run_stl_phase(args, type, mode, OpKind::Read, size, args.ops, true);
-          if (!args.json) print_human(st);
-          results.push_back(std::move(st));
-        }
-
-        if (args.cleanup) {
-          run_stl_phase(args, type, mode, OpKind::Delete, size, args.ops, false);
-        }
-      }
+    for (const auto& st : results) {
+      std::cout << std::left << std::setw(14) << st.value("stl_type", "")
+                << std::setw(7) << st.value("stl_sync", "")
+                << std::setw(8) << st.value("size_label", "")
+                << std::setw(8) << st.value("op", "") << std::right << std::setw(8)
+                << st.value("ok", 0) << std::setw(6) << st.value("err", 0) << std::setw(10)
+                << std::fixed << std::setprecision(1) << st.value("iops", 0.0) << std::setw(10)
+                << std::setprecision(3) << st.value("p50_ms", 0.0) << std::setw(10)
+                << st.value("p95_ms", 0.0) << std::setw(10) << st.value("p99_ms", 0.0)
+                << std::setw(10) << st.value("avg_ms", 0.0) << "\n";
     }
+    return;
   }
-
-  if (args.json) {
-    std::cout << "{\n\"mode\":\"stl\",\"endpoint\":\"" << args.endpoint
-              << "\",\"threads\":" << args.threads << ",\"ops\":" << args.ops << ",\"results\":[\n";
-    for (std::size_t i = 0; i < results.size(); ++i) {
-      print_json_row(std::cout, results[i], i == 0);
-    }
-    std::cout << "\n]}\n";
+  std::cout << "aios-bench mode=object endpoint=" << doc.value("endpoint", "")
+            << " threads=" << doc.value("threads", 0) << " ops=" << doc.value("ops", 0)
+            << " (ops÷4 at ≥4MiB, ÷16 at ≥16MiB)\n";
+  std::cout << std::left << std::setw(8) << "size" << std::setw(8) << "op" << std::right
+            << std::setw(8) << "ok" << std::setw(6) << "err" << std::setw(10) << "iops"
+            << std::setw(10) << "MiB/s" << std::setw(10) << "p50_ms" << std::setw(10) << "p95_ms"
+            << std::setw(10) << "p99_ms" << std::setw(10) << "avg_ms" << "\n";
+  for (const auto& st : results) {
+    std::cout << std::left << std::setw(8) << st.value("size_label", "") << std::setw(8)
+              << st.value("op", "") << std::right << std::setw(8) << st.value("ok", 0)
+              << std::setw(6) << st.value("err", 0) << std::setw(10) << std::fixed
+              << std::setprecision(1) << st.value("iops", 0.0) << std::setw(10)
+              << std::setprecision(2) << st.value("mib_s", 0.0) << std::setw(10)
+              << std::setprecision(3) << st.value("p50_ms", 0.0) << std::setw(10)
+              << st.value("p95_ms", 0.0) << std::setw(10) << st.value("p99_ms", 0.0)
+              << std::setw(10) << st.value("avg_ms", 0.0) << "\n";
   }
-
-  std::size_t total_err = 0;
-  for (const auto& r : results) total_err += r.err;
-  return total_err > 0 ? 1 : 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  BenchArgs args;
-  if (!parse_args(argc, argv, args)) {
+  aios::HttpBenchConfig args;
+  bool json_out = false;
+  if (!parse_args(argc, argv, args, json_out)) {
     usage();
     return 2;
   }
-
-  std::string host, port;
-  try {
-    parse_endpoint(args.endpoint, host, port);
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << "\n";
-    return 2;
-  }
-
-  // Probe connectivity (404 on missing oid is fine). Print first so a wedged
-  // cluster cannot look like a no-op hang with zero output. Also wall-clock
-  // the probe: socket timeouts alone are not always honored by Asio sync I/O.
-  if (!args.json) {
+  if (!json_out) {
     std::cerr << "aios-bench probing " << args.endpoint << " …\n" << std::flush;
   }
-  {
-    HttpResp r;
-    std::mutex mu;
-    std::condition_variable cv;
-    bool done = false;
-    std::thread th([&] {
-      HttpSession probe(host, port, args.cluster_key);
-      auto local = probe.request("GET", "/o/" + url_encode_oid(args.prefix + "/probe"), nullptr, 0,
-                                 {});
-      probe.close();
-      {
-        std::lock_guard<std::mutex> lk(mu);
-        r = std::move(local);
-        done = true;
-      }
-      cv.notify_one();
-    });
-    {
-      std::unique_lock<std::mutex> lk(mu);
-      if (!cv.wait_for(lk, std::chrono::seconds(30), [&] { return done; })) {
-        std::cerr << "cannot reach " << args.endpoint
-                  << ": probe timed out (cluster may be wedged; restart testbed)\n";
-        th.detach();
-        return 1;
-      }
-    }
-    th.join();
-    if (r.status < 0) {
-      std::cerr << "cannot reach " << args.endpoint << ": "
-                << (r.error.empty() ? "timeout or I/O error" : r.error) << "\n";
-      return 1;
-    }
+  const auto doc = aios::run_http_bench(args);
+  if (doc.contains("error")) {
+    std::cerr << doc["error"].get<std::string>() << "\n";
+    return 1;
   }
-
-  if (args.mode == "stl") return run_stl_bench(args);
-  return run_object_bench(args, host, port);
+  if (json_out) {
+    std::cout << doc.dump(2) << "\n";
+  } else {
+    print_human(doc);
+  }
+  std::size_t total_err = 0;
+  for (const auto& r : doc.value("results", nlohmann::json::array())) {
+    total_err += r.value("err", 0);
+  }
+  return total_err > 0 ? 1 : 0;
 }

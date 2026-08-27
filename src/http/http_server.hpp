@@ -11,6 +11,7 @@
 #include "object/object_service.hpp"
 
 #include <boost/asio.hpp>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -49,6 +50,16 @@ class HttpServer {
     on_lifecycle_changed_ = std::move(cb);
   }
 
+  using BenchStartFn = std::function<nlohmann::json(const nlohmann::json&)>;
+  using BenchStatusFn = std::function<nlohmann::json()>;
+  void set_bench_handlers(BenchStartFn start, BenchStatusFn status, BenchStatusFn stop,
+                          BenchStatusFn defaults) {
+    bench_start_ = std::move(start);
+    bench_status_ = std::move(status);
+    bench_stop_ = std::move(stop);
+    bench_defaults_ = std::move(defaults);
+  }
+
   std::uint64_t requests() const { return objects_.ops().total().http_requests.load(); }
 
  private:
@@ -76,6 +87,10 @@ class HttpServer {
   std::shared_ptr<PosixLayoutStore> posix_layout_;
   std::shared_ptr<VbdRegistryStore> vbd_registry_;
   std::function<void()> on_lifecycle_changed_;
+  BenchStartFn bench_start_;
+  BenchStatusFn bench_status_;
+  BenchStatusFn bench_stop_;
+  BenchStatusFn bench_defaults_;
   boost::asio::ip::tcp::acceptor acceptor_;
   // Blocking read/write session loop must not run on ioc_ (would stall accepts).
   // A session owns its thread for its whole keep-alive lifetime, so the pool size

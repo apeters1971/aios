@@ -47,6 +47,7 @@
           <button type="button" data-tab="qos" class="tab">QoS</button>
           <button type="button" data-tab="posix-layout" class="tab">POSIX</button>
           <button type="button" data-tab="lifecycle" class="tab">Lifecycle</button>
+          <button type="button" data-tab="bench" class="tab">Benchmark</button>
         </nav>
       </div>
       <button type="button" id="logout-btn" class="btn ghost">Log out</button>
@@ -278,6 +279,76 @@
         <div id="lifecycle-table" class="table-wrap"></div>
         <pre id="lifecycle-result" class="code-block small hidden"></pre>
         <p id="lifecycle-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-bench" class="panel hidden">
+        <h2>Benchmark</h2>
+        <p class="note">Runs the same suite as <code>aios-bench</code> from this console against the local HTTP API. This generates real cluster load. Conservative defaults stay well below the CLI’s 16 MiB sweep.</p>
+        <div class="btn-row bench-presets">
+          <button type="button" class="btn" data-bench-preset="quick">Quick</button>
+          <button type="button" class="btn" data-bench-preset="standard">Standard</button>
+          <button type="button" class="btn" data-bench-preset="wide">Wide</button>
+          <button type="button" class="btn" data-bench-preset="stl">STL</button>
+        </div>
+        <form id="bench-form" class="s3-form bench-form">
+          <label class="field"><span>Mode</span>
+            <select id="bench-mode">
+              <option value="object">object (PUT/GET)</option>
+              <option value="stl">stl (client types)</option>
+            </select>
+          </label>
+          <label class="field"><span>Threads</span><input id="bench-threads" type="number" min="1" max="64" value="4" /></label>
+          <label class="field"><span>Ops / size / phase</span><input id="bench-ops" type="number" min="1" max="2000" value="50" /></label>
+          <label class="field"><span>Warmup</span><input id="bench-warmup" type="number" min="0" max="200" value="5" /></label>
+          <label class="field"><span>Sizes</span><input id="bench-sizes" spellcheck="false" value="1k,4k,64k" /></label>
+          <label class="field"><span>Prefix</span><input id="bench-prefix" spellcheck="false" value="bench" /></label>
+          <label class="field"><span>Layout</span>
+            <select id="bench-layout">
+              <option value="">cluster default</option>
+              <option value="replica">replica</option>
+              <option value="ec">ec</option>
+            </select>
+          </label>
+          <label class="field bench-ec"><span>EC k</span><input id="bench-ec-k" type="number" min="0" value="0" /></label>
+          <label class="field bench-ec"><span>EC m</span><input id="bench-ec-m" type="number" min="0" value="0" /></label>
+          <label class="field bench-ec"><span>EC codec</span>
+            <select id="bench-ec-codec">
+              <option value="">default</option>
+              <option value="xor">xor</option>
+              <option value="isal">isal</option>
+            </select>
+          </label>
+          <label class="field bench-stl"><span>STL sync</span>
+            <select id="bench-stl-sync">
+              <option value="async">async</option>
+              <option value="sync">sync</option>
+              <option value="both">both</option>
+            </select>
+          </label>
+        </form>
+        <div class="bench-mix">
+          <span class="muted">Ops</span>
+          <label><input type="checkbox" id="bench-op-create" checked /> create</label>
+          <label><input type="checkbox" id="bench-op-update" checked /> update</label>
+          <label><input type="checkbox" id="bench-op-read" checked /> read</label>
+          <label><input type="checkbox" id="bench-cleanup" checked /> cleanup after</label>
+        </div>
+        <div class="bench-mix bench-stl">
+          <span class="muted">STL types</span>
+          <label><input type="checkbox" class="bench-stl-type" value="string" checked /> string</label>
+          <label><input type="checkbox" class="bench-stl-type" value="map" checked /> map</label>
+          <label><input type="checkbox" class="bench-stl-type" value="unordered_map" /> unordered_map</label>
+          <label><input type="checkbox" class="bench-stl-type" value="set" /> set</label>
+          <label><input type="checkbox" class="bench-stl-type" value="list" /> list</label>
+          <label><input type="checkbox" class="bench-stl-type" value="deque" /> deque</label>
+        </div>
+        <div class="btn-row">
+          <button type="button" id="bench-run" class="btn primary">Run</button>
+          <button type="button" id="bench-stop" class="btn" disabled>Stop</button>
+          <span id="bench-state" class="badge">idle</span>
+        </div>
+        <div id="bench-table" class="table-wrap"></div>
+        <p id="bench-error" class="error" hidden></p>
       </section>
     </main>
   </div>

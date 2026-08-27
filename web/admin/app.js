@@ -544,6 +544,7 @@
         (ae.matches("input, select, button") || ae.closest("tr"));
       if (!editing) await refreshLifecycle();
     }
+    if (activeTab === "bench") await refreshBench();
     if (activeTab === "actions") await refreshArchiveBackup();
   }
 
@@ -710,6 +711,7 @@
     if (btn.dataset.tab === "qos") refreshQos().catch(() => {});
     if (btn.dataset.tab === "posix-layout") refreshPosixLayout().catch(() => {});
     if (btn.dataset.tab === "lifecycle") refreshLifecycle().catch(() => {});
+    if (btn.dataset.tab === "bench") refreshBench().catch(() => {});
     if (btn.dataset.tab === "actions") refreshArchiveBackup().catch(() => {});
   });
 
@@ -985,6 +987,161 @@
       btn.disabled = false;
     }
   });
+
+  let benchPoll = null;
+
+  function benchPresets() {
+    return {
+      quick: { mode: "object", threads: 4, ops: 20, warmup: 2, sizes: "1k,4k", mix: ["create", "read"], layout: "", stl_sync: "async", types: ["string"] },
+      standard: { mode: "object", threads: 4, ops: 50, warmup: 5, sizes: "1k,4k,64k", mix: ["create", "update", "read"], layout: "", stl_sync: "async", types: ["string", "map"] },
+      wide: { mode: "object", threads: 8, ops: 80, warmup: 5, sizes: "1k,64k,1M", mix: ["create", "update", "read"], layout: "", stl_sync: "async", types: ["string", "map"] },
+      stl: { mode: "stl", threads: 4, ops: 40, warmup: 4, sizes: "16,64,256", mix: ["create", "update", "read"], layout: "", stl_sync: "async", types: ["string", "map"] },
+    };
+  }
+
+  function applyBenchPreset(name) {
+    const p = benchPresets()[name];
+    if (!p) return;
+    document.getElementById("bench-mode").value = p.mode;
+    document.getElementById("bench-threads").value = p.threads;
+    document.getElementById("bench-ops").value = p.ops;
+    document.getElementById("bench-warmup").value = p.warmup;
+    document.getElementById("bench-sizes").value = p.sizes;
+    document.getElementById("bench-layout").value = p.layout;
+    document.getElementById("bench-stl-sync").value = p.stl_sync;
+    document.getElementById("bench-op-create").checked = p.mix.includes("create");
+    document.getElementById("bench-op-update").checked = p.mix.includes("update");
+    document.getElementById("bench-op-read").checked = p.mix.includes("read");
+    document.querySelectorAll(".bench-stl-type").forEach((el) => {
+      el.checked = p.types.includes(el.value);
+    });
+    syncBenchModeFields();
+  }
+
+  function syncBenchModeFields() {
+    const stl = document.getElementById("bench-mode").value === "stl";
+    const ec = document.getElementById("bench-layout").value === "ec";
+    document.querySelectorAll(".bench-stl").forEach((el) => el.classList.toggle("hidden", !stl));
+    document.querySelectorAll(".bench-ec").forEach((el) => el.classList.toggle("hidden", stl || !ec));
+  }
+
+  function benchFormBody() {
+    const mix = [];
+    if (document.getElementById("bench-op-create").checked) mix.push("create");
+    if (document.getElementById("bench-op-update").checked) mix.push("update");
+    if (document.getElementById("bench-op-read").checked) mix.push("read");
+    const types = [...document.querySelectorAll(".bench-stl-type:checked")].map((el) => el.value);
+    const body = {
+      mode: document.getElementById("bench-mode").value,
+      threads: Number(document.getElementById("bench-threads").value) || 4,
+      ops: Number(document.getElementById("bench-ops").value) || 50,
+      warmup: Number(document.getElementById("bench-warmup").value) || 0,
+      sizes: document.getElementById("bench-sizes").value.trim(),
+      prefix: document.getElementById("bench-prefix").value.trim() || "bench",
+      ops_mix: mix,
+      cleanup: document.getElementById("bench-cleanup").checked,
+      layout: document.getElementById("bench-layout").value,
+      stl_sync: document.getElementById("bench-stl-sync").value,
+      stl_types: types,
+    };
+    if (body.layout === "ec") {
+      body.ec_k = Number(document.getElementById("bench-ec-k").value) || 0;
+      body.ec_m = Number(document.getElementById("bench-ec-m").value) || 0;
+      body.ec_codec = document.getElementById("bench-ec-codec").value;
+    }
+    return body;
+  }
+
+  function renderBench(doc) {
+    const state = (doc && doc.state) || "idle";
+    const badge = document.getElementById("bench-state");
+    badge.textContent = state;
+    badge.className = "badge " + (state === "done" ? "up" : state === "error" || state === "cancelled" ? "off" : state === "running" ? "warn" : "");
+    document.getElementById("bench-run").disabled = state === "running";
+    document.getElementById("bench-stop").disabled = state !== "running";
+    const errEl = document.getElementById("bench-error");
+    if (doc && doc.error) {
+      errEl.hidden = false;
+      errEl.textContent = doc.error;
+    } else {
+      errEl.hidden = true;
+    }
+    const results = (doc && doc.results) || [];
+    const stl = results.some((r) => r.stl_type);
+    const head = stl
+      ? `<th>Type</th><th>Sync</th><th>Size</th><th>Op</th><th class="num">OK</th><th class="num">Err</th><th class="num">IOPS</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th>`
+      : `<th>Size</th><th>Op</th><th class="num">OK</th><th class="num">Err</th><th class="num">IOPS</th><th class="num">MiB/s</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th>`;
+    const rows = results
+      .map((r) => {
+        const n = (x, d) => (x == null ? "—" : Number(x).toFixed(d));
+        if (stl) {
+          return `<tr><td>${esc(r.stl_type || "—")}</td><td>${esc(r.stl_sync || "—")}</td><td>${esc(r.size_label || r.size)}</td><td>${esc(r.op)}</td><td class="num">${r.ok ?? 0}</td><td class="num">${r.err ?? 0}</td><td class="num">${n(r.iops, 1)}</td><td class="num">${n(r.p50_ms, 2)}</td><td class="num">${n(r.p95_ms, 2)}</td><td class="num">${n(r.p99_ms, 2)}</td></tr>`;
+        }
+        return `<tr><td>${esc(r.size_label || r.size)}</td><td>${esc(r.op)}</td><td class="num">${r.ok ?? 0}</td><td class="num">${r.err ?? 0}</td><td class="num">${n(r.iops, 1)}</td><td class="num">${n(r.mib_s, 2)}</td><td class="num">${n(r.p50_ms, 2)}</td><td class="num">${n(r.p95_ms, 2)}</td><td class="num">${n(r.p99_ms, 2)}</td></tr>`;
+      })
+      .join("");
+    document.getElementById("bench-table").innerHTML =
+      `<table><thead><tr>${head}</tr></thead><tbody>${
+        rows || emptyRow(stl ? 10 : 9, state === "running" ? "Running…" : "No results yet")
+      }</tbody></table>`;
+    const running = state === "running";
+    if (running && !benchPoll) {
+      benchPoll = setInterval(() => refreshBench().catch(() => {}), 1000);
+    }
+    if (!running && benchPoll) {
+      clearInterval(benchPoll);
+      benchPoll = null;
+    }
+  }
+
+  async function refreshBench() {
+    const { res, json } = await api("/admin/api/bench");
+    if (res.status === 401) {
+      showLogin("Session expired — sign in again.");
+      return;
+    }
+    if (res.ok) renderBench(json);
+    else renderBench({ state: "idle", results: [], error: (json && json.error) || "Bench API unavailable" });
+  }
+
+  document.getElementById("bench-form").addEventListener("input", syncBenchModeFields);
+  document.getElementById("bench-mode").addEventListener("change", syncBenchModeFields);
+  document.getElementById("bench-layout").addEventListener("change", syncBenchModeFields);
+  document.querySelector(".bench-presets").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-bench-preset]");
+    if (!btn) return;
+    applyBenchPreset(btn.dataset.benchPreset);
+  });
+  document.getElementById("bench-run").addEventListener("click", async () => {
+    const errEl = document.getElementById("bench-error");
+    errEl.hidden = true;
+    const body = benchFormBody();
+    if (!body.ops_mix.length) {
+      errEl.hidden = false;
+      errEl.textContent = "Select at least one operation";
+      return;
+    }
+    if (body.mode === "stl" && !body.stl_types.length) {
+      errEl.hidden = false;
+      errEl.textContent = "Select at least one STL type";
+      return;
+    }
+    const { res, json } = await api("/admin/api/bench/run", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      errEl.hidden = false;
+      errEl.textContent = (json && json.error) || "Start failed";
+      return;
+    }
+    await refreshBench();
+  });
+  document.getElementById("bench-stop").addEventListener("click", async () => {
+    await api("/admin/api/bench/stop", { method: "POST", body: "{}" });
+    await refreshBench();
+  });
+  syncBenchModeFields();
 
   document.getElementById("posix-layout-reload").addEventListener("click", () => {
     refreshPosixLayout().catch(() => {});

@@ -234,6 +234,7 @@ add_library(aios_client STATIC
   src/client/string.cpp
   src/client/mutex.cpp
   src/client/vbd_registry_client.cpp
+  src/bench/http_bench.cpp
 )
 target_include_directories(aios_client PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src

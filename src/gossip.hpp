@@ -32,6 +32,7 @@ class GossipEngine {
   void start();
   // Stop acceptors / HTTP workers (call before io_context::stop).
   void stop();
+  HttpServer* http() { return http_server_.get(); }
 
   const ClusterMap& cluster_map() const { return cluster_map_; }
   LocalStores& local_stores() { return local_stores_; }

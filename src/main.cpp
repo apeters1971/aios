@@ -1,3 +1,4 @@
+#include "bench/http_bench.hpp"
 #include "config.hpp"
 #include "fs/fs_table.hpp"
 #include "gossip.hpp"
@@ -97,6 +98,16 @@ int main(int argc, char** argv) {
       // without racing acceptor teardown against the io_context thread.
       engine.start();
 
+      auto bench_ep = s3_loopback_http_endpoint(cfg.http_listen);
+      if (bench_ep.empty()) bench_ep = "127.0.0.1:7480";
+      auto bench = std::make_shared<HttpBenchJob>(bench_ep, cfg.cluster_key);
+      if (auto* http = engine.http()) {
+        http->set_bench_handlers(
+            [bench](const nlohmann::json& j) { return bench->start(j); },
+            [bench] { return bench->status(); }, [bench] { return bench->stop(); },
+            [bench] { return bench->defaults(); });
+      }
+
       // Run the io_context before S3 starts: posix mount needs loopback HTTP.
       std::thread ioc_thread([&] { ioc.run(); });
       const IoStopper io_stopper{ioc, ioc_thread, work};
@@ -119,6 +130,7 @@ int main(int argc, char** argv) {
       // stop() closes accept on ioc then unmounts (rstat flush needs loopback HTTP).
       if (s3) s3->stop();
       s3.reset();
+      bench->stop();
       // Close acceptors + HTTP keep-alive sockets before stopping ioc/joining workers.
       engine.stop();
       // ~IoStopper stops the io_context and joins its thread, before ~GossipEngine.

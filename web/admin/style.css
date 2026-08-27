@@ -899,6 +899,24 @@ code {
   cursor: default;
 }
 
+.bench-presets { margin: 0 0 1rem; }
+.bench-form { max-width: none; }
+.bench-mix {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem 1rem;
+  margin: 0 0 0.85rem;
+  font-size: 0.88rem;
+}
+.bench-mix label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+#tab-bench .btn.primary { width: auto; }
+#bench-state { margin-left: 0.25rem; }
+
 @media (max-width: 720px) {
   .topbar {
     align-items: flex-start;
