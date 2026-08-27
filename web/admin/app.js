@@ -75,6 +75,22 @@
     return String(n);
   }
 
+  function fmtBytes(n) {
+    if (n == null || Number.isNaN(Number(n))) return "—";
+    const v = Number(n);
+    const abs = Math.abs(v);
+    const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let i = 0;
+    let x = abs;
+    while (x >= 1024 && i < units.length - 1) {
+      x /= 1024;
+      i += 1;
+    }
+    const sign = v < 0 ? "-" : "";
+    const digits = i === 0 ? 0 : x >= 10 ? 1 : 2;
+    return sign + x.toFixed(digits) + " " + units[i];
+  }
+
   function fmtRateUnit(n, unit) {
     if (n == null || Number.isNaN(n)) return "—";
     const abs = Math.abs(n);
@@ -545,6 +561,7 @@
       if (!editing) await refreshLifecycle();
     }
     if (activeTab === "bench") await refreshBench();
+    if (activeTab === "space") await refreshSpace();
     if (activeTab === "actions") await refreshArchiveBackup();
   }
 
@@ -702,6 +719,276 @@
     else renderQos({ volume_uids: [], volume_gids: [], projects: [], monitoring: {} });
   }
 
+  let spaceDoc = null;
+  let spaceRange = "1y";
+
+  function usedFillClass(pct) {
+    if (pct >= 90) return "danger";
+    if (pct >= 75) return "warn";
+    return "";
+  }
+
+  function drawSpaceRing(used, total) {
+    const canvas = document.getElementById("space-ring");
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const css = 200;
+    if (canvas.width !== Math.floor(css * dpr) || canvas.height !== Math.floor(css * dpr)) {
+      canvas.width = Math.floor(css * dpr);
+      canvas.height = Math.floor(css * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, css, css);
+    const cx = css / 2;
+    const cy = css / 2;
+    const r = 74;
+    const lw = 18;
+    const pct = total > 0 ? Math.min(1, used / total) : 0;
+    ctx.lineWidth = lw;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(28,25,22,0.08)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#b87333";
+    const warn = getComputedStyle(document.documentElement).getPropertyValue("--warn").trim() || "#9a6b1f";
+    const danger = getComputedStyle(document.documentElement).getPropertyValue("--danger").trim() || "#a33b2b";
+    ctx.strokeStyle = pct >= 0.9 ? danger : pct >= 0.75 ? warn : accent;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + pct * Math.PI * 2);
+    ctx.stroke();
+    const ink = getComputedStyle(document.documentElement).getPropertyValue("--ink").trim() || "#1c1916";
+    const muted = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() || "#6b635a";
+    ctx.fillStyle = ink;
+    ctx.font = "650 28px Sora, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(total > 0 ? Math.round(pct * 100) + "%" : "—", cx, cy - 8);
+    ctx.fillStyle = muted;
+    ctx.font = "500 12px Sora, sans-serif";
+    ctx.fillText("used", cx, cy + 16);
+    const label = document.getElementById("space-ring-label");
+    if (label) {
+      label.textContent = total > 0 ? `${fmtBytes(used)} of ${fmtBytes(total)}` : "No disks in the map";
+    }
+  }
+
+  function renderSpaceBars(el, rows, nameKey) {
+    if (!el) return;
+    if (!rows || !rows.length) {
+      el.innerHTML = `<p class="empty">No usable disks</p>`;
+      return;
+    }
+    el.innerHTML = rows
+      .map((r) => {
+        const tot = Number(r.total_bytes) || 0;
+        const used = Number(r.used_bytes) || 0;
+        const pct = tot > 0 ? (100 * used) / tot : 0;
+        const disks = Number(r.disks) || 0;
+        const name = esc(r[nameKey] || "—") + (disks ? ` <span class="muted">· ${disks} disk${disks === 1 ? "" : "s"}</span>` : "");
+        return `<div class="space-bar">
+          <div class="bar-head"><strong>${name}</strong><span class="muted">${fmtBytes(used)} / ${fmtBytes(tot)}</span></div>
+          <div class="bar-track"><div class="bar-fill ${usedFillClass(pct)}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
+        </div>`;
+      })
+      .join("");
+  }
+
+  function spaceHistorySeries(doc, range) {
+    const h = (doc && doc.history) || {};
+    const now = Date.now();
+    let raw = h.daily || [];
+    let windowMs = 366 * 24 * 3600 * 1000;
+    if (range === "24h") {
+      raw = h.recent || [];
+      windowMs = 24 * 3600 * 1000;
+    } else if (range === "7d") {
+      raw = h.hourly || [];
+      windowMs = 7 * 24 * 3600 * 1000;
+    } else if (range === "30d") {
+      raw = h.hourly || [];
+      windowMs = 30 * 24 * 3600 * 1000;
+    }
+    const cutoff = now - windowMs;
+    return raw
+      .filter((p) => Number(p.t) >= cutoff)
+      .map((p) => ({
+        t: Number(p.t),
+        used: Number(p.used_bytes) || 0,
+        total: Number(p.total_bytes) || 0,
+        avail: Number(p.avail_bytes) || 0,
+      }));
+  }
+
+  function drawSpaceHistory(series) {
+    const canvas = document.getElementById("chart-space");
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || 640;
+    const cssH = canvas.clientHeight || 200;
+    if (canvas.width !== Math.floor(cssW * dpr) || canvas.height !== Math.floor(cssH * dpr)) {
+      canvas.width = Math.floor(cssW * dpr);
+      canvas.height = Math.floor(cssH * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    const pad = { l: 52, r: 10, t: 10, b: 28 };
+    const w = cssW - pad.l - pad.r;
+    const h = cssH - pad.t - pad.b;
+    const muted = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() || "#6b635a";
+    const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#b87333";
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--surface-2").trim() || "#f3eee7";
+    ctx.fillRect(pad.l, pad.t, w, h);
+    let maxY = 0;
+    for (const p of series) maxY = Math.max(maxY, p.total || 0, p.used || 0);
+    if (maxY <= 0) maxY = 1;
+    ctx.strokeStyle = "rgba(28,25,22,0.08)";
+    ctx.lineWidth = 1;
+    ctx.font = "11px Sora, sans-serif";
+    ctx.fillStyle = muted;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i <= 4; ++i) {
+      const y = pad.t + (h * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(pad.l, y);
+      ctx.lineTo(pad.l + w, y);
+      ctx.stroke();
+      ctx.fillText(fmtBytes(maxY * (1 - i / 4)), pad.l - 6, y);
+    }
+    if (!series.length) {
+      ctx.textAlign = "center";
+      ctx.fillText("No samples yet — the first point is recorded at startup", pad.l + w / 2, pad.t + h / 2);
+      return;
+    }
+    const xAt = (i) => pad.l + (series.length === 1 ? w / 2 : (w * i) / (series.length - 1));
+    const yAt = (v) => pad.t + h - (Math.min(v, maxY) / maxY) * h;
+    ctx.beginPath();
+    series.forEach((p, i) => {
+      const x = xAt(i);
+      const y = yAt(p.used);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.lineTo(xAt(series.length - 1), pad.t + h);
+    ctx.lineTo(xAt(0), pad.t + h);
+    ctx.closePath();
+    ctx.fillStyle = "rgba(184, 115, 51, 0.22)";
+    ctx.fill();
+    ctx.beginPath();
+    series.forEach((p, i) => {
+      const x = xAt(i);
+      if (i === 0) ctx.moveTo(x, yAt(p.used));
+      else ctx.lineTo(x, yAt(p.used));
+    });
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    series.forEach((p, i) => {
+      const x = xAt(i);
+      if (i === 0) ctx.moveTo(x, yAt(p.total));
+      else ctx.lineTo(x, yAt(p.total));
+    });
+    ctx.strokeStyle = "rgba(28,25,22,0.28)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const fmtWhen = (t) => {
+      const d = new Date(t);
+      if (Number.isNaN(d.getTime())) return "";
+      const span = series[series.length - 1].t - series[0].t;
+      if (span <= 36 * 3600 * 1000) {
+        return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      }
+      return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    };
+    ctx.fillStyle = muted;
+    ctx.font = "11px Sora, sans-serif";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    ctx.fillText(fmtWhen(series[0].t), pad.l, pad.t + h + 6);
+    ctx.textAlign = "right";
+    ctx.fillText(fmtWhen(series[series.length - 1].t), pad.l + w, pad.t + h + 6);
+  }
+
+  function renderSpace(doc) {
+    spaceDoc = doc;
+    const tot = (doc && doc.totals) || {};
+    const used = Number(tot.used_bytes) || 0;
+    const total = Number(tot.total_bytes) || 0;
+    const avail = Number(tot.avail_bytes) || 0;
+    const pct = total > 0 ? (100 * used) / total : 0;
+    drawSpaceRing(used, total);
+    document.getElementById("space-summary").innerHTML = [
+      ["Total", fmtBytes(total)],
+      ["Used", fmtBytes(used)],
+      ["Available", fmtBytes(avail)],
+      ["Full", total > 0 ? pct.toFixed(1) + "%" : "—"],
+    ]
+      .map(
+        ([label, value]) =>
+          `<div class="card${label === "Full" ? (pct >= 75 ? " warn" : " ok") : ""}"><span class="label">${label}</span><div class="value">${value}</div></div>`
+      )
+      .join("");
+    renderSpaceBars(document.getElementById("space-hosts"), doc.by_host || [], "node_id");
+    renderSpaceBars(document.getElementById("space-classes"), doc.by_class || [], "storage_class");
+    const disks = (doc && doc.disks) || [];
+    const rows = disks
+      .map((d) => {
+        const t = Number(d.total_bytes) || 0;
+        const u = Number(d.used_bytes) || 0;
+        const p = t > 0 ? ((100 * u) / t).toFixed(1) + "%" : "—";
+        return `<tr>
+          <td>${esc(d.node_id || "—")}${d.self ? badge("self", "self") : ""}</td>
+          <td>${esc(d.mount || d.aios_path || "—")}</td>
+          <td>${esc(d.storage_class || "—")}</td>
+          <td>${stateBadge(d.state)}${d.usable ? "" : badge("unusable", "off")}</td>
+          <td class="num">${fmtBytes(t)}</td>
+          <td class="num">${fmtBytes(u)}</td>
+          <td class="num">${fmtBytes(d.avail_bytes)}</td>
+          <td class="num">${p}</td>
+        </tr>`;
+      })
+      .join("");
+    document.getElementById("space-table").innerHTML =
+      `<table><thead><tr><th>Host</th><th>Disk</th><th>Class</th><th>State</th><th class="num">Total</th><th class="num">Used</th><th class="num">Avail</th><th class="num">Full</th></tr></thead><tbody>${
+        rows || emptyRow(8, "No disks in the cluster map")
+      }</tbody></table>`;
+    document.querySelectorAll("#space-range .btn").forEach((b) => {
+      b.classList.toggle("active", b.dataset.range === spaceRange);
+    });
+    const series = spaceHistorySeries(doc, spaceRange);
+    drawSpaceHistory(series);
+    const nowEl = document.getElementById("chart-space-now");
+    const last = series[series.length - 1];
+    if (nowEl) {
+      nowEl.textContent = last
+        ? `${spaceRange}  used ${fmtBytes(last.used)} · total ${fmtBytes(last.total)} · ${series.length} samples`
+        : `${spaceRange}  no samples yet`;
+    }
+  }
+
+  async function refreshSpace() {
+    const { res, json } = await api("/admin/api/space");
+    if (res.status === 401) {
+      showLogin("Session expired — sign in again.");
+      return;
+    }
+    if (res.ok) renderSpace(json);
+    else renderSpace({ totals: {}, disks: [], by_host: [], by_class: [], history: {} });
+  }
+
+  document.getElementById("space-range").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-range]");
+    if (!btn) return;
+    spaceRange = btn.dataset.range;
+    if (spaceDoc) renderSpace(spaceDoc);
+  });
+
   document.getElementById("tabs").addEventListener("click", (e) => {
     const btn = e.target.closest(".tab");
     if (!btn) return;
@@ -712,6 +999,7 @@
     if (btn.dataset.tab === "posix-layout") refreshPosixLayout().catch(() => {});
     if (btn.dataset.tab === "lifecycle") refreshLifecycle().catch(() => {});
     if (btn.dataset.tab === "bench") refreshBench().catch(() => {});
+    if (btn.dataset.tab === "space") refreshSpace().catch(() => {});
     if (btn.dataset.tab === "actions") refreshArchiveBackup().catch(() => {});
   });
 
@@ -1630,6 +1918,7 @@
 
   window.addEventListener("resize", () => {
     if (activeTab === "overview") drawIoCharts();
+    if (activeTab === "space" && spaceDoc) renderSpace(spaceDoc);
   });
 
   document.getElementById("overview-cards").addEventListener("click", (e) => {

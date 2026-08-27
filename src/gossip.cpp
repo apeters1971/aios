@@ -97,6 +97,7 @@ void GossipEngine::rebuild_cluster_map() {
                   " replica_count=", replicas);
     warn_thin_failure_domains(map_snapshot());
   }
+  if (space_history_) space_history_->maybe_record(fs_table_.snapshot(), cfg_.node_id);
 }
 
 ClusterMap GossipEngine::map_snapshot() const {
@@ -166,10 +167,13 @@ void GossipEngine::start() {
       posix_layout_ = std::make_shared<PosixLayoutStore>(cfg_, *object_service_);
       posix_layout_->seed_from_config_if_empty();
       vbd_registry_ = std::make_shared<VbdRegistryStore>(cfg_, *object_service_);
+      space_history_ = std::make_shared<SpaceHistory>(SpaceHistory::default_path(cfg_.status_file));
+      space_history_->maybe_record(fs_table_.snapshot(), cfg_.node_id);
     }
     http_server_ = std::make_unique<HttpServer>(ioc_, cfg_, *object_service_, membership_,
                                                 s3_iam_, quota_, qos_, backup_policies_,
                                                 posix_layout_, vbd_registry_);
+    if (space_history_) http_server_->set_space_history(space_history_);
     http_server_->set_on_lifecycle_changed([this] {
       // Runs on an HTTP worker thread, but cluster_map_, autotune_weights_ and
       // local_stores_ are owned by the io_context thread (the timers read the map by

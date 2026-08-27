@@ -348,6 +348,8 @@ textarea.code-block:focus {
 
 .chart-legend .swatch.read { background: var(--ok); }
 .chart-legend .swatch.write { background: var(--accent); }
+.chart-legend .swatch.used { background: var(--accent); }
+.chart-legend .swatch.total { background: rgba(28, 25, 22, 0.35); }
 
 .chart-card canvas {
   display: block;
@@ -916,6 +918,86 @@ code {
 }
 #tab-bench .btn.primary { width: auto; }
 #bench-state { margin-left: 0.25rem; }
+
+.space-hero {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1rem 1.4rem;
+  align-items: center;
+  margin: 0 0 1.25rem;
+}
+.space-ring-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem 1.15rem 0.85rem;
+  text-align: center;
+  min-width: 13rem;
+}
+#space-ring {
+  display: block;
+  width: 200px;
+  height: 200px;
+  margin: 0 auto;
+}
+.space-ring-label {
+  margin-top: 0.35rem;
+  font-size: 0.82rem;
+}
+.space-summary { margin: 0; }
+.space-split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem 1.25rem;
+  margin-bottom: 0.5rem;
+}
+.space-bars { display: grid; gap: 0.55rem; }
+.space-bar {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.55rem 0.7rem 0.65rem;
+}
+.space-bar .bar-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.82rem;
+  margin-bottom: 0.35rem;
+}
+.space-bar .bar-track {
+  height: 8px;
+  border-radius: 99px;
+  background: rgba(28, 25, 22, 0.08);
+  overflow: hidden;
+}
+.space-bar .bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+.space-bar .bar-fill.warn { background: var(--warn); }
+.space-bar .bar-fill.danger { background: var(--danger); }
+.space-history-card { margin-top: 1.15rem; }
+.space-history-card .chart-head {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.space-range { display: flex; gap: 0.35rem; }
+.space-range .btn {
+  padding: 0.28rem 0.6rem;
+  font-size: 0.78rem;
+  width: auto;
+}
+.space-range .btn.active {
+  background: var(--accent);
+  border-color: var(--accent-dim);
+  color: #fff;
+}
+#chart-space { display: block; width: 100%; height: 200px; }
+@media (max-width: 800px) {
+  .space-hero, .space-split { grid-template-columns: 1fr; }
+}
 
 @media (max-width: 720px) {
   .topbar {

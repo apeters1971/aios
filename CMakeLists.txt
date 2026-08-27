@@ -188,6 +188,7 @@ add_library(aios_core STATIC
   src/http/backup_policy.cpp
   src/http/posix_layout_store.cpp
   src/http/vbd_registry.cpp
+  src/http/space_history.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
   src/metrics/qos_rates.cpp
@@ -490,6 +491,7 @@ add_executable(aios_tests
   tests/test_stl_client.cpp
   tests/test_append.cpp
   tests/test_admin.cpp
+  tests/test_space_history.cpp
   tests/test_posix_fs.cpp
   tests/test_xrd_cred.cpp
   tests/test_archive.cpp

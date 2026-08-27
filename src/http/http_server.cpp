@@ -2172,6 +2172,15 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                    keep_alive);
         continue;
       }
+      if (method == "GET" && path == "/admin/api/space") {
+        if (!space_history_) {
+          write_json(*sock, 404, "Not Found", {{"error", "space history unavailable"}},
+                     keep_alive);
+        } else {
+          write_json(*sock, 200, "OK", space_history_->to_json(), keep_alive);
+        }
+        continue;
+      }
       if (method == "GET" && path == "/admin/api/lifecycle") {
         const std::string peer = qmap.count("node_id") ? qmap.at("node_id") : "";
         if (!peer.empty() && peer != cfg_.node_id) {

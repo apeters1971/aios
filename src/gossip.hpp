@@ -5,6 +5,7 @@
 #include "fs/fs_table.hpp"
 #include "http/backup_policy.hpp"
 #include "http/http_server.hpp"
+#include "http/space_history.hpp"
 #include "http/posix_layout_store.hpp"
 #include "http/qos_admin.hpp"
 #include "http/vbd_registry.hpp"
@@ -81,6 +82,7 @@ class GossipEngine {
   std::shared_ptr<VbdRegistryStore> vbd_registry_;
   std::unique_ptr<TcpServer> server_;
   std::unique_ptr<HttpServer> http_server_;
+  std::shared_ptr<SpaceHistory> space_history_;
   // Last advertised autotune weight per aios_path (hysteresis).
   std::unordered_map<std::string, int> autotune_weights_;
   boost::asio::steady_timer gossip_timer_;

@@ -40,6 +40,7 @@
         <nav class="tabs" id="tabs">
           <button type="button" data-tab="overview" class="tab active">Overview</button>
           <button type="button" data-tab="cluster" class="tab">Cluster</button>
+          <button type="button" data-tab="space" class="tab">Space</button>
           <button type="button" data-tab="config" class="tab">Config</button>
           <button type="button" data-tab="actions" class="tab">Actions</button>
           <button type="button" data-tab="s3" class="tab">S3</button>
@@ -100,6 +101,47 @@
         <h2>Cluster</h2>
         <p class="note section-head">Members, gossip liveness, and whether each node has a usable storage target in the map.</p>
         <div id="cluster-table" class="table-wrap"></div>
+      </section>
+
+      <section id="tab-space" class="panel hidden">
+        <h2>Space</h2>
+        <p class="note">Filesystem capacity from gossiped <code>statvfs</code> on each disk. Used is total minus available. History is sampled every 5 minutes on this console and kept for a year (5‑minute / hourly / daily).</p>
+        <div class="space-hero">
+          <div class="space-ring-card">
+            <canvas id="space-ring" width="240" height="240" aria-label="Cluster space used"></canvas>
+            <div id="space-ring-label" class="space-ring-label muted">—</div>
+          </div>
+          <div id="space-summary" class="cards space-summary"></div>
+        </div>
+        <div class="space-split">
+          <div>
+            <h3>By host</h3>
+            <div id="space-hosts" class="space-bars"></div>
+          </div>
+          <div>
+            <h3>By class</h3>
+            <div id="space-classes" class="space-bars"></div>
+          </div>
+        </div>
+        <h3>Disks</h3>
+        <div id="space-table" class="table-wrap"></div>
+        <div class="chart-card space-history-card">
+          <div class="chart-head">
+            <strong>Usage history</strong>
+            <span class="chart-legend">
+              <span class="swatch used"></span> used
+              <span class="swatch total"></span> total
+            </span>
+            <div class="space-range" id="space-range">
+              <button type="button" class="btn" data-range="24h">24h</button>
+              <button type="button" class="btn" data-range="7d">7d</button>
+              <button type="button" class="btn" data-range="30d">30d</button>
+              <button type="button" class="btn active" data-range="1y">1y</button>
+            </div>
+          </div>
+          <canvas id="chart-space" width="640" height="220" aria-label="Space history"></canvas>
+          <div id="chart-space-now" class="chart-now muted"></div>
+        </div>
       </section>
 
       <section id="tab-config" class="panel hidden">

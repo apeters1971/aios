@@ -6,6 +6,7 @@
 #include "http/qos_admin.hpp"
 #include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
+#include "http/space_history.hpp"
 #include "http/vbd_registry.hpp"
 #include "membership.hpp"
 #include "object/object_service.hpp"
@@ -60,6 +61,8 @@ class HttpServer {
     bench_defaults_ = std::move(defaults);
   }
 
+  void set_space_history(std::shared_ptr<SpaceHistory> h) { space_history_ = std::move(h); }
+
   std::uint64_t requests() const { return objects_.ops().total().http_requests.load(); }
 
  private:
@@ -91,6 +94,7 @@ class HttpServer {
   BenchStatusFn bench_status_;
   BenchStatusFn bench_stop_;
   BenchStatusFn bench_defaults_;
+  std::shared_ptr<SpaceHistory> space_history_;
   boost::asio::ip::tcp::acceptor acceptor_;
   // Blocking read/write session loop must not run on ioc_ (would stall accepts).
   // A session owns its thread for its whole keep-alive lifetime, so the pool size
