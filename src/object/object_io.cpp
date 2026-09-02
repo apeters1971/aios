@@ -135,14 +135,24 @@ bool load_object_bytes(const Config& cfg, const std::string& advertise, const Cl
 bool install_replica_version(const Config& cfg, const std::string& advertise,
                              const ClusterMap& map, LocalStores& stores, const Placement& dest,
                              const std::string& oid, const std::vector<std::uint8_t>& data,
-                             const std::unordered_map<std::string, std::string>& attrs) {
+                             const std::unordered_map<std::string, std::string>& attrs,
+                             std::optional<std::uint64_t> expected_prev_tip,
+                             std::uint64_t* new_seq_out, bool* tip_moved_out) {
+  if (tip_moved_out) *tip_moved_out = false;
   if (dest.acting_set.empty() || dest.acting_set[0].node_id != cfg.node_id) return false;
-  auto* primary = stores.get(dest.acting_set[0].aios_path);
+  auto primary = stores.get_shared(dest.acting_set[0].aios_path);
   if (!primary) return false;
   std::string err;
   PreparedVersion pv;
-  if (!primary->prepare_put(oid, data.data(), data.size(), attrs, true, std::nullopt, pv, err)) {
-    AIOS_LOG_WARN("install_replica prepare ", oid, ": ", err);
+  if (!primary->prepare_put(oid, data.data(), data.size(), attrs, true, std::nullopt,
+                            expected_prev_tip, pv, err)) {
+    if (expected_prev_tip.has_value() && err == "tip changed during upload") {
+      if (tip_moved_out) *tip_moved_out = true;
+      AIOS_LOG_WARN("install_replica ", oid, ": tip moved past ", *expected_prev_tip,
+                    "; skipping");
+    } else {
+      AIOS_LOG_WARN("install_replica prepare ", oid, ": ", err);
+    }
     return false;
   }
   int ok = 1;
@@ -180,6 +190,7 @@ bool install_replica_version(const Config& cfg, const std::string& advertise,
                                 map.epoch, t.aios_path, oid, pv.seq);
     }
   }
+  if (new_seq_out) *new_seq_out = pv.seq;
   return true;
 }
 

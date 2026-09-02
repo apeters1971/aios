@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
@@ -104,28 +105,35 @@ struct RingSlot {
 
 constexpr std::size_t kRingCacheSlots = 8;
 std::mutex g_ring_mu;
-std::array<RingSlot, kRingCacheSlots> g_rings;
+std::array<std::shared_ptr<const RingSlot>, kRingCacheSlots> g_rings;
 std::size_t g_ring_next{0};
 
 // Cached vnode ring + Up pool. Keyed by epoch, class, vnode knobs, and the
-// actual target list so tests/maps that share epoch 0 do not collide.
-std::pair<std::vector<StorageTarget>, std::vector<VNode>> cached_ring(
-    const ClusterMap& map, const std::string& storage_class) {
+// actual target list so tests/maps that share epoch 0 do not collide. Callers
+// share the immutable snapshot; the lock is held only for the lookup, and the
+// (expensive) ring build runs outside it.
+std::shared_ptr<const RingSlot> cached_ring(const ClusterMap& map,
+                                            const std::string& storage_class) {
   const auto fp = ring_fingerprint(map, storage_class);
+  {
+    std::lock_guard lock(g_ring_mu);
+    for (const auto& s : g_rings) {
+      if (s && s->fingerprint == fp) return s;
+    }
+  }
+  auto slot = std::make_shared<RingSlot>();
+  slot->fingerprint = fp;
+  for (const auto& t : map.targets_for_class(storage_class)) {
+    if (t.state == LifecycleState::Up) slot->pool.push_back(t);
+  }
+  slot->ring = build_ring(slot->pool, map.placement);
+  std::shared_ptr<const RingSlot> out = std::move(slot);
   std::lock_guard lock(g_ring_mu);
   for (const auto& s : g_rings) {
-    if (s.fingerprint == fp) return {s.pool, s.ring};
+    if (s && s->fingerprint == fp) return s;
   }
-  std::vector<StorageTarget> pool;
-  for (const auto& t : map.targets_for_class(storage_class)) {
-    if (t.state == LifecycleState::Up) pool.push_back(t);
-  }
-  auto ring = build_ring(pool, map.placement);
-  auto& slot = g_rings[g_ring_next++ % kRingCacheSlots];
-  slot.fingerprint = fp;
-  slot.pool = pool;
-  slot.ring = ring;
-  return {std::move(pool), std::move(ring)};
+  g_rings[g_ring_next++ % kRingCacheSlots] = out;
+  return out;
 }
 
 }  // namespace
@@ -137,7 +145,9 @@ Placement place(const std::string& oid, const ClusterMap& map, int n,
   p.storage_class = storage_class;
   if (map.targets.empty() || n < 1 || storage_class.empty()) return p;
 
-  auto [pool, ring] = cached_ring(map, storage_class);
+  const auto slot = cached_ring(map, storage_class);
+  const auto& pool = slot->pool;
+  const auto& ring = slot->ring;
   if (static_cast<std::size_t>(n) > pool.size()) return p;
   if (ring.empty()) return p;
 

@@ -147,7 +147,17 @@ class ObjectStore {
   bool prepare_put(const std::string& oid, const std::uint8_t* data, std::size_t len,
                    const std::unordered_map<std::string, std::string>& attrs,
                    bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
-                   PreparedVersion& out, std::string& err);
+                   PreparedVersion& out, std::string& err) {
+    return prepare_put(oid, data, len, attrs, replace_attrs, expected_crc32c, std::nullopt, out,
+                       err);
+  }
+  // expected_prev_tip: fail with "tip changed during upload" when the current tip
+  // differs (compare-and-swap for background jobs that read a body earlier).
+  bool prepare_put(const std::string& oid, const std::uint8_t* data, std::size_t len,
+                   const std::unordered_map<std::string, std::string>& attrs,
+                   bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
+                   std::optional<std::uint64_t> expected_prev_tip, PreparedVersion& out,
+                   std::string& err);
   // FS-backed prepare from a completed staging file (moved into place). Always non-inline.
   bool prepare_put_file(const std::string& oid, const std::string& staging_abs_path,
                         std::uint64_t size, std::uint32_t crc32c_val,
@@ -255,7 +265,14 @@ class ObjectStore {
                         const std::string& cursor, bool include_attrs, std::string& err);
 
   std::size_t scrub_orphans(std::string& err);
+  // Remove leftover staging/upload files under each shard's tmp/ that are older
+  // than max_age_ms (0 = all). Only safe when no other process writes this store,
+  // e.g. at daemon startup before any pipeline/stage session exists.
+  std::size_t sweep_tmp(std::int64_t max_age_ms, std::string& err);
   std::vector<std::string> list_oids(std::size_t max_count, std::string& err);
+
+  // Test-only: true if any cached statement of any open shard is still stepped.
+  bool debug_any_stmt_busy() const;
 
  private:
   struct Shard {
@@ -282,6 +299,13 @@ class ObjectStore {
   bool use_inline(std::size_t len) const;
 
   std::string version_relpath(const std::string& oid, std::uint64_t seq) const;
+  // A body relpath must stay inside shard.dir: relative, no leading "..".
+  static bool relpath_ok(const std::string& relpath);
+  bool fsync_file(const std::string& abs_path, std::string& err) const;
+  bool fsync_parent_dir(const std::string& abs_path, std::string& err) const;
+  // fsync tmp, rename tmp -> final, fsync final's directory (honors data_fsync).
+  bool place_file_durably(const std::string& tmp_abs, const std::string& final_abs,
+                          std::string& err) const;
   bool write_fs_object(Shard& shard, const std::string& relpath, const std::uint8_t* data,
                        std::size_t len, std::string& err);
   bool remove_fs_object(Shard& shard, const std::string& relpath, std::string& err);

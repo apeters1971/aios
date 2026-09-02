@@ -7,6 +7,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -305,13 +306,47 @@ bool update_aios_marker_file(const std::string& marker_path,
     }
     if (state) root["state"] = lower_copy(*state);
     if (weight) root["weight"] = *weight;
-    std::ofstream out(marker_path, std::ios::trunc);
-    if (!out) {
-      err = "cannot write " + marker_path;
+    // Write-to-temp, fsync, rename: a crash mid-write must not leave a truncated
+    // .aios that the next scan rejects (dropping the whole mount from placement).
+    std::ostringstream body;
+    body << root << "\n";
+    const std::string text = body.str();
+    const std::string tmp_path = marker_path + ".tmp";
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+      err = "cannot write " + tmp_path + ": " + std::strerror(errno);
       return false;
     }
-    out << root;
-    out << "\n";
+    std::size_t done = 0;
+    while (done < text.size()) {
+      const ssize_t n = ::write(fd, text.data() + done, text.size() - done);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        err = std::string("write ") + tmp_path + ": " + std::strerror(errno);
+        ::close(fd);
+        ::unlink(tmp_path.c_str());
+        return false;
+      }
+      done += static_cast<std::size_t>(n);
+    }
+    if (::fsync(fd) != 0) {
+      err = std::string("fsync ") + tmp_path + ": " + std::strerror(errno);
+      ::close(fd);
+      ::unlink(tmp_path.c_str());
+      return false;
+    }
+    ::close(fd);
+    if (::rename(tmp_path.c_str(), marker_path.c_str()) != 0) {
+      err = std::string("rename ") + tmp_path + ": " + std::strerror(errno);
+      ::unlink(tmp_path.c_str());
+      return false;
+    }
+    const std::string dir = fs::path(marker_path).parent_path().string();
+    int dfd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY);
+    if (dfd >= 0) {
+      ::fsync(dfd);
+      ::close(dfd);
+    }
     return true;
   } catch (const std::exception& e) {
     err = e.what();

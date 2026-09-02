@@ -49,7 +49,14 @@ struct ArchiveMember {
   std::string sha256_hex;
   std::unordered_map<std::string, std::string> attrs;
   std::vector<std::uint8_t> data;
+  // Tip seq the body was read from (not serialized); used to refuse stubbing a
+  // member that a client overwrote while the bag was being assembled.
+  std::uint64_t tip_seq{0};
 };
+
+// Smallest possible on-disk index record: u16 oid_len + u64 offset + u64 length +
+// 64-byte sha256 hex + u32 attrs_len.
+inline constexpr std::size_t kMinMemberRecord = 2 + 8 + 8 + 64 + 4;
 
 struct ArchiveBag {
   std::vector<ArchiveMember> members;

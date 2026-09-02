@@ -1,6 +1,7 @@
 #include "cluster/cluster_map.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 #include <unordered_map>
 
@@ -70,32 +71,65 @@ nlohmann::json ClusterMap::to_json() const {
   };
 }
 
+namespace {
+
+bool jget(const nlohmann::json& o, const char* key, std::string& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (!it->is_string()) return false;
+  out = it->get<std::string>();
+  return true;
+}
+bool jget(const nlohmann::json& o, const char* key, std::uint64_t& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (it->is_number_unsigned()) {
+    out = it->get<std::uint64_t>();
+    return true;
+  }
+  if (it->is_number_integer() && it->get<std::int64_t>() >= 0) {
+    out = static_cast<std::uint64_t>(it->get<std::int64_t>());
+    return true;
+  }
+  return false;
+}
+bool jget(const nlohmann::json& o, const char* key, int& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (!it->is_number_integer()) return false;
+  const auto v = it->get<std::int64_t>();
+  if (v < INT32_MIN || v > INT32_MAX) return false;
+  out = static_cast<int>(v);
+  return true;
+}
+
+}  // namespace
+
 ClusterMap ClusterMap::from_json(const nlohmann::json& j) {
   ClusterMap m;
   if (!j.is_object()) return m;
-  m.epoch = j.value("epoch", static_cast<std::uint64_t>(0));
-  m.replica_count = j.value("replica_count", 3);
-  if (j.contains("placement") && j["placement"].is_object()) {
-    const auto& p = j["placement"];
-    m.placement.vnodes_per_target = p.value("vnodes_per_target", 128);
-    m.placement.min_vnodes = p.value("min_vnodes", 16);
-    m.placement.max_vnodes = p.value("max_vnodes", 1024);
+  // Peer-supplied: wrong-typed top-level fields keep defaults; malformed targets are skipped.
+  jget(j, "epoch", m.epoch);
+  jget(j, "replica_count", m.replica_count);
+  if (auto p = j.find("placement"); p != j.end() && p->is_object()) {
+    jget(*p, "vnodes_per_target", m.placement.vnodes_per_target);
+    jget(*p, "min_vnodes", m.placement.min_vnodes);
+    jget(*p, "max_vnodes", m.placement.max_vnodes);
   }
-  if (!j.contains("targets") || !j["targets"].is_array()) return m;
-  for (const auto& e : j["targets"]) {
+  auto targets = j.find("targets");
+  if (targets == j.end() || !targets->is_array()) return m;
+  for (const auto& e : *targets) {
     if (!e.is_object()) continue;
     StorageTarget t;
-    t.node_id = e.value("node_id", "");
-    t.addr = e.value("addr", "");
-    t.http_addr = e.value("http_addr", "");
-    t.aios_path = e.value("aios_path", "");
-    t.mount = e.value("mount", "");
-    t.storage_class = e.value("storage_class", "");
-    t.rack = e.value("rack", "");
+    std::string state = "up";
+    const bool ok = jget(e, "node_id", t.node_id) && jget(e, "addr", t.addr) &&
+                    jget(e, "http_addr", t.http_addr) && jget(e, "aios_path", t.aios_path) &&
+                    jget(e, "mount", t.mount) && jget(e, "storage_class", t.storage_class) &&
+                    jget(e, "rack", t.rack) && jget(e, "weight", t.weight) &&
+                    jget(e, "state", state) && jget(e, "bavail", t.bavail);
+    if (!ok) continue;
     if (t.rack.empty() && !t.node_id.empty()) t.rack = t.node_id;
-    t.weight = e.value("weight", 1);
-    t.state = lifecycle_state_from_string(e.value("state", "up"));
-    t.bavail = e.value("bavail", static_cast<std::uint64_t>(0));
+    t.state = lifecycle_state_from_string(state);
     if (!t.node_id.empty() && !t.aios_path.empty() && !t.storage_class.empty() &&
         t.state != LifecycleState::Off) {
       m.targets.push_back(std::move(t));

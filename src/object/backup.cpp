@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <queue>
 #include <random>
 #include <sstream>
@@ -27,6 +28,54 @@ namespace aios {
 namespace {
 
 constexpr std::int64_t kDayMs = 24ll * 60 * 60 * 1000;
+
+// Checked accessors: object metadata is client-authored and must never throw out
+// of a background job. Missing keys keep the default; wrong types fail.
+bool json_u64(const nlohmann::json& j, const char* key, std::uint64_t& out) {
+  if (!j.is_object()) return false;
+  auto it = j.find(key);
+  if (it == j.end()) return true;
+  if (it->is_number_unsigned()) {
+    out = it->get<std::uint64_t>();
+    return true;
+  }
+  if (it->is_number_integer() && it->get<std::int64_t>() >= 0) {
+    out = static_cast<std::uint64_t>(it->get<std::int64_t>());
+    return true;
+  }
+  return false;
+}
+
+bool json_i64(const nlohmann::json& j, const char* key, std::int64_t& out) {
+  if (!j.is_object()) return false;
+  auto it = j.find(key);
+  if (it == j.end()) return true;
+  if (!it->is_number_integer()) return false;
+  out = it->get<std::int64_t>();
+  return true;
+}
+
+bool json_str(const nlohmann::json& j, const char* key, std::string& out) {
+  if (!j.is_object()) return false;
+  auto it = j.find(key);
+  if (it == j.end()) return true;
+  if (!it->is_string()) return false;
+  out = it->get<std::string>();
+  return true;
+}
+
+bool parse_u64(const std::string& s, std::uint64_t& out) {
+  if (s.empty() || s.size() > 20) return false;
+  std::uint64_t v = 0;
+  for (char c : s) {
+    if (c < '0' || c > '9') return false;
+    const auto d = static_cast<std::uint64_t>(c - '0');
+    if (v > (std::numeric_limits<std::uint64_t>::max() - d) / 10) return false;
+    v = v * 10 + d;
+  }
+  out = v;
+  return true;
+}
 
 std::string make_snap_id() {
   static thread_local std::mt19937_64 rng{
@@ -261,7 +310,9 @@ bool decode_dir_log(const std::string& buf, std::uint64_t snapshot_op,
       args.push_back(std::move(s));
     }
     if (op_u == 1 && args.size() >= 2) {
-      entries[args[0]] = static_cast<std::uint64_t>(std::stoull(args[1]));
+      std::uint64_t ino = 0;
+      if (!parse_u64(args[1], ino)) return false;
+      entries[args[0]] = ino;
     } else if (op_u == 2 && args.size() >= 1) {
       entries.erase(args[0]);
     } else if (op_u == 3 && args.size() >= 2) {
@@ -284,12 +335,21 @@ bool load_dir_entries(ObjectService& svc, const std::string& volume, std::uint64
   const std::string log_oid = "posix/" + volume + "/dir/" + std::to_string(ino) + "/log";
   nlohmann::json meta;
   if (!get_json(svc, meta_oid, meta)) return true;  // empty dir
-  const std::uint64_t log_bytes = meta.value("log_bytes", static_cast<std::uint64_t>(0));
-  const std::uint64_t snapshot_op = meta.value("snapshot_op", static_cast<std::uint64_t>(0));
+  std::uint64_t log_bytes = 0;
+  std::uint64_t snapshot_op = 0;
+  if (!json_u64(meta, "log_bytes", log_bytes) || !json_u64(meta, "snapshot_op", snapshot_op)) {
+    err = "bad dir meta";
+    return false;
+  }
   if (snapshot_op > 0) {
     nlohmann::json sj;
-    if (get_json(svc, snap_oid, sj) && sj.contains("entries") && sj["entries"].is_object()) {
+    if (get_json(svc, snap_oid, sj) && sj.is_object() && sj.contains("entries") &&
+        sj["entries"].is_object()) {
       for (auto it = sj["entries"].begin(); it != sj["entries"].end(); ++it) {
+        if (!it.value().is_number_unsigned()) {
+          err = "bad dir snapshot";
+          return false;
+        }
         entries[it.key()] = it.value().get<std::uint64_t>();
       }
     }
@@ -356,7 +416,12 @@ bool collect_subtree_oids(ObjectService& svc, const std::string& volume, std::ui
     nlohmann::json ij;
     if (!load_inode(svc, volume, ino, ij, err)) return false;
     oids.push_back("posix/" + volume + "/ino/" + std::to_string(ino));
-    const std::uint32_t mode = ij.value("mode", 0u);
+    std::uint64_t mode64 = 0;
+    if (!json_u64(ij, "mode", mode64) || mode64 > std::numeric_limits<std::uint32_t>::max()) {
+      err = "bad inode mode: " + std::to_string(ino);
+      return false;
+    }
+    const std::uint32_t mode = static_cast<std::uint32_t>(mode64);
     if (S_ISDIR(mode)) {
       for (const char* part : {"meta", "log", "snap"}) {
         oids.push_back("posix/" + volume + "/dir/" + std::to_string(ino) + "/" + part);
@@ -368,9 +433,12 @@ bool collect_subtree_oids(ObjectService& svc, const std::string& volume, std::ui
         if (seen.insert(child).second) q.push(child);
       }
     } else if (S_ISREG(mode)) {
-      const std::uint64_t size = ij.value("size", static_cast<std::uint64_t>(0));
-      const std::uint64_t stripe =
-          ij.value("stripe_unit", static_cast<std::uint64_t>(1024ull * 1024ull));
+      std::uint64_t size = 0;
+      std::uint64_t stripe = 1024ull * 1024ull;
+      if (!json_u64(ij, "size", size) || !json_u64(ij, "stripe_unit", stripe)) {
+        err = "bad inode geometry: " + std::to_string(ino);
+        return false;
+      }
       if (stripe == 0) {
         err = "bad stripe_unit";
         return false;
@@ -411,9 +479,13 @@ std::vector<SnapInfo> load_snap_manifests(ObjectService& svc, const std::string&
     if (!get_json(svc, man_oid, j)) continue;
     SnapInfo s;
     s.id = id;
-    s.created_ms = j.value("created_ms", static_cast<std::int64_t>(0));
-    s.path = normalize_path(j.value("path", "/"));
-    s.policy_id = j.value("policy_id", "");
+    std::string path = "/";
+    if (!json_i64(j, "created_ms", s.created_ms) || !json_str(j, "path", path) ||
+        !json_str(j, "policy_id", s.policy_id)) {
+      AIOS_LOG_WARN("backup: malformed snapshot manifest ", man_oid, "; skipping");
+      continue;
+    }
+    s.path = normalize_path(path);
     out.push_back(std::move(s));
   }
   return out;
@@ -423,7 +495,7 @@ std::vector<SnapInfo> load_snap_manifests(ObjectService& svc, const std::string&
 
 bool backup_snapshot_posix(ObjectService& svc, const std::string& volume, const std::string& path,
                            std::string& snap_id_out, std::string& err, std::size_t* oids_copied,
-                           const std::string& policy_id) {
+                           const std::string& policy_id) try {
   if (volume.empty() || volume.find('/') != std::string::npos) {
     err = "invalid volume";
     return false;
@@ -488,11 +560,17 @@ done:
   }
   if (oids_copied) *oids_copied = copied;
   return ok;
+} catch (const std::exception& e) {
+  AIOS_LOG_ERROR("backup posix snapshot ", volume, ": ", e.what());
+  err = std::string("backup failed: ") + e.what();
+  std::string uerr;
+  set_posix_frozen(svc, volume, false, uerr);
+  return false;
 }
 
 bool backup_snapshot_vbd(ObjectService& svc, const std::string& pool, const std::string& name,
                          const std::string& dest_name, std::string& err,
-                         std::size_t* oids_copied) {
+                         std::size_t* oids_copied) try {
   if (pool.empty() || name.empty() || dest_name.empty()) {
     err = "pool/name/dest required";
     return false;
@@ -511,8 +589,12 @@ bool backup_snapshot_vbd(ObjectService& svc, const std::string& pool, const std:
     err = "bad vbd header";
     return false;
   }
-  const std::uint64_t size = hj.value("size", static_cast<std::uint64_t>(0));
-  const std::uint32_t obj_order = hj.value("obj_order", 22u);
+  std::uint64_t size = 0;
+  std::uint64_t obj_order = 22;
+  if (!json_u64(hj, "size", size) || !json_u64(hj, "obj_order", obj_order)) {
+    err = "bad vbd header";
+    return false;
+  }
   if (size == 0 || obj_order < 16 || obj_order > 24) {
     err = "invalid vbd geometry";
     return false;
@@ -577,10 +659,10 @@ bool backup_snapshot_vbd(ObjectService& svc, const std::string& pool, const std:
     v.pool = pool;
     v.name = dest_name;
     v.size = size;
-    v.obj_order = obj_order;
+    v.obj_order = static_cast<std::uint32_t>(obj_order);
     v.sealed = true;
     v.snapshot_of = pool + "/" + name;
-    v.created_ms = hj.value("created_ms", static_cast<std::int64_t>(0));
+    json_i64(hj, "created_ms", v.created_ms);
     std::string rerr;
     if (!reg.upsert(std::move(v), rerr)) {
       AIOS_LOG_WARN("vbd registry upsert for snapshot ", pool, "/", dest_name, ": ", rerr);
@@ -588,10 +670,14 @@ bool backup_snapshot_vbd(ObjectService& svc, const std::string& pool, const std:
   }
   if (oids_copied) *oids_copied = copied + 1;
   return true;
+} catch (const std::exception& e) {
+  AIOS_LOG_ERROR("backup vbd snapshot ", pool, "/", name, ": ", e.what());
+  err = std::string("backup failed: ") + e.what();
+  return false;
 }
 
 std::size_t backup_prune_gfs(ObjectService& svc, const std::string& volume, const std::string& path,
-                             const std::string& policy_id, int keep_days, int keep_monthly) {
+                             const std::string& policy_id, int keep_days, int keep_monthly) try {
   const auto norm_path = normalize_path(path);
   const auto now = now_ms();
   auto snaps = load_snap_manifests(svc, volume);
@@ -635,11 +721,14 @@ std::size_t backup_prune_gfs(ObjectService& svc, const std::string& volume, cons
     }
   }
   return pruned;
+} catch (const std::exception& e) {
+  AIOS_LOG_ERROR("backup prune ", volume, path, ": ", e.what());
+  return 0;
 }
 
 BackupStats run_backup(const Config& cfg, const std::string& advertise, const ClusterMap& map,
                        LocalStores& stores, ObjectService& svc, std::size_t max_oids_per_store,
-                       BackupPolicyStore* policies, bool force_live) {
+                       BackupPolicyStore* policies, bool force_live) try {
   BackupStats stats;
 
   auto pack_drain = [&](const ArchiveRule& ar) {
@@ -741,6 +830,11 @@ BackupStats run_backup(const Config& cfg, const std::string& advertise, const Cl
     }
   }
 
+  return stats;
+} catch (const std::exception& e) {
+  AIOS_LOG_ERROR("backup pass aborted: ", e.what());
+  BackupStats stats;
+  ++stats.failed;
   return stats;
 }
 

@@ -168,6 +168,10 @@ bool decode_archive_bag(const std::uint8_t* data, std::size_t len, ArchiveBag& o
     err = "bad index offset";
     return false;
   }
+  if (count > (len - index_off) / kMinMemberRecord) {
+    err = "bad member count";
+    return false;
+  }
   p = data + index_off;
   out.members.reserve(count);
   for (std::uint32_t i = 0; i < count; ++i) {
@@ -206,7 +210,7 @@ bool decode_archive_bag(const std::uint8_t* data, std::size_t len, ArchiveBag& o
       return false;
     }
     p += alen;
-    if (m.offset + m.length > len) {
+    if (m.offset > len || m.length > len - m.offset) {
       err = "member out of range";
       return false;
     }

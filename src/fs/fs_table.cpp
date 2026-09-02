@@ -2,6 +2,8 @@
 
 #include "util/log.hpp"
 
+#include <cstdint>
+
 namespace aios {
 
 void FsTable::set_local(const std::string& node_id, const std::vector<AiosTarget>& targets,
@@ -94,29 +96,84 @@ nlohmann::json FsTable::to_json() const {
   return {{"entries", entries}};
 }
 
+namespace {
+
+// Gossip payloads come from peers; a wrong-typed field skips the entry rather
+// than throwing out of the receive path. Missing keys keep the default.
+bool jget(const nlohmann::json& o, const char* key, std::string& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (!it->is_string()) return false;
+  out = it->get<std::string>();
+  return true;
+}
+bool jget(const nlohmann::json& o, const char* key, std::uint64_t& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (it->is_number_unsigned()) {
+    out = it->get<std::uint64_t>();
+    return true;
+  }
+  if (it->is_number_integer() && it->get<std::int64_t>() >= 0) {
+    out = static_cast<std::uint64_t>(it->get<std::int64_t>());
+    return true;
+  }
+  return false;
+}
+bool jget(const nlohmann::json& o, const char* key, std::int64_t& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (!it->is_number_integer()) return false;
+  out = it->get<std::int64_t>();
+  return true;
+}
+bool jget(const nlohmann::json& o, const char* key, int& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (!it->is_number_integer()) return false;
+  const auto v = it->get<std::int64_t>();
+  if (v < INT32_MIN || v > INT32_MAX) return false;
+  out = static_cast<int>(v);
+  return true;
+}
+bool jget(const nlohmann::json& o, const char* key, bool& out) {
+  auto it = o.find(key);
+  if (it == o.end()) return true;
+  if (!it->is_boolean()) return false;
+  out = it->get<bool>();
+  return true;
+}
+
+}  // namespace
+
 std::vector<FsEntry> FsTable::from_json(const nlohmann::json& j) {
   std::vector<FsEntry> out;
-  const auto& arr = j.contains("entries") ? j.at("entries") : j;
-  if (!arr.is_array()) return out;
-  for (const auto& x : arr) {
+  const nlohmann::json* arr = &j;
+  if (j.is_object()) {
+    auto it = j.find("entries");
+    if (it == j.end()) return out;
+    arr = &*it;
+  }
+  if (!arr->is_array()) return out;
+  for (const auto& x : *arr) {
+    if (!x.is_object()) continue;
     FsEntry e;
-    e.node_id = x.value("node_id", "");
-    e.mount = x.value("mount", "");
-    e.target_path = x.value("target_path", "");
-    e.aios_path = x.value("aios_path", "");
-    e.storage_class = x.value("storage_class", "");
-    e.rack = x.value("rack", "");
+    std::string state = "up";
+    const bool ok = jget(x, "node_id", e.node_id) && jget(x, "mount", e.mount) &&
+                    jget(x, "target_path", e.target_path) &&
+                    jget(x, "aios_path", e.aios_path) &&
+                    jget(x, "storage_class", e.storage_class) && jget(x, "rack", e.rack) &&
+                    jget(x, "weight", e.weight) && jget(x, "state", state) &&
+                    jget(x, "bsize", e.bsize) && jget(x, "blocks", e.blocks) &&
+                    jget(x, "bfree", e.bfree) && jget(x, "bavail", e.bavail) &&
+                    jget(x, "files", e.files) && jget(x, "ffree", e.ffree) &&
+                    jget(x, "usable", e.usable) && jget(x, "updated_ms", e.updated_ms);
+    if (!ok) {
+      AIOS_LOG_WARN("fs_table: skipping malformed gossip entry");
+      continue;
+    }
     if (e.rack.empty() && !e.node_id.empty()) e.rack = e.node_id;
-    e.weight = x.value("weight", 1);
-    e.state = lifecycle_state_from_string(x.value("state", "up"));
-    e.bsize = x.value("bsize", std::uint64_t{0});
-    e.blocks = x.value("blocks", std::uint64_t{0});
-    e.bfree = x.value("bfree", std::uint64_t{0});
-    e.bavail = x.value("bavail", std::uint64_t{0});
-    e.files = x.value("files", std::uint64_t{0});
-    e.ffree = x.value("ffree", std::uint64_t{0});
-    e.usable = x.value("usable", false);
-    e.updated_ms = x.value("updated_ms", std::int64_t{0});
+    e.state = lifecycle_state_from_string(state);
     out.push_back(std::move(e));
   }
   return out;

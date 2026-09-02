@@ -48,6 +48,9 @@ bool seal_bag(const Config& cfg, const std::string& advertise, const ClusterMap&
               ArchiveStats& stats) {
   if (members.empty()) return true;
   std::string err;
+  // Tip seqs the bodies were read from; the decoded index below does not carry them.
+  std::unordered_map<std::string, std::uint64_t> member_tips;
+  for (const auto& m : members) member_tips[m.oid] = m.tip_seq;
   std::vector<std::uint8_t> plain_bytes;
   if (!encode_archive_bag(members, plain_bytes, err)) {
     AIOS_LOG_WARN("archive encode: ", err);
@@ -120,8 +123,19 @@ bool seal_bag(const Config& cfg, const std::string& advertise, const ClusterMap&
     }
     apply_frozen_stub_attrs(stub_attrs, bag_id, m.offset, m.length, m.sha256_hex);
     std::vector<std::uint8_t> empty;
-    if (!install_replica_version(cfg, advertise, map, stores, mdest, m.oid, empty, stub_attrs)) {
-      ++stats.failed;
+    std::optional<std::uint64_t> expect;
+    if (auto ti = member_tips.find(m.oid); ti != member_tips.end() && ti->second > 0) {
+      expect = ti->second;
+    }
+    bool tip_moved = false;
+    if (!install_replica_version(cfg, advertise, map, stores, mdest, m.oid, empty, stub_attrs,
+                                 expect, nullptr, &tip_moved)) {
+      if (tip_moved) {
+        AIOS_LOG_WARN("archive stub ", m.oid, ": tip changed during pack; left live");
+        ++stats.tip_moved;
+      } else {
+        ++stats.failed;
+      }
       continue;
     }
     ++stats.packed;
@@ -146,13 +160,18 @@ bool seal_bag(const Config& cfg, const std::string& advertise, const ClusterMap&
         if (!info || info->is_delete) continue;
         auto attrs = s->list_attrs(m.oid, e2);
         if (!attrs_are_frozen(attrs)) continue;
+        // Only flip a stub this seal produced; a different bag id means the
+        // member was re-frozen elsewhere in the meantime.
+        auto bid_it = attrs.find(kBagIdAttr);
+        if (bid_it == attrs.end() || bid_it->second != bag_id) continue;
         attrs[kArchiveStateAttr] = kArchiveStateOnTape;
         const int sn = placement_n_for_attrs(attrs, map.replica_count);
         const std::string sc = storage_class_for_attrs(attrs, rule.from);
         auto mdest = place(m.oid, map, sn, sc);
         if (mdest.acting_set.empty() || mdest.acting_set[0].node_id != cfg.node_id) break;
         std::vector<std::uint8_t> empty;
-        install_replica_version(cfg, advertise, map, stores, mdest, m.oid, empty, attrs);
+        install_replica_version(cfg, advertise, map, stores, mdest, m.oid, empty, attrs,
+                                info->seq);
         break;
       }
     }
@@ -210,17 +229,24 @@ bool read_frozen_member(const Config& cfg, const std::string& advertise, const C
     err = "bag not available";
     return false;
   }
+  // Slice a plain AIAB body in place; only transformed bags need a second buffer,
+  // and the stored copy is released before the member slice is materialized.
   std::vector<std::uint8_t> bag;
-  if (!untransform_bag_from_storage(stored.data(), stored.size(), cfg.bag_encryption_key, bag,
-                                    err)) {
-    return false;
+  const std::vector<std::uint8_t>* src = &stored;
+  if (bag_body_is_transformed(stored.data(), stored.size())) {
+    if (!untransform_bag_from_storage(stored.data(), stored.size(), cfg.bag_encryption_key, bag,
+                                      err)) {
+      return false;
+    }
+    std::vector<std::uint8_t>().swap(stored);
+    src = &bag;
   }
-  if (offset + length > bag.size()) {
+  if (offset > src->size() || length > src->size() - offset) {
     err = "bag slice out of range";
     return false;
   }
-  out.assign(bag.begin() + static_cast<std::ptrdiff_t>(offset),
-             bag.begin() + static_cast<std::ptrdiff_t>(offset + length));
+  out.assign(src->begin() + static_cast<std::ptrdiff_t>(offset),
+             src->begin() + static_cast<std::ptrdiff_t>(offset + length));
   auto expect = stub_attrs.find(kContentSha256Attr);
   if (expect != stub_attrs.end() && !expect->second.empty()) {
     if (sha256_hex_bytes(out.data(), out.size()) != expect->second) {
@@ -232,14 +258,16 @@ bool read_frozen_member(const Config& cfg, const std::string& advertise, const C
 }
 
 bool recall_archived_oid(const Config& cfg, const std::string& advertise, const ClusterMap& map,
-                         LocalStores& stores, const std::string& oid, std::string& err) {
+                         LocalStores& stores, const std::string& oid, std::string& err) try {
   std::unordered_map<std::string, std::string> attrs;
+  std::uint64_t stub_tip = 0;
   for (const auto& path : stores.paths()) {
-    auto* s = stores.get(path);
+    auto s = stores.get_shared(path);
     if (!s) continue;
     auto info = s->stat(oid, err);
     if (!info || info->is_delete) continue;
     attrs = s->list_attrs(oid, err);
+    stub_tip = info->seq;
     break;
   }
   if (!attrs_are_frozen(attrs)) {
@@ -262,7 +290,15 @@ bool recall_archived_oid(const Config& cfg, const std::string& advertise, const 
     auto mdest = place(oid, map, sn, sc);
     if (!mdest.acting_set.empty() && mdest.acting_set[0].node_id == cfg.node_id) {
       std::vector<std::uint8_t> empty;
-      install_replica_version(cfg, advertise, map, stores, mdest, oid, empty, attrs);
+      std::uint64_t new_seq = 0;
+      bool tip_moved = false;
+      if (install_replica_version(cfg, advertise, map, stores, mdest, oid, empty, attrs,
+                                  stub_tip, &new_seq, &tip_moved)) {
+        stub_tip = new_seq;
+      } else if (tip_moved) {
+        err = "tip changed during recall";
+        return false;
+      }
     }
   }
 
@@ -291,17 +327,23 @@ bool recall_archived_oid(const Config& cfg, const std::string& advertise, const 
     err = "not primary for oid";
     return false;
   }
-  if (!install_replica_version(cfg, advertise, map, stores, dest, oid, data, attrs)) {
-    err = "rehydrate failed";
+  bool tip_moved = false;
+  if (!install_replica_version(cfg, advertise, map, stores, dest, oid, data, attrs, stub_tip,
+                               nullptr, &tip_moved)) {
+    err = tip_moved ? "tip changed during recall" : "rehydrate failed";
     return false;
   }
   return true;
+} catch (const std::exception& e) {
+  AIOS_LOG_ERROR("recall ", oid, ": ", e.what());
+  err = std::string("recall failed: ") + e.what();
+  return false;
 }
 
 ArchiveStats run_archive_with_rules(const Config& cfg, const std::string& advertise,
                                     const ClusterMap& map, LocalStores& stores,
                                     std::size_t max_oids_per_store,
-                                    const std::vector<ArchiveRule>& rules) {
+                                    const std::vector<ArchiveRule>& rules) try {
   ArchiveStats stats;
   if (rules.empty() || map.targets.empty()) return stats;
 
@@ -349,6 +391,7 @@ ArchiveStats run_archive_with_rules(const Config& cfg, const std::string& advert
       ArchiveMember m;
       m.oid = oid;
       m.attrs = attrs;
+      m.tip_seq = info->seq;
       m.data = std::move(data);
       m.sha256_hex = sha256_hex_bytes(m.data.data(), m.data.size());
       m.length = m.data.size();
@@ -374,6 +417,11 @@ ArchiveStats run_archive_with_rules(const Config& cfg, const std::string& advert
       seal_bag(cfg, advertise, map, stores, rule, open[ri], stats);
     }
   }
+  return stats;
+} catch (const std::exception& e) {
+  AIOS_LOG_ERROR("archive pass aborted: ", e.what());
+  ArchiveStats stats;
+  ++stats.failed;
   return stats;
 }
 

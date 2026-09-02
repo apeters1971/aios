@@ -63,6 +63,16 @@ bool file_create_empty(const std::string& path, std::string& err) {
   return true;
 }
 
+bool file_create_exclusive(const std::string& path, std::string& err) {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0) {
+    err = std::string(errno == EEXIST ? "exists: " : "create: ") + std::strerror(errno);
+    return false;
+  }
+  ::close(fd);
+  return true;
+}
+
 bool file_truncate(const std::string& path, std::string& err) {
   return file_create_empty(path, err);
 }

@@ -10,10 +10,12 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -102,6 +104,23 @@ void finalize_cached(sqlite3_stmt*& slot) {
   }
 }
 
+// Cached statements must not stay stepped between calls: a busy statement pins a
+// read snapshot/WAL frames and blocks checkpoints until the next reuse.
+struct StmtReset {
+  sqlite3_stmt* stmt{nullptr};
+  explicit StmtReset(sqlite3_stmt* s) : stmt(s) {}
+  StmtReset(const StmtReset&) = delete;
+  StmtReset& operator=(const StmtReset&) = delete;
+  ~StmtReset() {
+    if (stmt) {
+      sqlite3_reset(stmt);
+      sqlite3_clear_bindings(stmt);
+    }
+  }
+};
+
+std::atomic<std::uint64_t> g_staging_counter{0};
+
 bool load_attrs_for_seq(sqlite3* db, sqlite3_stmt*& slot, const std::string& oid,
                         std::uint64_t seq, std::unordered_map<std::string, std::string>& out,
                         std::string& err) {
@@ -109,6 +128,7 @@ bool load_attrs_for_seq(sqlite3* db, sqlite3_stmt*& slot, const std::string& oid
   sqlite3_stmt* stmt =
       cached_prepare(db, slot, "SELECT key, value FROM version_attrs WHERE oid=?1 AND seq=?2;", err);
   if (!stmt) return false;
+  StmtReset reset(stmt);
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(seq));
   while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -171,6 +191,9 @@ ObjectStore::~ObjectStore() { close(); }
 void ObjectStore::close() {
   for (auto& s : shards_) {
     if (!s) continue;
+    // Serialize with in-flight shard operations so a statement is never
+    // finalized (or the connection closed) underneath them.
+    std::lock_guard<std::recursive_mutex> guard(s->mu);
     finalize_cached(s->stmt_tip_seq);
     finalize_cached(s->stmt_max_seq);
     finalize_cached(s->stmt_load_version);
@@ -183,6 +206,18 @@ void ObjectStore::close() {
   }
   shards_.clear();
   root_.clear();
+}
+
+bool ObjectStore::debug_any_stmt_busy() const {
+  for (const auto& s : shards_) {
+    if (!s) continue;
+    std::lock_guard<std::recursive_mutex> guard(s->mu);
+    for (sqlite3_stmt* st : {s->stmt_tip_seq, s->stmt_max_seq, s->stmt_load_version,
+                             s->stmt_load_attrs, s->stmt_get_inline}) {
+      if (st && sqlite3_stmt_busy(st)) return true;
+    }
+  }
+  return false;
 }
 
 bool ObjectStore::exec_db(sqlite3* db, const char* sql, std::string& err) {
@@ -227,7 +262,9 @@ CREATE INDEX IF NOT EXISTS idx_object_versions_fs_path ON object_versions(fs_pat
 )SQL";
   if (!exec_db(db, "PRAGMA foreign_keys = ON;", err)) return false;
   if (!exec_db(db, "PRAGMA journal_mode = WAL;", err)) return false;
-  if (!exec_db(db, data_fsync ? "PRAGMA synchronous = NORMAL;" : "PRAGMA synchronous = OFF;", err))
+  // WAL + FULL fsyncs the log on every commit, so a published tip survives power
+  // loss together with the fsynced body it points at.
+  if (!exec_db(db, data_fsync ? "PRAGMA synchronous = FULL;" : "PRAGMA synchronous = OFF;", err))
     return false;
   if (!exec_db(db, ddl, err)) return false;
   // Older versioned DBs may lack redirect_oid (duplicate column errors ignored).
@@ -552,9 +589,77 @@ ObjectStore::Shard* ObjectStore::shard_for(const std::string& oid) {
   return shards_[id].get();
 }
 
+bool ObjectStore::relpath_ok(const std::string& relpath) {
+  if (relpath.empty()) return false;
+  const fs::path p(relpath);
+  if (p.is_absolute()) return false;
+  const fs::path norm = p.lexically_normal();
+  if (norm.empty()) return false;
+  auto first = norm.begin();
+  if (first == norm.end()) return false;
+  const std::string head = first->string();
+  if (head == ".." || head == "." || head.empty()) return false;
+  for (const auto& part : norm) {
+    if (part == "..") return false;
+  }
+  return true;
+}
+
+bool ObjectStore::fsync_file(const std::string& abs_path, std::string& err) const {
+  if (!opts_.data_fsync) return true;
+  int fd = ::open(abs_path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    err = std::string("open for fsync: ") + std::strerror(errno);
+    return false;
+  }
+  if (::fsync(fd) != 0) {
+    err = std::string("fsync data: ") + std::strerror(errno);
+    ::close(fd);
+    return false;
+  }
+  ::close(fd);
+  return true;
+}
+
+bool ObjectStore::fsync_parent_dir(const std::string& abs_path, std::string& err) const {
+  if (!opts_.data_fsync) return true;
+  const fs::path dir = fs::path(abs_path).parent_path();
+  int dir_fd = ::open(dir.c_str(), O_RDONLY);
+  if (dir_fd < 0) return true;  // some filesystems refuse O_RDONLY on dirs
+  if (::fsync(dir_fd) != 0) {
+    err = std::string("fsync dir: ") + std::strerror(errno);
+    ::close(dir_fd);
+    return false;
+  }
+  ::close(dir_fd);
+  return true;
+}
+
+bool ObjectStore::place_file_durably(const std::string& tmp_abs, const std::string& final_abs,
+                                     std::string& err) const {
+  std::error_code ec;
+  if (!fsync_file(tmp_abs, err)) {
+    fs::remove(tmp_abs, ec);
+    return false;
+  }
+  fs::create_directories(fs::path(final_abs).parent_path(), ec);
+  ec.clear();
+  fs::rename(tmp_abs, final_abs, ec);
+  if (ec) {
+    err = "rename: " + ec.message();
+    fs::remove(tmp_abs, ec);
+    return false;
+  }
+  return fsync_parent_dir(final_abs, err);
+}
+
 bool ObjectStore::write_fs_object(Shard& shard, const std::string& relpath,
                                  const std::uint8_t* data, std::size_t len,
                                  std::string& err) {
+  if (!relpath_ok(relpath)) {
+    err = "invalid fs relpath";
+    return false;
+  }
   const fs::path final_path = fs::path(shard.dir) / relpath;
   fs::path tmp_rel = fs::path("tmp") / relpath;
   tmp_rel.replace_extension(".tmp");
@@ -603,22 +708,15 @@ bool ObjectStore::write_fs_object(Shard& shard, const std::string& relpath,
     fs::remove(tmp_path, ec);
     return false;
   }
-  if (opts_.data_fsync) {
-    int dir_fd = ::open(final_path.parent_path().c_str(), O_RDONLY);
-    if (dir_fd >= 0) {
-      if (::fsync(dir_fd) != 0) {
-        err = std::string("fsync dir: ") + std::strerror(errno);
-        ::close(dir_fd);
-        return false;
-      }
-      ::close(dir_fd);
-    }
-  }
-  return true;
+  return fsync_parent_dir(final_path.string(), err);
 }
 
 bool ObjectStore::remove_fs_object(Shard& shard, const std::string& relpath, std::string& err) {
   if (relpath.empty()) return true;
+  if (!relpath_ok(relpath)) {
+    err = "invalid fs relpath";
+    return false;
+  }
   std::error_code ec;
   fs::remove(fs::path(shard.dir) / relpath, ec);
   if (ec) {
@@ -630,6 +728,10 @@ bool ObjectStore::remove_fs_object(Shard& shard, const std::string& relpath, std
 
 bool ObjectStore::ensure_fs_size(Shard& shard, const std::string& relpath, std::uint64_t size,
                                 std::string& err) {
+  if (!relpath_ok(relpath)) {
+    err = "invalid fs relpath";
+    return false;
+  }
   const fs::path path = fs::path(shard.dir) / relpath;
   std::error_code ec;
   fs::create_directories(path.parent_path(), ec);
@@ -650,6 +752,10 @@ bool ObjectStore::ensure_fs_size(Shard& shard, const std::string& relpath, std::
 bool ObjectStore::pwrite_fs(Shard& shard, const std::string& relpath, std::uint64_t offset,
                             const std::uint8_t* data, std::size_t len, std::string& err,
                             bool do_fsync) {
+  if (!relpath_ok(relpath)) {
+    err = "invalid fs relpath";
+    return false;
+  }
   const fs::path path = fs::path(shard.dir) / relpath;
   int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
   if (fd < 0) {
@@ -686,6 +792,10 @@ bool ObjectStore::crc_file_range(Shard& shard, const std::string& relpath,
                                 std::uint32_t& out_crc, std::string& err) {
   out_crc = 0;
   if (len == 0) return true;
+  if (!relpath_ok(relpath)) {
+    err = "invalid fs relpath";
+    return false;
+  }
   const fs::path path = fs::path(shard.dir) / relpath;
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) {
@@ -757,6 +867,7 @@ bool ObjectStore::tip_seq_locked(Shard& s, const std::string& oid, std::uint64_t
   sqlite3_stmt* stmt =
       cached_prepare(s.db, s.stmt_tip_seq, "SELECT tip_seq FROM object_tips WHERE oid=?1;", err);
   if (!stmt) return false;
+  StmtReset reset(stmt);
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   const int rc = sqlite3_step(stmt);
   if (rc == SQLITE_ROW) {
@@ -778,6 +889,7 @@ bool ObjectStore::next_seq_locked(Shard& s, const std::string& oid, std::uint64_
       s.db, s.stmt_max_seq,
       "SELECT seq FROM object_versions WHERE oid=?1 ORDER BY seq DESC LIMIT 1;", err);
   if (!stmt) return false;
+  StmtReset reset(stmt);
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   const int rc = sqlite3_step(stmt);
   if (rc == SQLITE_ROW) {
@@ -867,6 +979,7 @@ bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uin
       "redirect_oid FROM object_versions WHERE oid=?1 AND seq=?2;",
       err);
   if (!stmt) return false;
+  StmtReset reset(stmt);
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(seq));
   const int rc = sqlite3_step(stmt);
@@ -993,6 +1106,7 @@ bool ObjectStore::rewrite_version_attrs_locked(
 bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, std::size_t len,
                               const std::unordered_map<std::string, std::string>& attrs,
                               bool replace_attrs, std::optional<std::uint32_t> expected_crc32c,
+                              std::optional<std::uint64_t> expected_prev_tip,
                               PreparedVersion& out, std::string& err) {
   out = PreparedVersion{};
   if (!is_open()) {
@@ -1022,6 +1136,11 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
   std::uint64_t tip = 0;
   if (!tip_seq_locked(s, oid, tip, err)) {
     rollback(s);
+    return false;
+  }
+  if (expected_prev_tip.has_value() && *expected_prev_tip != tip) {
+    rollback(s);
+    err = "tip changed during upload";
     return false;
   }
 
@@ -1109,12 +1228,20 @@ bool ObjectStore::create_staging_file(const std::string& oid, std::string& abs_p
   }
   std::lock_guard<std::recursive_mutex> guard(sp->mu);
   const auto h = sha256_hex(oid);
-  const auto name = "upload-" + h + "-" + std::to_string(now_ms());
+  // Two uploads of the same oid in the same millisecond must never share (and
+  // O_TRUNC) one staging file; the counter makes the name unique per process and
+  // O_EXCL catches any collision with a leftover from another process.
+  const auto seqno = g_staging_counter.fetch_add(1, std::memory_order_relaxed);
+  const auto name = "upload-" + h + "-" + std::to_string(now_ms()) + "-" +
+                    std::to_string(static_cast<unsigned long long>(getpid())) + "-" +
+                    std::to_string(seqno);
   const fs::path tmp = fs::path(sp->dir) / "tmp" / name;
   std::error_code ec;
   fs::create_directories(tmp.parent_path(), ec);
-  if (!file_create_empty(tmp.string(), err)) {
-    err = "cannot create staging file";
+  std::string cerr;
+  if (!file_create_exclusive(tmp.string(), cerr)) {
+    AIOS_LOG_ERROR("staging file collision or create failure ", tmp.string(), ": ", cerr);
+    err = "cannot create staging file: " + cerr;
     return false;
   }
   abs_path_out = tmp.string();
@@ -1193,24 +1320,23 @@ bool ObjectStore::place_staging_as_version(const std::string& oid, std::uint64_t
   const fs::path final_path = fs::path(sp->dir) / rel;
   std::error_code ec;
   fs::create_directories(final_path.parent_path(), ec);
+  ec.clear();
+  if (!fsync_file(staging_abs_path, err)) return false;
   fs::rename(staging_abs_path, final_path, ec);
   if (ec) {
-    // Cross-device rename may fail; fall back to copy+remove.
+    // Cross-device rename may fail; copy next to the destination, then place durably.
     ec.clear();
-    fs::copy_file(staging_abs_path, final_path, fs::copy_options::overwrite_existing, ec);
+    const fs::path copy_tmp = final_path.string() + ".tmp";
+    fs::copy_file(staging_abs_path, copy_tmp, fs::copy_options::overwrite_existing, ec);
     if (ec) {
       err = "place staging: " + ec.message();
+      fs::remove(copy_tmp, ec);
       return false;
     }
+    if (!place_file_durably(copy_tmp.string(), final_path.string(), err)) return false;
     fs::remove(staging_abs_path, ec);
-  }
-  if (opts_.data_fsync) {
-    FILE* f = std::fopen(final_path.c_str(), "rb");
-    if (f) {
-      fflush(f);
-      fsync(fileno(f));
-      std::fclose(f);
-    }
+  } else if (!fsync_parent_dir(final_path.string(), err)) {
+    return false;
   }
   relpath_out = rel;
   return true;
@@ -1403,6 +1529,7 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
           rollback(s);
           return false;
         }
+        StmtReset reset(stmt);
         sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(tip));
         if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1442,6 +1569,11 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
   fs::create_directories(new_abs.parent_path(), ec);
 
   if (tip_live && !tip_info.fs_path.empty()) {
+    if (!relpath_ok(tip_info.fs_path)) {
+      rollback(s);
+      err = "invalid fs relpath";
+      return false;
+    }
     const fs::path src = fs::path(s.dir) / tip_info.fs_path;
     if (!clone_or_copy_file(src.string(), new_abs.string(), !opts_.clone_required, err)) {
       rollback(s);
@@ -1748,6 +1880,17 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
 
   PreparedVersion pv = v;
   std::string written_fs;
+  // Caller-supplied bodies are verified against the prepared CRC unless the
+  // caller already accumulated it while staging.
+  auto data_crc_ok = [&]() -> bool {
+    if (pv.crc_verified) return true;
+    if (crc32c(data, len) != pv.crc32c) {
+      rollback(s);
+      err = "install crc32c mismatch";
+      return false;
+    }
+    return true;
+  };
   if (pv.is_delete || !pv.redirect_oid.empty()) {
     pv.size = 0;
     pv.inline_body = false;
@@ -1758,7 +1901,13 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
       err = "install size mismatch";
       return false;
     }
+    if (!data_crc_ok()) return false;
   } else {
+    if (!pv.fs_path.empty() && !relpath_ok(pv.fs_path)) {
+      AIOS_LOG_WARN("install_version ", pv.oid, "@", pv.seq, ": ignoring unsafe fs_path '",
+                    pv.fs_path, "'");
+      pv.fs_path.clear();
+    }
     if (pv.fs_path.empty()) pv.fs_path = version_relpath(pv.oid, pv.seq);
     if (data && len > 0) {
       if (len != pv.size) {
@@ -1766,6 +1915,7 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
         err = "install size mismatch";
         return false;
       }
+      if (!data_crc_ok()) return false;
       if (!write_fs_object(s, pv.fs_path, data, len, err)) {
         rollback(s);
         return false;
@@ -2091,6 +2241,10 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get(const std::string& oid
   std::lock_guard<std::recursive_mutex> guard(s.mu);
 
   if (!info->fs_path.empty()) {
+    if (!relpath_ok(info->fs_path)) {
+      err = "invalid fs relpath";
+      return std::nullopt;
+    }
     const auto abs = (fs::path(s.dir) / info->fs_path).string();
     std::vector<std::uint8_t> out;
     if (!file_read_exact(abs, static_cast<std::size_t>(info->size), out, err)) {
@@ -2103,6 +2257,7 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get(const std::string& oid
   sqlite3_stmt* stmt = cached_prepare(
       s.db, s.stmt_get_inline, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;", err);
   if (!stmt) return std::nullopt;
+  StmtReset reset(stmt);
   sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(info->seq));
   const int rc = sqlite3_step(stmt);
@@ -2158,6 +2313,10 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get_range(
     return std::nullopt;
   }
   std::lock_guard<std::recursive_mutex> guard(sp->mu);
+  if (!relpath_ok(info->fs_path)) {
+    err = "invalid fs relpath";
+    return std::nullopt;
+  }
   const fs::path path = fs::path(sp->dir) / info->fs_path;
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) {
@@ -2194,6 +2353,10 @@ std::optional<std::string> ObjectStore::fs_body_path(const std::string& oid,
   if (!info) return std::nullopt;
   if (info->inline_body || info->fs_path.empty()) {
     err = "not fs-backed";
+    return std::nullopt;
+  }
+  if (!relpath_ok(info->fs_path)) {
+    err = "invalid fs relpath";
     return std::nullopt;
   }
   Shard* sp = shard_for(oid);
@@ -2272,6 +2435,7 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
       rollback(s);
       return false;
     }
+    StmtReset reset(stmt);
     sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(tip));
     if (sqlite3_step(stmt) != SQLITE_ROW) {
@@ -2288,11 +2452,22 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
   } else {
     pv.inline_body = false;
     pv.fs_path = version_relpath(oid, seq);
+    if (!relpath_ok(tip_info.fs_path)) {
+      rollback(s);
+      err = "invalid fs relpath";
+      return false;
+    }
     const fs::path src = fs::path(s.dir) / tip_info.fs_path;
     const fs::path dst = fs::path(s.dir) / pv.fs_path;
     std::error_code ec;
     fs::create_directories(dst.parent_path(), ec);
     if (!clone_or_copy_file(src.string(), dst.string(), !opts_.clone_required, err)) {
+      rollback(s);
+      return false;
+    }
+    if (!fsync_file(dst.string(), err) || !fsync_parent_dir(dst.string(), err)) {
+      std::string rm_err;
+      remove_fs_object(s, pv.fs_path, rm_err);
       rollback(s);
       return false;
     }
@@ -2773,6 +2948,35 @@ std::size_t ObjectStore::scrub_orphans(std::string& err) {
         fs::remove(it->path(), ec);
         if (!ec) ++removed;
       }
+    }
+  }
+  return removed;
+}
+
+std::size_t ObjectStore::sweep_tmp(std::int64_t max_age_ms, std::string& err) {
+  if (!is_open()) {
+    err = "store not open";
+    return 0;
+  }
+  std::size_t removed = 0;
+  const auto now = fs::file_time_type::clock::now();
+  for (std::uint32_t id = 0; id < opts_.shard_count; ++id) {
+    if (!open_shard(id, err)) return removed;
+    Shard& s = *shards_[id];
+    std::lock_guard<std::recursive_mutex> guard(s.mu);
+    const fs::path tmp = fs::path(s.dir) / "tmp";
+    std::error_code ec;
+    if (!fs::exists(tmp, ec)) continue;
+    for (auto it = fs::recursive_directory_iterator(tmp, ec);
+         it != fs::recursive_directory_iterator(); ++it) {
+      if (!it->is_regular_file(ec)) continue;
+      const auto mtime = it->last_write_time(ec);
+      if (ec) continue;
+      const auto age =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - mtime).count();
+      if (age < max_age_ms) continue;
+      fs::remove(it->path(), ec);
+      if (!ec) ++removed;
     }
   }
   return removed;

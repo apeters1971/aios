@@ -17,6 +17,8 @@ struct ArchiveStats {
   std::size_t packed{0};
   std::size_t bags_sealed{0};
   std::size_t failed{0};
+  // Members left unstubbed because a client overwrote them mid-pack.
+  std::size_t tip_moved{0};
 };
 
 // Pack matching tips into large bag objects on staging_class; stub members.

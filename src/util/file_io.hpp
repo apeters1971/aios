@@ -10,6 +10,8 @@ namespace aios {
 // POSIX file helpers for hot object I/O paths (avoid iostreams).
 
 bool file_create_empty(const std::string& path, std::string& err);
+// Create a new empty file; fails (EEXIST) if the path already exists.
+bool file_create_exclusive(const std::string& path, std::string& err);
 bool file_truncate(const std::string& path, std::string& err);
 
 // Read exactly `n` bytes into `dst` (must have room for n).
