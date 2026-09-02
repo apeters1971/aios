@@ -344,7 +344,8 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 	/* Owned by c->mu, which every caller of this function holds. */
 	char *req = c->reqbuf;
 	char *hdrbuf = c->hdrbuf;
-	char auth[512];
+	/* Also owned by mu; too large for the stack once it carries a ticket. */
+	char *auth = c->authbuf;
 	size_t have = 0;
 	unsigned long content_length = 0;
 	char clen[32];
@@ -366,10 +367,10 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 
 	if (body_len > AIOS_HTTP_MAX_BODY)
 		return -EFBIG;
-	if (!req || !hdrbuf)
+	if (!req || !hdrbuf || !auth)
 		return -ENOMEM;
 
-	err = aios_http_build_auth(c, method, path, auth, sizeof(auth));
+	err = aios_http_build_auth(c, method, path, auth, AIOS_HTTP_AUTH_MAX);
 	if (err)
 		return err;
 

@@ -162,6 +162,12 @@ struct Config {
   // When true, requests with a body must sign a concrete x-aios-content-sha256;
   // UNSIGNED-PAYLOAD is rejected. Off by default: the kernel client still sends it.
   bool http_require_signed_payload{false};
+  // Ticket auth (util/ticket.hpp). Lifetime of tickets minted by POST /auth/ticket.
+  std::int64_t http_ticket_lifetime_ms{8 * 3600 * 1000};
+  // Who may still sign HTTP requests with the shared cluster key instead of a
+  // principal ticket: "any" (default, compatible) or "loopback" (only peers on
+  // 127.0.0.0/8 or ::1 — the daemon's own S3 gateway and local tools).
+  std::string http_shared_key_clients{"any"};
   // S3-compatible API listen address; empty disables. Uses libaios_posix on s3_volume.
   std::string s3_listen;
   // Largest S3 request body buffered in memory (PutObject / UploadPart). Default 64 MiB.

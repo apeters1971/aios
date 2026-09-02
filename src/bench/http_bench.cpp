@@ -809,7 +809,9 @@ PhaseStats run_stl_phase(const BenchArgs& a, const std::string& type, aios::sync
   std::atomic<std::size_t> err{0};
   std::atomic<std::uint64_t> bytes{0};
 
-  aios::SessionConfig cfg{a.endpoint, a.cluster_key};
+  aios::SessionConfig cfg;
+  cfg.endpoint = a.endpoint;
+  cfg.cluster_key = a.cluster_key;
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<std::thread> workers;
   workers.reserve(nthreads);

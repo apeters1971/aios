@@ -399,6 +399,15 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["http_max_long_polls"]) cfg.http_max_long_polls = root["http_max_long_polls"].as<int>();
     if (root["http_require_signed_payload"])
       cfg.http_require_signed_payload = root["http_require_signed_payload"].as<bool>();
+    if (root["http_ticket_lifetime_ms"])
+      cfg.http_ticket_lifetime_ms = root["http_ticket_lifetime_ms"].as<std::int64_t>();
+    if (root["http_shared_key_clients"]) {
+      cfg.http_shared_key_clients = root["http_shared_key_clients"].as<std::string>();
+      if (cfg.http_shared_key_clients != "any" && cfg.http_shared_key_clients != "loopback") {
+        err = "http_shared_key_clients must be any|loopback";
+        return false;
+      }
+    }
     if (root["s3_listen"]) cfg.s3_listen = root["s3_listen"].as<std::string>();
     if (root["s3_max_body_bytes"])
       cfg.s3_max_body_bytes = root["s3_max_body_bytes"].as<std::uint64_t>();

@@ -12,6 +12,37 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Added — ticket authentication (cephx / Kerberos style)
+
+- **Principals** replace handing `cluster_key` to clients. `aios admin principal
+  create|list|rotate|delete` manages a cluster-wide keyring (object `auth/principals`, AES-256-GCM
+  sealed under a key derived from `cluster_key`, refused over HTTP for every caller). Each principal
+  has a role (`client` / `admin` / `node`) and optional oid-prefix caps. Works on every node, admin
+  UI not required.
+- **`POST /auth/ticket`**: one round trip, HMAC-only on the client. The principal key never
+  travels; both sides derive a per-session key from two nonces, the server proves it knows the key
+  (mutual auth), and the client gets an opaque AES-GCM ticket any node can open locally. Requests
+  then use the existing `AIOS-HMAC-SHA256` header with `Credential=<ticket>` and the session key.
+  Tickets default to 8 h (`http_ticket_lifetime_ms`), renew at half-life, and a captured ticket is
+  useless without its session key. Grant attempts share the admin-login throttle and the replay
+  cache.
+- Roles and caps are enforced in the HTTP front end: `client` may not reach `/admin/*` or
+  `/metrics` (`403 forbidden_role`), and with caps set may only touch matching oids and list inside
+  them (`403 forbidden_cap`). Auth failures now carry a stable `code`.
+- `http_shared_key_clients: loopback` refuses `cluster_key`-signed HTTP requests from non-loopback
+  peers, so only principals can talk to the cluster from outside while the daemon's own gateway
+  still works.
+- Clients: `SessionConfig::principal` / `principal_key` (lazy grant, half-life renewal, one retry
+  on `ticket_expired`); `aios --principal NAME --key HEX` (or `AIOS_PRINCIPAL` /
+  `AIOS_PRINCIPAL_KEY`); kernel `aios_http` gains `aios_http_client_set_principal` /
+  `aios_http_pool_set_principal` and `aiosfs` the `principal=,key=` mount options (http backend).
+  The kernel auth header buffer moved off the stack to hold the ticket. `aiosvd` still uses the
+  shared key (its map ioctl ABI has no principal field yet).
+- Tests: `tests/test_ticket_auth.cpp` (seal/open, tamper, expiry, grant protocol, verifier policy,
+  keyring at rest, end-to-end roles/caps/rotate/delete/replay/renewal, kernel canonical-string
+  pin); the process smoke test now creates a principal and drives the CLI with it across a daemon
+  restart.
+
 ### Security model (documented, not yet changed)
 
 - README gained a *Security model and limitations* section: plaintext transport, one shared

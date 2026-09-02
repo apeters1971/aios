@@ -35,7 +35,8 @@ struct aios_http_client *aios_http_client_create(const char *endpoint, const cha
 
 	c->reqbuf = kmalloc(AIOS_HTTP_MAX_HDR, gfp);
 	c->hdrbuf = kmalloc(AIOS_HTTP_MAX_HDR, gfp);
-	if (!c->reqbuf || !c->hdrbuf) {
+	c->authbuf = kmalloc(AIOS_HTTP_AUTH_MAX, gfp);
+	if (!c->reqbuf || !c->hdrbuf || !c->authbuf) {
 		aios_http_client_destroy(c);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -71,11 +72,60 @@ void aios_http_client_destroy(struct aios_http_client *c)
 	aios_http_client_close_sock(c);
 	mutex_unlock(&c->mu);
 	memzero_explicit(c->cluster_key, sizeof(c->cluster_key));
+	memzero_explicit(c->session_key, sizeof(c->session_key));
 	kfree(c->reqbuf);
 	kfree(c->hdrbuf);
+	kfree(c->authbuf);
 	kfree(c);
 }
 EXPORT_SYMBOL_GPL(aios_http_client_destroy);
+
+int aios_http_client_set_principal(struct aios_http_client *c, const char *principal)
+{
+	size_t i;
+
+	if (!c || !principal || !*principal)
+		return -EINVAL;
+	if (strlen(principal) >= AIOS_HTTP_PRINCIPAL_MAX)
+		return -EINVAL;
+	for (i = 0; principal[i]; i++) {
+		char ch = principal[i];
+
+		if (!isalnum(ch) && ch != '.' && ch != '_' && ch != '-')
+			return -EINVAL;
+	}
+	/* The key field now holds the principal key: exactly 64 hex digits. */
+	if (strlen(c->cluster_key) != 64)
+		return -EINVAL;
+	for (i = 0; i < 64; i++) {
+		if (!isxdigit(c->cluster_key[i]))
+			return -EINVAL;
+	}
+	mutex_lock(&c->mu);
+	strscpy(c->principal, principal, sizeof(c->principal));
+	c->ticket[0] = '\0';
+	c->session_key[0] = '\0';
+	c->ticket_issued_ms = 0;
+	c->ticket_expires_ms = 0;
+	mutex_unlock(&c->mu);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(aios_http_client_set_principal);
+
+int aios_http_client_login(struct aios_http_client *c)
+{
+	int err;
+
+	if (!c)
+		return -EINVAL;
+	if (!c->principal[0])
+		return 0;
+	mutex_lock(&c->mu);
+	err = aios_http_ensure_ticket(c, true);
+	mutex_unlock(&c->mu);
+	return err;
+}
+EXPORT_SYMBOL_GPL(aios_http_client_login);
 
 void aios_http_client_set_app_label(struct aios_http_client *c, const char *label)
 {
@@ -187,6 +237,41 @@ int aios_http_json_string(const char *js, size_t js_len, const char *key, char *
 	return 0;
 }
 
+int aios_http_json_s64(const char *js, size_t js_len, const char *key, s64 *out)
+{
+	char pat[80];
+	const char *p;
+	const char *end;
+	bool neg = false;
+	s64 v = 0;
+	int digits = 0;
+
+	if (!js || !key || !out)
+		return -EINVAL;
+	if (snprintf(pat, sizeof(pat), "\"%s\":", key) >= (int)sizeof(pat))
+		return -EINVAL;
+	end = js + js_len;
+	p = strnstr(js, pat, js_len);
+	if (!p)
+		return -ENOENT;
+	p += strlen(pat);
+	while (p < end && (*p == ' ' || *p == '\t'))
+		p++;
+	if (p < end && *p == '-') {
+		neg = true;
+		p++;
+	}
+	for (; p < end && *p >= '0' && *p <= '9'; p++, digits++) {
+		if (digits >= 18)
+			return -ERANGE;
+		v = v * 10 + (*p - '0');
+	}
+	if (!digits)
+		return -EINVAL;
+	*out = neg ? -v : v;
+	return 0;
+}
+
 int aios_http_fill_posix_cas(struct aios_http_client *c, const char *oid, u64 expected_cas,
 			     char *out, size_t out_len, u64 *new_cas_out)
 {
@@ -249,6 +334,7 @@ static int request_loop(struct aios_http_client *c, const char *method, const ch
 	char *location;
 	int hop;
 	int err = 0;
+	bool ticket_renewed = false;
 
 	if (!c || !method || !path || !status_out)
 		return -EINVAL;
@@ -273,6 +359,19 @@ static int request_loop(struct aios_http_client *c, const char *method, const ch
 		if (err)
 			break;
 		*status_out = status;
+		/*
+		 * Principal mode: a 401 after a ticket was accepted before is
+		 * almost always an expired ticket (server clock ahead of the
+		 * half-life renewal). Renew once and repeat this hop; a real
+		 * credential problem fails on the retry.
+		 */
+		if (status == 401 && c->principal[0] && !ticket_renewed) {
+			ticket_renewed = true;
+			if (!aios_http_ensure_ticket(c, true)) {
+				hop--;
+				continue;
+			}
+		}
 		if (status == 307 || status == 301 || status == 302) {
 			if (!location[0]) {
 				pr_err("aios_http: %s %s HTTP %d no Location\n", method, cur_path,

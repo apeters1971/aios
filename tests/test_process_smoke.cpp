@@ -265,6 +265,61 @@ TEST(ProcessSmoke, DaemonServesObjectsWritesStatusAndShutsDownCleanly) {
     EXPECT_EQ(read_file(out), std::string(70000, 'c'));
   }
 
+  // Ticket auth through the real binaries: create a principal with the shared
+  // key, then drive the daemon as that principal (ticket grant + session key
+  // signing in the CLI), including a cap violation and a wrong key.
+  std::string principal_key;
+  {
+    const std::vector<std::string> shared{"--cluster-key", kClusterKey, "--endpoint", d.endpoint()};
+    auto create = shared;
+    create.insert(create.end(), {"admin", "principal", "create", "client.smoke", "--caps", "smoke/"});
+    ASSERT_EQ(run_and_wait(AIOS_TEST_AIOS_CLI_PATH, create, root / "principal-create.txt"), 0)
+        << read_file(root / "principal-create.txt");
+    const auto created = read_file(root / "principal-create.txt");
+    const auto kpos = created.find("key:   ");
+    ASSERT_NE(kpos, std::string::npos) << created;
+    const std::string key = created.substr(kpos + 7, 64);
+    ASSERT_EQ(key.size(), 64u);
+    principal_key = key;
+
+    const std::vector<std::string> as_smoke{"--principal", "client.smoke", "--key", key,
+                                            "--endpoint", d.endpoint()};
+    const auto in = root / "smoke-in.bin";
+    const auto out = root / "smoke-out.bin";
+    std::ofstream(in, std::ios::binary) << std::string(1234, 'p');
+    auto put_args = as_smoke;
+    put_args.insert(put_args.end(), {"put", "smoke/principal", in.string()});
+    ASSERT_EQ(run_and_wait(AIOS_TEST_AIOS_CLI_PATH, put_args, root / "p-put.txt"), 0)
+        << read_file(root / "p-put.txt");
+    auto get_args = as_smoke;
+    get_args.insert(get_args.end(), {"get", "smoke/principal", "-o", out.string()});
+    ASSERT_EQ(run_and_wait(AIOS_TEST_AIOS_CLI_PATH, get_args, root / "p-get.txt"), 0)
+        << read_file(root / "p-get.txt");
+    EXPECT_EQ(read_file(out), std::string(1234, 'p'));
+
+    // Outside the caps: refused by the daemon, reported by the CLI.
+    auto denied = as_smoke;
+    denied.insert(denied.end(), {"put", "other/x", in.string()});
+    EXPECT_NE(run_and_wait(AIOS_TEST_AIOS_CLI_PATH, denied, root / "p-denied.txt"), 0);
+    EXPECT_NE(read_file(root / "p-denied.txt").find("403"), std::string::npos)
+        << read_file(root / "p-denied.txt");
+
+    // Wrong key: no ticket, clear message, non-zero exit.
+    std::vector<std::string> wrong{"--principal", "client.smoke", "--key", std::string(64, '0'),
+                                   "--endpoint", d.endpoint(), "stat", "smoke/principal"};
+    EXPECT_NE(run_and_wait(AIOS_TEST_AIOS_CLI_PATH, wrong, root / "p-wrong.txt"), 0);
+    EXPECT_NE(read_file(root / "p-wrong.txt").find("authentication as client.smoke failed"),
+              std::string::npos)
+        << read_file(root / "p-wrong.txt");
+
+    auto list = shared;
+    list.insert(list.end(), {"admin", "principal", "list"});
+    ASSERT_EQ(run_and_wait(AIOS_TEST_AIOS_CLI_PATH, list, root / "p-list.txt"), 0);
+    EXPECT_NE(read_file(root / "p-list.txt").find("client.smoke  role=client  caps=smoke/"),
+              std::string::npos)
+        << read_file(root / "p-list.txt");
+  }
+
   // Status file is written atomically and lists this node as online.
   {
     const auto deadline = std::chrono::steady_clock::now() + 10s;
@@ -314,8 +369,17 @@ TEST(ProcessSmoke, DaemonServesObjectsWritesStatusAndShutsDownCleanly) {
     s->delete_object(oid);
     EXPECT_FALSE(s->head_object(oid).exists);
     auto listed = s->list_prefix("smoke/");
-    ASSERT_EQ(listed.objects.size(), 1u);
+    ASSERT_EQ(listed.objects.size(), 2u);
     EXPECT_EQ(listed.objects[0].oid, "smoke/cli");
+    EXPECT_EQ(listed.objects[1].oid, "smoke/principal");
+
+    // The keyring survived the restart too: the principal can still log in.
+    aios::SessionConfig pc;
+    pc.endpoint = d.endpoint();
+    pc.principal = "client.smoke";
+    pc.principal_key = principal_key;
+    aios::Session ps(pc);
+    EXPECT_EQ(ps.get_object("smoke/principal").body, std::string(1234, 'p'));
   }
   ASSERT_EQ(d.stop_gracefully(), 0) << read_file(d.log);
   std::filesystem::remove_all(root);

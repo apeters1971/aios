@@ -18,12 +18,17 @@ enum {
 	Opt_uid,
 	Opt_gid,
 	Opt_backend,
+	Opt_principal,
+	Opt_key,
 	Opt_err,
 };
 
 static const match_table_t aios_tokens = {
 	{ Opt_endpoint, "endpoint=%s" },
 	{ Opt_cluster_key, "cluster_key=%s" },
+	/* Ticket auth: principal=NAME,key=HEX instead of cluster_key= (http backend). */
+	{ Opt_principal, "principal=%s" },
+	{ Opt_key, "key=%s" },
 	{ Opt_volume, "volume=%s" },
 	{ Opt_app_label, "app_label=%s" },
 	{ Opt_stripe_unit, "stripe_unit=%s" },
@@ -53,6 +58,14 @@ static int aios_parse_options(char *options, struct aios_sb_info *info)
 			match_strlcpy(info->endpoint, &args[0], sizeof(info->endpoint));
 			break;
 		case Opt_cluster_key:
+			match_strlcpy(info->cluster_key, &args[0], sizeof(info->cluster_key));
+			break;
+		case Opt_principal:
+			match_strlcpy(info->principal, &args[0], sizeof(info->principal));
+			break;
+		case Opt_key:
+			/* The principal key travels in the same field as the cluster key;
+			 * aios_http_client_set_principal changes how it is used. */
 			match_strlcpy(info->cluster_key, &args[0], sizeof(info->cluster_key));
 			break;
 		case Opt_volume:
@@ -176,6 +189,8 @@ int aios_show_options(struct seq_file *m, struct dentry *root)
 		seq_puts(m, ",backend=upcall");
 	if (info->endpoint[0])
 		seq_printf(m, ",endpoint=%s", info->endpoint);
+	if (info->principal[0])
+		seq_printf(m, ",principal=%s", info->principal);
 	if (info->volume[0])
 		seq_printf(m, ",volume=%s", info->volume);
 	if (info->app_label[0])
@@ -299,7 +314,11 @@ static int aios_get_tree(struct fs_context *fc)
 	struct aios_sb_info *info = fc->s_fs_info;
 
 	if (!info->endpoint[0] || !info->cluster_key[0]) {
-		pr_err("aiosfs: endpoint= and cluster_key= are required\n");
+		pr_err("aiosfs: endpoint= and cluster_key= (or principal=,key=) are required\n");
+		return -EINVAL;
+	}
+	if (info->principal[0] && info->backend != AIOS_BACKEND_HTTP) {
+		pr_err("aiosfs: principal= requires backend=http\n");
 		return -EINVAL;
 	}
 	return get_tree_nodev(fc, aios_get_tree_fill);

@@ -1,3 +1,4 @@
+#include "client/session.hpp"
 #include "http/http_auth.hpp"
 #include "metrics/ops_counters.hpp"
 #include "util/log.hpp"
@@ -50,13 +51,22 @@ struct Args {
   std::string out_file;
   std::string prefix;
   bool testbed_no_fsync{false};
+  // Ticket auth: authenticate as this principal instead of with the cluster key.
+  std::string principal;
+  std::string principal_key;
 };
 
 void usage() {
   std::cout
       << "usage: aios --cluster-key KEY [--endpoint HOST:PORT] [--app-label LABEL]\n"
       << "            <cmd> [args]\n"
+      << "       aios --principal NAME --key HEX [--endpoint HOST:PORT] <cmd> [args]\n"
       << "       aios --version\n"
+      << "\n"
+      << "Authentication: either the shared --cluster-key (or AIOS_CLUSTER_KEY), or a\n"
+      << "principal created with `admin principal create` (--principal/--key, or\n"
+      << "AIOS_PRINCIPAL/AIOS_PRINCIPAL_KEY). Principals get a ticket from the cluster\n"
+      << "and never send their key.\n"
       << "\n"
       << "Commands:\n"
       << "  put  OID FILE\n"
@@ -84,6 +94,7 @@ void usage() {
       << "  admin s3-cred list|create|delete ...\n"
       << "  admin quota show|set|reconcile|project ...\n"
       << "  admin qos show|set|project ...\n"
+      << "  admin principal list|create|delete|rotate ...   (works on every node)\n"
       << "\n"
       << "Follows HTTP 307 redirects to the primary (Location).\n"
       << "put/get stream file bytes (no full-object client buffer).\n";
@@ -121,6 +132,18 @@ bool parse_args(int argc, char** argv, Args& a) {
       a.app_label = v;
       continue;
     }
+    if (arg == "--principal") {
+      const char* v = need("--principal");
+      if (!v) return false;
+      a.principal = v;
+      continue;
+    }
+    if (arg == "--key") {
+      const char* v = need("--key");
+      if (!v) return false;
+      a.principal_key = v;
+      continue;
+    }
     if (arg == "-o") {
       const char* v = need("-o");
       if (!v) return false;
@@ -151,11 +174,27 @@ bool parse_args(int argc, char** argv, Args& a) {
     a.cluster_key = "testbed";
   }
   if (a.cluster_key.empty()) {
-    std::cerr << "--cluster-key is required\n";
+    if (const char* env = std::getenv("AIOS_CLUSTER_KEY")) a.cluster_key = env;
+  }
+  if (a.principal.empty()) {
+    if (const char* env = std::getenv("AIOS_PRINCIPAL")) a.principal = env;
+  }
+  if (a.principal_key.empty()) {
+    if (const char* env = std::getenv("AIOS_PRINCIPAL_KEY")) a.principal_key = env;
+  }
+  if (!a.principal.empty() && a.principal_key.empty()) {
+    std::cerr << "--key is required with --principal\n";
+    return false;
+  }
+  if (a.cluster_key.empty() && a.principal.empty()) {
+    std::cerr << "--cluster-key or --principal/--key is required\n";
     return false;
   }
   return true;
 }
+
+// Credential label in Authorization: "cli" with the shared key, or the ticket.
+std::string g_credential = "cli";
 
 void parse_endpoint(const std::string& ep, std::string& host, std::string& port) {
   auto colon = ep.rfind(':');
@@ -175,8 +214,8 @@ void add_auth(std::unordered_map<std::string, std::string>& headers, const std::
   const auto canon =
       aios::http_canonical(method, target, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
   const auto sig = aios::http_sign(cluster_key, canon);
-  headers["authorization"] = "AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=" +
-                             signed_headers + ", Signature=" + sig;
+  headers["authorization"] = "AIOS-HMAC-SHA256 Credential=" + g_credential +
+                             ", SignedHeaders=" + signed_headers + ", Signature=" + sig;
 }
 
 // Set by main from --app-label for http_exchange.
@@ -1077,6 +1116,169 @@ int cmd_admin_posix_layout(std::string host, std::string port, const std::string
   return 2;
 }
 
+int cmd_admin_principal(std::string host, std::string port, const std::string& key,
+                        const std::vector<std::string>& args) {
+  const char* kUsage =
+      "usage: admin principal list\n"
+      "       admin principal create NAME [--role client|admin|node] [--caps P1,P2,...] [--key HEX]\n"
+      "       admin principal rotate NAME [--key HEX]\n"
+      "       admin principal delete NAME\n";
+  if (args.size() < 2) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  const std::string action = args[1];
+  auto print_secret = [](const nlohmann::json& j) {
+    std::cout << "name:  " << j.value("name", "") << "\n"
+              << "role:  " << j.value("role", "") << "\n"
+              << "key:   " << j.value("key", "") << "\n";
+    if (j.contains("caps") && j["caps"].is_array() && !j["caps"].empty()) {
+      std::cout << "caps:  ";
+      bool first = true;
+      for (const auto& c : j["caps"]) {
+        if (!first) std::cout << ',';
+        first = false;
+        std::cout << c.get<std::string>();
+      }
+      std::cout << "\n";
+    }
+    std::cout << "(store the key now; it is not shown again)\n"
+              << "use: aios --principal " << j.value("name", "") << " --key " << j.value("key", "")
+              << " ...\n";
+  };
+  if (action == "list") {
+    auto r = admin_get(std::move(host), std::move(port), "/admin/api/principals", key);
+    if (r.status < 0) {
+      std::cerr << r.error << "\n";
+      return 1;
+    }
+    if (r.status != 200) {
+      std::cerr << "principal list failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    try {
+      auto j = nlohmann::json::parse(r.body);
+      auto ps = j.value("principals", nlohmann::json::array());
+      if (ps.empty()) {
+        std::cout << "(no principals; clients use the shared cluster key)\n";
+        return 0;
+      }
+      for (const auto& p : ps) {
+        std::cout << p.value("name", "") << "  role=" << p.value("role", "");
+        if (p.contains("caps") && p["caps"].is_array() && !p["caps"].empty()) {
+          std::cout << "  caps=";
+          bool first = true;
+          for (const auto& c : p["caps"]) {
+            if (!first) std::cout << ',';
+            first = false;
+            std::cout << c.get<std::string>();
+          }
+        }
+        std::cout << "\n";
+      }
+    } catch (...) {
+      std::cout << r.body << "\n";
+    }
+    return 0;
+  }
+  if (args.size() < 3 || args[2].rfind("--", 0) == 0) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  const std::string name = args[2];
+  std::string role = "client", caps, new_key;
+  for (std::size_t i = 3; i < args.size(); ++i) {
+    const auto& a = args[i];
+    auto need = [&](const char* flag) -> const char* {
+      if (i + 1 >= args.size()) {
+        std::cerr << "missing value for " << flag << "\n";
+        return nullptr;
+      }
+      return args[++i].c_str();
+    };
+    if (a == "--role") {
+      const char* v = need("--role");
+      if (!v) return 2;
+      role = v;
+    } else if (a == "--caps") {
+      const char* v = need("--caps");
+      if (!v) return 2;
+      caps = v;
+    } else if (a == "--key") {
+      const char* v = need("--key");
+      if (!v) return 2;
+      new_key = v;
+    } else {
+      std::cerr << "unknown flag: " << a << "\n";
+      return 2;
+    }
+  }
+  const std::string enc = url_encode_oid(name);
+  if (action == "create") {
+    nlohmann::json body{{"name", name}, {"role", role}};
+    if (!new_key.empty()) body["key"] = new_key;
+    nlohmann::json caps_arr = nlohmann::json::array();
+    std::stringstream ss(caps);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      if (!item.empty()) caps_arr.push_back(item);
+    }
+    body["caps"] = caps_arr;
+    auto r = admin_exchange(std::move(host), std::move(port), "POST", "/admin/api/principals",
+                            body.dump(), key);
+    if (r.status < 0) {
+      std::cerr << r.error << "\n";
+      return 1;
+    }
+    if (r.status != 201 && r.status != 200) {
+      std::cerr << "principal create failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    try {
+      print_secret(nlohmann::json::parse(r.body));
+    } catch (...) {
+      std::cout << r.body << "\n";
+    }
+    return 0;
+  }
+  if (action == "rotate") {
+    nlohmann::json body = nlohmann::json::object();
+    if (!new_key.empty()) body["key"] = new_key;
+    auto r = admin_exchange(std::move(host), std::move(port), "POST",
+                            "/admin/api/principals/" + enc + "/rotate", body.dump(), key);
+    if (r.status < 0) {
+      std::cerr << r.error << "\n";
+      return 1;
+    }
+    if (r.status != 200) {
+      std::cerr << "principal rotate failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    try {
+      print_secret(nlohmann::json::parse(r.body));
+    } catch (...) {
+      std::cout << r.body << "\n";
+    }
+    return 0;
+  }
+  if (action == "delete") {
+    auto r = admin_exchange(std::move(host), std::move(port), "DELETE",
+                            "/admin/api/principals/" + enc, "", key);
+    if (r.status < 0) {
+      std::cerr << r.error << "\n";
+      return 1;
+    }
+    if (r.status != 200) {
+      std::cerr << "principal delete failed status=" << r.status << " " << r.body << "\n";
+      return 1;
+    }
+    std::cout << "deleted " << name << "\n";
+    return 0;
+  }
+  std::cerr << kUsage;
+  return 2;
+}
+
 int cmd_admin_s3_cred(std::string host, std::string port, const std::string& key,
                       const std::vector<std::string>& args) {
   if (args.size() < 2) {
@@ -1837,6 +2039,29 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // Principal mode: trade the key for a ticket once, then sign everything below
+  // with the session key. The rest of the tool only sees "a signing key".
+  if (!args.principal.empty()) {
+    if (args.cmd == "testbed") {
+      std::cerr << "testbed needs --cluster-key (it starts the daemons)\n";
+      return 2;
+    }
+    try {
+      aios::SessionConfig scfg;
+      scfg.endpoint = args.endpoint;
+      scfg.principal = args.principal;
+      scfg.principal_key = args.principal_key;
+      aios::Session s(scfg);
+      s.ensure_ticket();
+      const auto m = s.ticket_material();
+      g_credential = m.ticket;
+      args.cluster_key = m.session_key;
+    } catch (const std::exception& e) {
+      std::cerr << "authentication as " << args.principal << " failed: " << e.what() << "\n";
+      return 1;
+    }
+  }
+
   try {
     if (args.cmd == "map") {
       auto r = http_exchange(host, port, "GET", "/map", {}, {}, nullptr, args.cluster_key);
@@ -1972,6 +2197,8 @@ int main(int argc, char** argv) {
         return cmd_admin_lifecycle(host, port, args.cluster_key, args.positional);
       if (sub == "s3-cred")
         return cmd_admin_s3_cred(host, port, args.cluster_key, args.positional);
+      if (sub == "principal")
+        return cmd_admin_principal(host, port, args.cluster_key, args.positional);
       if (sub == "quota") return cmd_admin_quota(host, port, args.cluster_key, args.positional);
       if (sub == "qos") return cmd_admin_qos(host, port, args.cluster_key, args.positional);
       std::cerr << "unknown admin subcommand: " << sub << "\n";

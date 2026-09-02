@@ -1148,6 +1148,8 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"s3_volume", c.s3_volume},
       {"s3_access_key", c.s3_access_key},
       {"cuobject_listen", c.cuobject_listen},
+      {"http_ticket_lifetime_ms", c.http_ticket_lifetime_ms},
+      {"http_shared_key_clients", c.http_shared_key_clients},
       {"compression", c.compression},
       {"compression_level", c.compression_level},
       {"compression_min_bytes", c.compression_min_bytes},
@@ -1235,6 +1237,8 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService&
       cfg_(cfg),
       objects_(objects),
       membership_(membership),
+      sealer_(cfg.cluster_key),
+      principals_(cfg.cluster_key, objects),
       s3_iam_(std::move(s3_iam)),
       quota_(std::move(quota)),
       qos_(std::move(qos)),
@@ -1327,6 +1331,197 @@ void HttpServer::note_login_failure(const std::string& peer) {
 void HttpServer::note_login_success(const std::string& peer) {
   std::lock_guard lock(login_mu_);
   login_failures_.erase(peer);
+}
+
+void HttpServer::handle_ticket_grant(tcp::socket& sock, const std::vector<std::uint8_t>& body,
+                                     const std::string& peer, bool keep_alive) {
+  // Proof guessing is throttled per source address exactly like admin login.
+  if (login_throttled(peer)) {
+    const auto j = json_dump(
+        nlohmann::json{{"error", "too many ticket attempts"}, {"code", "login_throttled"}});
+    write_response(sock, 429, "Too Many Requests",
+                   {{"Content-Type", "application/json"},
+                    {"Retry-After", std::to_string(kLoginLockoutMs / 1000)}},
+                   reinterpret_cast<const std::uint8_t*>(j.data()), j.size(), keep_alive);
+    return;
+  }
+  std::optional<TicketRequest> req;
+  try {
+    req = ticket_request_from_json(nlohmann::json::parse(body.begin(), body.end()));
+  } catch (const std::exception&) {
+  }
+  if (!req) {
+    write_json(sock, 400, "Bad Request",
+               {{"error", "body must be {principal, ts, nonce, proof}"}, {"code", "bad_request"}},
+               keep_alive);
+    return;
+  }
+  const auto now = now_ms();
+  // The proof itself is replay-protected: (principal, ts, nonce) is single-use
+  // within the skew window, so a captured request cannot mint a second ticket
+  // (whose session key the attacker could not derive anyway).
+  if (!http_replay_cache().check_and_insert(
+          "t\n" + req->principal + '\n' + std::to_string(req->ts_ms) + '\n' + req->nonce,
+          req->ts_ms + cfg_.auth_skew_ms + 1000, now)) {
+    note_login_failure(peer);
+    write_json(sock, 401, "Unauthorized",
+               {{"error", "replayed ticket request"}, {"code", "replayed"}}, keep_alive);
+    return;
+  }
+  auto principal = principals_.find(req->principal);
+  std::string err;
+  std::optional<TicketReply> reply;
+  if (principal) {
+    reply = grant_ticket(*req, *principal, sealer_, now, cfg_.auth_skew_ms,
+                         cfg_.http_ticket_lifetime_ms, err);
+  } else {
+    // Same reply for unknown principal and wrong key, so names cannot be probed.
+    err = "bad proof";
+  }
+  if (!reply) {
+    note_login_failure(peer);
+    AIOS_LOG_WARN("ticket grant refused for '", req->principal, "' from ", peer, ": ", err);
+    const bool skew = err.find("skew") != std::string::npos;
+    write_json(sock, 401, "Unauthorized",
+               {{"error", skew ? err : std::string("unknown principal or bad proof")},
+                {"code", skew ? "date_skew" : "bad_proof"}},
+               keep_alive);
+    return;
+  }
+  note_login_success(peer);
+  AIOS_LOG_INFO("ticket granted to ", principal->name, " (", principal_role_name(principal->role),
+                ") from ", peer);
+  write_json(sock, 200, "OK", ticket_reply_to_json(*reply), keep_alive);
+}
+
+bool HttpServer::handle_principal_admin(tcp::socket& sock, const std::string& method,
+                                        const std::string& path,
+                                        const std::vector<std::uint8_t>& body, bool keep_alive) {
+  constexpr const char* kBase = "/admin/api/principals";
+  if (path.rfind(kBase, 0) != 0) return false;
+  std::string rest = path.substr(std::strlen(kBase));
+  if (!rest.empty() && rest[0] != '/') return false;
+
+  auto fail = [&](int status, const std::string& err) {
+    const char* reason = status == 404 ? "Not Found" : status == 409 ? "Conflict" : "Bad Request";
+    write_json(sock, status, reason, {{"error", err}}, keep_alive);
+  };
+  auto status_for = [](const std::string& err) {
+    if (err == "not found") return 404;
+    if (err.find("already exists") != std::string::npos) return 409;
+    return 400;
+  };
+  auto principal_json = [](const Principal& p) {
+    nlohmann::json caps = nlohmann::json::array();
+    for (const auto& c : p.caps) caps.push_back(c);
+    return nlohmann::json{{"name", p.name},
+                          {"key", p.key},
+                          {"role", principal_role_name(p.role)},
+                          {"caps", caps},
+                          {"created_ms", p.created_ms}};
+  };
+
+  if (rest.empty()) {
+    if (method == "GET") {
+      write_json(sock, 200, "OK", principals_.list_redacted(), keep_alive);
+      return true;
+    }
+    if (method == "POST") {
+      nlohmann::json j;
+      try {
+        j = nlohmann::json::parse(body.begin(), body.end());
+      } catch (const std::exception&) {
+        fail(400, "invalid JSON");
+        return true;
+      }
+      if (!j.is_object()) {
+        fail(400, "body must be an object");
+        return true;
+      }
+      Principal p;
+      p.name = j.value("name", "");
+      p.key = j.value("key", "");
+      auto role = parse_principal_role(j.value("role", "client"));
+      if (!role) {
+        fail(400, "role must be client|admin|node");
+        return true;
+      }
+      p.role = *role;
+      if (j.contains("caps")) {
+        if (!j["caps"].is_array()) {
+          fail(400, "caps must be an array of oid prefixes");
+          return true;
+        }
+        for (const auto& c : j["caps"]) {
+          if (!c.is_string()) {
+            fail(400, "caps must be an array of oid prefixes");
+            return true;
+          }
+          p.caps.push_back(c.get<std::string>());
+        }
+      }
+      std::string err;
+      auto created = principals_.create(std::move(p), err);
+      if (!created) {
+        fail(status_for(err), err);
+        return true;
+      }
+      AIOS_LOG_INFO("principal created: ", created->name, " role=",
+                    principal_role_name(created->role));
+      write_json(sock, 201, "Created", principal_json(*created), keep_alive);
+      return true;
+    }
+    fail(400, "method not allowed");
+    return true;
+  }
+
+  // /admin/api/principals/{name}[/rotate]
+  rest.erase(0, 1);
+  std::string name = rest;
+  bool rotate = false;
+  const auto slash = rest.find('/');
+  if (slash != std::string::npos) {
+    name = rest.substr(0, slash);
+    if (rest.substr(slash) != "/rotate") return false;
+    rotate = true;
+  }
+  name = url_decode(name);
+  std::string err;
+  if (rotate) {
+    if (method != "POST") {
+      fail(400, "method not allowed");
+      return true;
+    }
+    std::string new_key;
+    if (!body.empty()) {
+      try {
+        auto j = nlohmann::json::parse(body.begin(), body.end());
+        new_key = j.value("key", "");
+      } catch (const std::exception&) {
+        fail(400, "invalid JSON");
+        return true;
+      }
+    }
+    auto p = principals_.rotate(name, new_key, err);
+    if (!p) {
+      fail(status_for(err), err);
+      return true;
+    }
+    AIOS_LOG_INFO("principal key rotated: ", name);
+    write_json(sock, 200, "OK", principal_json(*p), keep_alive);
+    return true;
+  }
+  if (method == "DELETE") {
+    if (!principals_.remove(name, err)) {
+      fail(status_for(err), err);
+      return true;
+    }
+    AIOS_LOG_INFO("principal deleted: ", name);
+    write_json(sock, 200, "OK", {{"ok", true}, {"name", name}}, keep_alive);
+    return true;
+  }
+  fail(400, "method not allowed");
+  return true;
 }
 
 void HttpServer::detached_end() {
@@ -1531,7 +1726,24 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     const bool admin_login = cfg_.admin && method == "POST" && path == "/admin/login";
     const bool admin_logout = cfg_.admin && method == "POST" && path == "/admin/logout";
     const bool admin_api = path.rfind("/admin/api/", 0) == 0;
-    const bool skip_hmac = metrics_public || admin_static || admin_login || admin_logout;
+    // Ticket grant is the one endpoint a principal reaches before it has a
+    // credential; it authenticates with the proof inside its body instead.
+    const bool ticket_grant = method == "POST" && path == "/auth/ticket";
+    const bool skip_hmac =
+        metrics_public || admin_static || admin_login || admin_logout || ticket_grant;
+
+    std::string peer_addr;
+    bool peer_loopback = false;
+    {
+      boost::system::error_code pec;
+      const auto ep = sock->remote_endpoint(pec);
+      if (!pec) {
+        peer_addr = ep.address().to_string();
+        peer_loopback = ep.address().is_loopback();
+      } else {
+        peer_addr = "unknown";
+      }
+    }
 
     // Only object bodies may exceed the in-memory threshold and be staged on disk:
     // PUT /o/{oid}, POST /o/{oid}/append, PUT /txn/{id}/o/{oid}. Everything else
@@ -1554,24 +1766,96 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     // carries x-aios-admin, which a cross-site form or fetch cannot add without a
     // CORS preflight this server never grants. HMAC-signed calls are unaffected.
     int auth_status = 401;
+    std::string auth_code;
+    HttpAuthResult auth_ctx;  // who is calling, once try_auth succeeded
     auto write_unauth = [&](const std::string& err) {
-      write_json(*sock, auth_status, auth_status == 403 ? "Forbidden" : "Unauthorized",
-                 {{"error", err}}, false);
+      nlohmann::json j{{"error", err}};
+      if (!auth_code.empty()) j["code"] = auth_code;
+      write_json(*sock, auth_status, auth_status == 403 ? "Forbidden" : "Unauthorized", j, false);
+    };
+    // Role and capability checks on an authenticated caller. Runs inside
+    // try_auth so streamed PUTs are refused before their body is spooled.
+    auto authorize = [&](const HttpAuthResult& a, std::string& err_out) -> bool {
+      // GET /admin/cluster only lists peer addresses; clients need it to learn
+      // which hosts a 307 may redirect them to.
+      const bool cluster_view = method == "GET" && path == "/admin/cluster";
+      const bool admin_surface =
+          (path.rfind("/admin", 0) == 0 && !cluster_view) || path == "/metrics";
+      if (admin_surface && !a.is_admin()) {
+        auth_status = 403;
+        auth_code = "forbidden_role";
+        err_out = "principal '" + a.principal + "' has role " +
+                  principal_role_name(a.role) + "; admin API needs role admin";
+        return false;
+      }
+      // Object ids under the auth/ prefix hold the (sealed) keyring; nobody
+      // reads or writes them over HTTP, whatever their role.
+      std::string oid;
+      std::string list_prefix;
+      if (path.rfind("/o/", 0) == 0) {
+        const std::string rest = path.substr(3);
+        oid = url_decode(rest.substr(0, rest.find('/')));
+      } else if (path.rfind("/txn/", 0) == 0) {
+        const auto pos = path.find("/o/", 5);
+        if (pos != std::string::npos) {
+          const std::string rest = path.substr(pos + 3);
+          oid = url_decode(rest.substr(0, rest.find('/')));
+        }
+      } else if (path == "/o") {
+        auto it = qmap.find("prefix");
+        if (it != qmap.end()) list_prefix = it->second;
+      }
+      if (oid.rfind(kReservedAuthOidPrefix, 0) == 0) {
+        auth_status = 403;
+        auth_code = "reserved_oid";
+        err_out = std::string("object ids under ") + kReservedAuthOidPrefix + " are reserved";
+        return false;
+      }
+      if (a.ticket && !a.ticket->caps.empty()) {
+        if (!oid.empty() && !a.ticket->allows_oid(oid)) {
+          auth_status = 403;
+          auth_code = "forbidden_cap";
+          err_out = "principal '" + a.principal + "' may not access '" + oid + "'";
+          return false;
+        }
+        if (path == "/o" && !a.ticket->allows_prefix(list_prefix)) {
+          auth_status = 403;
+          auth_code = "forbidden_cap";
+          err_out = "principal '" + a.principal + "' may not list prefix '" + list_prefix + "'";
+          return false;
+        }
+      }
+      return true;
     };
     auto try_auth = [&](const std::string& payload_hash, std::string& err_out) -> bool {
       if (skip_hmac) return true;
-      auto auth = http_auth_verify(method, target, headers, payload_hash, cfg_.cluster_key,
-                                   cfg_.auth_skew_ms);
-      if (auth.ok) return true;
+      HttpAuthPolicy policy;
+      policy.cluster_key = cfg_.cluster_key;
+      policy.sealer = &sealer_;
+      policy.skew_ms = cfg_.auth_skew_ms;
+      policy.allow_shared_key = cfg_.http_shared_key_clients != "loopback" || peer_loopback;
+      auto auth =
+          http_auth_verify(method, target, headers, payload_hash, policy, &http_replay_cache());
+      if (auth.ok) {
+        if (!authorize(auth, err_out)) return false;
+        auth_ctx = std::move(auth);
+        return true;
+      }
+      auth_code = auth.code;
       if (admin_api && cfg_.admin) {
         const auto tok = cookie_get(headers, kAdminCookie);
         if (!tok.empty() && verify_admin_session(tok, cfg_.cluster_key)) {
           const bool mutating = method != "GET" && method != "HEAD";
           if (mutating && header_get(headers, kAdminCsrfHeader).empty()) {
             auth_status = 403;
+            auth_code = "csrf_header_required";
             err_out = std::string("missing ") + kAdminCsrfHeader + " header";
             return false;
           }
+          auth_ctx = HttpAuthResult{};
+          auth_ctx.ok = true;
+          auth_ctx.role = PrincipalRole::Admin;
+          auth_ctx.principal = "admin-console";
           return true;
         }
         err_out = auth.error.empty() ? "login required" : auth.error;
@@ -1856,13 +2140,20 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       std::string aerr;
       if (!try_auth(payload_hash, aerr)) {
         cleanup_upload();
-        write_json(*sock, auth_status, auth_status == 403 ? "Forbidden" : "Unauthorized",
-                   {{"error", aerr}}, keep_alive);
+        nlohmann::json j{{"error", aerr}};
+        if (!auth_code.empty()) j["code"] = auth_code;
+        write_json(*sock, auth_status, auth_status == 403 ? "Forbidden" : "Unauthorized", j,
+                   keep_alive);
         continue;
       }
       authed = true;
     }
     (void)authed;
+
+    if (ticket_grant) {
+      handle_ticket_grant(*sock, body, peer_addr, keep_alive);
+      continue;
+    }
 
     // The signature covered the declared hash; the bytes that arrived must match it.
     if (!skip_hmac && concrete_sha && content_length > 0 && received_body_sha != expected_body_sha) {
@@ -1892,8 +2183,11 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     // Lifecycle GET/PUT is HMAC-authenticated on every node so the console can
     // proxy host/disk settings to peers that are not running the admin UI.
     const bool lifecycle_api = path.rfind("/admin/api/lifecycle", 0) == 0;
+    // Principal management likewise works on every node: a cluster without an
+    // admin UI still needs a way to hand out keys.
+    const bool principals_api = path.rfind("/admin/api/principals", 0) == 0;
     if (path.rfind("/admin", 0) == 0 || path == "/metrics") {
-      if (!cfg_.admin && !lifecycle_api) {
+      if (!cfg_.admin && !lifecycle_api && !principals_api) {
         write_json(*sock, 404, "Not Found",
                    {{"error", "admin API disabled (set admin: true)"}}, keep_alive);
         continue;
@@ -1964,6 +2258,10 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                        {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
                        reinterpret_cast<const std::uint8_t*>(body_txt.data()), body_txt.size(),
                        keep_alive);
+        continue;
+      }
+
+      if (principals_api && handle_principal_admin(*sock, method, path, body, keep_alive)) {
         continue;
       }
 

@@ -972,14 +972,48 @@ Notes:
 
 ## Authentication
 
-Every daemon and HTTP client in a cluster must share `cluster_key`.
+Daemons share `cluster_key`; it is the *node* secret. Clients should not hold it: they
+authenticate as **principals** with their own key and receive a short-lived **ticket**
+(cephx / Kerberos style). The shared key keeps working for HTTP clients for compatibility.
 
 | Surface | Mechanism |
 |---------|-----------|
-| TCP++ `Hello` / `Gossip` / object RPC | HMAC-SHA256 over canonical body + timestamp |
-| HTTP | `Authorization: AIOS-HMAC-SHA256 …` + `x-aios-date` + content hash |
+| TCP++ `Hello` / `Gossip` / object RPC | HMAC-SHA256 over canonical body + timestamp, keyed by `cluster_key` (nodes only) |
+| HTTP, ticket (recommended) | `POST /auth/ticket` proves possession of the principal key once; every request is then `Authorization: AIOS-HMAC-SHA256 Credential=<ticket> …` keyed by a per-session key |
+| HTTP, shared key (legacy) | Same header with `Credential=<label>`, HMAC keyed by `cluster_key`; full access |
+| S3 | AWS SigV4 with per-bucket IAM keys ([S3 auth](#auth-and-per-bucket-credentials)); the wire is plaintext, put TLS in front |
 
-Skew window: `auth_skew_ms` (default 60s). This is shared-secret clustering, not mutual TLS. Details: [`proto/README.md`](proto/README.md), [`proto/http.md`](proto/http.md).
+### Principals and tickets
+
+A principal is `name + 64-hex key + role + optional oid-prefix caps`, stored in a cluster-wide
+keyring (object `auth/principals`, AES-256-GCM encrypted under a key derived from `cluster_key`,
+unreadable over HTTP). Roles:
+
+| Role | May |
+|------|-----|
+| `client` | Object API (`/o`, `/txn`, locks, watches, pub/sub) within its caps; `GET /admin/cluster` for redirect discovery |
+| `admin` | Everything, including `/admin/*` and `/metrics` |
+| `node` | Same as admin; what a daemon acts as when using the shared key |
+
+```bash
+# bootstrap with the shared key (works on every node, admin UI not required)
+aios --cluster-key $KEY admin principal create client.alice --caps alice/,shared/
+aios --cluster-key $KEY admin principal create admin.ops --role admin
+aios --cluster-key $KEY admin principal list | rotate NAME | delete NAME
+
+# use it: the key never leaves the client, a ticket is fetched and renewed automatically
+aios --principal client.alice --key $ALICE_KEY put alice/doc ./doc     # or AIOS_PRINCIPAL / AIOS_PRINCIPAL_KEY
+mount -t aiosfs -o backend=http,endpoint=node:7480,principal=client.alice,key=$ALICE_KEY none /mnt/aios
+```
+
+In C++ set `SessionConfig::principal` / `principal_key` instead of `cluster_key`. Tickets live
+`http_ticket_lifetime_ms` (default 8 h), are renewed at half-life, and every node can verify them
+without contacting the issuer. Rotating a key invalidates future ticket grants only; deleting a
+principal likewise (issued tickets expire on schedule). Set `http_shared_key_clients: loopback` so
+the shared key is only accepted from local processes (the daemon's own S3 gateway) and every
+remote HTTP client must be a principal. Protocol details: [`proto/http.md`](proto/http.md).
+
+Skew window: `auth_skew_ms` (default 60s). Details: [`proto/README.md`](proto/README.md), [`proto/http.md`](proto/http.md).
 
 ---
 
@@ -991,19 +1025,19 @@ who can reach the ports or observe the wire.
 
 | Property | Current state |
 |----------|---------------|
-| **Transport** | Plaintext everywhere: gossip/RPC (TCP++), HTTP object API, admin UI/API, S3 gateway, kernel modules. No TLS, no mutual authentication. Anyone on the path can read every object body, every admin session cookie, and the S3 traffic. |
-| **One shared secret** | `cluster_key` is simultaneously the **node** secret (join the cluster, receive replicas, participate in placement), the **client** secret (HTTP object API), the **admin password** (web UI login) and the **S3 root secret** (`s3_access_key` / `cluster_key`). Consequently *any* S3 root client or HTTP client can join as a storage node, read or rewrite any object, and log in to the admin console. Per-bucket S3 IAM keys are the only scoped credential and they exist only on the S3 surface. |
+| **Transport** | Plaintext for gossip/RPC (TCP++), the HTTP object API, admin UI/API and the kernel modules: no TLS, so anyone on the path can read object bodies and admin session cookies (not credentials: principal keys never travel, and a captured ticket is useless without its session key). The S3 gateway is plaintext too; SigV4 offers no confidentiality on its own. |
+| **Shared secret vs principals** | `cluster_key` remains the **node** secret (join the cluster, receive replicas, participate in placement), the **admin UI password** and the **S3 root secret** (`s3_access_key` / `cluster_key`); anyone holding it has every power. HTTP clients no longer need it: create **principals** (`aios admin principal create`) with role `client` and oid-prefix caps, and set `http_shared_key_clients: loopback` so the shared key is refused from remote clients. Per-bucket S3 IAM keys scope the S3 surface. |
 | **Integrity of bodies** | HMAC-SHA256 covers the canonical request/frame metadata. Streamed bodies are covered only when the client sends a content hash: HTTP PUTs above 256 KiB are currently signed as `UNSIGNED-PAYLOAD`, and replica RPC frames carry the body as an unsigned trailer with a CRC32C (being fixed — see `CHANGELOG.md` OBJ-13 / POS-11). Until then, an on-path party can substitute object contents while the signature still verifies. |
 | **Replay** | Requests are valid for the `auth_skew_ms` window (default **60 s**). RPC frames have a nonce + replay cache; HTTP requests currently do not (HTTP-4). Clocks must be synchronised (NTP) across nodes and clients. |
-| **Key rotation** | None. Changing `cluster_key` means restarting every node and client with the new value; there is no dual-key grace period. Per-bucket IAM secrets can be deleted and recreated individually. |
-| **Authorization** | There is no per-object ACL on the HTTP object API: a valid `cluster_key` grants everything. POSIX uid/gid checks apply on the FUSE/S3/XRootD paths only. |
+| **Key rotation** | Principal keys rotate individually (`aios admin principal rotate`): issued tickets run to their expiry, new grants need the new key. Changing `cluster_key` still means restarting every node with the new value; there is no dual-key grace period, and it re-seals the keyring (principals must be recreated). Per-bucket IAM secrets can be deleted and recreated individually. |
+| **Authorization** | Principal tickets carry a role (`client` / `admin`) and optional oid-prefix caps enforced on `/o`, `/txn` and LIST. There is no finer per-object ACL, and the shared `cluster_key` still grants everything. POSIX uid/gid checks apply on the FUSE/S3/XRootD paths only. |
 | **Admin UI** | Cookie session (`HttpOnly; SameSite=Strict`), constant-time password compare; no CSRF token, no login rate limiting, no TLS. |
 
 **Recommendations**
 
 - Run all nodes on a **private / isolated network** (VLAN, VPC, WireGuard); firewall `listen`, `http_listen`, `s3_listen`, `cuobject_listen` so only nodes and trusted clients reach them.
 - Put a **TLS-terminating reverse proxy** (nginx, HAProxy, Envoy) in front of the HTTP API, admin UI and S3 gateway for anything that leaves that network; bind the daemon ports to loopback or the private interface.
-- Use **per-bucket IAM keys** for S3 users; never hand out `cluster_key` to an application.
+- Give every application its own **principal** (`role: client`, caps on its prefixes) and set `http_shared_key_clients: loopback`; use **per-bucket IAM keys** for S3 users; never hand out `cluster_key` to an application.
 - Treat `cluster_key` as a root credential: keep it out of shell history and process listings (`--config` file with mode `0600` rather than `--cluster-key` on the command line).
 - Keep NTP running; a skewed clock is indistinguishable from an attack and is rejected with `401`.
 

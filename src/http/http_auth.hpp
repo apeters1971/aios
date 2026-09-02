@@ -1,7 +1,10 @@
 #pragma once
 
+#include "util/ticket.hpp"
+
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -50,16 +53,43 @@ std::string http_sign(const std::string& cluster_key, const std::string& canonic
 struct HttpAuthResult {
   bool ok{false};
   std::string error;
+  // Stable error code for clients: bad_signature, ticket_expired, bad_ticket,
+  // shared_key_refused, replayed, ...
+  std::string code;
   std::string credential;
+  // Who signed. Empty principal means the shared cluster key was used, which is
+  // treated as PrincipalRole::Node (full access) for compatibility.
+  std::string principal;
+  PrincipalRole role{PrincipalRole::Node};
+  std::optional<Ticket> ticket;
+
+  bool is_admin() const { return role == PrincipalRole::Admin || role == PrincipalRole::Node; }
+};
+
+// What a verifier accepts. `sealer == nullptr` disables ticket credentials;
+// `allow_shared_key == false` refuses the legacy cluster-key HMAC (the caller
+// decides that per peer, e.g. loopback only).
+struct HttpAuthPolicy {
+  std::string cluster_key;
+  const TicketSealer* sealer{nullptr};
+  bool allow_shared_key{true};
+  int skew_ms{300000};
 };
 
 // Authorization: AIOS-HMAC-SHA256 Credential=..., SignedHeaders=..., Signature=...
-// Requires x-aios-date or date header within skew. Replay protection: with an
-// x-aios-nonce the (date, nonce, signature) tuple is single-use; without one,
-// mutating methods (PUT/POST/DELETE) whose signature covers a concrete payload
-// hash are single-use on (method, target, date, signature). UNSIGNED-PAYLOAD
-// bodies are exempt so distinct writes issued in the same millisecond (kernel
-// range PUTs, appends) are not mistaken for replays. replay == nullptr disables.
+// Credential is either an opaque label (legacy: HMAC keyed by the cluster key)
+// or a ticket "t1...." (HMAC keyed by the ticket's session key, see
+// util/ticket.hpp). Requires x-aios-date or date header within skew.
+// Replay protection: with an x-aios-nonce the (date, nonce, signature) tuple is
+// single-use; without one, mutating methods (PUT/POST/DELETE) whose signature
+// covers a concrete payload hash are single-use on (method, target, date,
+// signature). UNSIGNED-PAYLOAD bodies are exempt so distinct writes issued in
+// the same millisecond (kernel range PUTs, appends) are not mistaken for
+// replays. replay == nullptr disables.
+HttpAuthResult http_auth_verify(const std::string& method, const std::string& path_with_query,
+                                const std::unordered_map<std::string, std::string>& headers,
+                                const std::string& payload_hash_hex,
+                                const HttpAuthPolicy& policy, HttpReplayCache* replay);
 HttpAuthResult http_auth_verify(const std::string& method, const std::string& path_with_query,
                                 const std::unordered_map<std::string, std::string>& headers,
                                 const std::string& payload_hash_hex,

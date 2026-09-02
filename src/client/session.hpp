@@ -17,7 +17,14 @@ namespace aios {
 
 struct SessionConfig {
   std::string endpoint{"127.0.0.1:7480"};
+  // Shared cluster key (legacy: full access, HMAC keyed by the key itself).
+  // Leave empty when authenticating as a principal instead.
   std::string cluster_key;
+  // Ticket auth (util/ticket.hpp): principal name + its 64-hex key. The session
+  // obtains a ticket on first use, renews it at half-life, and signs requests
+  // with the derived session key; the principal key never leaves the process.
+  std::string principal;
+  std::string principal_key;
   // Optional workload label sent as x-aios-app-label on every request.
   std::string app_label{};
   // Per-socket read/write deadline. Applied as SO_RCVTIMEO / SO_SNDTIMEO on a
@@ -148,10 +155,26 @@ class Session {
   static std::string url_encode_oid(const std::string& oid);
   static std::string stl_oid(const std::string& type, const std::string& name);
 
+  // Principal mode only. Fetches a ticket now (or renews when `force`), throwing
+  // client_error("unauthorized", ...) if the cluster refuses the principal.
+  // Called implicitly by request(); exposed so callers can fail fast at startup.
+  void ensure_ticket(bool force = false);
+  bool uses_ticket() const { return !cfg_.principal.empty(); }
+  // Expiry of the current ticket in unix ms (0 = none yet).
+  std::int64_t ticket_expires_ms() const;
+  // Current ticket and its session key, for tools that sign requests themselves.
+  struct TicketMaterial {
+    std::string ticket;
+    std::string session_key;
+    std::int64_t expires_ms{0};
+  };
+  TicketMaterial ticket_material() const;
+
  private:
   void parse_endpoint();
   void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
                 const std::string& target, const std::string& body) const;
+  HttpResponse post_ticket_request(const std::string& body);
   static std::string next_nonce();
   static void validate_header_value(const std::string& value, const char* what);
   static ObjectSnapshot parse_object_meta(const HttpResponse& resp, bool with_body);
@@ -172,6 +195,13 @@ class Session {
   std::unordered_set<std::string> redirect_allow_;
   std::atomic<bool> redirect_refreshed_{false};
   std::atomic<bool> refreshing_allowlist_{false};
+  // Current ticket (principal mode). Renewal happens under ticket_mu_ so a burst
+  // of expired-ticket 401s from many threads costs one grant, not one each.
+  mutable std::mutex ticket_mu_;
+  std::string ticket_;
+  std::string session_key_;
+  std::int64_t ticket_issued_ms_{0};
+  std::int64_t ticket_expires_ms_{0};
   struct ConnPool;
   std::unique_ptr<ConnPool> pool_;
 };

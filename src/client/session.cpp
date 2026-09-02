@@ -436,7 +436,16 @@ struct Session::ConnPool {
 };
 
 Session::Session(SessionConfig cfg) : cfg_(std::move(cfg)), pool_(std::make_unique<ConnPool>()) {
-  if (cfg_.cluster_key.empty()) throw client_error("bad_request", "cluster_key required");
+  if (!cfg_.principal.empty()) {
+    if (!valid_principal_name(cfg_.principal)) {
+      throw client_error("bad_request", "invalid principal name");
+    }
+    if (cfg_.principal_key.size() != 64) {
+      throw client_error("bad_request", "principal_key must be 64 hex characters");
+    }
+  } else if (cfg_.cluster_key.empty()) {
+    throw client_error("bad_request", "cluster_key or principal+principal_key required");
+  }
   parse_endpoint();
   allow_redirect_peer(host_ + ":" + port_);
   for (const auto& p : cfg_.redirect_peers) allow_redirect_peer(p);
@@ -484,6 +493,7 @@ bool Session::redirect_allowed(const std::string& host, const std::string& port)
 HttpResponse Session::bootstrap_get(const std::string& path) {
   std::unordered_map<std::string, std::string> headers;
   headers["content-length"] = "0";
+  ensure_ticket();
   add_auth(headers, "GET", path, {});
 
   auto hop = [&](bool allow_reuse) -> HttpResponse {
@@ -591,9 +601,88 @@ void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
   const auto canon =
       http_canonical(method, target, date, signed_headers, headers, payload_hash);
-  const auto sig = http_sign(cfg_.cluster_key, canon);
-  headers["authorization"] = "AIOS-HMAC-SHA256 Credential=stl, SignedHeaders=" +
-                             signed_headers + ", Signature=" + sig;
+  std::string credential = "stl";
+  std::string key = cfg_.cluster_key;
+  if (uses_ticket()) {
+    std::lock_guard lock(ticket_mu_);
+    credential = ticket_;
+    key = session_key_;
+  }
+  const auto sig = http_sign(key, canon);
+  headers["authorization"] = "AIOS-HMAC-SHA256 Credential=" + credential +
+                             ", SignedHeaders=" + signed_headers + ", Signature=" + sig;
+}
+
+std::int64_t Session::ticket_expires_ms() const {
+  std::lock_guard lock(ticket_mu_);
+  return ticket_expires_ms_;
+}
+
+Session::TicketMaterial Session::ticket_material() const {
+  std::lock_guard lock(ticket_mu_);
+  return {ticket_, session_key_, ticket_expires_ms_};
+}
+
+HttpResponse Session::post_ticket_request(const std::string& body) {
+  std::unordered_map<std::string, std::string> headers;
+  headers["content-length"] = std::to_string(body.size());
+  headers["content-type"] = "application/json";
+  // Always a fresh connection to the bootstrap endpoint: no credential is sent,
+  // and a stale pooled socket must not turn a grant into a spurious failure.
+  bool reused = false;
+  auto conn = pool_->take(host_, port_, cfg_.socket_timeout_ms, &reused);
+  if (reused) {
+    pool_->put(std::move(conn), false);
+    conn = pool_->take(host_, port_, cfg_.socket_timeout_ms, &reused);
+  }
+  try {
+    bool close_conn = false;
+    auto r = exchange_http(conn->sock, conn->leftover, "POST", "/auth/ticket", host_, port_,
+                           headers, body, &close_conn);
+    pool_->put(std::move(conn), !close_conn);
+    return r;
+  } catch (...) {
+    pool_->put(std::move(conn), false);
+    throw;
+  }
+}
+
+void Session::ensure_ticket(bool force) {
+  if (!uses_ticket()) return;
+  std::lock_guard lock(ticket_mu_);
+  const auto now = now_ms();
+  if (!force && !ticket_.empty()) {
+    // Renew at half-life so a ticket never expires mid-burst.
+    const auto half = ticket_issued_ms_ + (ticket_expires_ms_ - ticket_issued_ms_) / 2;
+    if (now < half) return;
+  }
+  const auto req = make_ticket_request(cfg_.principal, cfg_.principal_key, now);
+  HttpResponse resp = post_ticket_request(ticket_request_to_json(req).dump());
+  if (resp.status != 200) {
+    std::string code = "unauthorized";
+    std::string msg = "ticket grant failed (HTTP " + std::to_string(resp.status) + ")";
+    try {
+      auto j = nlohmann::json::parse(resp.body);
+      if (j.contains("error") && j["error"].is_string()) msg += ": " + j["error"].get<std::string>();
+      if (j.contains("code") && j["code"].is_string()) code = j["code"].get<std::string>();
+    } catch (...) {
+    }
+    if (resp.status == 429) code = "login_throttled";
+    throw client_error(code, msg);
+  }
+  std::optional<TicketReply> reply;
+  try {
+    reply = ticket_reply_from_json(nlohmann::json::parse(resp.body));
+  } catch (...) {
+  }
+  if (!reply) throw client_error("http", "malformed ticket reply");
+  std::string err;
+  auto session_key = verify_ticket_reply(*reply, cfg_.principal_key, req.nonce, err);
+  if (!session_key) throw client_error("unauthorized", err);
+  ticket_ = reply->ticket;
+  session_key_ = *session_key;
+  ticket_issued_ms_ = now;
+  ticket_expires_ms_ = reply->expires_ms;
 }
 
 HttpResponse Session::request(const std::string& method, const std::string& target,
@@ -612,7 +701,9 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
   std::string port = port_;
   std::string path = target;
   HttpResponse resp;
+  bool ticket_renewed = false;
 
+  ensure_ticket();
   for (int hop = 0; hop <= max_redirects; ++hop) {
     headers.erase("authorization");
     headers.erase("x-aios-date");
@@ -660,6 +751,22 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
       }
     };
     resp = try_hop();
+
+    // A node's clock or a long idle gap can expire the ticket before the
+    // half-life renewal ran; fetch a new one and repeat this hop once.
+    if (resp.status == 401 && uses_ticket() && !ticket_renewed) {
+      std::string code;
+      try {
+        code = nlohmann::json::parse(resp.body).value("code", "");
+      } catch (...) {
+      }
+      if (code == "ticket_expired" || code == "bad_ticket") {
+        ticket_renewed = true;
+        ensure_ticket(/*force=*/true);
+        --hop;
+        continue;
+      }
+    }
 
     if (resp.status == 307 || resp.status == 301 || resp.status == 302) {
       const auto loc = header_get(resp.headers, "location");

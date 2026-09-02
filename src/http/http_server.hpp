@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "http/backup_policy.hpp"
 #include "http/posix_layout_store.hpp"
+#include "http/principal_store.hpp"
 #include "http/qos_admin.hpp"
 #include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
@@ -83,6 +84,13 @@ class HttpServer {
   bool login_throttled(const std::string& peer);
   void note_login_failure(const std::string& peer);
   void note_login_success(const std::string& peer);
+  // POST /auth/ticket: proof-of-key -> sealed ticket (util/ticket.hpp).
+  void handle_ticket_grant(boost::asio::ip::tcp::socket& sock, const std::vector<std::uint8_t>& body,
+                           const std::string& peer, bool keep_alive);
+  // /admin/api/principals[...]; returns false when the route did not match.
+  bool handle_principal_admin(boost::asio::ip::tcp::socket& sock, const std::string& method,
+                              const std::string& path, const std::vector<std::uint8_t>& body,
+                              bool keep_alive);
   nlohmann::json admin_status_json() const;
   nlohmann::json admin_config_json() const;
   nlohmann::json admin_lifecycle_json() const;
@@ -91,6 +99,8 @@ class HttpServer {
   Config& cfg_;
   ObjectService& objects_;
   MembershipTable& membership_;
+  TicketSealer sealer_;
+  PrincipalStore principals_;
   std::shared_ptr<S3IamStore> s3_iam_;
   std::shared_ptr<QuotaAdminStore> quota_;
   std::shared_ptr<QosAdminStore> qos_;

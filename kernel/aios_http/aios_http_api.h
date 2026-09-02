@@ -16,10 +16,26 @@ struct aios_http_buf {
 	size_t len;
 };
 
+/* Principal names: [A-Za-z0-9._-], at most 64 chars (+ NUL). */
+#define AIOS_HTTP_PRINCIPAL_MAX 65
+
 struct aios_http_client *aios_http_client_create(const char *endpoint /* HOST:PORT */,
 						 const char *cluster_key, gfp_t gfp);
 void aios_http_client_destroy(struct aios_http_client *c);
 void aios_http_client_set_app_label(struct aios_http_client *c, const char *label);
+
+/*
+ * Ticket authentication (cephx / krb5 style; src/util/ticket.hpp). After this
+ * call the key passed to aios_http_client_create is treated as the principal's
+ * 64-hex key: the client proves possession to POST /auth/ticket, receives a
+ * sealed ticket plus a per-session key, and signs every request with that
+ * session key. The principal key is never sent. The ticket is renewed at its
+ * half-life. Returns -EINVAL for a bad name or key, otherwise 0; the first
+ * ticket is fetched lazily by the first request (or aios_http_client_login).
+ */
+int aios_http_client_set_principal(struct aios_http_client *c, const char *principal);
+/* Fetch a ticket now (principal mode), so mount can fail fast on bad credentials. */
+int aios_http_client_login(struct aios_http_client *c);
 
 /* Socket send/recv timeout (default 30000). Applied to sk_sndtimeo/sk_rcvtimeo. */
 void aios_http_client_set_timeout_ms(struct aios_http_client *c, unsigned int ms);
@@ -73,6 +89,9 @@ int aios_http_txn_abort(struct aios_http_client *c, const char *txn_id);
 struct aios_http_pool *aios_http_pool_create(const char *endpoint, const char *cluster_key,
 					     const char *app_label, unsigned int n, gfp_t gfp);
 void aios_http_pool_destroy(struct aios_http_pool *p);
+/* Principal mode for every client in the pool (see aios_http_client_set_principal).
+ * Logs the first client in so a bad key fails here rather than on first I/O. */
+int aios_http_pool_set_principal(struct aios_http_pool *p, const char *principal);
 struct aios_http_client *aios_http_pool_get(struct aios_http_pool *p);
 void aios_http_pool_put(struct aios_http_pool *p, struct aios_http_client *c);
 void aios_http_pool_set_timeout_ms(struct aios_http_pool *p, unsigned int ms);

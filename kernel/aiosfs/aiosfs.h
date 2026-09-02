@@ -135,7 +135,9 @@ struct aios_sb_info {
 	struct aios_dir_cache *dir_cache;
 	int mount_id;
 	char endpoint[256];
+	/* Shared cluster key, or the principal key when principal[0] is set. */
 	char cluster_key[256];
+	char principal[65];
 	char volume[64];
 	char app_label[64];
 	u64 stripe_unit;

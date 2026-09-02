@@ -3895,6 +3895,18 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 		return PTR_ERR(pool);
 	}
 	aios_http_pool_set_timeout_ms(pool, 30000);
+	if (info->principal[0]) {
+		/* Trades the principal key for a ticket now: a wrong key fails the
+		 * mount instead of every later I/O. */
+		err = aios_http_pool_set_principal(pool, info->principal);
+		if (err) {
+			pr_err("aiosfs: authentication as principal %s failed: %d\n",
+			       info->principal, err);
+			aios_http_pool_destroy(pool);
+			dir_cache_free_all(info);
+			return err;
+		}
+	}
 	info->http_pool = pool;
 	/* max_active tracks the client pool: extra workers would only pile up
 	 * blocked in aios_http_pool_get, one kernel stack each. */

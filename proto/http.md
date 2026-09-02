@@ -36,12 +36,96 @@ Canonical string:
 <payload_hash>
 ```
 
-`Signature = HMAC-SHA256(cluster_key, canonical)` as lowercase hex.
+`Signature = HMAC-SHA256(key, canonical)` as lowercase hex, where `key` depends on the
+credential:
+
+| `Credential=` | HMAC key | Identity |
+|---------------|----------|----------|
+| any label not starting with `t1.` (e.g. `stl`, `cli`) | `cluster_key` | shared key, role `node` (full access) |
+| `t1.<base64>` — a ticket | the ticket's session key | the principal inside the ticket, its role and caps |
+
+Failures are `401` (`403` for role / cap / reserved-oid refusals) with a JSON body
+`{"error": ..., "code": ...}`. Codes: `missing_auth`, `bad_auth_fields`, `missing_date`,
+`bad_date`, `date_skew`, `bad_signature`, `replayed`, `bad_ticket`, `ticket_expired`,
+`shared_key_refused`, `forbidden_role`, `forbidden_cap`, `reserved_oid`. A client holding a
+ticket should fetch a new one on `ticket_expired` / `bad_ticket` and retry once.
+
+### Tickets (`POST /auth/ticket`)
+
+One round trip turns a principal key into a ticket and a session key. The principal key is never
+transmitted; the exchange needs only HMAC-SHA256 on the client, so kernel clients can do it.
+The endpoint takes no `Authorization` header (the proof is in the body); failed attempts are
+throttled per source address like admin login (`429`).
+
+Request body:
+
+```json
+{"principal": "client.alice", "ts": <unix-ms>, "nonce": "<16+ random bytes, hex>",
+ "proof": HMAC-SHA256-hex(principal_key, "aios-ticket-req-v1\n" principal "\n" ts "\n" nonce)}
+```
+
+`ts` must be within `auth_skew_ms` of the server clock; `(principal, ts, nonce)` is single-use.
+
+Reply (`200`):
+
+```json
+{"ticket": "t1....", "server_nonce": "<hex>", "expires_ms": <unix-ms>,
+ "server_proof": "<hex>", "principal": "client.alice", "role": "client"}
+```
+
+Both sides derive
+
+```
+session_key  = HMAC-SHA256-hex(principal_key, "aios-session-v1\n" nonce "\n" server_nonce)
+server_proof = HMAC-SHA256-hex(session_key, "aios-ticket-reply-v1\n" nonce "\n" ticket "\n" server_nonce "\n" expires_ms)
+```
+
+The client verifies `server_proof` before trusting the ticket (mutual authentication: only a
+holder of the principal key — i.e. a real cluster node — can produce it). Note the HMAC *key* is
+the 64-character hex string of `session_key`, not its decoded bytes; requests are signed the same
+way. Errors: `401 bad_proof` (unknown principal or wrong key — deliberately indistinguishable),
+`401 date_skew`, `401 replayed`, `400 bad_request`, `429 login_throttled`.
+
+The ticket is opaque: `"t1." + base64(nonce12 ‖ AES-256-GCM(seal_key, principal, role, caps,
+session_key, issued, expires))` with `seal_key = HMAC-SHA256(cluster_key, "aios-ticket-seal-v1")`.
+Any node opens it locally; there is no ticket server to consult. Lifetime `http_ticket_lifetime_ms`
+(default 8 h); clients renew at half-life.
+
+### Roles and caps
+
+| Role | `/o`, `/txn`, locks, watches, pub/sub | `/admin/*`, `/metrics` |
+|------|---------------------------------------|------------------------|
+| `client` | within caps | `403 forbidden_role` (except `GET /admin/cluster`) |
+| `admin`, `node`, shared key | all | all |
+
+Caps are oid prefixes. With non-empty caps, `/o/{oid}…` and `/txn/{id}/o/{oid}` require the oid
+to start with a cap, and `GET /o?prefix=` requires the prefix to lie inside a cap
+(`403 forbidden_cap`). Oids under `auth/` (the keyring) are refused for everyone
+(`403 reserved_oid`).
+
+### Principal management (`/admin/api/principals`)
+
+Available on every node (like `/admin/api/lifecycle`), authenticated with the shared key or an
+`admin` ticket.
+
+| Method | Path | Body / result |
+|--------|------|---------------|
+| `GET` | `/admin/api/principals` | `{"principals":[{name, role, caps, created_ms, key:"***"}]}` |
+| `POST` | `/admin/api/principals` | `{name, role?: client\|admin\|node, caps?: [prefix], key?: hex64}` → `201` with the plaintext key (shown once) |
+| `POST` | `/admin/api/principals/{name}/rotate` | `{key?: hex64}` → `200` with the new key; issued tickets keep working until expiry |
+| `DELETE` | `/admin/api/principals/{name}` | `200` / `404` |
+
+### Shared-key policy
+
+`http_shared_key_clients: any` (default) accepts `cluster_key`-signed requests from anywhere;
+`loopback` accepts them only from `127.0.0.0/8` / `::1` (`401 shared_key_refused` otherwise), so
+remote clients must be principals while the daemon's own S3 gateway keeps working.
 
 ## Endpoints
 
 | Method | Path | Notes |
 |--------|------|-------|
+| `POST` | `/auth/ticket` | Principal → ticket + session key (no `Authorization`; see above) |
 | `PUT` | `/o/{oid}` | Full replace, or partial with `Content-Range: bytes start-end/*` (new version) |
 | `POST` | `/o/{oid}/append` | Atomic byte-append at tip size (primary-serialized) → `200` `{offset,size,seq,epoch}` |
 | `GET` | `/o/{oid}` | Tip, or `?version={seq}` / `x-aios-version`; `Range` → 206 |

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <sstream>
 
@@ -158,10 +159,22 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
                                 const std::string& payload_hash_hex,
                                 const std::string& cluster_key, int skew_ms,
                                 HttpReplayCache* replay) {
+  HttpAuthPolicy policy;
+  policy.cluster_key = cluster_key;
+  policy.skew_ms = skew_ms;
+  return http_auth_verify(method, path_with_query, headers, payload_hash_hex, policy, replay);
+}
+
+HttpAuthResult http_auth_verify(const std::string& method, const std::string& path_with_query,
+                                const std::unordered_map<std::string, std::string>& headers,
+                                const std::string& payload_hash_hex,
+                                const HttpAuthPolicy& policy, HttpReplayCache* replay) {
   HttpAuthResult r;
+  const int skew_ms = policy.skew_ms;
   const std::string auth = header_get(headers, "authorization");
   if (auth.rfind("AIOS-HMAC-SHA256 ", 0) != 0) {
     r.error = "missing or unsupported Authorization";
+    r.code = "missing_auth";
     return r;
   }
   const std::string rest = auth.substr(16);
@@ -184,6 +197,7 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
   }
   if (credential.empty() || signed_headers.empty() || signature.size() != 64) {
     r.error = "bad Authorization fields";
+    r.code = "bad_auth_fields";
     return r;
   }
 
@@ -191,25 +205,61 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
   if (date.empty()) date = header_get(headers, "date");
   if (date.empty()) {
     r.error = "missing date";
+    r.code = "missing_date";
     return r;
   }
 
   std::int64_t ts = 0;
   if (!parse_auth_date_ms(date, ts)) {
     r.error = "unparsable date";
+    r.code = "bad_date";
     return r;
   }
   const std::int64_t now = now_ms();
   if (std::llabs(now - ts) > skew_ms) {
     r.error = "date skew too large";
+    r.code = "date_skew";
     return r;
+  }
+
+  // Pick the HMAC key: the session key inside a ticket credential, or the
+  // shared cluster key for the legacy scheme.
+  std::string hmac_key;
+  if (credential.compare(0, std::strlen(kTicketPrefix), kTicketPrefix) == 0) {
+    if (!policy.sealer) {
+      r.error = "ticket credentials not accepted";
+      r.code = "bad_ticket";
+      return r;
+    }
+    std::string terr;
+    auto t = policy.sealer->open(credential, now, terr);
+    if (!t) {
+      r.error = terr;
+      r.code = terr == "ticket expired" ? "ticket_expired" : "bad_ticket";
+      return r;
+    }
+    hmac_key = t->session_key;
+    r.principal = t->principal;
+    r.role = t->role;
+    r.ticket = std::move(t);
+  } else {
+    if (!policy.allow_shared_key) {
+      r.error = "shared cluster key not accepted from this peer; use a principal ticket";
+      r.code = "shared_key_refused";
+      return r;
+    }
+    hmac_key = policy.cluster_key;
+    r.role = PrincipalRole::Node;
   }
 
   const auto canon =
       http_canonical(method, path_with_query, date, signed_headers, headers, payload_hash_hex);
-  const auto expect = http_sign(cluster_key, canon);
+  const auto expect = http_sign(hmac_key, canon);
   if (!const_time_eq(expect, signature)) {
     r.error = "bad signature";
+    r.code = "bad_signature";
+    r.principal.clear();
+    r.ticket.reset();
     return r;
   }
 
@@ -226,6 +276,9 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
     // A replay stays inside the skew window for at most skew_ms past its date.
     if (!key.empty() && !replay->check_and_insert(key, ts + skew_ms + 1000, now)) {
       r.error = "replayed request";
+      r.code = "replayed";
+      r.principal.clear();
+      r.ticket.reset();
       return r;
     }
   }

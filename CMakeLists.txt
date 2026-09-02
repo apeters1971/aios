@@ -205,6 +205,7 @@ add_library(aios_core STATIC
   src/util/file_io.cpp
   src/util/compression.cpp
   src/util/aes_gcm.cpp
+  src/util/ticket.cpp
   src/store/object_store.cpp
   src/store/fs_clone.cpp
   src/store/local_stores.cpp
@@ -228,6 +229,7 @@ add_library(aios_core STATIC
   src/http/http_server.cpp
   src/http/s3_auth.cpp
   src/http/s3_iam.cpp
+  src/http/principal_store.cpp
   src/http/quota_admin.cpp
   src/http/qos_admin.cpp
   src/http/backup_policy.cpp
@@ -372,7 +374,7 @@ add_executable(aios-store-bench tools/aios_store_bench.cpp)
 target_link_libraries(aios-store-bench PRIVATE aios_core)
 
 add_executable(aios tools/aios.cpp)
-target_link_libraries(aios PRIVATE aios_core)
+target_link_libraries(aios PRIVATE aios_client)
 
 add_executable(aios-cuobj-s3 tools/aios_cuobj_s3.cpp)
 target_link_libraries(aios-cuobj-s3 PRIVATE aios_core aios_cuobject)
@@ -587,6 +589,7 @@ add_executable(aios_tests
   tests/test_review2_posix.cpp
   tests/test_review2_kabi.cpp
   tests/test_process_smoke.cpp
+  tests/test_ticket_auth.cpp
 )
 target_include_directories(aios_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)

@@ -56,6 +56,23 @@ struct aios_http_pool *aios_http_pool_create(const char *endpoint, const char *c
 }
 EXPORT_SYMBOL_GPL(aios_http_pool_create);
 
+int aios_http_pool_set_principal(struct aios_http_pool *p, const char *principal)
+{
+	unsigned int i;
+	int err;
+
+	if (!p || !principal || !*principal)
+		return -EINVAL;
+	for (i = 0; i < p->n; i++) {
+		err = aios_http_client_set_principal(p->clients[i], principal);
+		if (err)
+			return err;
+	}
+	/* One grant proves the credentials; the other clients fetch lazily. */
+	return aios_http_client_login(p->clients[0]);
+}
+EXPORT_SYMBOL_GPL(aios_http_pool_set_principal);
+
 void aios_http_pool_destroy(struct aios_http_pool *p)
 {
 	unsigned int i;
