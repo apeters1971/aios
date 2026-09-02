@@ -61,6 +61,7 @@ struct aiosvd_device {
 	struct workqueue_struct *stripe_wq; /* parallel stripe I/O */
 	struct mutex open_mu;
 	int open_count;
+	bool renaming; /* under open_mu: refuse open() while objects migrate */
 	/* Object cache (RMW / reuse) */
 	struct mutex cache_mu;
 	struct aiosvd_ocache_ent cache[AIOSVD_OCACHE_SIZE];

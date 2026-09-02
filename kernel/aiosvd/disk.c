@@ -66,6 +66,10 @@ static int aiosvd_open(struct block_device *bdev, fmode_t mode)
 	(void)mode;
 #endif
 	mutex_lock(&dev->open_mu);
+	if (dev->renaming) {
+		mutex_unlock(&dev->open_mu);
+		return -EBUSY;
+	}
 	dev->open_count++;
 	mutex_unlock(&dev->open_mu);
 	return 0;

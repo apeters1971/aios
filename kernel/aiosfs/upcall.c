@@ -5,22 +5,47 @@
  */
 #include "aiosfs.h"
 
+#include <linux/err.h>
+#include <linux/kref.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
+/*
+ * Lifetime: the waiting VFS thread holds one reference; aios_dev_read takes
+ * another for as long as it touches the request outside conn->lock (copying
+ * to userspace, re-queueing on failure). Whoever drops the last reference
+ * frees it, so an interrupted waiter can no longer free a request the daemon
+ * is still reading.
+ */
 struct aios_request {
+	struct kref ref;
 	struct list_head list;
 	struct aios_kabi_req_hdr hdr;
 	void *payload;
 	wait_queue_head_t wait;
 	bool done;
+	bool abandoned; /* waiter gave up; do not re-queue */
 	int result;
 	void *rep_payload;
 	u32 rep_len;
 };
+
+static void aios_request_release(struct kref *ref)
+{
+	struct aios_request *req = container_of(ref, struct aios_request, ref);
+
+	kfree(req->payload);
+	kfree(req->rep_payload);
+	kfree(req);
+}
+
+static void aios_request_put(struct aios_request *req)
+{
+	kref_put(&req->ref, aios_request_release);
+}
 
 struct aios_conn {
 	struct mutex lock;
@@ -97,6 +122,8 @@ int aios_upcall(struct aios_conn *conn, u32 opcode, int mount_id,
 	req = kzalloc(sizeof(*req), GFP_KERNEL);
 	if (!req)
 		return -ENOMEM;
+	kref_init(&req->ref);
+	INIT_LIST_HEAD(&req->list);
 	init_waitqueue_head(&req->wait);
 	req->hdr.magic = AIOS_KABI_MAGIC;
 	req->hdr.version = AIOS_KABI_VERSION;
@@ -108,7 +135,7 @@ int aios_upcall(struct aios_conn *conn, u32 opcode, int mount_id,
 	if (in_len) {
 		req->payload = kmemdup(payload_in, in_len, GFP_KERNEL);
 		if (!req->payload) {
-			kfree(req);
+			aios_request_put(req);
 			return -ENOMEM;
 		}
 	}
@@ -116,8 +143,7 @@ int aios_upcall(struct aios_conn *conn, u32 opcode, int mount_id,
 	mutex_lock(&conn->lock);
 	if (!conn->daemon_open) {
 		mutex_unlock(&conn->lock);
-		kfree(req->payload);
-		kfree(req);
+		aios_request_put(req);
 		return -ENOTCONN;
 	}
 	list_add_tail(&req->list, &conn->pending);
@@ -128,11 +154,15 @@ int aios_upcall(struct aios_conn *conn, u32 opcode, int mount_id,
 	if (err) {
 		mutex_lock(&conn->lock);
 		if (!req->done) {
+			/*
+			 * The reader may still hold a reference (it re-lists
+			 * on failure); mark the request abandoned so it is
+			 * dropped instead, and let the last ref free it.
+			 */
+			req->abandoned = true;
 			list_del_init(&req->list);
 			mutex_unlock(&conn->lock);
-			kfree(req->payload);
-			kfree(req->rep_payload);
-			kfree(req);
+			aios_request_put(req);
 			return -EINTR;
 		}
 		mutex_unlock(&conn->lock);
@@ -144,16 +174,36 @@ int aios_upcall(struct aios_conn *conn, u32 opcode, int mount_id,
 		*out_len = req->rep_len;
 		req->rep_payload = NULL;
 	} else {
-		kfree(req->rep_payload);
 		if (payload_out)
 			*payload_out = NULL;
 		if (out_len)
 			*out_len = 0;
 	}
 
-	kfree(req->payload);
-	kfree(req);
+	aios_request_put(req);
 	return err;
+}
+
+/*
+ * Return a request the reader could not deliver to the head of the pending
+ * list, unless the waiter has given up meanwhile. Drops the reader's ref.
+ */
+static void aios_dev_requeue(struct aios_conn *conn, struct aios_request *req)
+{
+	bool wake = false;
+
+	mutex_lock(&conn->lock);
+	if (!req->abandoned && !req->done && conn->daemon_open) {
+		list_del_init(&req->list);
+		list_add(&req->list, &conn->pending);
+		wake = true;
+	} else {
+		list_del_init(&req->list);
+	}
+	mutex_unlock(&conn->lock);
+	if (wake)
+		wake_up_interruptible(&conn->read_wait);
+	aios_request_put(req);
 }
 
 static ssize_t aios_dev_read(struct file *file, char __user *buf, size_t count,
@@ -172,6 +222,7 @@ static ssize_t aios_dev_read(struct file *file, char __user *buf, size_t count,
 		mutex_lock(&conn->lock);
 		if (!list_empty(&conn->pending)) {
 			req = list_first_entry(&conn->pending, struct aios_request, list);
+			kref_get(&req->ref);
 			list_del_init(&req->list);
 			list_add_tail(&req->list, &conn->waiting);
 			mutex_unlock(&conn->lock);
@@ -194,11 +245,7 @@ static ssize_t aios_dev_read(struct file *file, char __user *buf, size_t count,
 	need = sizeof(req->hdr) + req->hdr.payload_len;
 	if (count < need) {
 		/* Put back at head for retry with larger buffer. */
-		mutex_lock(&conn->lock);
-		list_del_init(&req->list);
-		list_add(&req->list, &conn->pending);
-		mutex_unlock(&conn->lock);
-		wake_up_interruptible(&conn->read_wait);
+		aios_dev_requeue(conn, req);
 		return -EMSGSIZE;
 	}
 	if (copy_to_user(buf, &req->hdr, sizeof(req->hdr)))
@@ -206,13 +253,11 @@ static ssize_t aios_dev_read(struct file *file, char __user *buf, size_t count,
 	if (req->hdr.payload_len &&
 	    copy_to_user(buf + sizeof(req->hdr), req->payload, req->hdr.payload_len))
 		goto fault;
+	aios_request_put(req);
 	return (ssize_t)need;
 
 fault:
-	mutex_lock(&conn->lock);
-	list_del_init(&req->list);
-	list_add(&req->list, &conn->pending);
-	mutex_unlock(&conn->lock);
+	aios_dev_requeue(conn, req);
 	return -EFAULT;
 }
 
@@ -263,7 +308,10 @@ static ssize_t aios_dev_write(struct file *file, const char __user *buf,
 		return -ENOENT;
 	}
 	list_del_init(&req->list);
-	req->result = hdr.result;
+	/* Results are -errno; anything positive would end up in ERR_PTR(). */
+	req->result = hdr.result > 0 ? -EIO : hdr.result;
+	if (req->result < -MAX_ERRNO)
+		req->result = -EIO;
 	req->rep_payload = payload;
 	req->rep_len = hdr.payload_len;
 	req->done = true;

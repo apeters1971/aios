@@ -7,6 +7,7 @@
 
 #include "posix/aios_posix.h"
 #include "aios_kabi.h"
+#include "aios_kbridge_wire.hpp"
 
 #include <cerrno>
 #include <cstddef>
@@ -44,18 +45,7 @@ std::mutex g_mu;
 std::unordered_map<int, std::unique_ptr<Mount>> g_mounts;
 int g_next_mount_id{1};
 
-bool write_reply(int fd, uint64_t unique, int32_t result, const void* payload,
-                 uint32_t payload_len) {
-  aios_kabi_rep_hdr hdr{};
-  hdr.magic = AIOS_KABI_MAGIC;
-  hdr.version = AIOS_KABI_VERSION;
-  hdr.unique = unique;
-  hdr.result = result;
-  hdr.payload_len = payload_len;
-  if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) return false;
-  if (payload_len && write(fd, payload, payload_len) != (ssize_t)payload_len) return false;
-  return true;
-}
+using aios_kbridge::write_reply;
 
 int handle_mount(const aios_kabi_mount_in* in, aios_kabi_mount_out* out) {
   aios_posix_config cfg{};

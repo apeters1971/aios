@@ -134,6 +134,36 @@ int aios_io_set_size(struct inode *inode, loff_t size)
 	return upcall_io_set_size(inode, size);
 }
 
+/*
+ * Deferred size push after chunk writes (write_inode / evict_inode). Unlike an
+ * explicit truncate this must never shrink the server copy: another client
+ * may have extended the file since we last looked. aios_http_io_set_size is
+ * grow-only by itself; for the upcall backend ask the daemon first.
+ */
+int aios_io_grow_size(struct inode *inode, loff_t size)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_kabi_ino_in in = { .ino = inode->i_ino };
+	void *out = NULL;
+	u32 out_len = 0;
+	int err;
+
+	if (info->backend == AIOS_BACKEND_HTTP)
+		return aios_http_io_set_size(inode, size);
+
+	err = aios_upcall(info->conn, AIOS_OP_GETATTR, info->mount_id, &in, sizeof(in), &out,
+			  &out_len);
+	if (!err) {
+		const struct aios_kabi_stat *st = out;
+		bool skip = out_len >= sizeof(*st) && st->size >= (u64)size;
+
+		kfree(out);
+		if (skip)
+			return 0;
+	}
+	return upcall_io_set_size(inode, size);
+}
+
 int aios_io_fsync(struct inode *inode)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);

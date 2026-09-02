@@ -10,6 +10,7 @@
 
 #include <linux/falloc.h>
 #include <linux/pagemap.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
 #include <linux/writeback.h>
@@ -386,27 +387,52 @@ long aios_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 	return err;
 }
 
+struct aios_inode_aux *aios_inode_aux_get(struct inode *inode, bool *created)
+{
+	struct aios_inode_aux *aux = READ_ONCE(inode->i_private);
+	struct aios_inode_aux *fresh;
+	unsigned int i;
+
+	if (created)
+		*created = false;
+	if (aux)
+		return aux;
+	fresh = kzalloc(sizeof(*fresh), GFP_KERNEL);
+	if (!fresh)
+		return NULL;
+	spin_lock_init(&fresh->extras_lock);
+	for (i = 0; i < AIOS_CHUNK_LOCK_STRIPES; i++)
+		mutex_init(&fresh->chunk_mu[i]);
+	fresh->last_synced_size = (u64)i_size_read(inode);
+	aux = cmpxchg(&inode->i_private, NULL, fresh);
+	if (aux) {
+		kfree(fresh);
+		return aux;
+	}
+	if (created)
+		*created = true;
+	return fresh;
+}
+
 int aios_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
-	struct aios_inode_aux *aux = inode->i_private;
+	struct aios_inode_aux *aux;
 	loff_t size;
 	int err;
 
 	if (!S_ISREG(inode->i_mode))
 		return 0;
+	if (inode->i_nlink == 0)
+		return 0;
 	size = i_size_read(inode);
-	if (!aux) {
-		aux = kzalloc(sizeof(*aux), GFP_KERNEL);
-		if (!aux)
-			return -ENOMEM;
-		aux->last_synced_size = (u64)size;
-		inode->i_private = aux;
-	}
+	aux = aios_inode_aux_get(inode, NULL);
+	if (!aux)
+		return -ENOMEM;
 	if (aux->last_synced_size == (u64)size)
 		return 0;
 	if ((u64)size < aux->last_synced_size)
 		return 0;
-	err = aios_io_set_size(inode, size);
+	err = aios_io_grow_size(inode, size);
 	if (!err) {
 		aux->last_synced_size = (u64)size;
 		aux->dirty_bytes = 0;
@@ -418,10 +444,22 @@ int aios_write_inode(struct inode *inode, struct writeback_control *wbc)
 void aios_evict_inode(struct inode *inode)
 {
 	struct aios_inode_aux *aux = inode->i_private;
+	struct aios_sb_info *info = inode->i_sb ? AIOS_SB(inode->i_sb) : NULL;
+	bool unlinked = inode->i_nlink == 0 && info && info->backend == AIOS_BACKEND_HTTP &&
+			(S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode));
 
-	if (S_ISREG(inode->i_mode) && aux && aux->dirty_since)
-		aios_io_set_size(inode, i_size_read(inode));
+	if (!unlinked && S_ISREG(inode->i_mode) && aux && aux->dirty_since &&
+	    (u64)i_size_read(inode) > aux->last_synced_size)
+		aios_io_grow_size(inode, i_size_read(inode));
 	truncate_inode_pages_final(&inode->i_data);
+	if (unlinked) {
+		/* Eviction can be driven by reclaim; the deletes below do
+		 * socket I/O and allocate. */
+		unsigned int noio = memalloc_noio_save();
+
+		aios_http_evict_unlinked(inode);
+		memalloc_noio_restore(noio);
+	}
 	clear_inode(inode);
 	if (aux) {
 		kfree(aux->xattrs_obj);

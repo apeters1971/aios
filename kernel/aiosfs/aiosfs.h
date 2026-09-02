@@ -8,6 +8,7 @@
 #include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/seq_file.h>
+#include <linux/spinlock.h>
 #include <linux/uio.h>
 #include <linux/uidgid.h>
 #include <linux/wait.h>
@@ -87,6 +88,14 @@ enum aios_backend {
 
 struct aios_conn;
 
+/*
+ * Chunk read-modify-write on the HTTP backend is GET → patch → PUT of a whole
+ * stripe unit. Every path that does it (buffered writeback workers, writepage,
+ * O_DIRECT, punch, truncate) must hold the stripe's mutex across the three
+ * steps or concurrent 4 KiB updates to the same chunk lose each other.
+ */
+#define AIOS_CHUNK_LOCK_STRIPES 16
+
 struct aios_inode_aux {
 	u64 last_synced_size;
 	u64 cas;
@@ -94,10 +103,21 @@ struct aios_inode_aux {
 	u32 stripe_width;
 	u64 dirty_bytes;
 	unsigned long dirty_since; /* jiffies; 0 if size/mtime is clean */
+	/* extras_lock guards xattrs_obj / symlink / extras_valid. */
+	spinlock_t extras_lock;
 	char *xattrs_obj; /* heap `"xattrs"` object `{...}`, or NULL */
 	char *symlink;
 	bool extras_valid;
+	struct mutex chunk_mu[AIOS_CHUNK_LOCK_STRIPES];
 };
+
+/* Get-or-create inode->i_private. Safe against concurrent callers. */
+struct aios_inode_aux *aios_inode_aux_get(struct inode *inode, bool *created);
+
+static inline struct mutex *aios_chunk_lock(struct aios_inode_aux *aux, u64 chunk)
+{
+	return &aux->chunk_mu[chunk % AIOS_CHUNK_LOCK_STRIPES];
+}
 
 struct aios_dir_cache;
 
@@ -152,6 +172,7 @@ struct inode *aios_iget(struct super_block *sb, const struct aios_kabi_stat *st)
 int aios_io_read(struct inode *inode, loff_t pos, void *buf, size_t len, size_t *out_len);
 int aios_io_write(struct inode *inode, loff_t pos, const void *buf, size_t len);
 int aios_io_set_size(struct inode *inode, loff_t size);
+int aios_io_grow_size(struct inode *inode, loff_t size);
 int aios_io_fsync(struct inode *inode);
 
 int aios_http_io_read(struct inode *inode, loff_t pos, void *buf, size_t len, size_t *out_len);
@@ -160,6 +181,8 @@ int aios_http_io_set_size(struct inode *inode, loff_t size);
 int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len);
 /* Parallel dirty-page flush using aios_http_pool (chunk-grouped). */
 int aios_http_writepages(struct address_space *mapping, struct writeback_control *wbc);
+/* Called from evict_inode when i_nlink == 0: remove chunks + inode object. */
+void aios_http_evict_unlinked(struct inode *inode);
 
 /* xattrs (HTTP backend) */
 int aios_http_getxattr(struct inode *inode, const char *name, void *buf, size_t size);

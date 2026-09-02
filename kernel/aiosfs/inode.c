@@ -38,6 +38,11 @@ void aios_stat_to_inode(struct inode *inode, const struct aios_kabi_stat *st)
 		struct address_space *mapping = inode->i_mapping;
 		bool keep = aux && aux->dirty_since;
 
+		/* A writer may dirty a page between the mapping_tagged() probe
+		 * and i_size_write(); while anyone holds the file open for
+		 * writing the local size is authoritative. */
+		if (inode_is_open_for_write(inode))
+			keep = true;
 		if (mapping && (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY) ||
 				mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK)))
 			keep = true;

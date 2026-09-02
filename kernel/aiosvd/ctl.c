@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "aiosvd.h"
 
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 
 static bool valid_name(const char *s)
@@ -25,6 +27,12 @@ static bool valid_name(const char *s)
 		return false;
 	}
 	return true;
+}
+
+/* ioctl string fields come from userspace and may lack a terminator. */
+static bool str_field_ok(const char *s, size_t n)
+{
+	return strnlen(s, n) < n;
 }
 
 static u32 default_nclients(u32 requested)
@@ -80,14 +88,17 @@ static int slot_claim(const char *pool, const char *name, struct aiosvd_device *
 	return 0;
 }
 
-int aiosvd_map(struct aiosvd_map_arg *arg)
-{
-	struct aiosvd_device *dev = NULL;
+struct aiosvd_map_scratch {
 	char header_oid[192];
 	char hdr_js[768];
-	char parent_pool[AIOSVD_POOL_MAX + 1] = "";
-	char parent_name[AIOSVD_NAME_MAX + 1] = "";
-	char key_id[AIOSVD_KEY_ID_MAX + 1] = "";
+	char parent_pool[AIOSVD_POOL_MAX + 1];
+	char parent_name[AIOSVD_NAME_MAX + 1];
+	char key_id[AIOSVD_KEY_ID_MAX + 1];
+};
+
+static int aiosvd_map_do(struct aiosvd_map_arg *arg, struct aiosvd_map_scratch *sc)
+{
+	struct aiosvd_device *dev = NULL;
 	struct aios_http_buf body = { 0 };
 	struct aios_http_client *probe;
 	u64 size;
@@ -96,6 +107,13 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 	u32 nclients;
 	int err;
 
+	if (!str_field_ok(arg->endpoint, sizeof(arg->endpoint)) ||
+	    !str_field_ok(arg->cluster_key, sizeof(arg->cluster_key)) ||
+	    !str_field_ok(arg->pool, sizeof(arg->pool)) ||
+	    !str_field_ok(arg->name, sizeof(arg->name)) ||
+	    !str_field_ok(arg->app_label, sizeof(arg->app_label)) ||
+	    !str_field_ok(arg->key_id, sizeof(arg->key_id)))
+		return -EINVAL;
 	if (!arg->endpoint[0] || !arg->cluster_key[0])
 		return -EINVAL;
 	if (!valid_name(arg->pool) || !valid_name(arg->name))
@@ -108,7 +126,7 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 		return -EINVAL;
 
 	if (arg->key_id[0])
-		strscpy(key_id, arg->key_id, sizeof(key_id));
+		strscpy(sc->key_id, arg->key_id, sizeof(sc->key_id));
 
 	probe = aios_http_client_create(arg->endpoint, arg->cluster_key, GFP_KERNEL);
 	if (IS_ERR(probe))
@@ -119,34 +137,35 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 		strscpy(arg->app_label, "vbd", sizeof(arg->app_label));
 	aios_http_client_set_app_label(probe, arg->app_label);
 
-	aiosvd_header_oid(arg->pool, arg->name, header_oid, sizeof(header_oid));
+	aiosvd_header_oid(arg->pool, arg->name, sc->header_oid, sizeof(sc->header_oid));
 
 	if (arg->flags & AIOSVD_MAP_CREATE) {
 		if (!arg->size) {
 			aios_http_client_destroy(probe);
 			return -EINVAL;
 		}
-		err = aiosvd_header_format(hdr_js, sizeof(hdr_js), arg->pool, arg->name, arg->size,
-					   order, NULL, NULL, key_id);
+		err = aiosvd_header_format(sc->hdr_js, sizeof(sc->hdr_js), arg->pool, arg->name,
+					   arg->size, order, NULL, NULL, sc->key_id);
 		if (err) {
 			aios_http_client_destroy(probe);
 			return err;
 		}
 		header_cas = 0;
-		err = aios_http_put(probe, header_oid, hdr_js, strlen(hdr_js), NULL, &header_cas);
+		err = aios_http_put(probe, sc->header_oid, sc->hdr_js, strlen(sc->hdr_js), NULL,
+				    &header_cas);
 		if (err == -EAGAIN) {
 			if (arg->flags & AIOSVD_MAP_EXCL) {
 				aios_http_client_destroy(probe);
 				return -EEXIST;
 			}
-			err = aios_http_get(probe, header_oid, &body, &header_cas);
+			err = aios_http_get(probe, sc->header_oid, &body, &header_cas);
 			if (err) {
 				aios_http_client_destroy(probe);
 				return err;
 			}
-			err = aiosvd_header_parse(body.data, body.len, &size, &order, parent_pool,
-						  sizeof(parent_pool), parent_name,
-						  sizeof(parent_name), key_id, sizeof(key_id));
+			err = aiosvd_header_parse(body.data, body.len, &size, &order, sc->parent_pool,
+						  sizeof(sc->parent_pool), sc->parent_name,
+						  sizeof(sc->parent_name), sc->key_id, sizeof(sc->key_id));
 			aios_http_buf_free(&body);
 			if (err) {
 				aios_http_client_destroy(probe);
@@ -154,38 +173,38 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 			}
 		} else if (err) {
 			pr_err("aiosvd: map create PUT %s failed: %d (endpoint=%s)\n",
-			       header_oid, err, arg->endpoint);
+			       sc->header_oid, err, arg->endpoint);
 			aios_http_client_destroy(probe);
 			return err;
 		} else {
 			size = arg->size;
 		}
 	} else {
-		err = aios_http_get(probe, header_oid, &body, &header_cas);
+		err = aios_http_get(probe, sc->header_oid, &body, &header_cas);
 		if (err) {
 			pr_err("aiosvd: map GET %s failed: %d (endpoint=%s)\n",
-			       header_oid, err, arg->endpoint);
+			       sc->header_oid, err, arg->endpoint);
 			aios_http_client_destroy(probe);
 			return err;
 		}
-		err = aiosvd_header_parse(body.data, body.len, &size, &order, parent_pool,
-					  sizeof(parent_pool), parent_name, sizeof(parent_name),
-					  key_id, sizeof(key_id));
+		err = aiosvd_header_parse(body.data, body.len, &size, &order, sc->parent_pool,
+					  sizeof(sc->parent_pool), sc->parent_name, sizeof(sc->parent_name),
+					  sc->key_id, sizeof(sc->key_id));
 		aios_http_buf_free(&body);
 		if (err) {
-			pr_err("aiosvd: map header parse %s failed: %d\n", header_oid, err);
+			pr_err("aiosvd: map header parse %s failed: %d\n", sc->header_oid, err);
 			aios_http_client_destroy(probe);
 			return err;
 		}
 		/* Map-arg key_id overrides header if provided. */
 		if (arg->key_id[0])
-			strscpy(key_id, arg->key_id, sizeof(key_id));
+			strscpy(sc->key_id, arg->key_id, sizeof(sc->key_id));
 	}
 	aios_http_client_destroy(probe);
 
-	if (key_id[0])
+	if (sc->key_id[0])
 		pr_info("aiosvd: map %s/%s key_id=%s (hook only; no in-kernel crypto)\n",
-			arg->pool, arg->name, key_id);
+			arg->pool, arg->name, sc->key_id);
 
 	mutex_lock(&aiosvd_devs_mu);
 	err = slot_claim(arg->pool, arg->name, &dev);
@@ -203,9 +222,9 @@ int aiosvd_map(struct aiosvd_map_arg *arg)
 	dev->queue_depth = arg->queue_depth;
 	strscpy(dev->pool, arg->pool, sizeof(dev->pool));
 	strscpy(dev->name, arg->name, sizeof(dev->name));
-	strscpy(dev->parent_pool, parent_pool, sizeof(dev->parent_pool));
-	strscpy(dev->parent_name, parent_name, sizeof(dev->parent_name));
-	strscpy(dev->key_id, key_id, sizeof(dev->key_id));
+	strscpy(dev->parent_pool, sc->parent_pool, sizeof(dev->parent_pool));
+	strscpy(dev->parent_name, sc->parent_name, sizeof(dev->parent_name));
+	strscpy(dev->key_id, sc->key_id, sizeof(dev->key_id));
 	strscpy(dev->endpoint, arg->endpoint, sizeof(dev->endpoint));
 	strscpy(dev->cluster_key, arg->cluster_key, sizeof(dev->cluster_key));
 	strscpy(dev->app_label, arg->app_label, sizeof(dev->app_label));
@@ -240,6 +259,19 @@ fail_slot:
 	mutex_lock(&aiosvd_devs_mu);
 	dev->mapped = false;
 	mutex_unlock(&aiosvd_devs_mu);
+	return err;
+}
+
+int aiosvd_map(struct aiosvd_map_arg *arg)
+{
+	struct aiosvd_map_scratch *sc;
+	int err;
+
+	sc = kzalloc(sizeof(*sc), GFP_KERNEL);
+	if (!sc)
+		return -ENOMEM;
+	err = aiosvd_map_do(arg, sc);
+	kfree(sc);
 	return err;
 }
 
@@ -397,12 +429,18 @@ int aiosvd_resize(struct aiosvd_resize_arg *arg)
 	return 0;
 }
 
-int aiosvd_clone(struct aiosvd_clone_arg *arg)
-{
-	struct aiosvd_device *src, *dev = NULL;
+struct aiosvd_clone_ctx {
 	struct aiosvd_map_arg map;
 	char header_oid[192];
 	char hdr_js[768];
+	char src_pool[AIOSVD_POOL_MAX + 1];
+	char src_name[AIOSVD_NAME_MAX + 1];
+};
+
+int aiosvd_clone(struct aiosvd_clone_arg *arg)
+{
+	struct aiosvd_device *src, *dev = NULL;
+	struct aiosvd_clone_ctx *c;
 	struct aios_http_client *http;
 	u64 header_cas = 0;
 	u64 size;
@@ -411,87 +449,95 @@ int aiosvd_clone(struct aiosvd_clone_arg *arg)
 
 	if (arg->src_dev_id < 0 || arg->src_dev_id >= AIOSVD_MAX_DEVS)
 		return -EINVAL;
+	if (!str_field_ok(arg->pool, sizeof(arg->pool)) ||
+	    !str_field_ok(arg->name, sizeof(arg->name)))
+		return -EINVAL;
 	if (!valid_name(arg->pool) || !valid_name(arg->name))
 		return -EINVAL;
 
-	{
-		char src_pool[AIOSVD_POOL_MAX + 1];
-		char src_name[AIOSVD_NAME_MAX + 1];
+	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	if (!c)
+		return -ENOMEM;
 
-		mutex_lock(&aiosvd_devs_mu);
-		src = &aiosvd_devs[arg->src_dev_id];
-		if (!src->mapped) {
-			mutex_unlock(&aiosvd_devs_mu);
-			return -ENOENT;
-		}
-		size = src->size;
-		order = src->obj_order;
-		memset(&map, 0, sizeof(map));
-		strscpy(map.endpoint, src->endpoint, sizeof(map.endpoint));
-		strscpy(map.cluster_key, src->cluster_key, sizeof(map.cluster_key));
-		strscpy(map.app_label, src->app_label, sizeof(map.app_label));
-		strscpy(map.key_id, src->key_id, sizeof(map.key_id));
-		map.queue_depth = src->queue_depth;
-		map.max_clients = src->http_pool ? aios_http_pool_size(src->http_pool) : 0;
-		strscpy(map.pool, arg->pool, sizeof(map.pool));
-		strscpy(map.name, arg->name, sizeof(map.name));
-		strscpy(src_pool, src->pool, sizeof(src_pool));
-		strscpy(src_name, src->name, sizeof(src_name));
+	mutex_lock(&aiosvd_devs_mu);
+	src = &aiosvd_devs[arg->src_dev_id];
+	if (!src->mapped) {
 		mutex_unlock(&aiosvd_devs_mu);
+		err = -ENOENT;
+		goto out;
+	}
+	size = src->size;
+	order = src->obj_order;
+	strscpy(c->map.endpoint, src->endpoint, sizeof(c->map.endpoint));
+	strscpy(c->map.cluster_key, src->cluster_key, sizeof(c->map.cluster_key));
+	strscpy(c->map.app_label, src->app_label, sizeof(c->map.app_label));
+	strscpy(c->map.key_id, src->key_id, sizeof(c->map.key_id));
+	c->map.queue_depth = src->queue_depth;
+	c->map.max_clients = src->http_pool ? aios_http_pool_size(src->http_pool) : 0;
+	strscpy(c->map.pool, arg->pool, sizeof(c->map.pool));
+	strscpy(c->map.name, arg->name, sizeof(c->map.name));
+	strscpy(c->src_pool, src->pool, sizeof(c->src_pool));
+	strscpy(c->src_name, src->name, sizeof(c->src_name));
+	mutex_unlock(&aiosvd_devs_mu);
 
-		/* Flush parent so child sees consistent base. */
-		err = aiosvd_cache_flush(src);
-		if (err)
-			return err;
+	/* Flush parent so child sees consistent base. */
+	err = aiosvd_cache_flush(src);
+	if (err)
+		goto out;
 
-		http = aios_http_client_create(map.endpoint, map.cluster_key, GFP_KERNEL);
-		if (IS_ERR(http))
-			return PTR_ERR(http);
-		aios_http_client_set_timeout_ms(http, 30000);
-		if (!map.app_label[0])
-			strscpy(map.app_label, "vbd", sizeof(map.app_label));
-		aios_http_client_set_app_label(http, map.app_label);
+	http = aios_http_client_create(c->map.endpoint, c->map.cluster_key, GFP_KERNEL);
+	if (IS_ERR(http)) {
+		err = PTR_ERR(http);
+		goto out;
+	}
+	aios_http_client_set_timeout_ms(http, 30000);
+	if (!c->map.app_label[0])
+		strscpy(c->map.app_label, "vbd", sizeof(c->map.app_label));
+	aios_http_client_set_app_label(http, c->map.app_label);
 
-		aiosvd_header_oid(arg->pool, arg->name, header_oid, sizeof(header_oid));
-		err = aiosvd_header_format(hdr_js, sizeof(hdr_js), arg->pool, arg->name, size,
-					   order, src_pool, src_name, map.key_id);
-		if (err) {
-			aios_http_client_destroy(http);
-			return err;
-		}
-		header_cas = 0;
-		err = aios_http_put(http, header_oid, hdr_js, strlen(hdr_js), NULL, &header_cas);
+	aiosvd_header_oid(arg->pool, arg->name, c->header_oid, sizeof(c->header_oid));
+	err = aiosvd_header_format(c->hdr_js, sizeof(c->hdr_js), arg->pool, arg->name, size,
+				   order, c->src_pool, c->src_name, c->map.key_id);
+	if (err) {
 		aios_http_client_destroy(http);
-		if (err)
-			return err == -EAGAIN ? -EEXIST : err;
-
-		mutex_lock(&aiosvd_devs_mu);
-		err = slot_claim(arg->pool, arg->name, &dev);
-		if (err) {
-			mutex_unlock(&aiosvd_devs_mu);
-			return err;
-		}
-		dev->size = size;
-		dev->obj_order = order;
-		dev->obj_size = 1u << order;
-		dev->header_cas = header_cas;
-		dev->flags = 0;
-		dev->readonly = false;
-		dev->queue_depth = map.queue_depth;
-		strscpy(dev->pool, arg->pool, sizeof(dev->pool));
-		strscpy(dev->name, arg->name, sizeof(dev->name));
-		strscpy(dev->parent_pool, src_pool, sizeof(dev->parent_pool));
-		strscpy(dev->parent_name, src_name, sizeof(dev->parent_name));
-		strscpy(dev->key_id, map.key_id, sizeof(dev->key_id));
-		strscpy(dev->endpoint, map.endpoint, sizeof(dev->endpoint));
-		strscpy(dev->cluster_key, map.cluster_key, sizeof(dev->cluster_key));
-		strscpy(dev->app_label, map.app_label, sizeof(dev->app_label));
-		init_dev_stats(dev);
-		mutex_unlock(&aiosvd_devs_mu);
+		goto out;
+	}
+	header_cas = 0;
+	err = aios_http_put(http, c->header_oid, c->hdr_js, strlen(c->hdr_js), NULL,
+			    &header_cas);
+	aios_http_client_destroy(http);
+	if (err) {
+		if (err == -EAGAIN)
+			err = -EEXIST;
+		goto out;
 	}
 
-	err = aiosvd_clients_create(dev, map.endpoint, map.cluster_key, map.app_label,
-				    default_nclients(map.max_clients));
+	mutex_lock(&aiosvd_devs_mu);
+	err = slot_claim(arg->pool, arg->name, &dev);
+	if (err) {
+		mutex_unlock(&aiosvd_devs_mu);
+		goto out;
+	}
+	dev->size = size;
+	dev->obj_order = order;
+	dev->obj_size = 1u << order;
+	dev->header_cas = header_cas;
+	dev->flags = 0;
+	dev->readonly = false;
+	dev->queue_depth = c->map.queue_depth;
+	strscpy(dev->pool, arg->pool, sizeof(dev->pool));
+	strscpy(dev->name, arg->name, sizeof(dev->name));
+	strscpy(dev->parent_pool, c->src_pool, sizeof(dev->parent_pool));
+	strscpy(dev->parent_name, c->src_name, sizeof(dev->parent_name));
+	strscpy(dev->key_id, c->map.key_id, sizeof(dev->key_id));
+	strscpy(dev->endpoint, c->map.endpoint, sizeof(dev->endpoint));
+	strscpy(dev->cluster_key, c->map.cluster_key, sizeof(dev->cluster_key));
+	strscpy(dev->app_label, c->map.app_label, sizeof(dev->app_label));
+	init_dev_stats(dev);
+	mutex_unlock(&aiosvd_devs_mu);
+
+	err = aiosvd_clients_create(dev, c->map.endpoint, c->map.cluster_key, c->map.app_label,
+				    default_nclients(c->map.max_clients));
 	if (err)
 		goto fail_slot;
 
@@ -504,45 +550,91 @@ int aiosvd_clone(struct aiosvd_clone_arg *arg)
 	arg->dest_dev_id = dev->id;
 	pr_info("aiosvd: cloned → %s/%s as /dev/%s%d (COW parent=%s/%s)\n", arg->pool, arg->name,
 		AIOSVD_DISK_PREFIX, dev->id, dev->parent_pool, dev->parent_name);
-	return 0;
+	err = 0;
+	goto out;
 
 fail_slot:
 	mutex_lock(&aiosvd_devs_mu);
 	dev->mapped = false;
 	mutex_unlock(&aiosvd_devs_mu);
+out:
+	memzero_explicit(c->map.cluster_key, sizeof(c->map.cluster_key));
+	kfree(c);
 	return err;
+}
+
+struct aiosvd_rename_ctx {
+	char old_hdr[192];
+	char new_hdr[192];
+	char old_oid[192];
+	char new_oid[192];
+	char hdr_js[768];
+	char old_pool[AIOSVD_POOL_MAX + 1];
+	char old_name[AIOSVD_NAME_MAX + 1];
+};
+
+/*
+ * Migration copies objects one by one; a concurrent writer would race with
+ * it (writes to old names after the copy are lost). The device must
+ * therefore be closed: we refuse when it is open and block new opens for
+ * the duration (see aiosvd_open).
+ */
+static int rename_begin(struct aiosvd_device *dev)
+{
+	int err = 0;
+
+	mutex_lock(&dev->open_mu);
+	if (dev->open_count > 0 || dev->renaming)
+		err = -EBUSY;
+	else
+		dev->renaming = true;
+	mutex_unlock(&dev->open_mu);
+	return err;
+}
+
+static void rename_end(struct aiosvd_device *dev)
+{
+	mutex_lock(&dev->open_mu);
+	dev->renaming = false;
+	mutex_unlock(&dev->open_mu);
 }
 
 int aiosvd_rename(struct aiosvd_rename_arg *arg)
 {
 	struct aiosvd_device *dev;
 	struct aios_http_client *http;
-	char old_hdr[192], new_hdr[192];
-	char old_oid[192], new_oid[192];
-	char hdr_js[768];
-	char old_pool[AIOSVD_POOL_MAX + 1];
-	char old_name[AIOSVD_NAME_MAX + 1];
+	struct aiosvd_rename_ctx *c;
 	u64 cas, size, nobj, objno;
 	u32 order;
 	int err, i;
 
 	if (arg->dev_id < 0 || arg->dev_id >= AIOSVD_MAX_DEVS)
 		return -EINVAL;
+	if (!str_field_ok(arg->pool, sizeof(arg->pool)) ||
+	    !str_field_ok(arg->name, sizeof(arg->name)))
+		return -EINVAL;
 	if (!valid_name(arg->pool) || !valid_name(arg->name))
 		return -EINVAL;
+
+	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	if (!c)
+		return -ENOMEM;
 
 	mutex_lock(&aiosvd_devs_mu);
 	dev = &aiosvd_devs[arg->dev_id];
 	if (!dev->mapped) {
 		mutex_unlock(&aiosvd_devs_mu);
+		kfree(c);
 		return -ENOENT;
 	}
 	if (dev->readonly) {
 		mutex_unlock(&aiosvd_devs_mu);
+		kfree(c);
 		return -EROFS;
 	}
 	if (!strcmp(dev->pool, arg->pool) && !strcmp(dev->name, arg->name)) {
 		mutex_unlock(&aiosvd_devs_mu);
+		kfree(c);
 		return 0;
 	}
 	for (i = 0; i < AIOSVD_MAX_DEVS; i++) {
@@ -551,11 +643,18 @@ int aiosvd_rename(struct aiosvd_rename_arg *arg)
 		if (!strcmp(aiosvd_devs[i].pool, arg->pool) &&
 		    !strcmp(aiosvd_devs[i].name, arg->name)) {
 			mutex_unlock(&aiosvd_devs_mu);
+			kfree(c);
 			return -EEXIST;
 		}
 	}
-	strscpy(old_pool, dev->pool, sizeof(old_pool));
-	strscpy(old_name, dev->name, sizeof(old_name));
+	err = rename_begin(dev);
+	if (err) {
+		mutex_unlock(&aiosvd_devs_mu);
+		kfree(c);
+		return err;
+	}
+	strscpy(c->old_pool, dev->pool, sizeof(c->old_pool));
+	strscpy(c->old_name, dev->name, sizeof(c->old_name));
 	size = dev->size;
 	order = dev->obj_order;
 	cas = dev->header_cas;
@@ -563,27 +662,32 @@ int aiosvd_rename(struct aiosvd_rename_arg *arg)
 
 	err = aiosvd_cache_flush(dev);
 	if (err)
-		return err;
+		goto out_end;
 
-	aiosvd_header_oid(old_pool, old_name, old_hdr, sizeof(old_hdr));
-	aiosvd_header_oid(arg->pool, arg->name, new_hdr, sizeof(new_hdr));
-	err = aiosvd_header_format(hdr_js, sizeof(hdr_js), arg->pool, arg->name, size, order,
-				   dev->parent_pool, dev->parent_name, dev->key_id);
+	aiosvd_header_oid(c->old_pool, c->old_name, c->old_hdr, sizeof(c->old_hdr));
+	aiosvd_header_oid(arg->pool, arg->name, c->new_hdr, sizeof(c->new_hdr));
+	err = aiosvd_header_format(c->hdr_js, sizeof(c->hdr_js), arg->pool, arg->name, size,
+				   order, dev->parent_pool, dev->parent_name, dev->key_id);
 	if (err)
-		return err;
+		goto out_end;
 
 	http = aiosvd_client_get(dev);
-	if (!http)
-		return -ENODEV;
+	if (!http) {
+		err = -ENODEV;
+		goto out_end;
+	}
 
 	/* Create new header (exclusive). */
 	{
 		u64 new_cas = 0;
 
-		err = aios_http_put(http, new_hdr, hdr_js, strlen(hdr_js), NULL, &new_cas);
+		err = aios_http_put(http, c->new_hdr, c->hdr_js, strlen(c->hdr_js), NULL,
+				    &new_cas);
 		if (err) {
 			aiosvd_client_put(dev, http);
-			return err == -EAGAIN ? -EEXIST : err;
+			if (err == -EAGAIN)
+				err = -EEXIST;
+			goto out_end;
 		}
 		cas = new_cas;
 	}
@@ -593,33 +697,34 @@ int aiosvd_rename(struct aiosvd_rename_arg *arg)
 	for (objno = 0; objno < nobj; objno++) {
 		struct aios_http_buf body = { 0 };
 
-		aiosvd_data_oid(old_pool, old_name, objno, old_oid, sizeof(old_oid));
-		aiosvd_data_oid(arg->pool, arg->name, objno, new_oid, sizeof(new_oid));
-		err = aios_http_get(http, old_oid, &body, NULL);
+		aiosvd_data_oid(c->old_pool, c->old_name, objno, c->old_oid, sizeof(c->old_oid));
+		aiosvd_data_oid(arg->pool, arg->name, objno, c->new_oid, sizeof(c->new_oid));
+		err = aios_http_get(http, c->old_oid, &body, NULL);
 		if (err == -ENOENT) {
 			err = 0;
 			continue;
 		}
 		if (err)
 			break;
-		err = aios_http_put(http, new_oid, body.data, body.len, NULL, NULL);
+		err = aios_http_put(http, c->new_oid, body.data, body.len, NULL, NULL);
 		aios_http_buf_free(&body);
 		if (err)
 			break;
-		aios_http_delete(http, old_oid);
+		aios_http_delete(http, c->old_oid);
 	}
 	if (!err)
-		aios_http_delete(http, old_hdr);
+		aios_http_delete(http, c->old_hdr);
 	aiosvd_client_put(dev, http);
 	if (err)
-		return err;
+		goto out_end;
 
 	aiosvd_cache_invalidate(dev);
 
 	mutex_lock(&aiosvd_devs_mu);
 	if (!dev->mapped) {
 		mutex_unlock(&aiosvd_devs_mu);
-		return -ENOENT;
+		err = -ENOENT;
+		goto out_end;
 	}
 	strscpy(dev->pool, arg->pool, sizeof(dev->pool));
 	strscpy(dev->name, arg->name, sizeof(dev->name));
@@ -627,8 +732,11 @@ int aiosvd_rename(struct aiosvd_rename_arg *arg)
 	mutex_unlock(&aiosvd_devs_mu);
 
 	pr_info("aiosvd: renamed /dev/%s%d %s/%s → %s/%s\n", AIOSVD_DISK_PREFIX, arg->dev_id,
-		old_pool, old_name, arg->pool, arg->name);
-	return 0;
+		c->old_pool, c->old_name, arg->pool, arg->name);
+out_end:
+	rename_end(dev);
+	kfree(c);
+	return err;
 }
 
 static long aiosvd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -637,16 +745,17 @@ static long aiosvd_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case AIOSVD_IOCTL_MAP: {
-		struct aiosvd_map_arg m;
+		struct aiosvd_map_arg *m;
 
-		if (copy_from_user(&m, (void __user *)arg, sizeof(m)))
-			return -EFAULT;
-		err = aiosvd_map(&m);
-		if (err)
-			return err;
-		if (copy_to_user((void __user *)arg, &m, sizeof(m)))
-			return -EFAULT;
-		return 0;
+		m = memdup_user((void __user *)arg, sizeof(*m));
+		if (IS_ERR(m))
+			return PTR_ERR(m);
+		err = aiosvd_map(m);
+		if (!err && copy_to_user((void __user *)arg, m, sizeof(*m)))
+			err = -EFAULT;
+		memzero_explicit(m->cluster_key, sizeof(m->cluster_key));
+		kfree(m);
+		return err;
 	}
 	case AIOSVD_IOCTL_UNMAP: {
 		struct aiosvd_unmap_arg u;

@@ -134,17 +134,14 @@ int aios_http_encode_oid(const char *oid, char *out, size_t out_len)
 
 int aios_http_oid_path(const char *oid, char *oid_path_out, size_t out_len)
 {
-	char enc[1024];
-	int err;
+	static const char prefix[] = "/o/";
+	const size_t plen = sizeof(prefix) - 1;
 
-	if (!oid_path_out)
+	if (!oid_path_out || out_len <= plen)
 		return -EINVAL;
-	err = aios_http_encode_oid(oid, enc, sizeof(enc));
-	if (err)
-		return err;
-	if (snprintf(oid_path_out, out_len, "/o/%s", enc) >= (int)out_len)
-		return -ENAMETOOLONG;
-	return 0;
+	memcpy(oid_path_out, prefix, plen);
+	/* Encode straight into the caller's buffer; no intermediate copy. */
+	return aios_http_encode_oid(oid, oid_path_out + plen, out_len - plen);
 }
 EXPORT_SYMBOL_GPL(aios_http_oid_path);
 
@@ -322,20 +319,21 @@ static int request_with_hdrs(struct aios_http_client *c, const char *method, con
 int aios_http_get(struct aios_http_client *c, const char *oid, struct aios_http_buf *body,
 		  u64 *cas_out)
 {
-	char path[1100];
+	char *path;
 	char *hdrs;
 	int status = 0;
 	int err;
 
 	if (!c || !body)
 		return -EINVAL;
-	err = aios_http_oid_path(oid, path, sizeof(path));
-	if (err)
-		return err;
 	/* AIOS_HTTP_MAX_HDR is the size of an entire kernel stack; never automatic. */
-	hdrs = kmalloc(AIOS_HTTP_MAX_HDR, c->gfp);
+	hdrs = kmalloc(AIOS_HTTP_MAX_HDR + AIOS_HTTP_PATH_MAX, c->gfp);
 	if (!hdrs)
 		return -ENOMEM;
+	path = hdrs + AIOS_HTTP_MAX_HDR;
+	err = aios_http_oid_path(oid, path, AIOS_HTTP_PATH_MAX);
+	if (err)
+		goto out;
 	err = request_with_hdrs(c, "GET", path, NULL, NULL, 0, &status, body, hdrs,
 				AIOS_HTTP_MAX_HDR);
 	if (err)
@@ -358,7 +356,7 @@ EXPORT_SYMBOL_GPL(aios_http_get);
 
 int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u64 *cas_out)
 {
-	char path[1100];
+	char *path;
 	char *hdrs;
 	char sz[32];
 	int status = 0;
@@ -366,13 +364,14 @@ int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u
 
 	if (!c)
 		return -EINVAL;
-	err = aios_http_oid_path(oid, path, sizeof(path));
-	if (err)
-		return err;
 	/* AIOS_HTTP_MAX_HDR is the size of an entire kernel stack; never automatic. */
-	hdrs = kmalloc(AIOS_HTTP_MAX_HDR, c->gfp);
+	hdrs = kmalloc(AIOS_HTTP_MAX_HDR + AIOS_HTTP_PATH_MAX, c->gfp);
 	if (!hdrs)
 		return -ENOMEM;
+	path = hdrs + AIOS_HTTP_MAX_HDR;
+	err = aios_http_oid_path(oid, path, AIOS_HTTP_PATH_MAX);
+	if (err)
+		goto out;
 	err = request_with_hdrs(c, "HEAD", path, NULL, NULL, 0, &status, NULL, hdrs,
 				AIOS_HTTP_MAX_HDR);
 	if (err)
@@ -405,28 +404,37 @@ EXPORT_SYMBOL_GPL(aios_http_head);
 int aios_http_get_range(struct aios_http_client *c, const char *oid, u64 start, u64 end,
 			struct aios_http_buf *body)
 {
-	char path[1100];
+	char *path;
 	char extra[96];
 	int status = 0;
 	int err;
 
-	if (!body || end < start)
+	if (!c || !body || end < start)
 		return -EINVAL;
-	err = aios_http_oid_path(oid, path, sizeof(path));
+	path = kmalloc(AIOS_HTTP_PATH_MAX, c->gfp);
+	if (!path)
+		return -ENOMEM;
+	err = aios_http_oid_path(oid, path, AIOS_HTTP_PATH_MAX);
 	if (err)
-		return err;
+		goto out;
 	snprintf(extra, sizeof(extra), "Range: bytes=%llu-%llu\r\n",
 		 (unsigned long long)start, (unsigned long long)end);
 	err = aios_http_request(c, "GET", path, extra, NULL, 0, &status, body);
 	if (err)
-		return err;
+		goto out;
 	if (status == 404) {
 		aios_http_buf_free(body);
-		return -ENOENT;
+		err = -ENOENT;
+		goto out;
 	}
-	if (status == 416)
-		return -ERANGE;
-	return aios_http_map_status(status);
+	if (status == 416) {
+		err = -ERANGE;
+		goto out;
+	}
+	err = aios_http_map_status(status);
+out:
+	kfree(path);
+	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_get_range);
 
@@ -556,18 +564,28 @@ EXPORT_SYMBOL_GPL(aios_http_put_range);
 
 int aios_http_delete(struct aios_http_client *c, const char *oid)
 {
-	char path[1100];
+	char *path;
 	int status = 0;
 	int err;
 
-	err = aios_http_oid_path(oid, path, sizeof(path));
+	if (!c)
+		return -EINVAL;
+	path = kmalloc(AIOS_HTTP_PATH_MAX, c->gfp);
+	if (!path)
+		return -ENOMEM;
+	err = aios_http_oid_path(oid, path, AIOS_HTTP_PATH_MAX);
 	if (err)
-		return err;
+		goto out;
 	err = aios_http_request(c, "DELETE", path, NULL, NULL, 0, &status, NULL);
 	if (err)
-		return err;
-	if (status == 404)
-		return -ENOENT;
-	return aios_http_map_status(status);
+		goto out;
+	if (status == 404) {
+		err = -ENOENT;
+		goto out;
+	}
+	err = aios_http_map_status(status);
+out:
+	kfree(path);
+	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_delete);

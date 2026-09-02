@@ -215,6 +215,33 @@ static bool has_parent(struct aiosvd_device *dev)
 	return dev->parent_pool[0] && dev->parent_name[0];
 }
 
+/*
+ * An all-zero object is normally represented by absence (DELETE). On a COW
+ * clone absence means "fall through to the parent", so zeroing must instead
+ * leave a child object behind. Any existing child object is authoritative:
+ * reads past its end return zeros (see read_object_slice), so a short zero
+ * object acts as the tombstone.
+ */
+#define AIOSVD_ZERO_TOMBSTONE_LEN 512
+
+static int store_zero_object(struct aios_http_client *http, struct aiosvd_device *dev,
+			     const char *oid)
+{
+	void *z;
+	int err;
+
+	if (!has_parent(dev)) {
+		err = aios_http_delete(http, oid);
+		return (err == -ENOENT) ? 0 : err;
+	}
+	z = kzalloc(AIOSVD_ZERO_TOMBSTONE_LEN, GFP_KERNEL);
+	if (!z)
+		return -ENOMEM;
+	err = aios_http_put(http, oid, z, AIOSVD_ZERO_TOMBSTONE_LEN, NULL, NULL);
+	kfree(z);
+	return err;
+}
+
 /* ---- object cache ------------------------------------------------------ */
 
 static struct aiosvd_ocache_ent *cache_lookup(struct aiosvd_device *dev, u64 objno)
@@ -252,13 +279,10 @@ static int cache_writeback_ent(struct aiosvd_device *dev, struct aios_http_clien
 	if (!ent->valid || !ent->dirty)
 		return 0;
 	aiosvd_data_oid(dev->pool, dev->name, ent->objno, oid, sizeof(oid));
-	if (!ent->datalen || buffer_is_zero(ent->data, ent->datalen)) {
-		err = aios_http_delete(http, oid);
-		if (err == -ENOENT)
-			err = 0;
-	} else {
+	if (!ent->datalen || buffer_is_zero(ent->data, ent->datalen))
+		err = store_zero_object(http, dev, oid);
+	else
 		err = aios_http_put(http, oid, ent->data, ent->datalen, NULL, NULL);
-	}
 	if (!err)
 		ent->dirty = false;
 	return err;
@@ -388,11 +412,14 @@ static int read_object_slice(struct aios_http_client *http, struct aiosvd_device
 
 	aiosvd_data_oid(dev->pool, dev->name, objno, oid, sizeof(oid));
 	err = aios_http_get_range(http, oid, obj_off, obj_off + len - 1, &body);
+	/* Only a missing child falls through to the parent; a short child
+	 * (-ERANGE: range starts past its end) is authoritative and reads
+	 * as zeros. */
 	if (err == -ENOENT && has_parent(dev)) {
 		aiosvd_data_oid(dev->parent_pool, dev->parent_name, objno, oid, sizeof(oid));
 		err = aios_http_get_range(http, oid, obj_off, obj_off + len - 1, &body);
 	}
-	if (err == -ENOENT) {
+	if (err == -ENOENT || err == -ERANGE) {
 		memset(dst, 0, len);
 		return 0;
 	}
@@ -425,10 +452,8 @@ static int write_object_slice(struct aios_http_client *http, struct aiosvd_devic
 			ent->dirty = false;
 		}
 		mutex_unlock(&dev->cache_mu);
-		if (buffer_is_zero(src, len)) {
-			err = aios_http_delete(http, oid);
-			return (err == -ENOENT) ? 0 : err;
-		}
+		if (buffer_is_zero(src, len))
+			return store_zero_object(http, dev, oid);
 		return aios_http_put(http, oid, src, len, NULL, NULL);
 	}
 
@@ -496,8 +521,7 @@ static int discard_object_slice(struct aios_http_client *http, struct aiosvd_dev
 			ent->dirty = false;
 			ent->datalen = 0;
 			mutex_unlock(&dev->cache_mu);
-			err = aios_http_delete(http, oid);
-			return (err == -ENOENT) ? 0 : err;
+			return store_zero_object(http, dev, oid);
 		}
 		memset((char *)ent->data + obj_off, 0, len);
 		ent->dirty = true;
@@ -506,10 +530,8 @@ static int discard_object_slice(struct aios_http_client *http, struct aiosvd_dev
 	}
 	mutex_unlock(&dev->cache_mu);
 
-	if (obj_off == 0 && len == dev->obj_size) {
-		err = aios_http_delete(http, oid);
-		return (err == -ENOENT) ? 0 : err;
-	}
+	if (obj_off == 0 && len == dev->obj_size)
+		return store_zero_object(http, dev, oid);
 
 	/* Partial discard without cache: zero via range PUT when no parent. */
 	if (!has_parent(dev)) {
@@ -536,13 +558,10 @@ static int discard_object_slice(struct aios_http_client *http, struct aiosvd_dev
 	memset(obj + obj_off, 0, len);
 	if (put_len < obj_off + len)
 		put_len = obj_off + len;
-	if (buffer_is_zero(obj, put_len)) {
-		err = aios_http_delete(http, oid);
-		if (err == -ENOENT)
-			err = 0;
-	} else {
+	if (buffer_is_zero(obj, put_len))
+		err = store_zero_object(http, dev, oid);
+	else
 		err = aios_http_put(http, oid, obj, put_len, NULL, NULL);
-	}
 	kvfree(obj);
 	return err;
 }

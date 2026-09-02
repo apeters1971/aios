@@ -128,6 +128,7 @@ static void aios_put_super(struct super_block *sb)
 		aios_conn_put(info->conn);
 		info->conn = NULL;
 	}
+	memzero_explicit(info->cluster_key, sizeof(info->cluster_key));
 	kfree(info);
 	sb->s_fs_info = NULL;
 }
@@ -286,6 +287,7 @@ static int aios_get_tree_fill(struct super_block *sb, struct fs_context *fc)
 	else
 		err = aios_fill_super(sb, info);
 	if (err) {
+		memzero_explicit(info->cluster_key, sizeof(info->cluster_key));
 		kfree(info);
 		sb->s_fs_info = NULL;
 	}
@@ -305,7 +307,11 @@ static int aios_get_tree(struct fs_context *fc)
 
 static void aios_free_fc(struct fs_context *fc)
 {
-	kfree(fc->s_fs_info);
+	struct aios_sb_info *info = fc->s_fs_info;
+
+	if (info)
+		memzero_explicit(info->cluster_key, sizeof(info->cluster_key));
+	kfree(info);
 	fc->s_fs_info = NULL;
 }
 
