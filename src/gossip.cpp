@@ -133,7 +133,21 @@ void GossipEngine::start() {
 
   run_scan();
   rebuild_cluster_map();
+  // A target must be absent from three consecutive scans before its store is
+  // retired, so a transient scan glitch does not close (and later reopen) it.
+  local_stores_.set_retire_policy(3, 60 * 1000);
   sync_local_stores();
+
+  // The daemon is the sole writer to its stores, so anything left under tmp/
+  // (staging files from PUT pipelines / stage sessions) is a crash leftover.
+  for (const auto& path : local_stores_.paths()) {
+    auto store = local_stores_.get_shared(path);
+    if (!store) continue;
+    std::string err;
+    const auto n = store->sweep_tmp(0, err);
+    if (n > 0) AIOS_LOG_INFO("swept ", n, " stale staging file(s) from ", path);
+    if (!err.empty()) AIOS_LOG_WARN("sweep_tmp ", path, ": ", err);
+  }
 
   std::string host, port;
   if (!split_host_port(cfg_.listen, host, port)) {
@@ -196,21 +210,25 @@ void GossipEngine::start() {
 
 
   boost::asio::post(gossip_workers_, [this] {
-    for (const auto& p : cfg_.peers) {
-      if (stopped_.load()) return;
-      auto r = gossip_with_peer(p, cfg_.node_id, advertise_addr(), cfg_.cluster_key,
-                                cfg_.auth_skew_ms, membership_, fs_table_,
-                                derive_http_addr(advertise_addr(), cfg_.http_listen));
-      if (r.ok) {
-        AIOS_LOG_INFO("seed gossip ok with ", p, " as ", r.peer_node_id);
-        boost::asio::post(ioc_, [this] {
-          if (stopped_.load()) return;
-          rebuild_cluster_map();
-          write_status();
-        });
-      } else {
-        AIOS_LOG_WARN("seed gossip failed ", p, ": ", r.error);
+    try {
+      for (const auto& p : cfg_.peers) {
+        if (stopped_.load()) return;
+        auto r = gossip_with_peer(p, cfg_.node_id, advertise_addr(), cfg_.cluster_key,
+                                  cfg_.auth_skew_ms, membership_, fs_table_,
+                                  derive_http_addr(advertise_addr(), cfg_.http_listen));
+        if (r.ok) {
+          AIOS_LOG_INFO("seed gossip ok with ", p, " as ", r.peer_node_id);
+          boost::asio::post(ioc_, [this] {
+            if (stopped_.load()) return;
+            rebuild_cluster_map();
+            write_status();
+          });
+        } else {
+          AIOS_LOG_WARN("seed gossip failed ", p, ": ", r.error);
+        }
       }
+    } catch (const std::exception& e) {
+      AIOS_LOG_WARN("background job aborted: ", e.what());
     }
   });
 
@@ -288,11 +306,17 @@ Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
                            peer_listen.empty() ? std::string{} : peer_listen, now,
                            peer_http_addr);
   }
-  if (req.body.contains("membership")) {
-    membership_.merge(MembershipTable::from_json(req.body["membership"]), now);
-  }
-  if (req.body.contains("fs_table")) {
-    fs_table_.merge(FsTable::from_json(req.body["fs_table"]));
+  // from_json implementations read with value(); a peer sending a wrong-typed field
+  // must not unwind into the session worker.
+  try {
+    if (req.body.is_object() && req.body.contains("membership")) {
+      membership_.merge(MembershipTable::from_json(req.body["membership"]), now);
+    }
+    if (req.body.is_object() && req.body.contains("fs_table")) {
+      fs_table_.merge(FsTable::from_json(req.body["fs_table"]));
+    }
+  } catch (const std::exception& e) {
+    AIOS_LOG_WARN("inbound gossip from ", peer_node_id, " rejected: ", e.what());
   }
   rebuild_cluster_map();
 
@@ -323,15 +347,19 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
   // deadlocks multi-node PUTs that need inbound object RPC while gossip is in flight.
   boost::asio::post(gossip_workers_, [this, peers, node_id, adv, key, skew, http_adv,
                                       interval] {
-    for (const auto& p : peers) {
-      if (stopped_.load()) return;
-      auto r = gossip_with_peer(p.addr, node_id, adv, key, skew, membership_, fs_table_,
-                                http_adv);
-      if (r.ok) {
-        AIOS_LOG_DEBUG("gossip ok ", p.addr, " -> ", r.peer_node_id);
-      } else {
-        AIOS_LOG_DEBUG("gossip fail ", p.addr, ": ", r.error);
+    try {
+      for (const auto& p : peers) {
+        if (stopped_.load()) return;
+        auto r = gossip_with_peer(p.addr, node_id, adv, key, skew, membership_, fs_table_,
+                                  http_adv);
+        if (r.ok) {
+          AIOS_LOG_DEBUG("gossip ok ", p.addr, " -> ", r.peer_node_id);
+        } else {
+          AIOS_LOG_DEBUG("gossip fail ", p.addr, ": ", r.error);
+        }
       }
+    } catch (const std::exception& e) {
+      AIOS_LOG_WARN("background job aborted: ", e.what());
     }
     boost::asio::post(ioc_, [this, interval] {
       if (stopped_.load()) return;
@@ -410,15 +438,19 @@ void GossipEngine::on_repair_timer(const boost::system::error_code& ec) {
   // run_repair issues blocking object RPCs; running it on ioc_ stalls accept and
   // deadlocks the cluster when peers are also mid-repair waiting on each other.
   boost::asio::post(gossip_workers_, [this, map, adv, batch, interval] {
-    if (stopped_.load()) return;
-    const auto stats = run_repair(cfg_, adv, map, local_stores_, batch);
-    if (object_service_) {
-      object_service_->ops().note_repair(stats.oids_scanned, stats.repaired, stats.failed);
-    }
-    if (stats.oids_scanned > 0 || stats.under_replicated > 0) {
-      AIOS_LOG_INFO("repair scanned=", stats.oids_scanned,
-                    " under_replicated=", stats.under_replicated,
-                    " repaired=", stats.repaired, " failed=", stats.failed);
+    try {
+      if (stopped_.load()) return;
+      const auto stats = run_repair(cfg_, adv, map, local_stores_, batch);
+      if (object_service_) {
+        object_service_->ops().note_repair(stats.oids_scanned, stats.repaired, stats.failed);
+      }
+      if (stats.oids_scanned > 0 || stats.under_replicated > 0) {
+        AIOS_LOG_INFO("repair scanned=", stats.oids_scanned,
+                      " under_replicated=", stats.under_replicated,
+                      " repaired=", stats.repaired, " failed=", stats.failed);
+      }
+    } catch (const std::exception& e) {
+      AIOS_LOG_WARN("background job aborted: ", e.what());
     }
     boost::asio::post(ioc_, [this, interval] {
       if (stopped_.load()) return;
@@ -436,12 +468,16 @@ void GossipEngine::on_transition_timer(const boost::system::error_code& ec) {
   const auto batch = static_cast<std::size_t>(std::max(1, cfg_.transition_batch_oids));
   const auto interval = cfg_.transition_interval_ms;
   boost::asio::post(gossip_workers_, [this, map, adv, batch, interval] {
-    if (stopped_.load()) return;
-    const auto stats = run_transitions(cfg_, adv, map, local_stores_, batch);
-    if (stats.matched > 0 || stats.migrated > 0 || stats.drained > 0) {
-      AIOS_LOG_INFO("transition scanned=", stats.oids_scanned, " matched=", stats.matched,
-                    " migrated=", stats.migrated, " drained=", stats.drained,
-                    " failed=", stats.failed);
+    try {
+      if (stopped_.load()) return;
+      const auto stats = run_transitions(cfg_, adv, map, local_stores_, batch);
+      if (stats.matched > 0 || stats.migrated > 0 || stats.drained > 0) {
+        AIOS_LOG_INFO("transition scanned=", stats.oids_scanned, " matched=", stats.matched,
+                      " migrated=", stats.migrated, " drained=", stats.drained,
+                      " failed=", stats.failed);
+      }
+    } catch (const std::exception& e) {
+      AIOS_LOG_WARN("background job aborted: ", e.what());
     }
     boost::asio::post(ioc_, [this, interval] {
       if (stopped_.load()) return;
@@ -459,17 +495,21 @@ void GossipEngine::on_archive_timer(const boost::system::error_code& ec) {
   const auto batch = static_cast<std::size_t>(std::max(1, cfg_.archive_batch_oids));
   const auto interval = cfg_.archive_interval_ms;
   boost::asio::post(gossip_workers_, [this, map, adv, batch, interval] {
-    if (stopped_.load()) return;
-    const auto stats = run_archive(cfg_, adv, map, local_stores_, batch);
-    if (stats.matched > 0 || stats.bags_sealed > 0 || stats.packed > 0) {
-      AIOS_LOG_INFO("archive scanned=", stats.oids_scanned, " matched=", stats.matched,
-                    " packed=", stats.packed, " bags=", stats.bags_sealed,
-                    " failed=", stats.failed);
-    }
-    const auto drain = run_archive_drain(cfg_, adv, map, local_stores_, batch);
-    if (drain.drained > 0 || drain.failed > 0) {
-      AIOS_LOG_INFO("archive drain scanned=", drain.bags_scanned, " drained=", drain.drained,
-                    " skipped=", drain.skipped, " failed=", drain.failed);
+    try {
+      if (stopped_.load()) return;
+      const auto stats = run_archive(cfg_, adv, map, local_stores_, batch);
+      if (stats.matched > 0 || stats.bags_sealed > 0 || stats.packed > 0) {
+        AIOS_LOG_INFO("archive scanned=", stats.oids_scanned, " matched=", stats.matched,
+                      " packed=", stats.packed, " bags=", stats.bags_sealed,
+                      " failed=", stats.failed);
+      }
+      const auto drain = run_archive_drain(cfg_, adv, map, local_stores_, batch);
+      if (drain.drained > 0 || drain.failed > 0) {
+        AIOS_LOG_INFO("archive drain scanned=", drain.bags_scanned, " drained=", drain.drained,
+                      " skipped=", drain.skipped, " failed=", drain.failed);
+      }
+    } catch (const std::exception& e) {
+      AIOS_LOG_WARN("background job aborted: ", e.what());
     }
     boost::asio::post(ioc_, [this, interval] {
       if (stopped_.load()) return;
@@ -490,15 +530,19 @@ void GossipEngine::on_backup_timer(const boost::system::error_code& ec) {
     poll_ms = 60000;
   if (poll_ms <= 0) poll_ms = 60000;
   boost::asio::post(gossip_workers_, [this, map, adv, batch, poll_ms] {
-    if (stopped_.load()) return;
-    const auto stats =
-        run_backup(cfg_, adv, map, local_stores_, *object_service_, batch,
-                   backup_policies_.get(), false);
-    if (stats.snaps_created > 0 || stats.bags_sealed > 0 || stats.drained > 0) {
-      AIOS_LOG_INFO("backup rules=", stats.rules_run, " snaps=", stats.snaps_created,
-                    " oids=", stats.oids_copied, " bags=", stats.bags_sealed,
-                    " drained=", stats.drained, " pruned=", stats.pruned,
-                    " failed=", stats.failed);
+    try {
+      if (stopped_.load()) return;
+      const auto stats =
+          run_backup(cfg_, adv, map, local_stores_, *object_service_, batch,
+                     backup_policies_.get(), false);
+      if (stats.snaps_created > 0 || stats.bags_sealed > 0 || stats.drained > 0) {
+        AIOS_LOG_INFO("backup rules=", stats.rules_run, " snaps=", stats.snaps_created,
+                      " oids=", stats.oids_copied, " bags=", stats.bags_sealed,
+                      " drained=", stats.drained, " pruned=", stats.pruned,
+                      " failed=", stats.failed);
+      }
+    } catch (const std::exception& e) {
+      AIOS_LOG_WARN("background job aborted: ", e.what());
     }
     boost::asio::post(ioc_, [this, poll_ms] {
       if (stopped_.load()) return;

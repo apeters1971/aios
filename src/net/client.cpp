@@ -7,6 +7,13 @@
 #include "config.hpp"
 
 namespace aios {
+namespace {
+
+// Gossip rounds run on a small worker pool; a peer that accepts and stalls must
+// not pin a worker indefinitely.
+constexpr int kGossipIoTimeoutMs = 15000;
+
+}  // namespace
 
 GossipExchangeResult gossip_with_peer(const std::string& peer_addr,
                                       const std::string& local_node_id,
@@ -45,13 +52,13 @@ GossipExchangeResult gossip_with_peer(const std::string& peer_addr,
                 {"listen", local_listen},
                 {"http_addr", local_http_addr}};
   auth_sign(hello.body, MsgType::Hello, cluster_key);
-  if (!write_frame(sock, hello, err, ec)) {
+  if (!write_frame(sock, hello, err, ec, kGossipIoTimeoutMs)) {
     result.error = "hello write: " + err;
     return result;
   }
 
   Frame hello_reply;
-  if (!read_frame(sock, hello_reply, err, ec) || hello_reply.type != MsgType::Hello) {
+  if (!read_frame(sock, hello_reply, err, ec, kGossipIoTimeoutMs) || hello_reply.type != MsgType::Hello) {
     result.error = "hello read: " + err;
     return result;
   }
@@ -73,13 +80,13 @@ GossipExchangeResult gossip_with_peer(const std::string& peer_addr,
       {"fs_table", fs_table.to_json()},
   };
   auth_sign(gossip.body, MsgType::Gossip, cluster_key);
-  if (!write_frame(sock, gossip, err, ec)) {
+  if (!write_frame(sock, gossip, err, ec, kGossipIoTimeoutMs)) {
     result.error = "gossip write: " + err;
     return result;
   }
 
   Frame gossip_reply;
-  if (!read_frame(sock, gossip_reply, err, ec) ||
+  if (!read_frame(sock, gossip_reply, err, ec, kGossipIoTimeoutMs) ||
       gossip_reply.type != MsgType::Gossip) {
     result.error = "gossip read: " + err;
     return result;

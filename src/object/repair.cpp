@@ -6,6 +6,7 @@
 #include "ec/ec_attrs.hpp"
 #include "net/object_client.hpp"
 #include "object/object_layout.hpp"
+#include "util/auth.hpp"
 #include "util/crc32c.hpp"
 #include "util/file_io.hpp"
 #include "util/log.hpp"
@@ -17,8 +18,13 @@
 namespace aios {
 namespace {
 
+// Raw tip state of one target, delete markers included: `present` means the
+// target has a published tip for the oid (live or marker). Tip stat() hides
+// markers, which made a deleted object look like one the target never had and
+// let repair resurrect it from a stale live replica.
 struct TargetObjState {
   bool present{false};
+  bool deleted{false};
   std::uint64_t size{0};
   std::uint32_t crc32c{0};
   bool crc_known{false};
@@ -33,9 +39,12 @@ TargetObjState target_object_state(const Config& cfg, const std::string& adverti
     auto* store = stores.get(t.aios_path);
     if (!store) return st;
     std::string err;
-    auto info = store->stat(oid, err);
+    std::uint64_t tip = 0;
+    if (!store->tip_seq(oid, tip, err) || tip == 0) return st;
+    auto info = store->stat(oid, tip, err);
     if (!info) return st;
     st.present = true;
+    st.deleted = info->is_delete;
     st.size = info->size;
     st.crc32c = info->crc32c;
     st.crc_known = info->crc32c_known;
@@ -43,14 +52,64 @@ TargetObjState target_object_state(const Config& cfg, const std::string& adverti
     return st;
   }
   auto r = object_stat_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key,
-                              cfg.auth_skew_ms, map.epoch, t.aios_path, oid);
+                              cfg.auth_skew_ms, map.epoch, t.aios_path, oid,
+                              /*include_deleted=*/true);
   if (!r.ok) return st;
   st.present = true;
+  if (auto it = r.body.find("deleted"); it != r.body.end() && it->is_boolean()) {
+    st.deleted = it->get<bool>();
+  }
   st.size = r.size;
   st.crc32c = r.crc32c;
   st.crc_known = r.crc32c_known;
-  st.seq = r.body.value("seq", static_cast<std::uint64_t>(0));
+  if (auto it = r.body.find("seq"); it != r.body.end() && it->is_number_unsigned()) {
+    st.seq = it->get<std::uint64_t>();
+  }
   return st;
+}
+
+// Replicate a delete marker at `seq` to a target that still holds an older tip.
+bool push_delete_marker(const Config& cfg, const std::string& advertise, const ClusterMap& map,
+                        LocalStores& stores, const StorageTarget& dst, const std::string& oid,
+                        std::uint64_t seq) {
+  PreparedVersion pv;
+  pv.oid = oid;
+  pv.seq = seq;
+  pv.size = 0;
+  pv.crc32c = crc32c(nullptr, 0);
+  pv.inline_body = true;
+  pv.is_delete = true;
+  if (dst.node_id == cfg.node_id) {
+    auto* store = stores.get(dst.aios_path);
+    if (!store) return false;
+    std::string err;
+    std::uint64_t tip = 0;
+    if (store->tip_seq(oid, tip, err) && tip >= seq) return false;
+    return store->install_version(pv, nullptr, 0, {}, err) && store->publish_tip(oid, seq, err);
+  }
+  auto r = object_install_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                 cfg.auth_skew_ms, map.epoch, dst.aios_path, pv, nullptr, 0, {});
+  if (!r.ok) return false;
+  return object_publish_tip_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                   cfg.auth_skew_ms, map.epoch, dst.aios_path, oid, seq)
+      .ok;
+}
+
+// Authoritative copy: highest published seq (markers included); the primary wins
+// ties, then acting-set order. Returns acting_set.size() when nothing is present.
+std::size_t pick_authoritative(const std::vector<TargetObjState>& states) {
+  std::size_t auth = states.size();
+  for (std::size_t i = 0; i < states.size(); ++i) {
+    if (!states[i].present) continue;
+    if (auth == states.size() || states[i].seq > states[auth].seq) auth = i;
+  }
+  return auth;
+}
+
+void cleanup_temp_path(bool have_file, const std::string& body_path) {
+  if (!have_file || body_path.find("aios-repair-") == std::string::npos) return;
+  std::error_code ec;
+  std::filesystem::remove(body_path, ec);
 }
 
 bool push_replica(const Config& cfg, const std::string& advertise, const ClusterMap& map,
@@ -95,15 +154,19 @@ bool push_replica(const Config& cfg, const std::string& advertise, const Cluster
                                  cfg.auth_skew_ms, map.epoch, src.aios_path, oid);
     if (!st.ok) return false;
     pv.oid = oid;
-    pv.seq = st.body.value("seq", static_cast<std::uint64_t>(1));
+    pv.seq = 1;
+    if (auto it = st.body.find("seq"); it != st.body.end() && it->is_number_unsigned()) {
+      pv.seq = it->get<std::uint64_t>();
+    }
     pv.size = st.size;
     pv.crc32c = st.crc32c;
     pv.inline_body = false;
     pv.is_delete = false;
     // Stream large remote bodies to a temp file; small ones can stay in memory.
     if (pv.size > 256u * 1024u) {
+      // oid is untrusted for path building ("/" or ".." segments); hash it.
       body_path = (std::filesystem::temp_directory_path() /
-                   ("aios-repair-" + oid + "-" + std::to_string(pv.seq)))
+                   ("aios-repair-" + sha256_hex(oid) + "-" + std::to_string(pv.seq)))
                       .string();
       auto g = object_get_file_remote(src.addr, cfg.node_id, advertise, cfg.cluster_key,
                                       cfg.auth_skew_ms, map.epoch, src.aios_path, oid,
@@ -121,27 +184,36 @@ bool push_replica(const Config& cfg, const std::string& advertise, const Cluster
 
   if (pv.seq == 0) pv.seq = 1;
 
-  // Tip advances are monotonic. If the destination already has a newer tip (e.g. a
-  // delete marker that tip stat() hides), reinstall under a fresh seq.
-  if (dst.node_id == cfg.node_id) {
-    if (auto* store = stores.get(dst.aios_path)) {
-      std::string terr;
-      std::uint64_t tip = 0;
-      if (store->tip_seq(oid, tip, terr) && tip >= pv.seq) {
-        pv.seq = tip + 1;
-        pv.fs_path.clear();
+  // Tip advances are monotonic. The source is the highest-seq copy, so a newer
+  // destination tip (a delete marker, or a concurrent write) means our copy is
+  // stale: never push past it. Only a same-seq divergent copy (size/crc mismatch)
+  // is reinstalled under a fresh seq.
+  {
+    std::uint64_t dst_tip = 0;
+    bool dst_has_tip = false;
+    if (dst.node_id == cfg.node_id) {
+      if (auto* store = stores.get(dst.aios_path)) {
+        std::string terr;
+        dst_has_tip = store->tip_seq(oid, dst_tip, terr) && dst_tip > 0;
+      }
+    } else {
+      auto st = object_stat_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
+                                   cfg.auth_skew_ms, map.epoch, dst.aios_path, oid,
+                                   /*include_deleted=*/true);
+      if (st.ok) {
+        if (auto it = st.body.find("seq"); it != st.body.end() && it->is_number_unsigned()) {
+          dst_tip = it->get<std::uint64_t>();
+          dst_has_tip = dst_tip > 0;
+        }
       }
     }
-  } else {
-    auto st = object_stat_remote(dst.addr, cfg.node_id, advertise, cfg.cluster_key,
-                                 cfg.auth_skew_ms, map.epoch, dst.aios_path, oid);
-    // Remote stat hides delete markers; if the object "exists" with a higher tip, bump.
-    if (st.ok && st.body.contains("seq")) {
-      const auto tip = st.body.value("seq", static_cast<std::uint64_t>(0));
-      if (tip >= pv.seq) {
-        pv.seq = tip + 1;
-        pv.fs_path.clear();
-      }
+    if (dst_has_tip && dst_tip > pv.seq) {
+      cleanup_temp_path(have_file, body_path);
+      return false;
+    }
+    if (dst_has_tip && dst_tip == pv.seq) {
+      pv.seq = dst_tip + 1;
+      pv.fs_path.clear();
     }
   }
 
@@ -515,17 +587,43 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         has[i] = states[i].present;
       }
 
-      std::size_t auth = p.acting_set.size();
-      if (!p.acting_set.empty() && has[0]) auth = 0;
-      else {
+      const std::size_t auth = pick_authoritative(states);
+      if (auth == p.acting_set.size()) continue;
+
+      if (states[auth].deleted) {
+        // The newest version is a delete marker: propagate it to targets still
+        // holding an older live tip (or nothing). Never resurrect from them.
+        bool any_fix = false;
+        std::vector<bool> needs_fix(p.acting_set.size(), false);
         for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
-          if (has[i]) {
-            auth = i;
-            break;
+          if (i == auth) continue;
+          if (has[i] && states[i].seq >= states[auth].seq) continue;
+          needs_fix[i] = true;
+          any_fix = true;
+        }
+        if (!any_fix) continue;
+        ++stats.under_replicated;
+        if (!should_repair(cfg, p, has)) continue;
+        bool all_ok = true;
+        for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
+          if (!needs_fix[i]) continue;
+          if (push_delete_marker(cfg, advertise, map, stores, p.acting_set[i], oid,
+                                 states[auth].seq)) {
+            AIOS_LOG_INFO("repaired delete marker oid=", oid, " -> ",
+                          p.acting_set[i].node_id, ":", p.acting_set[i].aios_path);
+          } else {
+            all_ok = false;
+            AIOS_LOG_WARN("repair delete marker failed oid=", oid, " -> ",
+                          p.acting_set[i].node_id);
           }
         }
+        if (all_ok) {
+          ++stats.repaired;
+        } else {
+          ++stats.failed;
+        }
+        continue;
       }
-      if (auth == p.acting_set.size()) continue;
 
       if (p.acting_set[auth].node_id == cfg.node_id && !states[auth].crc_known) {
         auto* s = stores.get(p.acting_set[auth].aios_path);
@@ -578,6 +676,7 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         std::size_t src_idx = auth;
         for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
           if (!has[i] || p.acting_set[i].node_id != cfg.node_id) continue;
+          if (states[i].deleted || states[i].seq != states[auth].seq) continue;
           if (!states[auth].crc_known || !states[i].crc_known ||
               (states[i].crc32c == states[auth].crc32c &&
                states[i].size == states[auth].size)) {

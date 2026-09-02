@@ -210,15 +210,26 @@ std::vector<Member> MembershipTable::from_json(const nlohmann::json& j) {
   std::vector<Member> out;
   const auto& arr = j.contains("members") ? j.at("members") : j;
   if (!arr.is_array()) return out;
+  // Gossip payloads come from peers; value() throws on a wrong-typed field, so
+  // read each scalar with an explicit type check instead.
+  auto str = [](const nlohmann::json& o, const char* key) -> std::string {
+    auto it = o.find(key);
+    if (it == o.end() || !it->is_string()) return {};
+    return it->get<std::string>();
+  };
   for (const auto& e : arr) {
+    if (!e.is_object()) continue;
     Member m;
-    m.node_id = e.value("node_id", "");
-    m.addr = e.value("addr", "");
-    m.http_addr = e.value("http_addr", "");
-    m.rack = e.value("rack", "");
+    m.node_id = str(e, "node_id");
+    m.addr = str(e, "addr");
+    m.http_addr = str(e, "http_addr");
+    m.rack = str(e, "rack");
     if (m.rack.empty() && !m.node_id.empty()) m.rack = m.node_id;
-    m.state = member_state_from_string(e.value("state", "online"));
-    m.last_seen_ms = e.value("last_seen_ms", std::int64_t{0});
+    const auto state_s = str(e, "state");
+    m.state = member_state_from_string(state_s.empty() ? "online" : state_s);
+    if (auto it = e.find("last_seen_ms"); it != e.end() && it->is_number_integer()) {
+      m.last_seen_ms = it->get<std::int64_t>();
+    }
     if (!m.node_id.empty()) out.push_back(std::move(m));
   }
   return out;

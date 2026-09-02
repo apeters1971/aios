@@ -28,27 +28,44 @@ bool const_time_eq(const std::string& a, const std::string& b) {
 // Replay protection within the auth skew window. Each signed message carries a
 // unique nonce so identical legitimate payloads in the same millisecond (hellos,
 // empty acks) do not collide. Cache key is type+ts+nonce+sig.
-constexpr std::size_t kReplayCacheCap = 4096;
+//
+// Entries expire by sender timestamp: anything older than now - max_skew_ms is no
+// longer accepted by auth_verify anyway, so it can be dropped. The count cap is a
+// memory bound sized for peak rate (65536 / 60 s ≈ 1000 msg/s) so legitimate
+// entries are not evicted while still replayable.
+constexpr std::size_t kReplayCacheCap = 65536;
 constexpr std::size_t kReplayShards = 16;
 constexpr std::size_t kReplayShardCap = kReplayCacheCap / kReplayShards;
 
+struct ReplayEntry {
+  std::int64_t ts;
+  std::string digest;
+};
+
 struct ReplayShard {
   std::mutex mu;
-  std::deque<std::string> order;
+  // Insertion order; ts values are roughly monotone, so expiry pops from the front.
+  std::deque<ReplayEntry> order;
   std::unordered_set<std::string> seen;
 };
 
 std::array<ReplayShard, kReplayShards> g_replay;
 
-bool replay_mark(const std::string& digest) {
+bool replay_mark(const std::string& digest, std::int64_t ts, std::int64_t now,
+                 int max_skew_ms) {
   auto& shard = g_replay[std::hash<std::string>{}(digest) % kReplayShards];
   std::lock_guard lock(shard.mu);
   if (shard.seen.count(digest)) return false;
-  if (shard.order.size() >= kReplayShardCap) {
-    shard.seen.erase(shard.order.front());
+  const std::int64_t expire_before = now - static_cast<std::int64_t>(max_skew_ms);
+  while (!shard.order.empty() && shard.order.front().ts < expire_before) {
+    shard.seen.erase(shard.order.front().digest);
     shard.order.pop_front();
   }
-  shard.order.push_back(digest);
+  if (shard.order.size() >= kReplayShardCap) {
+    shard.seen.erase(shard.order.front().digest);
+    shard.order.pop_front();
+  }
+  shard.order.push_back({ts, digest});
   shard.seen.insert(digest);
   return true;
 }
@@ -137,21 +154,35 @@ void auth_sign(nlohmann::json& body, MsgType type, const std::string& cluster_ke
 
 bool auth_verify(const nlohmann::json& body, MsgType type, const std::string& cluster_key,
                  int max_skew_ms, std::string& err) {
-  if (!body.contains("ts") || !body.contains("sig")) {
+  // Every read below is type-checked: this runs on unauthenticated input, and a
+  // throwing nlohmann accessor would take down the RPC worker.
+  if (!body.is_object() || !body.contains("ts") || !body.contains("sig")) {
     err = "missing ts/sig";
     return false;
   }
-  std::int64_t ts = 0;
-  try {
-    ts = body.at("ts").get<std::int64_t>();
-  } catch (...) {
+  const auto& ts_j = body.at("ts");
+  if (!ts_j.is_number_integer()) {
     err = "bad ts";
     return false;
   }
-  const auto sig = body.value("sig", "");
+  const auto ts = ts_j.get<std::int64_t>();
+  const auto& sig_j = body.at("sig");
+  if (!sig_j.is_string()) {
+    err = "bad sig";
+    return false;
+  }
+  const auto sig = sig_j.get<std::string>();
   if (sig.size() != 64) {  // sha256 hex
     err = "bad sig length";
     return false;
+  }
+  std::string nonce;
+  if (auto it = body.find("nonce"); it != body.end()) {
+    if (!it->is_string()) {
+      err = "bad nonce";
+      return false;
+    }
+    nonce = it->get<std::string>();
   }
   const auto now = now_ms();
   if (std::llabs(now - ts) > max_skew_ms) {
@@ -164,10 +195,9 @@ bool auth_verify(const nlohmann::json& body, MsgType type, const std::string& cl
     return false;
   }
   // Prefer nonce when present (new peers); fall back to sig-only for older senders.
-  const auto nonce = body.value("nonce", "");
   const auto replay_key = std::string(msg_type_name(type)) + "\n" + std::to_string(ts) + "\n" +
                           nonce + "\n" + sig;
-  if (!replay_mark(replay_key)) {
+  if (!replay_mark(replay_key, ts, now, max_skew_ms)) {
     err = "replay";
     return false;
   }

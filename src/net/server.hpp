@@ -16,11 +16,14 @@ namespace aios {
 
 using tcp = boost::asio::ip::tcp;
 
+// timeout_ms < 0: block indefinitely (legacy behaviour). Otherwise the call fails
+// with ec == boost::asio::error::timed_out when the peer makes no progress for
+// timeout_ms (a per-poll progress deadline, not a total transfer deadline).
 bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
-                boost::system::error_code& ec);
+                boost::system::error_code& ec, int timeout_ms = -1);
 
 bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
-                 boost::system::error_code& ec);
+                 boost::system::error_code& ec, int timeout_ms = -1);
 
 struct RpcHandlers {
   std::string local_node_id;
@@ -28,6 +31,12 @@ struct RpcHandlers {
   std::string local_http_addr;  // host:port HTTP (optional)
   std::string cluster_key;
   int auth_skew_ms{60000};
+  // A connection that has not completed Hello within this window is dropped.
+  int pre_hello_timeout_ms{5000};
+  // Keep-alive sessions idle longer than this are closed so they stop pinning a
+  // session worker. Clients recycle pooled sockets well below this (see
+  // object_client.cpp kPoolIdleTtlMs).
+  int idle_timeout_ms{60000};
 
   // Merge inbound gossip; return outbound Gossip frame.
   // peer_http_addr is the Hello advertisement (may be empty).
@@ -59,6 +68,7 @@ class TcpServer {
  private:
   void do_accept();
   void handle_session(std::shared_ptr<tcp::socket> sock);
+  void run_session(tcp::socket& sock);
   void kick_sessions();
 
   boost::asio::io_context& ioc_;

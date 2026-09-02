@@ -7,6 +7,7 @@
 #include "object/archive_bag.hpp"
 #include "object/archive_pack.hpp"
 #include "object/object_layout.hpp"
+#include "util/auth.hpp"
 #include "util/base64.hpp"
 #include "util/compression.hpp"
 #include "util/crc32c.hpp"
@@ -28,6 +29,7 @@
 #include <random>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <unistd.h>
 #include <unordered_set>
@@ -120,24 +122,142 @@ bool decompress_api_result(ApiResult& r, std::string& err, std::uint64_t max_obj
   return true;
 }
 
+// ---- Checked JSON scalar reads -------------------------------------------------
+// Request bodies come off the wire; nlohmann's value() throws type_error when the
+// element exists with a different type, which would unwind through the RPC worker.
+// These return the default for absent/null keys and throw std::invalid_argument
+// for a present value of the wrong type, which ObjectService::handle turns into a
+// bad_request reply.
+
+[[noreturn]] void bad_field(const char* key, const char* want) {
+  throw std::invalid_argument(std::string("field '") + key + "' must be " + want);
+}
+
+const nlohmann::json* json_field(const nlohmann::json& body, const char* key) {
+  if (!body.is_object()) return nullptr;
+  auto it = body.find(key);
+  if (it == body.end() || it->is_null()) return nullptr;
+  return &*it;
+}
+
+std::uint64_t json_u64(const nlohmann::json& body, const char* key, std::uint64_t def = 0) {
+  const auto* v = json_field(body, key);
+  if (!v) return def;
+  if (!v->is_number_integer()) bad_field(key, "an integer");
+  if (v->is_number_unsigned()) return v->get<std::uint64_t>();
+  const auto i = v->get<std::int64_t>();
+  if (i < 0) bad_field(key, "a non-negative integer");
+  return static_cast<std::uint64_t>(i);
+}
+
+std::uint32_t json_u32(const nlohmann::json& body, const char* key, std::uint32_t def = 0) {
+  const auto v = json_u64(body, key, def);
+  if (v > 0xffffffffull) bad_field(key, "a 32-bit integer");
+  return static_cast<std::uint32_t>(v);
+}
+
+int json_int(const nlohmann::json& body, const char* key, int def) {
+  const auto* v = json_field(body, key);
+  if (!v) return def;
+  if (!v->is_number_integer()) bad_field(key, "an integer");
+  const auto i = v->get<std::int64_t>();
+  if (i < INT32_MIN || i > INT32_MAX) bad_field(key, "a 32-bit integer");
+  return static_cast<int>(i);
+}
+
+std::string json_str(const nlohmann::json& body, const char* key, const std::string& def = {}) {
+  const auto* v = json_field(body, key);
+  if (!v) return def;
+  if (!v->is_string()) bad_field(key, "a string");
+  return v->get<std::string>();
+}
+
+bool json_bool(const nlohmann::json& body, const char* key, bool def) {
+  const auto* v = json_field(body, key);
+  if (!v) return def;
+  if (!v->is_boolean()) bad_field(key, "a boolean");
+  return v->get<bool>();
+}
+
+// Present and non-null (used for optional scalars like seq / crc32c).
+bool json_has(const nlohmann::json& body, const char* key) {
+  return json_field(body, key) != nullptr;
+}
+
+// ---- Service lock ---------------------------------------------------------------
+// mu_ is recursive because api_* nest (txn → prepare → install → replicate). A
+// blocking peer RPC must run with the mutex fully released or two coordinators
+// doing cross-node work deadlock (each waiting on the other's session worker).
+// ServiceLock tracks the per-thread depth so UnlockForRpc can drop every level.
+
+thread_local int t_service_lock_depth = 0;
+
+struct ServiceLock {
+  std::recursive_mutex& m;
+  explicit ServiceLock(std::recursive_mutex& mu) : m(mu) {
+    m.lock();
+    ++t_service_lock_depth;
+  }
+  ~ServiceLock() {
+    --t_service_lock_depth;
+    m.unlock();
+  }
+  ServiceLock(const ServiceLock&) = delete;
+  ServiceLock& operator=(const ServiceLock&) = delete;
+};
+
+// Release every level of mu_ this thread holds (none is fine) for the scope, then
+// re-acquire the same depth.
+struct UnlockForRpc {
+  std::recursive_mutex& m;
+  int depth;
+  explicit UnlockForRpc(std::recursive_mutex& mu) : m(mu), depth(t_service_lock_depth) {
+    for (int i = 0; i < depth; ++i) m.unlock();
+    t_service_lock_depth = 0;
+  }
+  ~UnlockForRpc() {
+    for (int i = 0; i < depth; ++i) m.lock();
+    t_service_lock_depth = depth;
+  }
+  UnlockForRpc(const UnlockForRpc&) = delete;
+  UnlockForRpc& operator=(const UnlockForRpc&) = delete;
+};
+
+// Joins on scope exit so an exception between emplace_back and join cannot
+// destroy a joinable std::thread (which would std::terminate).
+struct ThreadJoiner {
+  std::vector<std::thread>& threads;
+  explicit ThreadJoiner(std::vector<std::thread>& t) : threads(t) {}
+  ~ThreadJoiner() {
+    for (auto& w : threads) {
+      if (w.joinable()) w.join();
+    }
+  }
+  ThreadJoiner(const ThreadJoiner&) = delete;
+  ThreadJoiner& operator=(const ThreadJoiner&) = delete;
+};
+
 }  // namespace
 
 ObjectService::ObjectService(Config cfg, ClusterMap& map, LocalStores& stores)
-    : cfg_(std::move(cfg)), map_(map), stores_(stores) {}
+    : cfg_(std::move(cfg)), map_(map), stores_(stores) {
+  epoch_.store(map_.epoch, std::memory_order_release);
+}
 
 void ObjectService::set_advertise(std::string advertise) {
   advertise_ = std::move(advertise);
 }
 
 std::uint64_t ObjectService::update_cluster_map(ClusterMap m) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   const auto prev = map_.epoch;
   map_ = std::move(m);
+  epoch_.store(map_.epoch, std::memory_order_release);
   return prev;
 }
 
 ClusterMap ObjectService::map_snapshot() const {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   return map_;
 }
 
@@ -169,7 +289,7 @@ ApiResult ObjectService::fail(const std::string& code, const std::string& error)
   r.ok = false;
   r.code = code;
   r.error = error;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   return r;
 }
 
@@ -186,7 +306,7 @@ ApiResult ObjectService::require_primary(const std::string& oid, Placement& plac
   }
   ApiResult ok;
   ok.ok = true;
-  ok.epoch = map_.epoch;
+  ok.epoch = cur_epoch();
   ok.placement = placement_out;
   return ok;
 }
@@ -198,7 +318,7 @@ ApiResult ObjectService::enforce_lock(const std::string& oid,
   }
   ApiResult ok;
   ok.ok = true;
-  ok.epoch = map_.epoch;
+  ok.epoch = cur_epoch();
   return ok;
 }
 
@@ -218,12 +338,15 @@ int ObjectService::quorum_need(const Placement& placement) const {
 }
 
 bool ObjectService::epoch_ok(std::uint64_t req_epoch, Frame& err_out) const {
-  if (req_epoch != 0 && req_epoch != map_.epoch) {
-    err_out = reply_err(map_.epoch, "epoch_mismatch", "cluster map epoch mismatch");
-    err_out.body["cluster_map"] = map_.to_json();
-    return false;
-  }
-  return true;
+  if (req_epoch == 0 || req_epoch == cur_epoch()) return true;
+  // Slow path: the mirror may lag a map that was swapped in from outside
+  // update_cluster_map; consult the real map under the lock and refresh.
+  ServiceLock lock(mu_);
+  epoch_.store(map_.epoch, std::memory_order_release);
+  if (req_epoch == map_.epoch) return true;
+  err_out = reply_err(map_.epoch, "epoch_mismatch", "cluster map epoch mismatch");
+  err_out.body["cluster_map"] = map_.to_json();
+  return false;
 }
 
 ObjectStore* ObjectService::primary_store(const Placement& p, std::string& err) {
@@ -313,16 +436,6 @@ bool ObjectService::local_abort(const std::string& aios_path, const std::string&
 
 namespace {
 
-// Caller must hold mu_. Release across peer RPC so inbound gossip can update the
-// map (otherwise multi-node PUTs deadlock with the gossip accept path).
-struct UnlockForRpc {
-  std::recursive_mutex& m;
-  explicit UnlockForRpc(std::recursive_mutex& mu) : m(mu) { m.unlock(); }
-  ~UnlockForRpc() { m.lock(); }
-  UnlockForRpc(const UnlockForRpc&) = delete;
-  UnlockForRpc& operator=(const UnlockForRpc&) = delete;
-};
-
 bool placement_has_remote(const Placement& placement, const std::string& node_id) {
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     if (placement.acting_set[i].node_id != node_id) return true;
@@ -330,14 +443,18 @@ bool placement_has_remote(const Placement& placement, const std::string& node_id
   return false;
 }
 
+// Per-oid mutation guard. Acquisition releases the service lock while waiting:
+// callers such as txn/pubsub paths already hold mu_ when they reach api_put, and
+// the holder of the oid guard needs mu_ to finish (lock-order inversion otherwise).
 struct MutatingOid {
   std::mutex& mu;
   std::condition_variable& cv;
   std::unordered_set<std::string>& oids;
   std::string oid;
-  MutatingOid(std::mutex& mu, std::condition_variable& cv, std::unordered_set<std::string>& oids,
-              std::string o)
+  MutatingOid(std::recursive_mutex& svc_mu, std::mutex& mu, std::condition_variable& cv,
+              std::unordered_set<std::string>& oids, std::string o)
       : mu(mu), cv(cv), oids(oids), oid(std::move(o)) {
+    UnlockForRpc unlock(svc_mu);
     std::unique_lock lk(mu);
     cv.wait(lk, [&] { return this->oids.count(oid) == 0; });
     this->oids.insert(oid);
@@ -369,8 +486,9 @@ int ObjectService::replicate_install(
   if (placement_has_remote(placement, cfg_.node_id)) unlock.emplace(mu_);
 
   // One primary read shared by all replica workers (avoids 2× re-read for r=3).
-  // Cap keeps huge objects on the per-peer file stream path.
-  constexpr std::uint64_t kSharedFanoutMax = 256ull * 1024ull * 1024ull;
+  // Above the cap each peer streams the FS body in kStageChunkSize pieces instead
+  // of pinning a whole-object copy per in-flight PUT.
+  constexpr std::uint64_t kSharedFanoutMax = 32ull * 1024ull * 1024ull;
   std::shared_ptr<const std::vector<std::uint8_t>> shared_body;
   const std::uint8_t* fanout = data;
   std::size_t fanout_len = len;
@@ -390,6 +508,7 @@ int ObjectService::replicate_install(
 
   std::atomic<int> ok{0};
   std::vector<std::thread> workers;
+  ThreadJoiner joiner(workers);
   workers.reserve(placement.acting_set.size() - 1);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     workers.emplace_back([&, i] {
@@ -445,6 +564,7 @@ int ObjectService::replicate_publish(const Placement& placement, const std::stri
 
   std::atomic<int> ok{0};
   std::vector<std::thread> workers;
+  ThreadJoiner joiner(workers);
   workers.reserve(placement.acting_set.size() - 1);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     workers.emplace_back([&, i] {
@@ -478,6 +598,7 @@ void ObjectService::replicate_abort(const Placement& placement, const std::strin
   UnlockForRpc unlock(mu_);
 
   std::vector<std::thread> workers;
+  ThreadJoiner joiner(workers);
   workers.reserve(placement.acting_set.size() - 1);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     workers.emplace_back([&, i] {
@@ -514,7 +635,7 @@ ApiResult ObjectService::install_prepared(
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.replicas = total_ok;
   r.placement = placement;
   r.attrs = attrs;
@@ -568,6 +689,30 @@ Frame ObjectService::handle(const Frame& req) {
   // Intentionally no outer mu_ lock: handlers that call api_*/replicate_* rely on
   // UnlockForRpc to release the mutex across peer RPC. An outer lock_guard would
   // keep the mutex held and reintroduce multi-node PUT/publish deadlocks under load.
+  try {
+    if (!req.raw_empty()) {
+      // The HMAC covers only the JSON envelope; clients bind the raw trailer to it
+      // with sha256. Required for authenticated (signed) frames; frames handed to
+      // handle() directly (in-process callers, tests) carry no sig and may omit it.
+      const bool signed_frame = json_has(req.body, "sig");
+      if (json_has(req.body, "sha256")) {
+        const auto got = sha256_hex(
+            std::string(reinterpret_cast<const char*>(req.raw_data()), req.raw_size()));
+        if (json_str(req.body, "sha256") != got) {
+          return reply_err(cur_epoch(), "bad_request", "raw body sha256 mismatch");
+        }
+      } else if (signed_frame) {
+        return reply_err(cur_epoch(), "bad_request", "raw body requires sha256");
+      }
+    }
+    return dispatch(req);
+  } catch (const std::exception& e) {
+    AIOS_LOG_WARN("object rpc ", msg_type_name(req.type), " rejected: ", e.what());
+    return reply_err(cur_epoch(), "bad_request", std::string("malformed request: ") + e.what());
+  }
+}
+
+Frame ObjectService::dispatch(const Frame& req) {
   switch (req.type) {
     case MsgType::ObjectPut:
       return handle_put(req);
@@ -596,7 +741,7 @@ Frame ObjectService::handle(const Frame& req) {
     case MsgType::ObjectList:
       return handle_list(req.body);
     default:
-      return reply_err(map_.epoch, "bad_type", "unsupported object message");
+      return reply_err(cur_epoch(), "bad_type", "unsupported object message");
   }
 }
 
@@ -616,22 +761,22 @@ static std::vector<AttrPrecondition> parse_preds_json(const nlohmann::json& body
   if (!body.contains("preconditions") || !body["preconditions"].is_array()) return preds;
   for (const auto& j : body["preconditions"]) {
     if (!j.is_object()) continue;
-    const std::string op = j.value("op", "");
+    const std::string op = json_str(j, "op");
     AttrPrecondition p;
     if (op == "eq") {
       p.kind = AttrPrecondition::Kind::Eq;
-      p.key = j.value("key", "");
-      p.value = j.value("value", "");
+      p.key = json_str(j, "key");
+      p.value = json_str(j, "value");
     } else if (op == "ne") {
       p.kind = AttrPrecondition::Kind::Ne;
-      p.key = j.value("key", "");
-      p.value = j.value("value", "");
+      p.key = json_str(j, "key");
+      p.value = json_str(j, "value");
     } else if (op == "absent") {
       p.kind = AttrPrecondition::Kind::Absent;
-      p.key = j.value("key", "");
+      p.key = json_str(j, "key");
     } else if (op == "present") {
       p.kind = AttrPrecondition::Kind::Present;
-      p.key = j.value("key", "");
+      p.key = json_str(j, "key");
     } else if (op == "must_exist") {
       p.kind = AttrPrecondition::Kind::MustExist;
     } else if (op == "must_not_exist") {
@@ -647,18 +792,18 @@ static std::vector<AttrPrecondition> parse_preds_json(const nlohmann::json& body
 Frame ObjectService::handle_put(const Frame& req) {
   Frame errf;
   const auto& body = req.body;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
 
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
-  const std::string role = body.value("role", "primary");
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
+  const std::string role = json_str(body, "role", "primary");
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
   }
 
   std::vector<std::uint8_t> data;
-  const bool is_delete = body.value("is_delete", false);
-  const std::string redirect_oid = body.value("redirect", "");
+  const bool is_delete = json_bool(body, "is_delete", false);
+  const std::string redirect_oid = json_str(body, "redirect");
   const bool is_redirect = !redirect_oid.empty();
   if (!is_delete && !is_redirect) {
     if (!req.raw_empty()) {
@@ -666,80 +811,82 @@ Frame ObjectService::handle_put(const Frame& req) {
     } else if (body.contains("data_b64") && body["data_b64"].is_string()) {
       std::string derr;
       if (!base64_decode(body["data_b64"].get<std::string>(), data, derr)) {
-        return reply_err(map_.epoch, "bad_request", "invalid data_b64: " + derr);
+        return reply_err(cur_epoch(), "bad_request", "invalid data_b64: " + derr);
       }
-    } else if (body.value("size", static_cast<std::uint64_t>(0)) != 0) {
-      return reply_err(map_.epoch, "bad_request", "missing put body");
+    } else if (json_u64(body, "size") != 0) {
+      return reply_err(cur_epoch(), "bad_request", "missing put body");
     }
   }
 
   auto attrs = parse_attrs_json(body);
 
   std::optional<std::uint32_t> expected_crc;
-  if (body.contains("crc32c") && !body["crc32c"].is_null()) {
-    expected_crc = body.value("crc32c", 0u);
+  if (json_has(body, "crc32c")) {
+    expected_crc = json_u32(body, "crc32c");
     if (!is_delete && !is_redirect && crc32c(data.data(), data.size()) != *expected_crc) {
-      return reply_err(map_.epoch, "crc_mismatch", "crc32c mismatch");
+      return reply_err(cur_epoch(), "crc_mismatch", "crc32c mismatch");
     }
   }
 
   // Replica install of a prepared version (seq present).
   if (role == "replica" && body.contains("seq")) {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-      return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
+      return reply_err(cur_epoch(), "not_replica", "not in acting set for oid");
     }
     PreparedVersion v;
     v.oid = oid;
-    v.seq = body.value("seq", static_cast<std::uint64_t>(0));
-    v.prev_tip = body.value("base_seq", static_cast<std::uint64_t>(0));
+    v.seq = json_u64(body, "seq");
+    v.prev_tip = json_u64(body, "base_seq");
     v.size = (is_delete || is_redirect)
                  ? 0
-                 : body.value("size", static_cast<std::uint64_t>(data.size()));
+                 : json_u64(body, "size", data.size());
     if (v.size == 0 && !is_delete && !is_redirect) v.size = data.size();
     v.crc32c = expected_crc.value_or(
         (is_delete || is_redirect) ? crc32c(nullptr, 0) : crc32c(data.data(), data.size()));
-    v.inline_body = body.value("inline_body", false);
-    v.fs_path = body.value("fs_path", "");
+    v.inline_body = json_bool(body, "inline_body", false);
+    // fs_path is never taken from the wire: the store derives the version's own
+    // relpath (a peer-supplied path would be a filesystem traversal vector).
+    v.fs_path.clear();
     v.is_delete = is_delete;
     v.redirect_oid = redirect_oid;
     std::string err;
     if (!local_install(aios_path, v, data.data(), data.size(), attrs, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
-    auto f = reply_ok(map_.epoch);
+    auto f = reply_ok(cur_epoch());
     f.body["seq"] = v.seq;
     return f;
   }
 
   if (role == "replica") {
     // Legacy full put (publish immediately) — kept for repair tooling.
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-      return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
+      return reply_err(cur_epoch(), "not_replica", "not in acting set for oid");
     }
     auto* store = stores_.get(aios_path);
-    if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+    if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
     std::string err;
     if (is_redirect) {
       if (!store->put_redirect(oid, redirect_oid, attrs, true, nullptr, err)) {
-        return reply_err(map_.epoch, "store_error", err);
+        return reply_err(cur_epoch(), "store_error", err);
       }
     } else if (!store->put(oid, data.data(), data.size(), attrs, true, expected_crc, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
-    return reply_ok(map_.epoch);
+    return reply_ok(cur_epoch());
   }
 
   // Full primary PUT with layout (replica or EC). Redirects keep the legacy path.
   // api_put locks mu_ itself (and UnlockForRpc must not see an outer hold).
   if (!is_delete && !is_redirect) {
     const LayoutRequest layout_req = layout_request_from_json(body);
-    const bool do_publish = body.value("publish", true);
+    const bool do_publish = json_bool(body, "publish", true);
     if (do_publish) {
       auto r = api_put(oid, data.data(), data.size(), attrs, true, {}, expected_crc, layout_req);
       if (!r.ok) {
-        auto f = reply_err(map_.epoch, r.code, r.error);
+        auto f = reply_err(cur_epoch(), r.code, r.error);
         if (r.code == "not_primary") {
           f.body["acting_set"] = nlohmann::json::array();
           for (const auto& t : r.placement.acting_set) {
@@ -749,7 +896,7 @@ Frame ObjectService::handle_put(const Frame& req) {
         }
         return f;
       }
-      auto f = reply_ok(map_.epoch);
+      auto f = reply_ok(cur_epoch());
       f.body["replicas"] = r.replicas;
       if (r.info) f.body["seq"] = r.info->seq;
       f.body["published"] = true;
@@ -759,24 +906,24 @@ Frame ObjectService::handle_put(const Frame& req) {
     ObjectLayout layout;
     std::string lerr;
     if (!resolve_object_layout(cfg_, oid, layout_req, layout, lerr)) {
-      return reply_err(map_.epoch, "bad_request", lerr);
+      return reply_err(cur_epoch(), "bad_request", lerr);
     }
     if (layout.is_ec()) {
-      return reply_err(map_.epoch, "bad_request",
+      return reply_err(cur_epoch(), "bad_request",
                        "ec layout not supported for unpublished ObjectPut");
     }
     apply_layout_attrs(attrs, layout);
   }
 
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   const std::string sc_for_primary = storage_class_for_attrs(attrs, cfg_.default_storage_class);
   const auto placement = place(oid, map_, sc_for_primary);
   if (placement.acting_set.empty()) {
-    return reply_err(map_.epoch, "no_targets", "no storage targets in cluster map");
+    return reply_err(cur_epoch(), "no_targets", "no storage targets in cluster map");
   }
 
   if (!is_primary_for(oid, map_, sc_for_primary, cfg_.node_id, aios_path)) {
-    auto f = reply_err(map_.epoch, "not_primary", "this node/target is not primary");
+    auto f = reply_err(cur_epoch(), "not_primary", "this node/target is not primary");
     f.body["acting_set"] = nlohmann::json::array();
     for (const auto& t : placement.acting_set) {
       f.body["acting_set"].push_back(
@@ -786,36 +933,36 @@ Frame ObjectService::handle_put(const Frame& req) {
   }
 
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
   std::string err;
-  const bool do_publish = body.value("publish", true);
+  const bool do_publish = json_bool(body, "publish", true);
   std::optional<std::string> lock_token;
   if (body.contains("lock_token") && body["lock_token"].is_string()) {
     lock_token = body["lock_token"].get<std::string>();
   }
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) {
-    return reply_err(map_.epoch, lk.code, lk.error);
+    return reply_err(cur_epoch(), lk.code, lk.error);
   }
   auto preds = parse_preds_json(body);
   auto pr = check_preds_on(store, oid, preds, err);
-  if (pr == PrecondResult::NotFound) return reply_err(map_.epoch, "not_found", err);
-  if (pr == PrecondResult::Conflict) return reply_err(map_.epoch, "precondition_failed", err);
+  if (pr == PrecondResult::NotFound) return reply_err(cur_epoch(), "not_found", err);
+  if (pr == PrecondResult::Conflict) return reply_err(cur_epoch(), "precondition_failed", err);
 
   PreparedVersion pv;
   if (is_redirect) {
     if (!store->prepare_redirect(oid, redirect_oid, attrs, true, pv, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
   } else if (!store->prepare_put(oid, data.data(), data.size(), attrs, true, expected_crc, pv,
                                  err)) {
-    if (err == "crc32c mismatch") return reply_err(map_.epoch, "crc_mismatch", err);
-    return reply_err(map_.epoch, "store_error", err);
+    if (err == "crc32c mismatch") return reply_err(cur_epoch(), "crc_mismatch", err);
+    return reply_err(cur_epoch(), "store_error", err);
   }
   ApiResult r = do_publish ? commit_prepared(store, placement, pv, data.data(), data.size(), attrs)
                            : install_prepared(store, placement, pv, data.data(), data.size(),
                                               attrs);
-  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
-  auto f = reply_ok(map_.epoch);
+  if (!r.ok) return reply_err(cur_epoch(), r.code, r.error);
+  auto f = reply_ok(cur_epoch());
   f.body["replicas"] = r.replicas;
   f.body["seq"] = pv.seq;
   f.body["prev_tip"] = pv.prev_tip;
@@ -827,38 +974,38 @@ Frame ObjectService::handle_put(const Frame& req) {
 Frame ObjectService::handle_put_range(const Frame& req) {
   Frame errf;
   const auto& body = req.body;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
 
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
-  const std::string role = body.value("role", "primary");
-  const auto offset = body.value("offset", static_cast<std::uint64_t>(0));
-  const bool replace_attrs = body.value("replace_attrs", false);
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
+  const std::string role = json_str(body, "role", "primary");
+  const auto offset = json_u64(body, "offset");
+  const bool replace_attrs = json_bool(body, "replace_attrs", false);
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
   }
 
   const auto* data = req.raw_data();
   const auto len = req.raw_size();
   auto attrs = parse_attrs_json(body);
 
-  if (body.contains("range_crc32c") && !body["range_crc32c"].is_null()) {
-    const auto expect = body.value("range_crc32c", 0u);
+  if (json_has(body, "range_crc32c")) {
+    const auto expect = json_u32(body, "range_crc32c");
     if (!data || crc32c(data, len) != expect) {
-      return reply_err(map_.epoch, "crc_mismatch", "range crc32c mismatch");
+      return reply_err(cur_epoch(), "crc_mismatch", "range crc32c mismatch");
     }
   }
 
   if (role == "replica") {
     // Range replicas are installed as full versions via ObjectPut+seq.
-    return reply_err(map_.epoch, "bad_request",
+    return reply_err(cur_epoch(), "bad_request",
                      "use ObjectPut with seq to install prepared range versions");
   }
 
   const LayoutRequest layout_req = layout_request_from_json(body);
   auto r = api_put_range(oid, offset, data, len, attrs, replace_attrs, {}, layout_req);
-  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
-  auto f = reply_ok(map_.epoch);
+  if (!r.ok) return reply_err(cur_epoch(), r.code, r.error);
+  auto f = reply_ok(cur_epoch());
   f.body["replicas"] = r.replicas;
   if (r.info) f.body["seq"] = r.info->seq;
   return f;
@@ -866,33 +1013,33 @@ Frame ObjectService::handle_put_range(const Frame& req) {
 
 Frame ObjectService::handle_get(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   if (!map_.targets.empty() && !in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-    return reply_err(map_.epoch, "not_replica", "not in acting set for oid");
+    return reply_err(cur_epoch(), "not_replica", "not in acting set for oid");
   }
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
   std::optional<std::uint64_t> seq;
-  if (body.contains("seq") && !body["seq"].is_null()) {
-    seq = body.value("seq", static_cast<std::uint64_t>(0));
+  if (json_has(body, "seq")) {
+    seq = json_u64(body, "seq");
   }
   std::string err;
   auto st = store->stat(oid, seq, err);
-  if (!st) return reply_err(map_.epoch, "not_found", err);
+  if (!st) return reply_err(cur_epoch(), "not_found", err);
   if (!st->redirect_oid.empty()) {
-    auto f = reply_ok(map_.epoch);
+    auto f = reply_ok(cur_epoch());
     f.body["redirect"] = st->redirect_oid;
     f.body["seq"] = st->seq;
     f.body["code"] = "redirect";
     return f;
   }
-  auto f = reply_ok(map_.epoch);
+  auto f = reply_ok(cur_epoch());
   f.body["seq"] = st->seq;
   f.body["size"] = st->size;
   if (st->crc32c_known) f.body["crc32c"] = st->crc32c;
@@ -907,10 +1054,10 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
 
   // Ranged or full raw get (avoids base64 / extra copies on the wire).
   if (body.contains("offset")) {
-    const auto offset = body.value("offset", static_cast<std::uint64_t>(0));
-    const auto len = body.value("length", static_cast<std::uint64_t>(0));
+    const auto offset = json_u64(body, "offset");
+    const auto len = json_u64(body, "length");
     if (len == 0 || len > kMaxBodySize) {
-      return reply_err(map_.epoch, "bad_request", "invalid get length");
+      return reply_err(cur_epoch(), "bad_request", "invalid get length");
     }
     std::optional<std::vector<std::uint8_t>> data;
     {
@@ -919,101 +1066,101 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
     }
     if (!data) {
       if (err == "range unsatisfiable") {
-        return reply_err(map_.epoch, "range_unsatisfiable", err);
+        return reply_err(cur_epoch(), "range_unsatisfiable", err);
       }
-      return reply_err(map_.epoch, "not_found", err);
+      return reply_err(cur_epoch(), "not_found", err);
     }
     attach_raw(std::move(*data), offset);
     return f;
   }
 
   if (st->size > kMaxBodySize) {
-    return reply_err(map_.epoch, "bad_request", "object exceeds RPC body limit; use ranged get");
+    return reply_err(cur_epoch(), "bad_request", "object exceeds RPC body limit; use ranged get");
   }
   std::optional<std::vector<std::uint8_t>> data;
   {
     UnlockForRpc unlock(mu_);
     data = store->get(oid, seq, err);
   }
-  if (!data) return reply_err(map_.epoch, "not_found", err);
+  if (!data) return reply_err(cur_epoch(), "not_found", err);
   attach_raw(std::move(*data), 0);
   return f;
 }
 
 Frame ObjectService::handle_del(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
-  const std::string role = body.value("role", "primary");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
+  const std::string role = json_str(body, "role", "primary");
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   const auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) {
-    return reply_err(map_.epoch, "no_targets", "no storage targets");
+    return reply_err(cur_epoch(), "no_targets", "no storage targets");
   }
 
   // Replica install of delete-marker version.
   if (role == "replica" && body.contains("seq")) {
     if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-      return reply_err(map_.epoch, "not_replica", "not in acting set");
+      return reply_err(cur_epoch(), "not_replica", "not in acting set");
     }
     PreparedVersion v;
     v.oid = oid;
-    v.seq = body.value("seq", static_cast<std::uint64_t>(0));
-    v.prev_tip = body.value("base_seq", static_cast<std::uint64_t>(0));
+    v.seq = json_u64(body, "seq");
+    v.prev_tip = json_u64(body, "base_seq");
     v.is_delete = true;
     v.crc32c = crc32c(nullptr, 0);
     std::string err;
     if (!local_install(aios_path, v, nullptr, 0, {}, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
-    return reply_ok(map_.epoch);
+    return reply_ok(cur_epoch());
   }
 
   if (role == "replica") {
     if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-      return reply_err(map_.epoch, "not_replica", "not in acting set");
+      return reply_err(cur_epoch(), "not_replica", "not in acting set");
     }
     auto* store = stores_.get(aios_path);
-    if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+    if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
     std::string err;
     if (!store->del(oid, err) && err != "object not found") {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
-    return reply_ok(map_.epoch);
+    return reply_ok(cur_epoch());
   }
 
   if (!is_primary_for(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-    return reply_err(map_.epoch, "not_primary", "not primary");
+    return reply_err(cur_epoch(), "not_primary", "not primary");
   }
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
   std::string err;
   std::optional<std::string> lock_token;
   if (body.contains("lock_token") && body["lock_token"].is_string()) {
     lock_token = body["lock_token"].get<std::string>();
   }
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) {
-    return reply_err(map_.epoch, lk.code, lk.error);
+    return reply_err(cur_epoch(), lk.code, lk.error);
   }
   auto preds = parse_preds_json(body);
   auto pr = check_preds_on(store, oid, preds, err);
-  if (pr == PrecondResult::NotFound) return reply_err(map_.epoch, "not_found", err);
-  if (pr == PrecondResult::Conflict) return reply_err(map_.epoch, "precondition_failed", err);
+  if (pr == PrecondResult::NotFound) return reply_err(cur_epoch(), "not_found", err);
+  if (pr == PrecondResult::Conflict) return reply_err(cur_epoch(), "precondition_failed", err);
 
   PreparedVersion pv;
   if (!store->prepare_delete(oid, pv, err)) {
-    if (err == "object not found") return reply_err(map_.epoch, "not_found", err);
-    return reply_err(map_.epoch, "store_error", err);
+    if (err == "object not found") return reply_err(cur_epoch(), "not_found", err);
+    return reply_err(cur_epoch(), "store_error", err);
   }
-  const bool do_publish = body.value("publish", true);
+  const bool do_publish = json_bool(body, "publish", true);
   ApiResult r = do_publish ? commit_prepared(store, placement, pv, nullptr, 0, {})
                            : install_prepared(store, placement, pv, nullptr, 0, {});
-  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
-  auto f = reply_ok(map_.epoch);
+  if (!r.ok) return reply_err(cur_epoch(), r.code, r.error);
+  auto f = reply_ok(cur_epoch());
   f.body["replicas"] = r.replicas;
   f.body["seq"] = pv.seq;
   f.body["prev_tip"] = pv.prev_tip;
@@ -1023,23 +1170,34 @@ Frame ObjectService::handle_del(const nlohmann::json& body) {
 
 Frame ObjectService::handle_stat(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
   std::optional<std::uint64_t> seq;
-  if (body.contains("seq") && !body["seq"].is_null()) {
-    seq = body.value("seq", static_cast<std::uint64_t>(0));
+  if (json_has(body, "seq")) {
+    seq = json_u64(body, "seq");
   }
   std::string err;
   auto info = store->stat(oid, seq, err);
-  if (!info) return reply_err(map_.epoch, "not_found", err);
-  auto f = reply_ok(map_.epoch);
+  if (!info && !seq.has_value() && json_bool(body, "include_deleted", false)) {
+    // Tip stat() hides delete markers; repair needs the raw tip so it never
+    // resurrects a deleted object from a stale live replica.
+    std::uint64_t tip = 0;
+    std::string terr;
+    if (store->tip_seq(oid, tip, terr) && tip > 0) {
+      info = store->stat(oid, tip, terr);
+      if (info && !info->is_delete) info.reset();
+    }
+  }
+  if (!info) return reply_err(cur_epoch(), "not_found", err);
+  auto f = reply_ok(cur_epoch());
+  f.body["deleted"] = info->is_delete;
   f.body["size"] = info->size;
   f.body["mtime_ms"] = info->mtime_ms;
   f.body["ctime_ms"] = info->ctime_ms;
@@ -1057,71 +1215,74 @@ Frame ObjectService::handle_stat(const nlohmann::json& body) {
 
 Frame ObjectService::handle_publish_tip(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
-  const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
-  const std::string role = body.value("role", "replica");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
+  const auto seq = json_u64(body, "seq");
+  const std::string role = json_str(body, "role", "replica");
   if (oid.empty() || aios_path.empty() || seq == 0) {
-    return reply_err(map_.epoch, "bad_request", "oid, aios_path, seq required");
+    return reply_err(cur_epoch(), "bad_request", "oid, aios_path, seq required");
   }
   // api_publish_version locks and UnlockForRpc across replica publish — no outer hold.
   if (role == "primary") {
     auto r = api_publish_version(oid, seq);
-    if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
-    return reply_ok(map_.epoch);
+    if (!r.ok) return reply_err(cur_epoch(), r.code, r.error);
+    return reply_ok(cur_epoch());
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-    return reply_err(map_.epoch, "not_replica", "not in acting set");
+    return reply_err(cur_epoch(), "not_replica", "not in acting set");
   }
   std::string err;
   if (!local_publish(aios_path, oid, seq, err)) {
-    return reply_err(map_.epoch, "store_error", err);
+    return reply_err(cur_epoch(), "store_error", err);
   }
-  return reply_ok(map_.epoch);
+  return reply_ok(cur_epoch());
 }
 
 Frame ObjectService::handle_abort_version(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
-  const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
-  const std::string role = body.value("role", "replica");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
+  const auto seq = json_u64(body, "seq");
+  const std::string role = json_str(body, "role", "replica");
   if (oid.empty() || aios_path.empty() || seq == 0) {
-    return reply_err(map_.epoch, "bad_request", "oid, aios_path, seq required");
+    return reply_err(cur_epoch(), "bad_request", "oid, aios_path, seq required");
   }
   if (role == "primary") {
     auto r = api_abort_prepared(oid, seq);
-    if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
-    return reply_ok(map_.epoch);
+    if (!r.ok) return reply_err(cur_epoch(), r.code, r.error);
+    return reply_ok(cur_epoch());
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
-    return reply_err(map_.epoch, "not_replica", "not in acting set");
+    return reply_err(cur_epoch(), "not_replica", "not in acting set");
   }
+  // An aborted pipelined/staged version leaves its stage session (fd + tmp file)
+  // behind otherwise.
+  close_stage_session(stage_key(aios_path, oid, seq), /*remove_file=*/true);
   std::string err;
   if (!local_abort(aios_path, oid, seq, err)) {
-    return reply_err(map_.epoch, "store_error", err);
+    return reply_err(cur_epoch(), "store_error", err);
   }
-  return reply_ok(map_.epoch);
+  return reply_ok(cur_epoch());
 }
 
 Frame ObjectService::handle_list_versions(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
   std::string err;
   auto vers = store->list_versions(oid, err);
-  auto f = reply_ok(map_.epoch);
+  auto f = reply_ok(cur_epoch());
   nlohmann::json arr = nlohmann::json::array();
   for (const auto& v : vers) {
     nlohmann::json j = {{"seq", v.seq},
@@ -1139,29 +1300,29 @@ Frame ObjectService::handle_list_versions(const nlohmann::json& body) {
 
 Frame ObjectService::handle_purge_versions(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid and aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
   std::string err;
-  if (body.contains("seq") && !body["seq"].is_null()) {
-    const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
-    const bool allow_tip = body.value("allow_tip", false);
+  if (json_has(body, "seq")) {
+    const auto seq = json_u64(body, "seq");
+    const bool allow_tip = json_bool(body, "allow_tip", false);
     if (!store->purge_version(oid, seq, allow_tip, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
   } else {
-    int keep = body.value("keep", store->options().max_versions);
+    int keep = json_int(body, "keep", store->options().max_versions);
     if (!store->trim_versions(oid, keep, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
   }
-  return reply_ok(map_.epoch);
+  return reply_ok(cur_epoch());
 }
 
 ApiResult ObjectService::commit_ec_put(
@@ -1255,7 +1416,7 @@ ApiResult ObjectService::commit_ec_put(
 
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.replicas = total_ok;
   r.placement = placement;
   r.attrs = a0;
@@ -1296,7 +1457,7 @@ ApiResult ObjectService::reconstruct_ec_object(
       a = s->list_attrs(oid, e);
     } else {
       auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                   cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+                                   cfg_.auth_skew_ms, cur_epoch(), t.aios_path, oid);
       if (!st.ok || !st.body.contains("attrs") || !st.body["attrs"].is_object()) return fallback;
       for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
         if (it.value().is_string()) a[it.key()] = it.value().get<std::string>();
@@ -1311,6 +1472,7 @@ ApiResult ObjectService::reconstruct_ec_object(
   std::mutex shard_mu;
   std::atomic<int> got{0};
   std::vector<std::thread> workers;
+  ThreadJoiner joiner(workers);
   workers.reserve(placement.acting_set.size());
   for (std::size_t ti = 0; ti < placement.acting_set.size(); ++ti) {
     workers.emplace_back([&, ti] {
@@ -1327,17 +1489,17 @@ ApiResult ObjectService::reconstruct_ec_object(
         data = std::move(*got_data);
       } else if (seq.has_value()) {
         auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                     cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+                                     cfg_.auth_skew_ms, cur_epoch(), t.aios_path, oid);
         if (!st.ok) return;
         auto r = object_get_range_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                         cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid, 0,
+                                         cfg_.auth_skew_ms, cur_epoch(), t.aios_path, oid, 0,
                                          static_cast<std::size_t>(st.size), seq);
         if (r.ok && !r.raw.empty()) data = std::move(r.raw);
         else if (r.ok && r.data) data = std::move(*r.data);
         else return;
       } else {
         auto r = object_get_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                   cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+                                   cfg_.auth_skew_ms, cur_epoch(), t.aios_path, oid);
         if (!r.ok || !r.data) return;
         data = std::move(*r.data);
       }
@@ -1412,7 +1574,7 @@ ApiResult ObjectService::reconstruct_ec_object(
 
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.attrs = tip_attrs;
   r.data = std::move(out);
@@ -1433,8 +1595,8 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
                                 std::optional<std::uint32_t> expected_crc32c,
                                 const LayoutRequest& layout_req,
                                 const std::optional<std::string>& lock_token) {
-  MutatingOid mutating(mutating_mu_, mutating_cv_, mutating_oids_, oid);
-  std::lock_guard lock(mu_);
+  MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
+  ServiceLock lock(mu_);
   ObjectLayout layout;
   std::string err;
   if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
@@ -1510,18 +1672,58 @@ std::string ObjectService::stage_key(const std::string& aios_path, const std::st
   return aios_path + '\n' + oid + '\n' + std::to_string(seq);
 }
 
-void ObjectService::close_stage_session(const std::string& key) {
+void ObjectService::close_stage_session(const std::string& key, bool remove_file) {
   auto it = stages_.find(key);
   if (it == stages_.end()) return;
-  if (it->second.fd >= 0) ::close(it->second.fd);
+  auto sess = std::move(it->second);
   stages_.erase(it);
+  if (!sess) return;
+  // Waits for a StageData chunk that is mid-pwrite on this session.
+  std::lock_guard slock(sess->mu);
+  sess->closed = true;
+  if (sess->fd >= 0) {
+    ::close(sess->fd);
+    sess->fd = -1;
+  }
+  if (remove_file && !sess->path.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(sess->path, ec);
+  }
+}
+
+namespace {
+// Sessions the coordinator never committed or aborted (crash, dropped connection).
+constexpr std::int64_t kStageIdleMaxMs = 10 * 60 * 1000;
+// LIST page cap; limit=0 used to mean unbounded.
+constexpr std::size_t kListLimitMax = 10000;
+}  // namespace
+
+void ObjectService::gc_stage_sessions() {
+  const auto now = now_ms();
+  std::vector<std::string> stale;
+  for (const auto& [key, sess] : stages_) {
+    if (!sess) {
+      stale.push_back(key);
+      continue;
+    }
+    std::int64_t last = 0;
+    {
+      std::lock_guard slock(sess->mu);
+      last = sess->last_used_ms;
+    }
+    if (now - last > kStageIdleMaxMs) stale.push_back(key);
+  }
+  for (const auto& key : stale) {
+    AIOS_LOG_WARN("closing idle stage session ", key.substr(0, key.find('\n')));
+    close_stage_session(key, /*remove_file=*/true);
+  }
 }
 
 ApiResult ObjectService::api_begin_put_staging(const std::string& oid,
                                               const LayoutRequest& layout_req,
                                               std::string& staging_abs_out) {
   staging_abs_out.clear();
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   ObjectLayout layout;
   std::string err;
   if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
@@ -1541,7 +1743,7 @@ ApiResult ObjectService::api_begin_put_staging(const std::string& oid,
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   return r;
 }
@@ -1597,9 +1799,21 @@ ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
     return fail("not_supported", "pipeline put not supported with compression");
   }
 
-  auto pl = std::make_shared<PutPipeline>();
   {
-    std::lock_guard lock(mu_);
+    // Checked before taking the oid guard: an open pipeline holds it, so a second
+    // begin would otherwise block until that pipeline finishes instead of failing.
+    ServiceLock lock(mu_);
+    if (pipelines_.count(oid)) {
+      return fail("conflict", "pipelined put already in progress for oid");
+    }
+  }
+  auto pl = std::make_shared<PutPipeline>();
+  // The pipeline peeks its seq at begin and installs it much later; holding the
+  // per-oid mutation guard until finish/abort keeps other writers from taking the
+  // same seq (and abort from tearing down a version it did not install).
+  pl->oid_guard = std::make_shared<MutatingOid>(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
+  {
+    ServiceLock lock(mu_);
     if (pipelines_.count(oid)) {
       return fail("conflict", "pipelined put already in progress for oid");
     }
@@ -1674,7 +1888,7 @@ ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
     if (!sess.begin(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key, cfg_.auth_skew_ms,
                     pl->placement.epoch, t.aios_path, pl->meta)) {
       {
-        std::lock_guard lock(mu_);
+        ServiceLock lock(mu_);
         pipelines_.erase(oid);
       }
       destroy_pipeline(pl, true);
@@ -1690,7 +1904,7 @@ ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
   staging_abs_out = pl->staging_path;
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = pl->placement;
   return r;
 }
@@ -1700,7 +1914,7 @@ ApiResult ObjectService::api_put_pipeline_data(const std::string& oid, std::uint
                                               PipelineDataKind kind) {
   std::shared_ptr<PutPipeline> pl;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto it = pipelines_.find(oid);
     if (it == pipelines_.end()) return fail("not_found", "no pipelined put for oid");
     pl = it->second;
@@ -1756,6 +1970,7 @@ ApiResult ObjectService::api_put_pipeline_data(const std::string& oid, std::uint
     std::string peer_err;
     std::mutex err_mu;
     std::vector<std::thread> workers;
+    ThreadJoiner joiner(workers);
     workers.reserve(npeers);
     for (std::size_t i = 0; i < npeers; ++i) {
       workers.emplace_back([&, i] {
@@ -1774,7 +1989,7 @@ ApiResult ObjectService::api_put_pipeline_data(const std::string& oid, std::uint
 
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = pl->placement;
   return r;
 }
@@ -1782,21 +1997,25 @@ ApiResult ObjectService::api_put_pipeline_data(const std::string& oid, std::uint
 ApiResult ObjectService::api_put_pipeline_abort(const std::string& oid) {
   std::shared_ptr<PutPipeline> pl;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto it = pipelines_.find(oid);
     if (it == pipelines_.end()) {
       ApiResult r;
       r.ok = true;
-      r.epoch = map_.epoch;
+      r.epoch = cur_epoch();
       return r;
     }
     pl = it->second;
     pipelines_.erase(it);
   }
-  destroy_pipeline(pl, true);
+  {
+    // Callers (pipeline_finish failure paths) may hold mu_; remote abort must not.
+    UnlockForRpc unlock(mu_);
+    destroy_pipeline(pl, true);
+  }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   return r;
 }
 
@@ -1806,7 +2025,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
     std::optional<std::uint32_t> expected_crc32c, const std::optional<std::string>& lock_token) {
   std::shared_ptr<PutPipeline> pl;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto it = pipelines_.find(oid);
     if (it == pipelines_.end()) return fail("not_found", "no pipelined put for oid");
     pl = it->second;
@@ -1850,7 +2069,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
   std::string err;
   ObjectStore* store = nullptr;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     if (auto lk = enforce_lock(oid, lock_token); !lk.ok) {
       api_put_pipeline_abort(oid);
       return lk;
@@ -1875,7 +2094,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
   apply_layout_attrs(put_attrs, layout);
   PreparedVersion pv;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     store = primary_store(placement, err);
     if (!store) {
       api_put_pipeline_abort(oid);
@@ -1896,6 +2115,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
   {
     std::lock_guard plock(pl->mu);
     std::vector<std::thread> workers;
+    ThreadJoiner joiner(workers);
     workers.reserve(pl->local_peers.size() + pl->remote_peers.size());
     for (std::size_t i = 0; i < pl->local_peers.size(); ++i) {
       workers.emplace_back([&, i] {
@@ -1951,7 +2171,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
   const int total_ok = 1 + peer_ok.load();
   if (total_ok < quorum_need(placement)) {
     {
-      std::lock_guard lock(mu_);
+      ServiceLock lock(mu_);
       store->abort_version(oid, seq, err);
       pipelines_.erase(oid);
       // replicate_* use UnlockForRpc and require mu_ to be held by the caller.
@@ -1971,7 +2191,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
 
   ApiResult r;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     if (!store->publish_tip(oid, seq, err)) {
       store->abort_version(oid, seq, err);
       pipelines_.erase(oid);
@@ -1985,7 +2205,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
     ops_.note_put(size);
 
     r.ok = true;
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     r.replicas = total_ok;
     r.placement = placement;
     r.attrs = put_attrs;
@@ -1998,6 +2218,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
     r.info->inline_body = false;
     r.info->fs_path = pv.fs_path;
   }
+  pl->oid_guard.reset();
   return r;
 }
 
@@ -2007,7 +2228,7 @@ ApiResult ObjectService::api_put_file(
     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
     std::optional<std::uint32_t> expected_crc32c, const LayoutRequest& layout_req,
     const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   ObjectLayout layout;
   std::string err;
   if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
@@ -2112,7 +2333,7 @@ ApiResult ObjectService::api_put_redirect(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds,
     const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -2142,8 +2363,11 @@ ApiResult ObjectService::api_put_range(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
     const std::optional<std::string>& lock_token) {
-  MutatingOid mutating(mutating_mu_, mutating_cv_, mutating_oids_, oid);
-  std::lock_guard lock(mu_);
+  // Range/append writes materialize the full new version on the primary and
+  // replicate the whole body (not a delta), so memory and network cost scale
+  // with object size rather than write size. Delta replication is out of scope.
+  MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
+  ServiceLock lock(mu_);
   ObjectLayout layout;
   std::string err;
   if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
@@ -2204,8 +2428,11 @@ ApiResult ObjectService::api_append(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
     const std::optional<std::string>& lock_token) {
-  MutatingOid mutating(mutating_mu_, mutating_cv_, mutating_oids_, oid);
-  std::lock_guard lock(mu_);
+  // Range/append writes materialize the full new version on the primary and
+  // replicate the whole body (not a delta), so memory and network cost scale
+  // with object size rather than write size. Delta replication is out of scope.
+  MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
+  ServiceLock lock(mu_);
   ObjectLayout layout;
   std::string err;
   if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
@@ -2277,7 +2504,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
                                 std::optional<std::uint64_t> end_inclusive,
                                 const std::vector<AttrPrecondition>& preds,
                                 std::optional<std::uint64_t> seq, bool meta_only) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   std::string err;
   ObjectStore* store = nullptr;
   std::optional<ObjectInfo> info;
@@ -2356,7 +2583,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     for (const auto& t : placement.acting_set) {
       if (t.node_id == cfg_.node_id) continue;
       auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                   cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+                                   cfg_.auth_skew_ms, cur_epoch(), t.aios_path, oid);
       if (!st.ok) continue;
       if (st.body.contains("attrs") && st.body["attrs"].is_object()) {
         for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
@@ -2378,7 +2605,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
       for (const auto& t : prev_p.acting_set) {
         if (t.node_id == cfg_.node_id) continue;
         auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                     cfg_.auth_skew_ms, map_.epoch, t.aios_path, oid);
+                                     cfg_.auth_skew_ms, cur_epoch(), t.aios_path, oid);
         if (!st.ok) continue;
         if (st.body.contains("attrs") && st.body["attrs"].is_object()) {
           for (auto it = st.body["attrs"].begin(); it != st.body["attrs"].end(); ++it) {
@@ -2400,7 +2627,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   if (!info->redirect_oid.empty()) {
     ApiResult r;
     r.ok = true;
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     r.info = info;
     r.attrs = attrs;
     r.placement = placement;
@@ -2416,7 +2643,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
       r.ok = false;
       r.code = "restoring";
       r.error = "archived object is on tape / restoring";
-      r.epoch = map_.epoch;
+      r.epoch = cur_epoch();
       r.info = info;
       r.attrs = attrs;
       r.placement = placement;
@@ -2431,7 +2658,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     if (meta_only) {
       ApiResult r;
       r.ok = true;
-      r.epoch = map_.epoch;
+      r.epoch = cur_epoch();
       r.info = info;
       r.attrs = attrs;
       r.placement = placement;
@@ -2458,7 +2685,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
         r.ok = false;
         r.code = "restoring";
         r.error = ferr;
-        r.epoch = map_.epoch;
+        r.epoch = cur_epoch();
         r.info = info;
         r.attrs = attrs;
         return r;
@@ -2467,7 +2694,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
     }
     ApiResult r;
     r.ok = true;
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     r.info = info;
     r.attrs = attrs;
     r.placement = placement;
@@ -2520,7 +2747,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
   if (meta_only) {
     ApiResult r;
     r.ok = true;
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     r.info = info;
     r.attrs = attrs;
     r.placement = placement;
@@ -2574,7 +2801,7 @@ ApiResult ObjectService::api_get(const std::string& oid, std::optional<std::uint
 
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.info = info;
   r.attrs = attrs;
   r.placement = placement;
@@ -2648,7 +2875,7 @@ ApiResult ObjectService::api_head(const std::string& oid,
 ApiResult ObjectService::api_del(const std::string& oid,
                                 const std::vector<AttrPrecondition>& preds,
                                 const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   std::string tip_class = cfg_.default_storage_class;
   {
     std::string err;
@@ -2686,36 +2913,111 @@ ApiResult ObjectService::api_del(const std::string& oid,
   return r;
 }
 
+namespace {
+
+// LIST cursors are opaque per-source continuation tokens: {source -> cursor}
+// (source = store path locally, node_id cluster-wide), base64-encoded. A store's
+// own cursor is shard-scoped, so a bare oid cannot resume it, and one shared
+// cursor across stores would skip entries of the stores that were still behind.
+// A source missing from a non-empty map is exhausted.
+constexpr const char* kListCursorTag = "c2:";
+
+bool decode_list_cursor(const std::string& cursor,
+                        std::unordered_map<std::string, std::string>& out, std::string& err) {
+  out.clear();
+  if (cursor.empty()) return true;
+  if (cursor.rfind(kListCursorTag, 0) != 0) {
+    err = "bad cursor";
+    return false;
+  }
+  std::vector<std::uint8_t> raw;
+  if (!base64_decode(cursor.substr(std::strlen(kListCursorTag)), raw, err)) return false;
+  try {
+    const auto j = nlohmann::json::parse(raw.begin(), raw.end());
+    if (!j.is_object()) {
+      err = "bad cursor";
+      return false;
+    }
+    for (auto it = j.begin(); it != j.end(); ++it) {
+      if (it.value().is_string()) out[it.key()] = it.value().get<std::string>();
+    }
+  } catch (const std::exception&) {
+    err = "bad cursor";
+    return false;
+  }
+  return true;
+}
+
+std::string encode_list_cursor(const std::unordered_map<std::string, std::string>& next) {
+  if (next.empty()) return {};
+  nlohmann::json j = nlohmann::json::object();
+  for (const auto& [k, v] : next) j[k] = v;
+  return kListCursorTag + base64_encode(j.dump());
+}
+
+void sort_dedupe_by_oid(std::vector<ObjectListEntry>& v) {
+  std::stable_sort(v.begin(), v.end(), [](const ObjectListEntry& a, const ObjectListEntry& b) {
+    return a.oid < b.oid;
+  });
+  std::vector<ObjectListEntry> uniq;
+  uniq.reserve(v.size());
+  for (auto& o : v) {
+    if (!uniq.empty() && uniq.back().oid == o.oid) continue;
+    uniq.push_back(std::move(o));
+  }
+  v.swap(uniq);
+}
+
+}  // namespace
+
 ApiResult ObjectService::api_list(const std::string& prefix, const std::string& attr_eq_key,
                                   const std::string& attr_eq_value, std::size_t limit,
                                   const std::string& cursor, bool include_attrs,
                                   bool cluster) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
+  if (limit == 0 || limit > kListLimitMax) limit = kListLimitMax;
 
+  // Every store contributes its own page (sized so the union fits `limit`);
+  // pages are sorted by oid and each store resumes from its own cursor, so no
+  // entry is dropped between pages.
   auto list_local = [&](const std::string& local_cursor) -> ApiResult {
     ApiResult lr;
     lr.ok = true;
-    lr.epoch = map_.epoch;
-    for (const auto& path : stores_.paths()) {
+    lr.epoch = cur_epoch();
+    std::unordered_map<std::string, std::string> cursors;
+    std::string cerr;
+    if (!decode_list_cursor(local_cursor, cursors, cerr)) return fail("bad_request", cerr);
+    const auto paths = stores_.paths();
+    const std::size_t per_store = std::max<std::size_t>(1, limit / std::max<std::size_t>(1, paths.size()));
+    std::unordered_map<std::string, std::string> next;
+    bool any_ok = false;
+    std::string first_err;
+    for (const auto& path : paths) {
       auto* store = stores_.get(path);
       if (!store) continue;
+      std::string store_cursor;
+      if (!local_cursor.empty()) {
+        auto it = cursors.find(path);
+        if (it == cursors.end()) continue;  // exhausted
+        store_cursor = it->second;
+      }
       std::string err;
-      auto part = store->list(prefix, attr_eq_key, attr_eq_value, limit, local_cursor,
+      auto part = store->list(prefix, attr_eq_key, attr_eq_value, per_store, store_cursor,
                               include_attrs, err);
-      if (!err.empty() && lr.list.objects.empty()) {
-        return fail("store_error", err);
+      if (!err.empty()) {
+        if (first_err.empty()) first_err = err;
+        continue;
       }
-      for (auto& o : part.objects) {
-        lr.list.objects.push_back(std::move(o));
-        if (limit > 0 && lr.list.objects.size() >= limit) {
-          lr.list.next_cursor = lr.list.objects.back().oid;
-          return lr;
-        }
-      }
+      any_ok = true;
+      if (!part.next_cursor.empty()) next[path] = part.next_cursor;
+      for (auto& o : part.objects) lr.list.objects.push_back(std::move(o));
     }
+    if (!any_ok && !first_err.empty()) return fail("store_error", first_err);
+    sort_dedupe_by_oid(lr.list.objects);
+    lr.list.next_cursor = encode_list_cursor(next);
     return lr;
   };
 
@@ -2725,59 +3027,61 @@ ApiResult ObjectService::api_list(const std::string& prefix, const std::string& 
     return lr;
   }
 
-  // Scatter-gather by unique node; merge sorted by oid; cursor = last oid.
-  std::vector<ObjectListEntry> merged;
-  std::unordered_set<std::string> seen_nodes;
-  for (const auto& t : map_.targets) {
-    if (!seen_nodes.insert(t.node_id).second) continue;
+  // Scatter-gather by unique node, each resuming from its own cursor.
+  std::unordered_map<std::string, std::string> cursors;
+  std::string cerr;
+  if (!decode_list_cursor(cursor, cursors, cerr)) return fail("bad_request", cerr);
+  std::vector<std::string> node_ids;
+  std::vector<std::string> node_addrs;
+  {
+    std::unordered_set<std::string> seen_nodes;
+    for (const auto& t : map_.targets) {
+      if (!seen_nodes.insert(t.node_id).second) continue;
+      node_ids.push_back(t.node_id);
+      node_addrs.push_back(t.addr);
+    }
+  }
+  const std::size_t per_node = std::max<std::size_t>(1, limit / std::max<std::size_t>(1, node_ids.size()));
+  std::unordered_map<std::string, std::string> next;
+  for (std::size_t i = 0; i < node_ids.size(); ++i) {
+    const auto& node_id = node_ids[i];
+    std::string node_cursor;
+    if (!cursor.empty()) {
+      auto it = cursors.find(node_id);
+      if (it == cursors.end()) continue;  // exhausted
+      node_cursor = it->second;
+    }
     ObjectListResult part;
-    if (t.node_id == cfg_.node_id) {
-      auto lr = list_local(cursor);
+    if (node_id == cfg_.node_id) {
+      auto lr = list_local(node_cursor);
       if (!lr.ok) return lr;
       part = std::move(lr.list);
     } else {
       UnlockForRpc unlock(mu_);
       auto remote =
-          object_list_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                             cfg_.auth_skew_ms, map_.epoch, prefix, attr_eq_key,
-                             attr_eq_value, limit, cursor, include_attrs);
+          object_list_remote(node_addrs[i], cfg_.node_id, advertise_, cfg_.cluster_key,
+                             cfg_.auth_skew_ms, cur_epoch(), prefix, attr_eq_key,
+                             attr_eq_value, per_node, node_cursor, include_attrs);
       if (!remote.ok) {
-        AIOS_LOG_WARN("cluster list from ", t.addr, " failed: ", remote.error);
+        AIOS_LOG_WARN("cluster list from ", node_addrs[i], " failed: ", remote.error);
         continue;
       }
       part = std::move(remote.list);
     }
+    if (!part.next_cursor.empty()) next[node_id] = part.next_cursor;
     for (auto& o : part.objects) {
-      if (!cursor.empty() && o.oid <= cursor) continue;
       if (!prefix.empty() && o.oid.rfind(prefix, 0) != 0) continue;
-      merged.push_back(std::move(o));
+      r.list.objects.push_back(std::move(o));
     }
   }
-  std::sort(merged.begin(), merged.end(),
-            [](const ObjectListEntry& a, const ObjectListEntry& b) { return a.oid < b.oid; });
-  // Dedup by oid (same object may appear if listed from multiple nodes incorrectly).
-  {
-    std::vector<ObjectListEntry> uniq;
-    for (auto& o : merged) {
-      if (!uniq.empty() && uniq.back().oid == o.oid) continue;
-      uniq.push_back(std::move(o));
-    }
-    merged.swap(uniq);
-  }
-  for (auto& o : merged) {
-    r.list.objects.push_back(std::move(o));
-    if (limit > 0 && r.list.objects.size() >= limit) {
-      r.list.next_cursor = r.list.objects.back().oid;
-      ops_.note_list();
-      return r;
-    }
-  }
+  sort_dedupe_by_oid(r.list.objects);
+  r.list.next_cursor = encode_list_cursor(next);
   ops_.note_list();
   return r;
 }
 
 ApiResult ObjectService::api_list_versions(const std::string& oid) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   ObjectStore* store = nullptr;
   std::string err;
@@ -2799,14 +3103,14 @@ ApiResult ObjectService::api_list_versions(const std::string& oid) {
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.versions = store->list_versions(oid, err);
   return r;
 }
 
 ApiResult ObjectService::api_purge_version(const std::string& oid, std::uint64_t seq,
                                            bool allow_tip) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -2817,6 +3121,7 @@ ApiResult ObjectService::api_purge_version(const std::string& oid, std::uint64_t
   if (!store) return fail("store_error", err);
   if (!store->purge_version(oid, seq, allow_tip, err)) return fail("store_error", err);
   // Best-effort fan-out.
+  UnlockForRpc unlock(mu_);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     const auto& t = placement.acting_set[i];
     if (t.node_id == cfg_.node_id) {
@@ -2828,12 +3133,12 @@ ApiResult ObjectService::api_purge_version(const std::string& oid, std::uint64_t
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   return r;
 }
 
 ApiResult ObjectService::api_trim_versions(const std::string& oid, int keep) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -2844,6 +3149,7 @@ ApiResult ObjectService::api_trim_versions(const std::string& oid, int keep) {
   if (!store) return fail("store_error", err);
   if (keep <= 0) keep = store->options().max_versions;
   if (!store->trim_versions(oid, keep, err)) return fail("store_error", err);
+  UnlockForRpc unlock(mu_);
   for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
     const auto& t = placement.acting_set[i];
     if (t.node_id == cfg_.node_id) {
@@ -2856,204 +3162,190 @@ ApiResult ObjectService::api_trim_versions(const std::string& oid, int keep) {
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   return r;
 }
 
 Frame ObjectService::handle_stage_begin(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
-  const auto seq = body.value("seq", static_cast<std::uint64_t>(0));
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
+  const auto seq = json_u64(body, "seq");
   if (oid.empty() || aios_path.empty() || seq == 0) {
-    return reply_err(map_.epoch, "bad_request", "oid/aios_path/seq required");
+    return reply_err(cur_epoch(), "bad_request", "oid/aios_path/seq required");
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
+  if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path), cfg_.node_id, aios_path)) {
+    return reply_err(cur_epoch(), "not_replica", "not in acting set for oid");
+  }
+  gc_stage_sessions();
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
   std::string path, err;
   if (!store->stage_path_for(oid, seq, path, err)) {
-    return reply_err(map_.epoch, "store_error", err);
-  }
-  if (!store->stage_truncate(path, err)) {
-    return reply_err(map_.epoch, "store_error", err);
+    return reply_err(cur_epoch(), "store_error", err);
   }
   const std::string key = stage_key(aios_path, oid, seq);
+  // Any earlier session for this version is superseded; close it before the
+  // truncate so an in-flight StageData on it cannot write into the new file.
   close_stage_session(key);
-  StageSession sess;
-  sess.path = path;
-  sess.fd = ::open(path.c_str(), O_RDWR, 0644);
-  if (sess.fd < 0) {
-    return reply_err(map_.epoch, "store_error",
+  if (!store->stage_truncate(path, err)) {
+    return reply_err(cur_epoch(), "store_error", err);
+  }
+  auto sess = std::make_shared<StageSession>();
+  sess->path = path;
+  sess->fd = ::open(path.c_str(), O_RDWR, 0644);
+  if (sess->fd < 0) {
+    return reply_err(cur_epoch(), "store_error",
                      std::string("open staging: ") + std::strerror(errno));
   }
-  stages_[key] = sess;
-  return reply_ok(map_.epoch);
+  sess->last_used_ms = now_ms();
+  stages_[key] = std::move(sess);
+  return reply_ok(cur_epoch());
 }
 
 Frame ObjectService::handle_stage_data(const Frame& req) {
   Frame errf;
-  if (!epoch_ok(req.body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = req.body.value("oid", "");
-  const std::string aios_path = req.body.value("aios_path", "");
-  const auto seq = req.body.value("seq", static_cast<std::uint64_t>(0));
-  const auto offset = req.body.value("offset", static_cast<std::uint64_t>(0));
+  if (!epoch_ok(json_u64(req.body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(req.body, "oid");
+  const std::string aios_path = json_str(req.body, "aios_path");
+  const auto seq = json_u64(req.body, "seq");
+  const auto offset = json_u64(req.body, "offset");
   if (oid.empty() || aios_path.empty() || seq == 0) {
-    return reply_err(map_.epoch, "bad_request", "oid/aios_path/seq required");
+    return reply_err(cur_epoch(), "bad_request", "oid/aios_path/seq required");
   }
 
-  int fd = -1;
-  std::string path;
+  std::shared_ptr<StageSession> sess;
   {
-    std::lock_guard lock(mu_);
-    const std::string key = stage_key(aios_path, oid, seq);
-    auto it = stages_.find(key);
-    if (it == stages_.end() || it->second.fd < 0) {
-      return reply_err(map_.epoch, "not_found", "no stage session; StageBegin required");
+    ServiceLock lock(mu_);
+    auto it = stages_.find(stage_key(aios_path, oid, seq));
+    if (it == stages_.end() || !it->second) {
+      return reply_err(cur_epoch(), "not_found", "no stage session; StageBegin required");
     }
-    if (offset != it->second.bytes) {
-      return reply_err(map_.epoch, "bad_request", "stage offset mismatch");
-    }
-    fd = it->second.fd;
-    path = it->second.path;
+    sess = it->second;
   }
 
   const auto* pdata = req.raw_data();
   const auto plen = req.raw_size();
   if (!pdata && plen > 0) {
-    return reply_err(map_.epoch, "store_error", "empty stage chunk");
+    return reply_err(cur_epoch(), "store_error", "empty stage chunk");
   }
 
-  // Disk I/O off mu_ so concurrent stage streams do not serialize on the service lock.
+  // Disk I/O off mu_ so concurrent stage streams do not serialize on the service
+  // lock; the session mutex keeps the fd alive and bytes/crc consistent with the
+  // data actually written even if StageBegin/Commit/Abort race on the same key.
+  std::lock_guard slock(sess->mu);
+  if (sess->closed || sess->fd < 0) {
+    return reply_err(cur_epoch(), "not_found", "stage session closed");
+  }
+  if (offset != sess->bytes) {
+    return reply_err(cur_epoch(), "bad_request", "stage offset mismatch");
+  }
   std::size_t done = 0;
   while (done < plen) {
-    const ssize_t n = ::pwrite(fd, pdata + done, plen - done,
+    const ssize_t n = ::pwrite(sess->fd, pdata + done, plen - done,
                                static_cast<off_t>(offset + done));
     if (n < 0) {
-      return reply_err(map_.epoch, "store_error",
+      return reply_err(cur_epoch(), "store_error",
                        std::string("pwrite: ") + std::strerror(errno));
     }
     if (n == 0) {
-      return reply_err(map_.epoch, "store_error", "pwrite short write");
+      return reply_err(cur_epoch(), "store_error", "pwrite short write");
     }
     done += static_cast<std::size_t>(n);
   }
-
-  {
-    std::lock_guard lock(mu_);
-    const std::string key = stage_key(aios_path, oid, seq);
-    auto it = stages_.find(key);
-    if (it != stages_.end()) {
-      it->second.crc = crc32c_update(it->second.crc, pdata, plen);
-      it->second.bytes += plen;
-    }
-  }
-  (void)path;
-  return reply_ok(map_.epoch);
+  sess->crc = crc32c_update(sess->crc, pdata, plen);
+  sess->bytes += plen;
+  sess->last_used_ms = now_ms();
+  return reply_ok(cur_epoch());
 }
 
 Frame ObjectService::handle_stage_commit(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string oid = body.value("oid", "");
-  const std::string aios_path = body.value("aios_path", "");
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
   if (oid.empty() || aios_path.empty()) {
-    return reply_err(map_.epoch, "bad_request", "oid/aios_path required");
+    return reply_err(cur_epoch(), "bad_request", "oid/aios_path required");
   }
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto* store = stores_.get(aios_path);
-  if (!store) return reply_err(map_.epoch, "store_error", "no local store");
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
 
   PreparedVersion v;
   v.oid = oid;
-  v.seq = body.value("seq", static_cast<std::uint64_t>(0));
-  v.prev_tip = body.value("base_seq", static_cast<std::uint64_t>(0));
-  v.size = body.value("size", static_cast<std::uint64_t>(0));
-  v.crc32c = body.value("crc32c", 0u);
+  v.seq = json_u64(body, "seq");
+  v.prev_tip = json_u64(body, "base_seq");
+  v.size = json_u64(body, "size");
+  v.crc32c = json_u32(body, "crc32c");
   v.inline_body = false;
-  v.is_delete = body.value("is_delete", false);
-  v.fs_path = body.value("fs_path", "");
-  v.redirect_oid = body.value("redirect", "");
-  if (v.seq == 0) return reply_err(map_.epoch, "bad_request", "seq required");
+  v.is_delete = json_bool(body, "is_delete", false);
+  v.fs_path.clear();  // never from the wire; set from place_staging_as_version below
+  v.redirect_oid = json_str(body, "redirect");
+  if (v.seq == 0) return reply_err(cur_epoch(), "bad_request", "seq required");
 
   const std::string key = stage_key(aios_path, oid, v.seq);
+  const bool needs_body = !v.is_delete && v.redirect_oid.empty() && v.size > 0;
   std::string staging;
   auto sit = stages_.find(key);
-  if (!v.is_delete && v.redirect_oid.empty() && v.size > 0) {
-    if (sit == stages_.end()) {
-      return reply_err(map_.epoch, "not_found", "no stage session; StageBegin required");
+  if (sit == stages_.end() && needs_body) {
+    return reply_err(cur_epoch(), "not_found", "no stage session; StageBegin required");
+  }
+  if (sit != stages_.end()) {
+    auto sess = sit->second;
+    stages_.erase(sit);
+    std::lock_guard slock(sess->mu);
+    sess->closed = true;
+    const bool consistent = sess->bytes == v.size && sess->crc == v.crc32c;
+    if (consistent && sess->fd >= 0 && cfg_.data_fsync) ::fsync(sess->fd);
+    if (sess->fd >= 0) {
+      ::close(sess->fd);
+      sess->fd = -1;
     }
-    if (sit->second.bytes != v.size) {
-      close_stage_session(key);
-      return reply_err(map_.epoch, "store_error", "stage size mismatch");
-    }
-    if (sit->second.crc != v.crc32c) {
-      close_stage_session(key);
-      return reply_err(map_.epoch, "store_error", "stage crc32c mismatch");
+    if (!consistent) {
+      std::error_code ec;
+      std::filesystem::remove(sess->path, ec);
+      return reply_err(cur_epoch(), "store_error",
+                       sess->bytes != v.size ? "stage size mismatch" : "stage crc32c mismatch");
     }
     v.crc_verified = true;
-    staging = sit->second.path;
-    if (sit->second.fd >= 0) {
-      if (cfg_.data_fsync) ::fsync(sit->second.fd);
-      ::close(sit->second.fd);
-      sit->second.fd = -1;
-    }
-    stages_.erase(sit);
-  } else if (sit != stages_.end()) {
-    if (sit->second.bytes != v.size) {
-      close_stage_session(key);
-      return reply_err(map_.epoch, "store_error", "stage size mismatch");
-    }
-    if (sit->second.crc != v.crc32c) {
-      close_stage_session(key);
-      return reply_err(map_.epoch, "store_error", "stage crc32c mismatch");
-    }
-    v.crc_verified = true;
-    staging = sit->second.path;
-    if (sit->second.fd >= 0) {
-      if (cfg_.data_fsync) ::fsync(sit->second.fd);
-      ::close(sit->second.fd);
-      sit->second.fd = -1;
-    }
-    stages_.erase(sit);
+    staging = sess->path;
   }
 
   auto attrs = parse_attrs_json(body);
   std::string err;
-  if (!v.is_delete && v.redirect_oid.empty() && v.size > 0) {
+  if (needs_body) {
     if (staging.empty() && !store->stage_path_for(oid, v.seq, staging, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
     std::string rel;
     if (!store->place_staging_as_version(oid, v.seq, staging, rel, err)) {
-      return reply_err(map_.epoch, "store_error", err);
+      return reply_err(cur_epoch(), "store_error", err);
     }
     v.fs_path = rel;
-  } else {
-    close_stage_session(key);
   }
   if (!store->install_version(v, nullptr, 0, attrs, err)) {
-    return reply_err(map_.epoch, "store_error", err);
+    return reply_err(cur_epoch(), "store_error", err);
   }
-  return reply_ok(map_.epoch);
+  return reply_ok(cur_epoch());
 }
 
 Frame ObjectService::handle_list(const nlohmann::json& body) {
   Frame errf;
-  if (!epoch_ok(body.value("epoch", static_cast<std::uint64_t>(0)), errf)) return errf;
-  const std::string prefix = body.value("prefix", "");
-  const std::string attr_key = body.value("attr_eq_key", "");
-  const std::string attr_val = body.value("attr_eq_value", "");
-  const std::size_t limit = body.value("limit", static_cast<std::size_t>(1000));
-  const std::string cursor = body.value("cursor", "");
-  const bool include_attrs = body.value("attrs", false);
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string prefix = json_str(body, "prefix");
+  const std::string attr_key = json_str(body, "attr_eq_key");
+  const std::string attr_val = json_str(body, "attr_eq_value");
+  const std::size_t limit = json_u64(body, "limit", 1000);
+  const std::string cursor = json_str(body, "cursor");
+  const bool include_attrs = json_bool(body, "attrs", false);
 
   // Local-only listing for scatter-gather leaves.
   auto r = api_list(prefix, attr_key, attr_val, limit, cursor, include_attrs,
                     /*cluster=*/false);
-  if (!r.ok) return reply_err(map_.epoch, r.code, r.error);
-  Frame f = reply_ok(map_.epoch);
+  if (!r.ok) return reply_err(cur_epoch(), r.code, r.error);
+  Frame f = reply_ok(cur_epoch());
   nlohmann::json arr = nlohmann::json::array();
   for (const auto& o : r.list.objects) {
     nlohmann::json jo = {{"oid", o.oid},
@@ -3089,7 +3381,7 @@ ApiResult ObjectService::api_prepare_put(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c,
     const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -3118,7 +3410,7 @@ ApiResult ObjectService::api_prepare_put_file(
     bool replace_attrs, const std::vector<AttrPrecondition>& preds,
     std::optional<std::uint32_t> expected_crc32c,
     const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -3145,7 +3437,7 @@ ApiResult ObjectService::api_prepare_put_file(
 ApiResult ObjectService::api_prepare_delete(const std::string& oid,
                                            const std::vector<AttrPrecondition>& preds,
                                            const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -3169,7 +3461,7 @@ ApiResult ObjectService::api_prepare_delete(const std::string& oid,
 }
 
 ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64_t seq) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -3189,14 +3481,14 @@ ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64
   signal_watch(oid, seq, op);
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   if (auto st = store->stat(oid, err)) r.info = st;
   return r;
 }
 
 ApiResult ObjectService::api_abort_prepared(const std::string& oid, std::uint64_t seq) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   auto placement = place(oid, map_, cfg_.default_storage_class);
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
   if (placement.acting_set[0].node_id != cfg_.node_id) {
@@ -3211,7 +3503,7 @@ ApiResult ObjectService::api_abort_prepared(const std::string& oid, std::uint64_
   replicate_abort(placement, oid, seq);
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   return r;
 }
@@ -3255,7 +3547,7 @@ ApiResult ObjectService::require_txn_primary(const std::string& txn_id,
 }
 
 ApiResult ObjectService::api_txn_begin() {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   // Pick a txn id whose primary is this node (coordinator = primary for txn/<id>).
   for (int attempt = 0; attempt < 64; ++attempt) {
     const auto id = make_txn_id();
@@ -3280,7 +3572,7 @@ ApiResult ObjectService::api_txn_begin() {
     }
     ApiResult r;
     r.ok = true;
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     r.placement = placement;
     r.attrs["txn_id"] = id;
     // Stash JSON in body for HTTP.
@@ -3292,7 +3584,7 @@ ApiResult ObjectService::api_txn_begin() {
 }
 
 ApiResult ObjectService::api_txn_get(const std::string& txn_id) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   nlohmann::json state;
   auto r = require_txn_primary(txn_id, state);
   if (!r.ok) return r;
@@ -3307,7 +3599,7 @@ ApiResult ObjectService::api_txn_prepare_put(
     std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
     const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c,
     const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
   if (!tr.ok) return tr;
@@ -3320,24 +3612,28 @@ ApiResult ObjectService::api_txn_prepare_put(
   put_attrs["aios.txn"] = txn_id;
 
   ApiResult prep;
-  if (placement.acting_set[0].node_id == cfg_.node_id) {
-    prep = api_prepare_put(oid, data, len, put_attrs, true, preds, expected_crc32c, lock_token);
-  } else {
-    auto remote = object_prepare_put_remote(
-        placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-        cfg_.auth_skew_ms, map_.epoch, placement.acting_set[0].aios_path, oid, data, len,
-        put_attrs, preds, lock_token);
-    if (!remote.ok) {
-      auto r = fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
-      r.placement = placement;
-      return r;
+  {
+    // Nested api_* / peer RPC run with mu_ fully released (see UnlockForRpc).
+    UnlockForRpc unlock(mu_);
+    if (placement.acting_set[0].node_id == cfg_.node_id) {
+      prep = api_prepare_put(oid, data, len, put_attrs, true, preds, expected_crc32c, lock_token);
+    } else {
+      auto remote = object_prepare_put_remote(
+          placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+          cfg_.auth_skew_ms, cur_epoch(), placement.acting_set[0].aios_path, oid, data, len,
+          put_attrs, preds, lock_token);
+      if (!remote.ok) {
+        auto r = fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
+        r.placement = placement;
+        return r;
+      }
+      prep.ok = true;
+      prep.epoch = remote.epoch;
+      prep.placement = placement;
+      prep.info = ObjectInfo{};
+      prep.info->oid = oid;
+      prep.info->seq = remote.body.value("seq", static_cast<std::uint64_t>(0));
     }
-    prep.ok = true;
-    prep.epoch = remote.epoch;
-    prep.placement = placement;
-    prep.info = ObjectInfo{};
-    prep.info->oid = oid;
-    prep.info->seq = remote.body.value("seq", static_cast<std::uint64_t>(0));
   }
   if (!prep.ok) return prep;
   if (!prep.info || prep.info->seq == 0) return fail("store_error", "prepare missing seq");
@@ -3351,11 +3647,12 @@ ApiResult ObjectService::api_txn_prepare_put(
   auto saved = save_txn_state(txn_id, state);
   if (!saved.ok) {
     // Best-effort abort prepared version.
+    UnlockForRpc unlock(mu_);
     if (placement.acting_set[0].node_id == cfg_.node_id) {
       api_abort_prepared(oid, prep.info->seq);
     } else {
       object_abort_prepared_remote(placement.acting_set[0].addr, cfg_.node_id, advertise_,
-                                   cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
+                                   cfg_.cluster_key, cfg_.auth_skew_ms, cur_epoch(),
                                    placement.acting_set[0].aios_path, oid, prep.info->seq);
     }
     return saved;
@@ -3370,7 +3667,7 @@ ApiResult ObjectService::api_txn_prepare_put_file(
     const std::unordered_map<std::string, std::string>& attrs,
     const std::vector<AttrPrecondition>& preds, std::optional<std::uint32_t> expected_crc32c,
     const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
   if (!tr.ok) return tr;
@@ -3386,8 +3683,12 @@ ApiResult ObjectService::api_txn_prepare_put_file(
   }
   std::unordered_map<std::string, std::string> put_attrs = attrs;
   put_attrs["aios.txn"] = txn_id;
-  auto prep = api_prepare_put_file(oid, staging_abs_path, size, crc32c_val, put_attrs, true,
-                                   preds, expected_crc32c, lock_token);
+  ApiResult prep;
+  {
+    UnlockForRpc unlock(mu_);
+    prep = api_prepare_put_file(oid, staging_abs_path, size, crc32c_val, put_attrs, true,
+                                preds, expected_crc32c, lock_token);
+  }
   if (!prep.ok) return prep;
   state["ops"].push_back({{"oid", oid},
                           {"seq", prep.info->seq},
@@ -3397,6 +3698,7 @@ ApiResult ObjectService::api_txn_prepare_put_file(
                           {"aios_path", placement.acting_set[0].aios_path}});
   auto saved = save_txn_state(txn_id, state);
   if (!saved.ok) {
+    UnlockForRpc unlock(mu_);
     api_abort_prepared(oid, prep.info->seq);
     return saved;
   }
@@ -3407,7 +3709,7 @@ ApiResult ObjectService::api_txn_prepare_put_file(
 ApiResult ObjectService::api_txn_prepare_delete(
     const std::string& txn_id, const std::string& oid,
     const std::vector<AttrPrecondition>& preds, const std::optional<std::string>& lock_token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
   if (!tr.ok) return tr;
@@ -3417,23 +3719,26 @@ ApiResult ObjectService::api_txn_prepare_delete(
   if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
 
   ApiResult prep;
-  if (placement.acting_set[0].node_id == cfg_.node_id) {
-    prep = api_prepare_delete(oid, preds, lock_token);
-  } else {
-    auto remote = object_prepare_delete_remote(
-        placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-        cfg_.auth_skew_ms, map_.epoch, placement.acting_set[0].aios_path, oid, preds,
-        lock_token);
-    if (!remote.ok) {
-      return fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
+  {
+    UnlockForRpc unlock(mu_);
+    if (placement.acting_set[0].node_id == cfg_.node_id) {
+      prep = api_prepare_delete(oid, preds, lock_token);
+    } else {
+      auto remote = object_prepare_delete_remote(
+          placement.acting_set[0].addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+          cfg_.auth_skew_ms, cur_epoch(), placement.acting_set[0].aios_path, oid, preds,
+          lock_token);
+      if (!remote.ok) {
+        return fail(remote.code.empty() ? "rpc_error" : remote.code, remote.error);
+      }
+      prep.ok = true;
+      prep.epoch = remote.epoch;
+      prep.placement = placement;
+      prep.info = ObjectInfo{};
+      prep.info->oid = oid;
+      prep.info->seq = remote.body.value("seq", static_cast<std::uint64_t>(0));
+      prep.info->is_delete = true;
     }
-    prep.ok = true;
-    prep.epoch = remote.epoch;
-    prep.placement = placement;
-    prep.info = ObjectInfo{};
-    prep.info->oid = oid;
-    prep.info->seq = remote.body.value("seq", static_cast<std::uint64_t>(0));
-    prep.info->is_delete = true;
   }
   if (!prep.ok) return prep;
   state["ops"].push_back({{"oid", oid},
@@ -3444,11 +3749,12 @@ ApiResult ObjectService::api_txn_prepare_delete(
                           {"aios_path", placement.acting_set[0].aios_path}});
   auto saved = save_txn_state(txn_id, state);
   if (!saved.ok) {
+    UnlockForRpc unlock(mu_);
     if (placement.acting_set[0].node_id == cfg_.node_id) {
       api_abort_prepared(oid, prep.info->seq);
     } else {
       object_abort_prepared_remote(placement.acting_set[0].addr, cfg_.node_id, advertise_,
-                                   cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
+                                   cfg_.cluster_key, cfg_.auth_skew_ms, cur_epoch(),
                                    placement.acting_set[0].aios_path, oid, prep.info->seq);
     }
     return saved;
@@ -3457,7 +3763,7 @@ ApiResult ObjectService::api_txn_prepare_delete(
 }
 
 ApiResult ObjectService::api_txn_commit(const std::string& txn_id) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
   if (!tr.ok) return tr;
@@ -3479,15 +3785,30 @@ ApiResult ObjectService::api_txn_commit(const std::string& txn_id) {
     const auto addr = op.value("addr", "");
     const auto aios_path = op.value("aios_path", "");
     bool ok = false;
-    if (primary == cfg_.node_id) {
-      ok = api_publish_version(oid, seq).ok;
-    } else {
-      ok = object_publish_prepared_remote(addr, cfg_.node_id, advertise_, cfg_.cluster_key,
-                                          cfg_.auth_skew_ms, map_.epoch, aios_path, oid, seq)
-               .ok;
+    {
+      // Publish/abort fan-out to primaries (local api_* or peer RPC) off mu_: two
+      // coordinators committing cross-node txns otherwise wait on each other.
+      UnlockForRpc unlock(mu_);
+      std::string perr;
+      if (primary == cfg_.node_id) {
+        auto pr = api_publish_version(oid, seq);
+        ok = pr.ok;
+        perr = pr.code + ": " + pr.error;
+      } else {
+        auto pr = object_publish_prepared_remote(addr, cfg_.node_id, advertise_,
+                                                 cfg_.cluster_key, cfg_.auth_skew_ms,
+                                                 cur_epoch(), aios_path, oid, seq);
+        ok = pr.ok;
+        perr = pr.code + ": " + pr.error;
+      }
+      if (!ok) {
+        AIOS_LOG_WARN("txn ", txn_id, " publish failed oid=", oid, " seq=", seq, " primary=",
+                      primary, ": ", perr);
+      }
     }
     if (!ok) {
       // Abort remaining (including failed) prepared versions.
+      UnlockForRpc unlock(mu_);
       for (const auto& mop : ops) {
         bool already = false;
         for (const auto& p : published) {
@@ -3503,7 +3824,7 @@ ApiResult ObjectService::api_txn_commit(const std::string& txn_id) {
           api_abort_prepared(moid, mseq);
         } else {
           object_abort_prepared_remote(mop.value("addr", ""), cfg_.node_id, advertise_,
-                                       cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
+                                       cfg_.cluster_key, cfg_.auth_skew_ms, cur_epoch(),
                                        mop.value("aios_path", ""), moid, mseq);
         }
       }
@@ -3526,21 +3847,24 @@ ApiResult ObjectService::api_txn_commit(const std::string& txn_id) {
 }
 
 ApiResult ObjectService::api_txn_abort(const std::string& txn_id) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   nlohmann::json state;
   auto tr = require_txn_primary(txn_id, state);
   if (!tr.ok) return tr;
   const auto cur = state.value("state", "");
   if (cur == "committed") return fail("conflict", "txn already committed");
-  for (const auto& op : state.value("ops", nlohmann::json::array())) {
-    const auto oid = op.value("oid", "");
-    const auto seq = op.value("seq", static_cast<std::uint64_t>(0));
-    if (op.value("primary", "") == cfg_.node_id) {
-      api_abort_prepared(oid, seq);
-    } else {
-      object_abort_prepared_remote(op.value("addr", ""), cfg_.node_id, advertise_,
-                                   cfg_.cluster_key, cfg_.auth_skew_ms, map_.epoch,
-                                   op.value("aios_path", ""), oid, seq);
+  {
+    UnlockForRpc unlock(mu_);
+    for (const auto& op : state.value("ops", nlohmann::json::array())) {
+      const auto oid = op.value("oid", "");
+      const auto seq = op.value("seq", static_cast<std::uint64_t>(0));
+      if (op.value("primary", "") == cfg_.node_id) {
+        api_abort_prepared(oid, seq);
+      } else {
+        object_abort_prepared_remote(op.value("addr", ""), cfg_.node_id, advertise_,
+                                     cfg_.cluster_key, cfg_.auth_skew_ms, cur_epoch(),
+                                     op.value("aios_path", ""), oid, seq);
+      }
     }
   }
   state["state"] = "aborted";
@@ -3552,7 +3876,7 @@ ApiResult ObjectService::api_txn_abort(const std::string& txn_id) {
 }
 
 ApiResult ObjectService::api_lock_acquire(const std::string& oid, int ttl_ms) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   Placement placement;
   auto pr = require_primary(oid, placement);
   if (!pr.ok) return pr;
@@ -3564,7 +3888,7 @@ ApiResult ObjectService::api_lock_acquire(const std::string& oid, int ttl_ms) {
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
   ops_.note_lock_acquire();
@@ -3573,7 +3897,7 @@ ApiResult ObjectService::api_lock_acquire(const std::string& oid, int ttl_ms) {
 
 ApiResult ObjectService::api_lock_renew(const std::string& oid, const std::string& token,
                                        int ttl_ms) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   Placement placement;
   auto pr = require_primary(oid, placement);
   if (!pr.ok) return pr;
@@ -3585,14 +3909,14 @@ ApiResult ObjectService::api_lock_renew(const std::string& oid, const std::strin
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
   return r;
 }
 
 ApiResult ObjectService::api_lock_release(const std::string& oid, const std::string& token) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   Placement placement;
   auto pr = require_primary(oid, placement);
   if (!pr.ok) return pr;
@@ -3603,13 +3927,13 @@ ApiResult ObjectService::api_lock_release(const std::string& oid, const std::str
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   return r;
 }
 
 ApiResult ObjectService::api_lock_stat(const std::string& oid) {
-  std::lock_guard lock(mu_);
+  ServiceLock lock(mu_);
   Placement placement;
   auto pr = require_primary(oid, placement);
   if (!pr.ok) return pr;
@@ -3617,7 +3941,7 @@ ApiResult ObjectService::api_lock_stat(const std::string& oid) {
   if (!locks_.stat(oid, expires)) return fail("not_found", "lock not held");
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.json_body = {{"oid", oid}, {"held", true}, {"expires_ms", expires}};
   return r;
@@ -3627,7 +3951,7 @@ ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t aft
                                       int timeout_ms) {
   Placement placement;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto pr = require_primary(oid, placement);
     if (!pr.ok) return pr;
     // Immediate event if tip already advanced past after_seq.
@@ -3638,7 +3962,7 @@ ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t aft
       if (st && st->seq > after_seq) {
         ApiResult r;
         r.ok = true;
-        r.epoch = map_.epoch;
+        r.epoch = cur_epoch();
         r.placement = placement;
         WatchEvent ev;
         ev.oid = oid;
@@ -3658,13 +3982,13 @@ ApiResult ObjectService::api_watch_oid(const std::string& oid, std::uint64_t aft
     ApiResult r;
     r.ok = true;
     r.code = "timeout";
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     r.placement = placement;
     return r;
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.watch_event = ev;
   ops_.note_watch();
@@ -3678,12 +4002,12 @@ ApiResult ObjectService::api_watch_prefix(const std::string& prefix, int timeout
     ApiResult r;
     r.ok = true;
     r.code = "timeout";
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     return r;
   }
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.watch_events = std::move(events);
   return r;
 }
@@ -3696,7 +4020,7 @@ ApiResult ObjectService::load_pubsub_meta(const std::string& topic, DeliveryMode
   if (!gr.data || gr.data->empty()) return fail("bad_request", "empty pubsub meta");
   try {
     const auto j = nlohmann::json::parse(gr.data->begin(), gr.data->end());
-    const auto mode_s = j.value("delivery", "");
+    const auto mode_s = json_str(j, "delivery");
     auto mode = parse_delivery_mode(mode_s);
     if (!mode || *mode != DeliveryMode::Durable) {
       return fail("bad_request", "invalid durable pubsub meta");
@@ -3706,7 +4030,7 @@ ApiResult ObjectService::load_pubsub_meta(const std::string& topic, DeliveryMode
     if (next_id_out == 0) next_id_out = 1;
     ApiResult ok;
     ok.ok = true;
-    ok.epoch = map_.epoch;
+    ok.epoch = cur_epoch();
     return ok;
   } catch (...) {
     return fail("bad_request", "invalid pubsub meta json");
@@ -3728,7 +4052,7 @@ ApiResult ObjectService::ensure_pubsub_topic(const std::string& topic,
   auto ok_res = [&] {
     ApiResult r;
     r.ok = true;
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     return r;
   };
 
@@ -3776,7 +4100,7 @@ ApiResult ObjectService::api_pubsub_create(const std::string& topic, DeliveryMod
   if (topic.empty()) return fail("bad_request", "empty topic");
   Placement placement;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto pr = require_primary(pubsub_meta_oid(topic), placement);
     if (!pr.ok) return pr;
   }
@@ -3816,7 +4140,7 @@ ApiResult ObjectService::api_pubsub_create(const std::string& topic, DeliveryMod
   pubsub_.stat(topic, st);
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.json_body = {{"topic", topic},
                  {"delivery", delivery_mode_name(st.delivery)},
@@ -3830,7 +4154,7 @@ ApiResult ObjectService::api_pubsub_stat(const std::string& topic) {
   if (topic.empty()) return fail("bad_request", "empty topic");
   Placement placement;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto pr = require_primary(pubsub_meta_oid(topic), placement);
     if (!pr.ok) return pr;
   }
@@ -3851,7 +4175,7 @@ ApiResult ObjectService::api_pubsub_stat(const std::string& topic) {
 
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.json_body = {{"topic", topic},
                  {"delivery", delivery_mode_name(st.delivery)},
@@ -3872,7 +4196,7 @@ ApiResult ObjectService::api_pubsub_publish(const std::string& topic, const std:
 
   Placement placement;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto pr = require_primary(pubsub_meta_oid(topic), placement);
     if (!pr.ok) return pr;
   }
@@ -3911,7 +4235,7 @@ ApiResult ObjectService::api_pubsub_publish(const std::string& topic, const std:
 
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.json_body = {{"topic", topic},
                  {"id", msg.id},
@@ -3926,7 +4250,7 @@ ApiResult ObjectService::api_pubsub_subscribe(const std::string& topic, std::uin
   if (topic.empty()) return fail("bad_request", "empty topic");
   Placement placement;
   {
-    std::lock_guard lock(mu_);
+    ServiceLock lock(mu_);
     auto pr = require_primary(pubsub_meta_oid(topic), placement);
     if (!pr.ok) return pr;
   }
@@ -3954,9 +4278,17 @@ ApiResult ObjectService::api_pubsub_subscribe(const std::string& topic, std::uin
 
   std::vector<PubMessage> messages;
 
-  // Durable catch-up from object store.
+  // Durable catch-up from object store, bounded per call: a subscriber starting at
+  // after_id=0 on a long topic would otherwise load every message into memory.
+  // The reply carries next_after_id so the client can page through the rest.
+  constexpr std::uint64_t kPubsubCatchupMax = 1000;
   if (known && st.delivery == DeliveryMode::Durable) {
-    const std::uint64_t tip = st.next_id > 0 ? st.next_id - 1 : 0;
+    std::uint64_t tip = st.next_id > 0 ? st.next_id - 1 : 0;
+    bool truncated = false;
+    if (tip > after_id && tip - after_id > kPubsubCatchupMax) {
+      tip = after_id + kPubsubCatchupMax;
+      truncated = true;
+    }
     for (std::uint64_t id = after_id + 1; id <= tip; ++id) {
       auto gr = api_get(pubsub_msg_oid(topic, id), std::nullopt, std::nullopt, {});
       if (!gr.ok) {
@@ -3979,10 +4311,10 @@ ApiResult ObjectService::api_pubsub_subscribe(const std::string& topic, std::uin
     if (!messages.empty()) {
       ApiResult r;
       r.ok = true;
-      r.epoch = map_.epoch;
+      r.epoch = cur_epoch();
       r.placement = placement;
       r.pub_messages = std::move(messages);
-      r.json_body = {{"topic", topic}};
+      r.json_body = {{"topic", topic}, {"next_after_id", tip}, {"more", truncated}};
       return r;
     }
   }
@@ -3992,14 +4324,14 @@ ApiResult ObjectService::api_pubsub_subscribe(const std::string& topic, std::uin
     ApiResult r;
     r.ok = true;
     r.code = "timeout";
-    r.epoch = map_.epoch;
+    r.epoch = cur_epoch();
     r.placement = placement;
     return r;
   }
 
   ApiResult r;
   r.ok = true;
-  r.epoch = map_.epoch;
+  r.epoch = cur_epoch();
   r.placement = placement;
   r.pub_messages = std::move(messages);
   r.json_body = {{"topic", topic}};

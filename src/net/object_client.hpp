@@ -41,6 +41,8 @@ ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& loca
 
 // Drop idle pooled sockets (call before tearing down peer TcpServers / in tests).
 void object_rpc_pool_clear();
+// Per-RPC progress deadline for every object RPC (default 30 s; <=0 restores it).
+void object_rpc_set_timeout_ms(int ms);
 
 ObjectRpcResult object_put_range_remote(
     const std::string& peer_addr, const std::string& local_node_id,
@@ -210,11 +212,13 @@ ObjectRpcResult object_del_remote(const std::string& peer_addr,
                                   std::uint64_t epoch, const std::string& aios_path,
                                   const std::string& oid, bool as_replica);
 
+// include_deleted=true reports a delete-marker tip as ok with {"deleted": true,
+// "seq": <marker seq>} instead of not_found (repair needs the raw tip).
 ObjectRpcResult object_stat_remote(const std::string& peer_addr,
                                    const std::string& local_node_id,
                                    const std::string& local_listen,
                                    const std::string& cluster_key, int auth_skew_ms,
                                    std::uint64_t epoch, const std::string& aios_path,
-                                   const std::string& oid);
+                                   const std::string& oid, bool include_deleted = false);
 
 }  // namespace aios

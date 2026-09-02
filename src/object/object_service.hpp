@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -225,6 +226,7 @@ class ObjectService {
   Frame reply_ok(std::uint64_t epoch) const;
   Frame reply_err(std::uint64_t epoch, const std::string& code,
                   const std::string& error) const;
+  Frame dispatch(const Frame& req);
   Frame handle_put(const Frame& req);
   Frame handle_put_range(const Frame& req);
   Frame handle_get(const nlohmann::json& body);
@@ -307,18 +309,31 @@ class ObjectService {
   ApiResult ensure_pubsub_topic(const std::string& topic, std::optional<DeliveryMode> mode,
                                 std::size_t capacity, DeliveryMode& mode_out);
 
+  // Replica staging session. `mu` serializes pwrite + bytes/crc updates with
+  // close, so a concurrent StageBegin/Commit/Abort on the same key can never
+  // close the fd underneath an in-flight write.
   struct StageSession {
+    std::mutex mu;
     std::string path;
     int fd{-1};
     std::uint32_t crc{0};
     std::uint64_t bytes{0};
+    std::int64_t last_used_ms{0};
+    bool closed{false};
   };
   static std::string stage_key(const std::string& aios_path, const std::string& oid,
                                std::uint64_t seq);
-  void close_stage_session(const std::string& key);
+  // Caller holds mu_. Closes the fd (waiting for an in-flight chunk) and drops
+  // the session; remove_file also unlinks the staging file.
+  void close_stage_session(const std::string& key, bool remove_file = false);
+  // Caller holds mu_. Close sessions idle longer than kStageIdleMaxMs.
+  void gc_stage_sessions();
 
   struct PutPipeline {
     std::mutex mu;
+    // Per-oid mutation guard held from begin to finish/abort so a concurrent
+    // regular PUT cannot take the seq this pipeline peeked (type-erased MutatingOid).
+    std::shared_ptr<void> oid_guard;
     std::string oid;
     std::string staging_path;
     int fd{-1};
@@ -342,10 +357,18 @@ class ObjectService {
   };
   void destroy_pipeline(const std::shared_ptr<PutPipeline>& pl, bool abort_peers);
 
+  // Lock-free mirror of map_.epoch for reply/error paths that run without mu_
+  // (a plain map_.epoch read there races update_cluster_map). Refreshed whenever
+  // the map is published or epoch_ok takes the slow path under the lock.
+  std::uint64_t cur_epoch() const { return epoch_.load(std::memory_order_acquire); }
+
   Config cfg_;
   ClusterMap& map_;
   LocalStores& stores_;
   std::string advertise_;
+  mutable std::atomic<std::uint64_t> epoch_{0};
+  // Recursive: api_* nests (txn → prepare → install). Always take it through
+  // ServiceLock (object_service.cpp) so UnlockForRpc can release the full depth.
   mutable std::recursive_mutex mu_;
   std::mutex mutating_mu_;
   std::condition_variable mutating_cv_;
@@ -355,7 +378,7 @@ class ObjectService {
   WatchHub watches_;
   TopicHub pubsub_;
   // Keep staging FDs open across ObjectStageData chunks (CRC accumulated here).
-  std::unordered_map<std::string, StageSession> stages_;
+  std::unordered_map<std::string, std::shared_ptr<StageSession>> stages_;
   // At most one in-flight pipelined PUT per oid (serializes seq reservation).
   std::unordered_map<std::string, std::shared_ptr<PutPipeline>> pipelines_;
 };

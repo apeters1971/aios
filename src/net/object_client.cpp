@@ -11,6 +11,7 @@
 #include <boost/asio.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -25,6 +26,22 @@
 
 namespace aios {
 namespace {
+
+// Per-RPC progress deadline (each poll on the socket, not the whole transfer).
+// Bounds a peer that accepts but never answers so replica fan-out threads and
+// HTTP workers cannot pin forever.
+constexpr int kRpcTimeoutDefaultMs = 30000;
+std::atomic<int> g_rpc_timeout_ms{kRpcTimeoutDefaultMs};
+int rpc_timeout_ms() { return g_rpc_timeout_ms.load(std::memory_order_relaxed); }
+// Idle pooled sockets are recycled before the server's idle_timeout_ms (60 s)
+// closes them from the other side.
+constexpr std::int64_t kPoolIdleTtlMs = 30000;
+
+// Raw trailers are outside the HMAC; bind them to the signed envelope.
+void sign_raw_trailer(nlohmann::json& body, const std::uint8_t* data, std::size_t len) {
+  if (!data || len == 0) return;
+  body["sha256"] = sha256_hex(std::string(reinterpret_cast<const char*>(data), len));
+}
 
 ObjectRpcResult parse_object_reply(Frame& reply) {
   ObjectRpcResult result;
@@ -69,7 +86,7 @@ ObjectRpcResult parse_object_reply(Frame& reply) {
       e.redirect_oid = o.value("redirect_oid", "");
       if (o.contains("attrs") && o["attrs"].is_object()) {
         for (auto it = o["attrs"].begin(); it != o["attrs"].end(); ++it) {
-          e.attrs[it.key()] = it.value().get<std::string>();
+          if (it.value().is_string()) e.attrs[it.key()] = it.value().get<std::string>();
         }
       }
       if (!e.oid.empty()) result.list.objects.push_back(std::move(e));
@@ -109,13 +126,14 @@ class ObjectRpcConn {
     hello.type = MsgType::Hello;
     hello.body = {{"node_id", local_node_id}, {"listen", local_listen}};
     auth_sign(hello.body, MsgType::Hello, cluster_key);
-    if (!write_frame(sock_, hello, err, ec)) {
+    if (!write_frame(sock_, hello, err, ec, rpc_timeout_ms())) {
       err = "hello write: " + err;
       close();
       return false;
     }
     Frame hello_reply;
-    if (!read_frame(sock_, hello_reply, err, ec) || hello_reply.type != MsgType::Hello) {
+    if (!read_frame(sock_, hello_reply, err, ec, rpc_timeout_ms()) ||
+        hello_reply.type != MsgType::Hello) {
       err = "hello read: " + err;
       close();
       return false;
@@ -126,36 +144,50 @@ class ObjectRpcConn {
       return false;
     }
     open_ = true;
+    reused_ = false;
+    touch();
     return true;
   }
 
-  ObjectRpcResult exchange(MsgType req_type, nlohmann::json req_body,
-                          std::vector<std::uint8_t> raw, const std::string& cluster_key,
+  // Signing mutates the envelope, so the JSON is copied; the raw trailer is
+  // referenced (raw_ext) so a retry does not duplicate a multi-MiB body.
+  ObjectRpcResult exchange(MsgType req_type, const nlohmann::json& req_body,
+                          const std::vector<std::uint8_t>& raw, const std::string& cluster_key,
                           int auth_skew_ms) {
     ObjectRpcResult result;
+    stale_failure_ = false;
     if (!open_ || !sock_.is_open()) {
       result.error = "not connected";
       result.code = "io";
+      stale_failure_ = true;
       return result;
     }
     std::string err;
     boost::system::error_code ec;
     Frame req;
     req.type = req_type;
-    req.body = std::move(req_body);
-    req.raw = std::move(raw);
+    req.body = req_body;
+    req.raw_ext = raw.data();
+    req.raw_ext_len = raw.size();
     if (!req.raw_empty()) req.flags |= kFlagRawBody;
     auth_sign(req.body, req_type, cluster_key);
-    if (!write_frame(sock_, req, err, ec)) {
+    if (!write_frame(sock_, req, err, ec, rpc_timeout_ms())) {
       result.error = "request write: " + err;
       result.code = "io";
+      stale_failure_ = ec != boost::asio::error::timed_out;
       close();
       return result;
     }
     Frame reply;
-    if (!read_frame(sock_, reply, err, ec) || reply.type != MsgType::ObjectReply) {
+    if (!read_frame(sock_, reply, err, ec, rpc_timeout_ms()) ||
+        reply.type != MsgType::ObjectReply) {
       result.error = "reply read: " + err;
       result.code = "io";
+      // EOF/reset before any reply byte means the server never took the request
+      // (idle close raced our send, or it restarted) — safe to retry on a new socket.
+      stale_failure_ = ec == boost::asio::error::eof ||
+                       ec == boost::asio::error::connection_reset ||
+                       ec == boost::asio::error::broken_pipe;
       close();
       return result;
     }
@@ -165,11 +197,19 @@ class ObjectRpcConn {
       close();
       return result;
     }
+    touch();
     return parse_object_reply(reply);
   }
 
   tcp::socket& socket() { return sock_; }
   bool is_open() const { return open_ && sock_.is_open(); }
+  bool reused() const { return reused_; }
+  void mark_reused() { reused_ = true; }
+  // True when the last exchange() failed in a way that indicates a dead pooled
+  // socket rather than a server-side error or timeout.
+  bool stale_failure() const { return stale_failure_; }
+  void touch() { last_used_ms_ = now_ms(); }
+  bool idle_expired() const { return now_ms() - last_used_ms_ > kPoolIdleTtlMs; }
 
   void close() {
     open_ = false;
@@ -188,6 +228,9 @@ class ObjectRpcConn {
   boost::asio::io_context ioc_;
   tcp::socket sock_{ioc_};
   bool open_{false};
+  bool reused_{false};
+  bool stale_failure_{false};
+  std::int64_t last_used_ms_{0};
 };
 
 class ObjectRpcPool {
@@ -202,6 +245,7 @@ class ObjectRpcPool {
                                          const std::string& local_listen,
                                          const std::string& cluster_key, int auth_skew_ms,
                                          std::string& err) {
+    std::vector<std::unique_ptr<ObjectRpcConn>> expired;
     {
       std::lock_guard<std::mutex> lock(mu_);
       auto it = idle_.find(peer_addr);
@@ -209,10 +253,17 @@ class ObjectRpcPool {
         while (!it->second.empty()) {
           auto conn = std::move(it->second.back());
           it->second.pop_back();
-          if (conn && conn->is_open()) return conn;
+          if (!conn || !conn->is_open()) continue;
+          if (conn->idle_expired()) {
+            expired.push_back(std::move(conn));
+            continue;
+          }
+          conn->mark_reused();
+          return conn;
         }
       }
     }
+    for (auto& c : expired) c->close();
     auto conn = std::make_unique<ObjectRpcConn>();
     if (!conn->open(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms, err)) {
       return nullptr;
@@ -226,6 +277,7 @@ class ObjectRpcPool {
       conn->close();
       return;
     }
+    conn->touch();
     std::lock_guard<std::mutex> lock(mu_);
     auto& bucket = idle_[peer_addr];
     if (bucket.size() >= kMaxIdlePerPeer) {
@@ -260,6 +312,10 @@ bool rpc_transport_failed(const ObjectRpcResult& r) {
 
 }  // namespace
 
+void object_rpc_set_timeout_ms(int ms) {
+  g_rpc_timeout_ms.store(ms > 0 ? ms : kRpcTimeoutDefaultMs, std::memory_order_relaxed);
+}
+
 void object_rpc_pool_clear() { ObjectRpcPool::instance().clear(); }
 
 ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& local_node_id,
@@ -278,8 +334,22 @@ ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& loca
                                                   : "io";
     return result;
   }
-  result = conn->exchange(req_type, std::move(req_body), std::move(raw), cluster_key,
-                          auth_skew_ms);
+  const bool pooled = conn->reused();
+  sign_raw_trailer(req_body, raw.data(), raw.size());
+  result = conn->exchange(req_type, req_body, raw, cluster_key, auth_skew_ms);
+  if (!result.ok && result.code == "io" && pooled && conn->stale_failure()) {
+    // The pooled socket had been closed by the peer (idle timeout / restart) and
+    // the request was never read; retry exactly once on a fresh connection.
+    conn->close();
+    conn = ObjectRpcPool::instance().acquire(peer_addr, local_node_id, local_listen,
+                                             cluster_key, auth_skew_ms, err);
+    if (!conn) {
+      result.error = err;
+      result.code = "io";
+      return result;
+    }
+    result = conn->exchange(req_type, req_body, raw, cluster_key, auth_skew_ms);
+  }
   ObjectRpcPool::instance().release(peer_addr, std::move(conn), !rpc_transport_failed(result));
   return result;
 }
@@ -347,12 +417,13 @@ ObjectRpcResult object_stat_remote(const std::string& peer_addr,
                                    const std::string& local_listen,
                                    const std::string& cluster_key, int auth_skew_ms,
                                    std::uint64_t epoch, const std::string& aios_path,
-                                   const std::string& oid) {
+                                   const std::string& oid, bool include_deleted) {
   nlohmann::json body = {
       {"epoch", epoch},
       {"aios_path", aios_path},
       {"oid", oid},
   };
+  if (include_deleted) body["include_deleted"] = true;
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
                     MsgType::ObjectStat, std::move(body));
 }
@@ -398,7 +469,6 @@ ObjectRpcResult object_install_remote(
       {"size", v.size},
       {"crc32c", v.crc32c},
       {"inline_body", v.inline_body},
-      {"fs_path", v.fs_path},
       {"is_delete", v.is_delete},
       {"attrs", attrs_j},
       {"role", "replica"},
@@ -474,16 +544,17 @@ ObjectRpcResult rpc_one(tcp::socket& sock, MsgType type, nlohmann::json body,
   Frame req;
   req.type = type;
   req.body = std::move(body);
+  sign_raw_trailer(req.body, raw.data(), raw.size());
   req.raw = std::move(raw);
   if (!req.raw_empty()) req.flags |= kFlagRawBody;
   auth_sign(req.body, type, cluster_key);
-  if (!write_frame(sock, req, err, ec)) {
+  if (!write_frame(sock, req, err, ec, rpc_timeout_ms())) {
     result.error = "write: " + err;
     result.code = "io";
     return result;
   }
   Frame reply;
-  if (!read_frame(sock, reply, err, ec) || reply.type != MsgType::ObjectReply) {
+  if (!read_frame(sock, reply, err, ec, rpc_timeout_ms()) || reply.type != MsgType::ObjectReply) {
     result.error = "reply: " + err;
     result.code = "io";
     return result;
@@ -510,17 +581,18 @@ ObjectRpcResult rpc_one_ext(tcp::socket& sock, MsgType type, nlohmann::json body
   Frame req;
   req.type = type;
   req.body = std::move(body);
+  sign_raw_trailer(req.body, raw, raw_len);
   req.raw_ext = raw;
   req.raw_ext_len = raw_len;
   if (!req.raw_empty()) req.flags |= kFlagRawBody;
   auth_sign(req.body, type, cluster_key);
-  if (!write_frame(sock, req, err, ec)) {
+  if (!write_frame(sock, req, err, ec, rpc_timeout_ms())) {
     result.error = "write: " + err;
     result.code = "io";
     return result;
   }
   Frame reply;
-  if (!read_frame(sock, reply, err, ec) || reply.type != MsgType::ObjectReply) {
+  if (!read_frame(sock, reply, err, ec, rpc_timeout_ms()) || reply.type != MsgType::ObjectReply) {
     result.error = "reply: " + err;
     result.code = "io";
     return result;
@@ -555,7 +627,6 @@ ObjectRpcResult stage_begin_commit_envelope(
       {"size", v.size},
       {"crc32c", v.crc32c},
       {"inline_body", false},
-      {"fs_path", v.fs_path},
       {"is_delete", v.is_delete},
       {"attrs", attrs_j},
       {"role", "replica"},
@@ -955,7 +1026,6 @@ bool RemoteStageSession::begin(const std::string& peer_addr, const std::string& 
   auth_skew_ms_ = auth_skew_ms;
   epoch_ = epoch;
   meta_ = v;
-  meta_.fs_path = v.fs_path;
   impl_->local_node_id = local_node_id;
   impl_->local_listen = local_listen;
   std::string err;
@@ -975,7 +1045,6 @@ bool RemoteStageSession::begin(const std::string& peer_addr, const std::string& 
       {"size", v.size},
       {"crc32c", v.crc32c},
       {"inline_body", false},
-      {"fs_path", v.fs_path},
       {"is_delete", v.is_delete},
       {"role", "replica"},
   };
@@ -1038,7 +1107,6 @@ bool RemoteStageSession::commit(const PreparedVersion& v,
       {"size", v.size},
       {"crc32c", v.crc32c},
       {"inline_body", false},
-      {"fs_path", v.fs_path},
       {"is_delete", v.is_delete},
       {"attrs", attrs_j},
       {"role", "replica"},

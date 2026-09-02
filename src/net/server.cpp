@@ -4,22 +4,99 @@
 #include "util/log.hpp"
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <thread>
 #include <vector>
 
 namespace aios {
+namespace {
+
+// Timed transfers go through the native fd: asio's synchronous ops ignore
+// SO_RCVTIMEO (they poll(-1) on EWOULDBLOCK), so poll() the fd ourselves.
+// Works whether asio left the fd blocking or non-blocking.
+bool wait_fd(int fd, short events, int timeout_ms, boost::system::error_code& ec) {
+  for (;;) {
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = events;
+    const int r = ::poll(&pfd, 1, timeout_ms);
+    if (r > 0) return true;
+    if (r == 0) {
+      ec = boost::asio::error::timed_out;
+      return false;
+    }
+    if (errno == EINTR) continue;
+    ec = boost::system::error_code(errno, boost::system::system_category());
+    return false;
+  }
+}
+
+bool recv_exact_timed(tcp::socket& sock, std::uint8_t* p, std::size_t n, int timeout_ms,
+                      boost::system::error_code& ec) {
+  const int fd = static_cast<int>(sock.native_handle());
+  while (n > 0) {
+    if (!wait_fd(fd, POLLIN, timeout_ms, ec)) return false;
+    const ssize_t r = ::recv(fd, p, n, 0);
+    if (r > 0) {
+      p += r;
+      n -= static_cast<std::size_t>(r);
+      continue;
+    }
+    if (r == 0) {
+      ec = boost::asio::error::eof;
+      return false;
+    }
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+    ec = boost::system::error_code(errno, boost::system::system_category());
+    return false;
+  }
+  return true;
+}
+
+bool send_all_timed(tcp::socket& sock, const std::uint8_t* p, std::size_t n, int timeout_ms,
+                    boost::system::error_code& ec) {
+  const int fd = static_cast<int>(sock.native_handle());
+  while (n > 0) {
+    if (!wait_fd(fd, POLLOUT, timeout_ms, ec)) return false;
+#ifdef MSG_NOSIGNAL
+    const ssize_t r = ::send(fd, p, n, MSG_NOSIGNAL);
+#else
+    const ssize_t r = ::send(fd, p, n, 0);
+#endif
+    if (r >= 0) {
+      p += r;
+      n -= static_cast<std::size_t>(r);
+      continue;
+    }
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+    ec = boost::system::error_code(errno, boost::system::system_category());
+    return false;
+  }
+  return true;
+}
+
+bool read_exact(tcp::socket& sock, std::uint8_t* p, std::size_t n, int timeout_ms,
+                boost::system::error_code& ec) {
+  if (timeout_ms < 0) {
+    boost::asio::read(sock, boost::asio::buffer(p, n), ec);
+    return !ec;
+  }
+  return recv_exact_timed(sock, p, n, timeout_ms, ec);
+}
+
+}  // namespace
 
 bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
-                boost::system::error_code& ec) {
+                boost::system::error_code& ec, int timeout_ms) {
   out = Frame{};
   std::array<std::uint8_t, kHeaderSize> header{};
-  boost::asio::read(sock, boost::asio::buffer(header), ec);
-  if (ec) {
+  if (!read_exact(sock, header.data(), header.size(), timeout_ms, ec)) {
     err = ec.message();
     return false;
   }
@@ -45,8 +122,7 @@ bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
 
   std::vector<std::uint8_t> body(body_len);
   if (body_len > 0) {
-    boost::asio::read(sock, boost::asio::buffer(body), ec);
-    if (ec) {
+    if (!read_exact(sock, body.data(), body.size(), timeout_ms, ec)) {
       err = ec.message();
       return false;
     }
@@ -95,7 +171,7 @@ bool read_frame(tcp::socket& sock, Frame& out, std::string& err,
 }
 
 bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
-                 boost::system::error_code& ec) {
+                 boost::system::error_code& ec, int timeout_ms) {
   try {
     // Large raw stage/get-range frames: gather-write header+json and raw to avoid
     // an extra full-body memcpy through encode_frame's contiguous buffer.
@@ -125,6 +201,14 @@ bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
       if (!json.empty()) {
         std::memcpy(head.data() + kHeaderSize + 4, json.data(), json.size());
       }
+      if (timeout_ms >= 0) {
+        if (!send_all_timed(sock, head.data(), head.size(), timeout_ms, ec) ||
+            (raw_n > 0 && !send_all_timed(sock, frame.raw_data(), raw_n, timeout_ms, ec))) {
+          err = ec.message();
+          return false;
+        }
+        return true;
+      }
       if (raw_n == 0) {
         boost::asio::write(sock, boost::asio::buffer(head), ec);
       } else {
@@ -141,6 +225,13 @@ bool write_frame(tcp::socket& sock, const Frame& frame, std::string& err,
       return true;
     }
     auto bytes = encode_frame(frame);
+    if (timeout_ms >= 0) {
+      if (!send_all_timed(sock, bytes.data(), bytes.size(), timeout_ms, ec)) {
+        err = ec.message();
+        return false;
+      }
+      return true;
+    }
     boost::asio::write(sock, boost::asio::buffer(bytes), ec);
     if (ec) {
       err = ec.message();
@@ -293,14 +384,41 @@ void TcpServer::do_accept() {
   });
 }
 
+namespace {
+
+// Peer-supplied JSON fields: a wrong type must never throw into the session.
+std::string json_str_or(const nlohmann::json& body, const char* key) {
+  if (!body.is_object()) return {};
+  auto it = body.find(key);
+  if (it == body.end() || !it->is_string()) return {};
+  return it->get<std::string>();
+}
+
+}  // namespace
+
 void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
+  // Sessions run on a thread_pool: an escaped exception is std::terminate for the
+  // whole daemon, and everything below parses unauthenticated peer input.
+  try {
+    run_session(*sock);
+  } catch (const std::exception& e) {
+    AIOS_LOG_WARN("inbound session aborted: ", e.what());
+  } catch (...) {
+    AIOS_LOG_WARN("inbound session aborted: unknown exception");
+  }
+  force_close_socket(*sock);
+}
+
+void TcpServer::run_session(tcp::socket& sock) {
   boost::system::error_code ec;
   std::string err;
-  sock->set_option(tcp::no_delay(true), ec);
+  sock.set_option(tcp::no_delay(true), ec);
   ec.clear();
+  const int pre_hello = handlers_.pre_hello_timeout_ms;
+  const int idle = handlers_.idle_timeout_ms;
 
   Frame hello;
-  if (!read_frame(*sock, hello, err, ec) || hello.type != MsgType::Hello) {
+  if (!read_frame(sock, hello, err, ec, pre_hello) || hello.type != MsgType::Hello) {
     AIOS_LOG_DEBUG("inbound hello failed: ", err);
     return;
   }
@@ -309,9 +427,9 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     AIOS_LOG_WARN("reject hello auth: ", err);
     return;
   }
-  const std::string peer_id = hello.body.value("node_id", "");
-  const std::string peer_listen = hello.body.value("listen", "");
-  const std::string peer_http = hello.body.value("http_addr", "");
+  const std::string peer_id = json_str_or(hello.body, "node_id");
+  const std::string peer_listen = json_str_or(hello.body, "listen");
+  const std::string peer_http = json_str_or(hello.body, "http_addr");
 
   Frame hello_reply;
   hello_reply.type = MsgType::Hello;
@@ -321,13 +439,13 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       {"http_addr", handlers_.local_http_addr},
   };
   auth_sign(hello_reply.body, MsgType::Hello, handlers_.cluster_key);
-  if (!write_frame(*sock, hello_reply, err, ec)) return;
+  if (!write_frame(sock, hello_reply, err, ec, pre_hello)) return;
 
   // Allow multiple object RPCs per connection (e.g. ObjectStageBegin/Data/Commit).
   for (;;) {
     if (closing_.load(std::memory_order_acquire)) return;
     Frame req;
-    if (!read_frame(*sock, req, err, ec)) {
+    if (!read_frame(sock, req, err, ec, idle)) {
       if (ec && ec != boost::asio::error::eof) {
         AIOS_LOG_DEBUG("inbound request read failed: ", err);
       }
@@ -336,7 +454,7 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (req.type == MsgType::Ping) {
       Frame pong;
       pong.type = MsgType::Pong;
-      write_frame(*sock, pong, err, ec);
+      write_frame(sock, pong, err, ec, idle);
       continue;
     }
     if (req.type == MsgType::Gossip) {
@@ -349,7 +467,7 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       auto gossip_reply = handlers_.on_gossip(peer_id, peer_listen, peer_http, req);
       if (!gossip_reply) return;
       auth_sign(gossip_reply->body, MsgType::Gossip, handlers_.cluster_key);
-      write_frame(*sock, *gossip_reply, err, ec);
+      write_frame(sock, *gossip_reply, err, ec, idle);
       return;  // gossip sessions are one-shot
     }
     if (is_object_req(req.type)) {
@@ -364,7 +482,7 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         reply.type = MsgType::ObjectReply;
       }
       auth_sign(reply.body, MsgType::ObjectReply, handlers_.cluster_key);
-      if (!write_frame(*sock, reply, err, ec)) return;
+      if (!write_frame(sock, reply, err, ec, idle)) return;
       continue;
     }
     AIOS_LOG_DEBUG("unsupported inbound type ", static_cast<int>(req.type));

@@ -144,8 +144,18 @@ TEST(ObjectRpc, Basic) {
   EXPECT_TRUE(st_reply.body.value("ok", false)) << "stat ok";
   EXPECT_TRUE(st_reply.body.value("size", 0u) == 12) << "stat size";
 
-  // Delete one replica to exercise repair.
-  EXPECT_TRUE(stores.get(placement.acting_set[1].aios_path)->del(oid, err)) << "del secondary";
+  // Lose one replica copy to exercise repair. Purge the tip version rather than
+  // del(): a delete marker is a legitimate newer version that repair must
+  // propagate (OBJ-4), not a missing copy to be re-filled.
+  {
+    auto* secondary = stores.get(placement.acting_set[1].aios_path);
+    std::uint64_t tip = 0;
+    err.clear();
+    ASSERT_TRUE(secondary->tip_seq(oid, tip, err)) << err;
+    ASSERT_TRUE(secondary->purge_version(oid, tip, /*allow_tip=*/true, err)) << err;
+    err.clear();
+    EXPECT_FALSE(secondary->stat(oid, err)) << "secondary copy gone";
+  }
   auto stats = run_repair(cfg, "127.0.0.1:7400", map, stores, 100);
   EXPECT_TRUE(stats.under_replicated >= 1) << "saw under-replicated";
   EXPECT_TRUE(stats.repaired >= 1) << "repaired";
