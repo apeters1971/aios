@@ -728,7 +728,9 @@ TEST(Review2Http, BenchIgnoresCallerSuppliedEndpoint) {
   aios::HttpBenchJob job("127.0.0.1:1", "key");
   EXPECT_EQ(job.defaults()["config"]["endpoint"], "127.0.0.1:1");
   auto r = job.start(nlohmann::json{{"endpoint", "10.255.255.1:80"}, {"ops", 1}, {"warmup", 0}});
-  if (r.contains("config")) EXPECT_EQ(r["config"]["endpoint"], "127.0.0.1:1") << r.dump();
+  if (r.contains("config")) {
+    EXPECT_EQ(r["config"]["endpoint"], "127.0.0.1:1") << r.dump();
+  }
   for (int i = 0; i < 200; ++i) {
     if (job.status()["state"] != "running") break;
     std::this_thread::sleep_for(std::chrono::milliseconds(20));

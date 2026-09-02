@@ -867,7 +867,9 @@ TEST(Review2Posix, FlockHeldByOneOpenSurvivesOtherOpenRelease) {
   EXPECT_EQ(aios_posix_flock(b.fs, ino, LOCK_EX | LOCK_NB), -EWOULDBLOCK);
 
   // The acquiring open's release does drop it.
-  if (owners.note_unlocked(ino, 1)) ASSERT_EQ(aios_posix_flock(a.fs, ino, LOCK_UN), 0);
+  if (owners.note_unlocked(ino, 1)) {
+    ASSERT_EQ(aios_posix_flock(a.fs, ino, LOCK_UN), 0);
+  }
   EXPECT_EQ(aios_posix_flock(b.fs, ino, LOCK_EX | LOCK_NB), 0);
   EXPECT_EQ(aios_posix_flock(b.fs, ino, LOCK_UN), 0);
 }

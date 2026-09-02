@@ -340,7 +340,7 @@ static int aios_symlink(AIOS_IDMAP *mnt_userns, struct inode *dir, struct dentry
 			const char *target)
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
-	struct aios_kabi_symlink_in in = { .parent = dir->i_ino };
+	struct aios_kabi_symlink_in *in;
 	struct aios_kabi_stat *st;
 	struct inode *inode;
 	void *out = NULL;
@@ -354,13 +354,18 @@ static int aios_symlink(AIOS_IDMAP *mnt_userns, struct inode *dir, struct dentry
 		return -ENAMETOOLONG;
 	if (dentry->d_name.len > AIOS_KABI_NAME_MAX)
 		return -ENAMETOOLONG;
-	memcpy(in.name, dentry->d_name.name, dentry->d_name.len);
-	in.name[dentry->d_name.len] = '\0';
-	memcpy(in.target, target, tlen);
-	in.target[tlen] = '\0';
+	in = kzalloc(sizeof(*in), GFP_KERNEL);
+	if (!in)
+		return -ENOMEM;
+	in->parent = dir->i_ino;
+	memcpy(in->name, dentry->d_name.name, dentry->d_name.len);
+	in->name[dentry->d_name.len] = '\0';
+	memcpy(in->target, target, tlen);
+	in->target[tlen] = '\0';
 
-	err = aios_upcall(info->conn, AIOS_OP_SYMLINK, info->mount_id, &in, sizeof(in),
+	err = aios_upcall(info->conn, AIOS_OP_SYMLINK, info->mount_id, in, sizeof(*in),
 			  &out, &out_len);
+	kfree(in);
 	if (err)
 		return err;
 	if (out_len < sizeof(*st)) {
