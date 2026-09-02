@@ -333,11 +333,12 @@ endif()
 add_library(aios_s3 STATIC
   src/http/s3_server.cpp
   src/http/s3_range.cpp
+  src/http/tls_stream.cpp
 )
 target_include_directories(aios_s3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(aios_s3 PUBLIC aios_core aios_posix aios_cuobject)
+target_link_libraries(aios_s3 PUBLIC aios_core aios_posix aios_cuobject OpenSSL::SSL)
 
 # Optional FUSE3 mount helper.
 option(AIOS_WITH_FUSE "Build aios-fuse when libfuse3 is available" ON)
@@ -590,6 +591,7 @@ add_executable(aios_tests
   tests/test_review2_kabi.cpp
   tests/test_process_smoke.cpp
   tests/test_ticket_auth.cpp
+  tests/test_s3_tls.cpp
 )
 target_include_directories(aios_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)

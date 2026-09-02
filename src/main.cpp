@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
         << "             [--replica-count N] [--write-quorum N]\n"
         << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
         << "             [--s3-listen HOST:PORT] [--s3-volume NAME] [--s3-access-key ID]\n"
+        << "             [--s3-tls-cert PEM --s3-tls-key PEM [--s3-tls-chain PEM]]\n"
         << "             [--no-fsync] [--version]\n"
         << "\n"
         << "Standalone AIOS daemon: gossip membership, .aios discovery,\n"

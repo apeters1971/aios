@@ -1145,6 +1145,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"weight_autotune_threshold_pct", cfg_.weight_autotune_threshold_pct},
       {"weight_autotune_min_delta", cfg_.weight_autotune_min_delta},
       {"s3_listen", c.s3_listen},
+      {"s3_tls", !c.s3_tls_cert.empty()},
       {"s3_volume", c.s3_volume},
       {"s3_access_key", c.s3_access_key},
       {"cuobject_listen", c.cuobject_listen},

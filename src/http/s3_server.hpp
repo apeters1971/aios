@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "cuobject/cuobject_endpoint.hpp"
 #include "http/s3_iam.hpp"
+#include "http/tls_stream.hpp"
 
 #include <boost/asio.hpp>
 
@@ -38,15 +39,19 @@ class S3Server {
   void set_cuobject_endpoint(std::shared_ptr<CuObjectEndpoint> ep) { cuobject_ = std::move(ep); }
   CuObjectEndpoint* cuobject_endpoint() const { return cuobject_.get(); }
 
+  // True when the listener speaks HTTPS (cfg.s3_tls_cert / s3_tls_key set).
+  bool tls() const { return tls_ != nullptr; }
+
  private:
   void do_accept();
-  void handle_session(std::shared_ptr<boost::asio::ip::tcp::socket> sock);
+  void handle_session(TlsStream& conn);
 
   boost::asio::io_context& ioc_;
   Config cfg_;
   std::string posix_endpoint_;
   std::shared_ptr<S3IamStore> iam_;
   std::shared_ptr<CuObjectEndpoint> cuobject_;
+  std::shared_ptr<TlsServerContext> tls_;
   aios_posix_fs* fs_{nullptr};
   boost::asio::ip::tcp::acceptor acceptor_;
   std::atomic<bool> stopping_{false};

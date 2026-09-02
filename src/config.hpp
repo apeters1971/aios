@@ -170,6 +170,11 @@ struct Config {
   std::string http_shared_key_clients{"any"};
   // S3-compatible API listen address; empty disables. Uses libaios_posix on s3_volume.
   std::string s3_listen;
+  // PEM certificate + private key for the S3 listener. Both set => HTTPS; both
+  // empty => plain HTTP. s3_tls_chain is an optional intermediate chain file.
+  std::string s3_tls_cert;
+  std::string s3_tls_key;
+  std::string s3_tls_chain;
   // Largest S3 request body buffered in memory (PutObject / UploadPart). Default 64 MiB.
   std::uint64_t s3_max_body_bytes{64ull * 1024ull * 1024ull};
   // POSIX volume backing S3 buckets (top-level dirs). Default "s3".

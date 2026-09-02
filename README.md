@@ -649,6 +649,24 @@ export AWS_SECRET_ACCESS_KEY='…secret from create…'
 aws --endpoint-url http://127.0.0.1:7481 s3 ls s3://photos/
 ```
 
+### HTTPS
+
+SigV4 authenticates but does not encrypt, and the ticket scheme above cannot apply to AWS
+clients, so the S3 listener speaks TLS natively when given a certificate:
+
+```yaml
+s3_listen: 0.0.0.0:7481
+s3_tls_cert: /etc/aios/s3.crt      # PEM leaf (or full chain, leaf first)
+s3_tls_key: /etc/aios/s3.key       # PEM private key, mode 0600
+s3_tls_chain: /etc/aios/ca.pem     # optional extra intermediates
+```
+
+Both `s3_tls_cert` and `s3_tls_key` set → HTTPS (TLS 1.2+, server certificate only); both
+empty → plain HTTP, unchanged. Unreadable files or a key that does not match the certificate
+fail `aiosd` startup. Plain-text clients on an HTTPS port are dropped at the handshake. Point
+clients at `https://…` (`aws --endpoint-url https://host:7481 …`, add `--no-verify-ssl` or
+`AWS_CA_BUNDLE` for a private CA).
+
 Optional GPUDirect / cuObject RDMA payload offload (`cuobject_listen`, `x-amz-rdma-token`): [`proto/cuobject.md`](proto/cuobject.md). Example client: `aios-cuobj-s3`.
 
 Details: [`proto/s3.md`](proto/s3.md).
@@ -981,7 +999,7 @@ authenticate as **principals** with their own key and receive a short-lived **ti
 | TCP++ `Hello` / `Gossip` / object RPC | HMAC-SHA256 over canonical body + timestamp, keyed by `cluster_key` (nodes only) |
 | HTTP, ticket (recommended) | `POST /auth/ticket` proves possession of the principal key once; every request is then `Authorization: AIOS-HMAC-SHA256 Credential=<ticket> …` keyed by a per-session key |
 | HTTP, shared key (legacy) | Same header with `Credential=<label>`, HMAC keyed by `cluster_key`; full access |
-| S3 | AWS SigV4 with per-bucket IAM keys ([S3 auth](#auth-and-per-bucket-credentials)); the wire is plaintext, put TLS in front |
+| S3 | AWS SigV4 with per-bucket IAM keys ([S3 auth](#auth-and-per-bucket-credentials)); the wire needs TLS (`s3_tls_cert` / `s3_tls_key`) |
 
 ### Principals and tickets
 
@@ -1025,7 +1043,7 @@ who can reach the ports or observe the wire.
 
 | Property | Current state |
 |----------|---------------|
-| **Transport** | Plaintext for gossip/RPC (TCP++), the HTTP object API, admin UI/API and the kernel modules: no TLS, so anyone on the path can read object bodies and admin session cookies (not credentials: principal keys never travel, and a captured ticket is useless without its session key). The S3 gateway is plaintext too; SigV4 offers no confidentiality on its own. |
+| **Transport** | Plaintext for gossip/RPC (TCP++), the HTTP object API, admin UI/API and the kernel modules: no TLS, so anyone on the path can read object bodies and admin session cookies (not credentials: principal keys never travel, and a captured ticket is useless without its session key). The **S3 gateway can run HTTPS** (`s3_tls_cert` / `s3_tls_key`); SigV4 offers no confidentiality on its own, so enable it for any S3 client outside the private network. |
 | **Shared secret vs principals** | `cluster_key` remains the **node** secret (join the cluster, receive replicas, participate in placement), the **admin UI password** and the **S3 root secret** (`s3_access_key` / `cluster_key`); anyone holding it has every power. HTTP clients no longer need it: create **principals** (`aios admin principal create`) with role `client` and oid-prefix caps, and set `http_shared_key_clients: loopback` so the shared key is refused from remote clients. Per-bucket S3 IAM keys scope the S3 surface. |
 | **Integrity of bodies** | HMAC-SHA256 covers the canonical request/frame metadata. Streamed bodies are covered only when the client sends a content hash: HTTP PUTs above 256 KiB are currently signed as `UNSIGNED-PAYLOAD`, and replica RPC frames carry the body as an unsigned trailer with a CRC32C (being fixed — see `CHANGELOG.md` OBJ-13 / POS-11). Until then, an on-path party can substitute object contents while the signature still verifies. |
 | **Replay** | Requests are valid for the `auth_skew_ms` window (default **60 s**). RPC frames have a nonce + replay cache; HTTP requests currently do not (HTTP-4). Clocks must be synchronised (NTP) across nodes and clients. |
@@ -1036,7 +1054,7 @@ who can reach the ports or observe the wire.
 **Recommendations**
 
 - Run all nodes on a **private / isolated network** (VLAN, VPC, WireGuard); firewall `listen`, `http_listen`, `s3_listen`, `cuobject_listen` so only nodes and trusted clients reach them.
-- Put a **TLS-terminating reverse proxy** (nginx, HAProxy, Envoy) in front of the HTTP API, admin UI and S3 gateway for anything that leaves that network; bind the daemon ports to loopback or the private interface.
+- Enable **HTTPS on the S3 gateway** (`s3_tls_cert` / `s3_tls_key`) and put a **TLS-terminating reverse proxy** (nginx, HAProxy, Envoy) in front of the HTTP API and admin UI for anything that leaves that network; bind the daemon ports to loopback or the private interface.
 - Give every application its own **principal** (`role: client`, caps on its prefixes) and set `http_shared_key_clients: loopback`; use **per-bucket IAM keys** for S3 users; never hand out `cluster_key` to an application.
 - Treat `cluster_key` as a root credential: keep it out of shell history and process listings (`--config` file with mode `0600` rather than `--cluster-key` on the command line).
 - Keep NTP running; a skewed clock is indistinguishable from an attack and is rejected with `401`.

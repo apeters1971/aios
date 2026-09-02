@@ -43,6 +43,20 @@ current fix cycle — check the regression test of the same name before relying 
   pin); the process smoke test now creates a principal and drives the CLI with it across a daemon
   restart.
 
+### Added — native HTTPS on the S3 listener
+
+- `s3_tls_cert` / `s3_tls_key` (+ optional `s3_tls_chain`) turn `s3_listen` into an HTTPS
+  endpoint (TLS 1.2+, OpenSSL on the same blocking socket so `http_idle_timeout_ms` still bounds
+  every read, including the handshake). SigV4 cannot provide confidentiality and AWS clients
+  cannot use AIOS tickets, so this is the way to put the S3 gateway on a non-private network
+  without a proxy. Plain HTTP when both are unset; half-configured or mismatched files fail
+  startup. New `src/http/tls_stream.{hpp,cpp}` (`TlsServerContext`, `TlsStream`) replaces the raw
+  fd calls in the S3 session so the HTTP listener can adopt it later.
+- `S3Server::stop()` no longer blocks forever when `start()` failed before `listen()` (there was
+  nothing to cancel, but it waited for an io_context that had never run).
+- Tests: `tests/test_s3_tls.cpp` (context loading errors, startup refusal, SigV4 PUT/GET over TLS
+  with a generated certificate, plaintext-on-TLS-port and TLS-on-plain-port both fail cleanly).
+
 ### Security model (documented, not yet changed)
 
 - README gained a *Security model and limitations* section: plaintext transport, one shared

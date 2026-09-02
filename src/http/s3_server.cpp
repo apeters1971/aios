@@ -5,6 +5,7 @@
 #include "http/s3_auth.hpp"
 #include "http/s3_range.hpp"
 #include "http/sock_io.hpp"
+#include "http/tls_stream.hpp"
 #include "posix/aios_posix.h"
 #include "util/auth.hpp"
 #include "util/log.hpp"
@@ -145,12 +146,12 @@ bool is_hex_sha256(const std::string& s) {
 // Reads the header block (through the blank line) with raw recv so SO_RCVTIMEO
 // applies. Bytes past the blank line are returned in `rest`.
 enum class HeaderRead { Ok, TooLarge, Closed };
-HeaderRead read_request_head(int fd, std::string& head, std::string& rest) {
+HeaderRead read_request_head(TlsStream& conn, std::string& head, std::string& rest) {
   std::string buf;
   char chunk[4096];
   while (true) {
     int err = 0;
-    const long n = fd_read_some(fd, chunk, sizeof(chunk), err);
+    const long n = conn.read_some(chunk, sizeof(chunk), err);
     if (n <= 0) return HeaderRead::Closed;
     buf.append(chunk, static_cast<std::size_t>(n));
     const auto pos = buf.find("\r\n\r\n");
@@ -196,7 +197,7 @@ std::string iso8601_from_ns(uint64_t ns) {
   return buf;
 }
 
-void write_http(tcp::socket& sock, int status, const std::string& reason,
+void write_http(TlsStream& sock, int status, const std::string& reason,
                 const std::unordered_map<std::string, std::string>& headers,
                 const std::string& body) {
   std::ostringstream oss;
@@ -214,13 +215,12 @@ void write_http(tcp::socket& sock, int status, const std::string& reason,
   for (const auto& [k, v] : headers) oss << k << ": " << v << "\r\n";
   oss << "\r\n";
   auto head = oss.str();
-  const int fd = static_cast<int>(sock.native_handle());
   int err = 0;
-  if (!fd_write_all(fd, head.data(), head.size(), err)) return;
-  if (!body.empty()) fd_write_all(fd, body.data(), body.size(), err);
+  if (!sock.write_all(head.data(), head.size(), err)) return;
+  if (!body.empty()) sock.write_all(body.data(), body.size(), err);
 }
 
-void write_s3_error(tcp::socket& sock, int status, const std::string& code,
+void write_s3_error(TlsStream& sock, int status, const std::string& code,
                     const std::string& message, const std::string& resource = {}) {
   std::ostringstream xml;
   xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -282,7 +282,7 @@ void apply_owner(aios_posix_fs* fs, uint64_t ino, bool set_owner, uint32_t uid, 
   aios_posix_setattr(fs, ino, &st, AIOS_POSIX_SET_UID | AIOS_POSIX_SET_GID);
 }
 
-bool write_posix_err(tcp::socket& sock, int err, const std::string& path) {
+bool write_posix_err(TlsStream& sock, int err, const std::string& path) {
   if (err == -EDQUOT) {
     write_s3_error(sock, 403, "QuotaExceeded", "quota exceeded", path);
     return true;
@@ -510,8 +510,12 @@ void S3Server::stop() {
   };
 
   // Cancel accept on the ioc thread, then drain so the completion handler cannot
-  // observe a destroyed S3Server (it captures this).
-  if (!ioc_.stopped()) {
+  // observe a destroyed S3Server (it captures this). When start() never reached
+  // listen() (bad TLS files, bad address) there is no handler to drain, and the
+  // ioc may never have run, so a posted round trip would wait forever.
+  if (!acceptor_.is_open()) {
+    // nothing to cancel
+  } else if (!ioc_.stopped()) {
     std::promise<void> drained;
     auto fut = drained.get_future();
     boost::asio::post(ioc_, [this, close_acceptor, &drained] {
@@ -536,6 +540,15 @@ void S3Server::stop() {
 }
 
 void S3Server::start() {
+  if (!cfg_.s3_tls_cert.empty() || !cfg_.s3_tls_key.empty()) {
+    if (cfg_.s3_tls_cert.empty() || cfg_.s3_tls_key.empty()) {
+      throw std::runtime_error("S3: s3_tls_cert and s3_tls_key must be set together");
+    }
+    std::string terr;
+    tls_ = TlsServerContext::load(cfg_.s3_tls_cert, cfg_.s3_tls_key, cfg_.s3_tls_chain, terr);
+    if (!tls_) throw std::runtime_error("S3 TLS: " + terr);
+  }
+
   aios_posix_config pcfg{};
   pcfg.endpoint = posix_endpoint_.c_str();
   pcfg.cluster_key = cfg_.cluster_key.c_str();
@@ -575,8 +588,8 @@ void S3Server::start() {
   acceptor_.set_option(tcp::acceptor::reuse_address(true));
   acceptor_.bind(eps.begin()->endpoint());
   acceptor_.listen();
-  AIOS_LOG_INFO("S3 API listening on ", cfg_.s3_listen, " volume=", cfg_.s3_volume,
-                " (posix via ", posix_endpoint_, ")",
+  AIOS_LOG_INFO("S3 API listening on ", cfg_.s3_listen, tls_ ? " (https)" : " (http)",
+                " volume=", cfg_.s3_volume, " (posix via ", posix_endpoint_, ")",
                 cuobject_ && cuobject_->available()
                     ? (cfg_.cuobject_listen.empty() ? " cuobject=on"
                                                    : (" cuobject=" + cfg_.cuobject_listen))
@@ -595,10 +608,17 @@ void S3Server::do_accept() {
       const int live = sessions_.fetch_add(1) + 1;
       std::thread([this, sock, live] {
         try {
-          if (live > kMaxSessions) {
-            write_s3_error(*sock, 503, "SlowDown", "too many concurrent connections", "/");
+          // The handshake runs on the session thread (it blocks) and under the
+          // same idle timeout as everything else on the socket.
+          const int fd = static_cast<int>(sock->native_handle());
+          TlsStream conn(fd, tls_);  // plain when tls_ is null
+          std::string herr;
+          if (!conn.accept(herr)) {
+            AIOS_LOG_DEBUG("S3 TLS handshake failed: ", herr);
+          } else if (live > kMaxSessions) {
+            write_s3_error(conn, 503, "SlowDown", "too many concurrent connections", "/");
           } else {
-            handle_session(sock);
+            handle_session(conn);
           }
         } catch (...) {
         }
@@ -612,15 +632,14 @@ void S3Server::do_accept() {
   });
 }
 
-void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
+void S3Server::handle_session(TlsStream& conn) {
   try {
-    const int fd = static_cast<int>(sock->native_handle());
     std::string head, rest;
-    switch (read_request_head(fd, head, rest)) {
+    switch (read_request_head(conn, head, rest)) {
       case HeaderRead::Ok:
         break;
       case HeaderRead::TooLarge:
-        write_s3_error(*sock, 431, "RequestHeaderSectionTooLarge",
+        write_s3_error(conn, 431, "RequestHeaderSectionTooLarge",
                        "Request header section too large", "/");
         return;
       case HeaderRead::Closed:
@@ -666,16 +685,16 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       try {
         content_len = static_cast<std::size_t>(std::stoull(cl));
       } catch (...) {
-        write_s3_error(*sock, 400, "InvalidArgument", "Invalid Content-Length", path);
+        write_s3_error(conn, 400, "InvalidArgument", "Invalid Content-Length", path);
         return;
       }
     }
     if (content_len > cfg_.max_object_bytes) {
-      write_s3_error(*sock, 413, "EntityTooLarge", "Body exceeds max_object_bytes", path);
+      write_s3_error(conn, 413, "EntityTooLarge", "Body exceeds max_object_bytes", path);
       return;
     }
     if (!header_get(headers, "transfer-encoding").empty()) {
-      write_s3_error(*sock, 501, "NotImplemented", "Transfer-Encoding is not supported", path);
+      write_s3_error(conn, 501, "NotImplemented", "Transfer-Encoding is not supported", path);
       return;
     }
     const bool rdma_put =
@@ -690,7 +709,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     std::string payload_hash = header_get(headers, "x-amz-content-sha256");
     if (payload_hash.empty()) {
       if (has_tcp_body) {
-        write_s3_error(*sock, 400, "InvalidRequest",
+        write_s3_error(conn, 400, "InvalidRequest",
                        "x-amz-content-sha256 is required for requests with a body", path);
         return;
       }
@@ -699,11 +718,11 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     }
     const bool streaming_payload = payload_hash.rfind(kStreamingPayload, 0) == 0;
     if (!streaming_payload && payload_hash != kUnsignedPayload && !is_hex_sha256(payload_hash)) {
-      write_s3_error(*sock, 400, "InvalidArgument", "Invalid x-amz-content-sha256", path);
+      write_s3_error(conn, 400, "InvalidArgument", "Invalid x-amz-content-sha256", path);
       return;
     }
     if (has_tcp_body && content_len > cfg_.s3_max_body_bytes) {
-      write_s3_error(*sock, 413, "EntityTooLarge",
+      write_s3_error(conn, 413, "EntityTooLarge",
                      "Body exceeds s3_max_body_bytes; use multipart upload", path);
       return;
     }
@@ -752,13 +771,13 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (iam_cred) secret = iam_cred->secret;
     }
     if (secret.empty()) {
-      write_s3_error(*sock, 403, "InvalidAccessKeyId", "Unknown access key", path);
+      write_s3_error(conn, 403, "InvalidAccessKeyId", "Unknown access key", path);
       return;
     }
     auto auth = s3_sigv4_verify(method, canon_uri, canonical_query_string(query), headers,
                                 payload_hash, akid, secret, cfg_.auth_skew_ms);
     if (!auth.ok) {
-      write_s3_error(*sock, 403, "SignatureDoesNotMatch", auth.error, path);
+      write_s3_error(conn, 403, "SignatureDoesNotMatch", auth.error, path);
       return;
     }
 
@@ -766,7 +785,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     std::string body;
     if (has_tcp_body) {
       if (streaming_payload) {
-        write_s3_error(*sock, 501, "NotImplemented",
+        write_s3_error(conn, 501, "NotImplemented",
                        "aws-chunked (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) uploads are not "
                        "supported; send a concrete x-amz-content-sha256 or UNSIGNED-PAYLOAD",
                        path);
@@ -779,12 +798,12 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       while (body.size() < content_len) {
         const std::size_t want = std::min(sizeof(chunk), content_len - body.size());
         int rerr = 0;
-        const long n = fd_read_some(fd, chunk, want, rerr);
+        const long n = conn.read_some(chunk, want, rerr);
         if (n <= 0) return;
         body.append(chunk, static_cast<std::size_t>(n));
       }
       if (payload_hash != kUnsignedPayload && lower(payload_hash) != sha256_hex(body)) {
-        write_s3_error(*sock, 400, "XAmzContentSHA256Mismatch",
+        write_s3_error(conn, 400, "XAmzContentSHA256Mismatch",
                        "The provided 'x-amz-content-sha256' header does not match what was "
                        "computed.",
                        path);
@@ -797,8 +816,8 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     auto fsync_or_fail = [&](uint64_t ino) -> bool {
       const int ferr = aios_posix_fsync(fs_, ino);
       if (ferr == 0) return true;
-      if (!write_posix_err(*sock, ferr, path))
-        write_s3_error(*sock, 500, "InternalError", "fsync failed", path);
+      if (!write_posix_err(conn, ferr, path))
+        write_s3_error(conn, 500, "InternalError", "fsync failed", path);
       return false;
     };
 
@@ -850,38 +869,38 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
       }
       xml << "</Buckets></ListAllMyBucketsResult>";
-      write_http(*sock, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
+      write_http(conn, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
       return;
     }
 
     if (bucket.empty()) {
-      write_s3_error(*sock, 400, "InvalidRequest", "bucket required", path);
+      write_s3_error(conn, 400, "InvalidRequest", "bucket required", path);
       return;
     }
     if (!allow_bucket(bucket)) {
-      write_s3_error(*sock, 403, "AccessDenied", "bucket not allowed for this access key", path);
+      write_s3_error(conn, 403, "AccessDenied", "bucket not allowed for this access key", path);
       return;
     }
 
     // ----- CreateBucket -----
     if (method == "PUT" && key.empty() && qmap.count("uploads") == 0) {
       if (!valid_bucket_name(bucket)) {
-        write_s3_error(*sock, 400, "InvalidBucketName", "invalid bucket name", path);
+        write_s3_error(conn, 400, "InvalidBucketName", "invalid bucket name", path);
         return;
       }
       aios_posix_stat st{};
       int err = aios_posix_lookup(fs_, kRootIno, bucket.c_str(), &st);
       if (err == 0) {
-        write_s3_error(*sock, 409, "BucketAlreadyOwnedByYou", "bucket exists", path);
+        write_s3_error(conn, 409, "BucketAlreadyOwnedByYou", "bucket exists", path);
         return;
       }
       err = aios_posix_mkdir(fs_, kRootIno, bucket.c_str(), 0755, &st);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "mkdir failed", path);
+        write_s3_error(conn, 500, "InternalError", "mkdir failed", path);
         return;
       }
       apply_owner(fs_, st.ino, set_owner, own_uid, own_gid);
-      write_http(*sock, 200, "OK", {{"Location", "/" + bucket}}, {});
+      write_http(conn, 200, "OK", {{"Location", "/" + bucket}}, {});
       return;
     }
 
@@ -890,24 +909,24 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       aios_posix_stat st{};
       int err = aios_posix_lookup(fs_, kRootIno, bucket.c_str(), &st);
       if (err || !S_ISDIR(st.mode)) {
-        write_s3_error(*sock, 404, "NoSuchBucket", "The specified bucket does not exist", path);
+        write_s3_error(conn, 404, "NoSuchBucket", "The specified bucket does not exist", path);
         return;
       }
       if (method == "HEAD") {
-        write_http(*sock, 200, "OK", {}, {});
+        write_http(conn, 200, "OK", {}, {});
         return;
       }
       if (!dir_empty(fs_, st.ino)) {
-        write_s3_error(*sock, 409, "BucketNotEmpty", "The bucket you tried to delete is not empty",
+        write_s3_error(conn, 409, "BucketNotEmpty", "The bucket you tried to delete is not empty",
                        path);
         return;
       }
       err = aios_posix_rmdir(fs_, kRootIno, bucket.c_str());
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "rmdir failed", path);
+        write_s3_error(conn, 500, "InternalError", "rmdir failed", path);
         return;
       }
-      write_http(*sock, 204, "No Content", {}, {});
+      write_http(conn, 204, "No Content", {}, {});
       return;
     }
 
@@ -918,7 +937,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       aios_posix_stat bst{};
       int err = aios_posix_lookup(fs_, kRootIno, bucket.c_str(), &bst);
       if (err || !S_ISDIR(bst.mode)) {
-        write_s3_error(*sock, 404, "NoSuchBucket", "The specified bucket does not exist", path);
+        write_s3_error(conn, 404, "NoSuchBucket", "The specified bucket does not exist", path);
         return;
       }
       std::string prefix = qmap.count("prefix") ? qmap["prefix"] : "";
@@ -971,13 +990,13 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         xml << "<CommonPrefixes><Prefix>" << xml_escape(cp) << "</Prefix></CommonPrefixes>";
       }
       xml << "</ListBucketResult>";
-      write_http(*sock, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
+      write_http(conn, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
       return;
     }
 
     // Need object key for remaining ops
     if (key.empty()) {
-      write_s3_error(*sock, 400, "InvalidRequest", "object key required", path);
+      write_s3_error(conn, 400, "InvalidRequest", "object key required", path);
       return;
     }
 
@@ -987,10 +1006,10 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       auto parts = split_key(bucket + "/" + key);
       int err = mkdir_p(fs_, parts, nullptr, set_owner, own_uid, own_gid);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "mkdir failed", path);
+        write_s3_error(conn, 500, "InternalError", "mkdir failed", path);
         return;
       }
-      write_http(*sock, 200, "OK", {}, {});
+      write_http(conn, 200, "OK", {}, {});
       return;
     }
 
@@ -998,12 +1017,12 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (method == "POST" && qmap.count("uploads")) {
       aios_posix_stat bst{};
       if (aios_posix_lookup(fs_, kRootIno, bucket.c_str(), &bst) || !S_ISDIR(bst.mode)) {
-        write_s3_error(*sock, 404, "NoSuchBucket", "The specified bucket does not exist", path);
+        write_s3_error(conn, 404, "NoSuchBucket", "The specified bucket does not exist", path);
         return;
       }
       std::string upload_id = random_upload_id();
       if (upload_id.empty()) {
-        write_s3_error(*sock, 500, "InternalError", "multipart init failed", path);
+        write_s3_error(conn, 500, "InternalError", "multipart init failed", path);
         return;
       }
       aios_posix_stat mst{};
@@ -1011,7 +1030,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       aios_posix_stat ust{};
       int err = aios_posix_mkdir(fs_, mst.ino, upload_id.c_str(), 0700, &ust);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "multipart init failed", path);
+        write_s3_error(conn, 500, "InternalError", "multipart init failed", path);
         return;
       }
       // Target key and owner live on the upload dir; UploadPart/Complete/Abort
@@ -1020,7 +1039,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       aios_posix_setxattr(fs_, ust.ino, kXattrUploadKey, key.data(), key.size(), 0);
       if (aios_posix_setxattr(fs_, ust.ino, kXattrUploadOwner, akid.data(), akid.size(), 0) != 0) {
         aios_posix_rmdir(fs_, mst.ino, upload_id.c_str());
-        write_s3_error(*sock, 500, "InternalError", "multipart init failed", path);
+        write_s3_error(conn, 500, "InternalError", "multipart init failed", path);
         return;
       }
       std::ostringstream xml;
@@ -1029,7 +1048,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
           << "<Bucket>" << xml_escape(bucket) << "</Bucket><Key>" << xml_escape(key)
           << "</Key><UploadId>" << xml_escape(upload_id) << "</UploadId>"
           << "</InitiateMultipartUploadResult>";
-      write_http(*sock, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
+      write_http(conn, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
       return;
     }
 
@@ -1040,11 +1059,11 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       aios_posix_stat mst{}, ust{};
       if (aios_posix_lookup(fs_, kRootIno, kMultipartDir, &mst) ||
           aios_posix_lookup(fs_, mst.ino, upload_id.c_str(), &ust)) {
-        write_s3_error(*sock, 404, "NoSuchUpload", "upload not found", path);
+        write_s3_error(conn, 404, "NoSuchUpload", "upload not found", path);
         return;
       }
       if (!upload_owned_by(fs_, ust.ino, akid)) {
-        write_s3_error(*sock, 403, "AccessDenied", "upload belongs to another principal", path);
+        write_s3_error(conn, 403, "AccessDenied", "upload belongs to another principal", path);
         return;
       }
       int pn = 0;
@@ -1054,25 +1073,25 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         pn = 0;
       }
       if (pn < 1 || pn > 10000 || std::to_string(pn) != part) {
-        write_s3_error(*sock, 400, "InvalidArgument", "partNumber must be 1..10000", path);
+        write_s3_error(conn, 400, "InvalidArgument", "partNumber must be 1..10000", path);
         return;
       }
       uint64_t fino = 0;
       int err = ensure_file(fs_, ust.ino, part.c_str(), &fino);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "part create failed", path);
+        write_s3_error(conn, 500, "InternalError", "part create failed", path);
         return;
       }
       aios_posix_truncate(fs_, fino, 0);
       size_t wrote = 0;
       err = aios_posix_write(fs_, fino, 0, body.data(), body.size(), &wrote);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "part write failed", path);
+        write_s3_error(conn, 500, "InternalError", "part write failed", path);
         return;
       }
       if (!fsync_or_fail(fino)) return;
       auto etag = md5_hex(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
-      write_http(*sock, 200, "OK", {{"ETag", "\"" + etag + "\""}}, {});
+      write_http(conn, 200, "OK", {{"ETag", "\"" + etag + "\""}}, {});
       return;
     }
 
@@ -1082,23 +1101,23 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       aios_posix_stat mst{}, ust{};
       if (aios_posix_lookup(fs_, kRootIno, kMultipartDir, &mst) ||
           aios_posix_lookup(fs_, mst.ino, upload_id.c_str(), &ust)) {
-        write_s3_error(*sock, 404, "NoSuchUpload", "upload not found", path);
+        write_s3_error(conn, 404, "NoSuchUpload", "upload not found", path);
         return;
       }
       if (!upload_owned_by(fs_, ust.ino, akid)) {
-        write_s3_error(*sock, 403, "AccessDenied", "upload belongs to another principal", path);
+        write_s3_error(conn, 403, "AccessDenied", "upload belongs to another principal", path);
         return;
       }
       const std::string tbucket = get_xattr_string(fs_, ust.ino, kXattrUploadBucket);
       const std::string tkey = get_xattr_string(fs_, ust.ino, kXattrUploadKey);
       if (tbucket.empty() || tkey.empty()) {
-        write_s3_error(*sock, 500, "InternalError", "upload meta missing", path);
+        write_s3_error(conn, 500, "InternalError", "upload meta missing", path);
         return;
       }
       // The target may differ from the request path; the principal's bucket
       // allow-list applies to where the object lands.
       if (!allow_bucket(tbucket)) {
-        write_s3_error(*sock, 403, "AccessDenied", "target bucket not allowed for this access key",
+        write_s3_error(conn, 403, "AccessDenied", "target bucket not allowed for this access key",
                        path);
         return;
       }
@@ -1124,13 +1143,13 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
           resolve_parent(fs_, tbucket, tkey, true, &parent, &name, nullptr, set_owner, own_uid,
                          own_gid);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "resolve target failed", path);
+        write_s3_error(conn, 500, "InternalError", "resolve target failed", path);
         return;
       }
       uint64_t fino = 0;
       err = ensure_file(fs_, parent, name, &fino, set_owner, own_uid, own_gid);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "create target failed", path);
+        write_s3_error(conn, 500, "InternalError", "create target failed", path);
         return;
       }
       aios_posix_truncate(fs_, fino, 0);
@@ -1155,7 +1174,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         if (err) break;
       }
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "assemble failed", path);
+        write_s3_error(conn, 500, "InternalError", "assemble failed", path);
         return;
       }
       if (!fsync_or_fail(fino)) return;
@@ -1175,7 +1194,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
           << "<CompleteMultipartUploadResult><Bucket>" << xml_escape(tbucket) << "</Bucket><Key>"
           << xml_escape(tkey) << "</Key><ETag>&quot;multipart-" << woff
           << "&quot;</ETag></CompleteMultipartUploadResult>";
-      write_http(*sock, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
+      write_http(conn, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
       return;
     }
 
@@ -1186,7 +1205,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (aios_posix_lookup(fs_, kRootIno, kMultipartDir, &mst) == 0 &&
           aios_posix_lookup(fs_, mst.ino, upload_id.c_str(), &ust) == 0) {
         if (!upload_owned_by(fs_, ust.ino, akid)) {
-          write_s3_error(*sock, 403, "AccessDenied", "upload belongs to another principal", path);
+          write_s3_error(conn, 403, "AccessDenied", "upload belongs to another principal", path);
           return;
         }
         uint64_t off = 0;
@@ -1201,7 +1220,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         aios_posix_rmdir(fs_, mst.ino, upload_id.c_str());
       }
-      write_http(*sock, 204, "No Content", {}, {});
+      write_http(conn, 204, "No Content", {}, {});
       return;
     }
 
@@ -1211,25 +1230,25 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (!src.empty() && src[0] == '/') src.erase(src.begin());
       auto slash = src.find('/');
       if (slash == std::string::npos) {
-        write_s3_error(*sock, 400, "InvalidArgument", "bad copy source", path);
+        write_s3_error(conn, 400, "InvalidArgument", "bad copy source", path);
         return;
       }
       std::string sbucket = src.substr(0, slash), skey = src.substr(slash + 1);
       if (!allow_bucket(sbucket)) {
-        write_s3_error(*sock, 403, "AccessDenied", "source bucket not allowed", path);
+        write_s3_error(conn, 403, "AccessDenied", "source bucket not allowed", path);
         return;
       }
       uint64_t sp = 0;
       std::string sname;
       int err = resolve_parent(fs_, sbucket, skey, false, &sp, &sname);
       if (err) {
-        write_s3_error(*sock, 404, "NoSuchKey", "source not found", path);
+        write_s3_error(conn, 404, "NoSuchKey", "source not found", path);
         return;
       }
       aios_posix_stat sst{};
       err = aios_posix_lookup(fs_, sp, sname.c_str(), &sst);
       if (err || !S_ISREG(sst.mode)) {
-        write_s3_error(*sock, 404, "NoSuchKey", "source not found", path);
+        write_s3_error(conn, 404, "NoSuchKey", "source not found", path);
         return;
       }
       uint64_t dp = 0;
@@ -1237,13 +1256,13 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       err = resolve_parent(fs_, bucket, key, true, &dp, &dname, nullptr, set_owner, own_uid,
                           own_gid);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "dest resolve failed", path);
+        write_s3_error(conn, 500, "InternalError", "dest resolve failed", path);
         return;
       }
       uint64_t dino = 0;
       err = ensure_file(fs_, dp, dname, &dino, set_owner, own_uid, own_gid);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "dest create failed", path);
+        write_s3_error(conn, 500, "InternalError", "dest create failed", path);
         return;
       }
       aios_posix_truncate(fs_, dino, 0);
@@ -1261,7 +1280,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         woff += wrote;
       }
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "copy failed", path);
+        write_s3_error(conn, 500, "InternalError", "copy failed", path);
         return;
       }
       if (!fsync_or_fail(dino)) return;
@@ -1269,7 +1288,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
           << "<CopyObjectResult><LastModified>" << iso8601_from_ns(sst.mtime_ns)
           << "</LastModified><ETag>&quot;copy-" << woff << "&quot;</ETag></CopyObjectResult>";
-      write_http(*sock, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
+      write_http(conn, 200, "OK", {{"Content-Type", "application/xml"}}, xml.str());
       return;
     }
 
@@ -1277,7 +1296,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (method == "PUT") {
       aios_posix_stat bst{};
       if (aios_posix_lookup(fs_, kRootIno, bucket.c_str(), &bst) || !S_ISDIR(bst.mode)) {
-        write_s3_error(*sock, 404, "NoSuchBucket", "The specified bucket does not exist", path);
+        write_s3_error(conn, 404, "NoSuchBucket", "The specified bucket does not exist", path);
         return;
       }
       uint64_t parent = 0;
@@ -1285,13 +1304,13 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       int err = resolve_parent(fs_, bucket, key, true, &parent, &name, nullptr, set_owner, own_uid,
                               own_gid);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "path resolve failed", path);
+        write_s3_error(conn, 500, "InternalError", "path resolve failed", path);
         return;
       }
       uint64_t ino = 0;
       err = ensure_file(fs_, parent, name, &ino, set_owner, own_uid, own_gid);
       if (err) {
-        write_s3_error(*sock, 500, "InternalError", "create failed", path);
+        write_s3_error(conn, 500, "InternalError", "create failed", path);
         return;
       }
 
@@ -1299,7 +1318,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       std::string rdma_reply;
       if (rdma_put) {
         if (rdma_object_size == 0 || rdma_object_size > kCuObjectMaxTransferBytes) {
-          write_s3_error(*sock, 400, "InvalidArgument",
+          write_s3_error(conn, 400, "InvalidArgument",
                          "RDMA PUT size out of range; retry without " +
                              std::string(kAmzRdmaToken),
                          path);
@@ -1318,7 +1337,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
             code = 400;
             ename = "InvalidArgument";
           }
-          write_s3_error(*sock, code, ename,
+          write_s3_error(conn, code, ename,
                          "RDMA PUT failed: " + rdma_err + "; retry without " +
                              std::string(kAmzRdmaToken),
                          path);
@@ -1332,8 +1351,8 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       size_t wrote = 0;
       err = aios_posix_write(fs_, ino, 0, put_data.data(), put_data.size(), &wrote);
       if (err) {
-        if (!write_posix_err(*sock, err, path))
-          write_s3_error(*sock, 500, "InternalError", "write failed", path);
+        if (!write_posix_err(conn, err, path))
+          write_s3_error(conn, 500, "InternalError", "write failed", path);
         return;
       }
       if (!fsync_or_fail(ino)) return;
@@ -1349,7 +1368,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       auto etag = md5_hex(reinterpret_cast<const std::uint8_t*>(put_data.data()), put_data.size());
       std::unordered_map<std::string, std::string> rh{{"ETag", "\"" + etag + "\""}};
       if (!rdma_reply.empty()) rh[kAmzRdmaReply] = rdma_reply;
-      write_http(*sock, 200, "OK", rh, {});
+      write_http(conn, 200, "OK", rh, {});
       return;
     }
 
@@ -1359,20 +1378,20 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       std::string name;
       int err = resolve_parent(fs_, bucket, key, false, &parent, &name);
       if (err) {
-        write_s3_error(*sock, 404, "NoSuchKey", "The specified key does not exist", path);
+        write_s3_error(conn, 404, "NoSuchKey", "The specified key does not exist", path);
         return;
       }
       aios_posix_stat st{};
       err = aios_posix_lookup(fs_, parent, name.c_str(), &st);
       if (err || !S_ISREG(st.mode)) {
-        write_s3_error(*sock, 404, "NoSuchKey", "The specified key does not exist", path);
+        write_s3_error(conn, 404, "NoSuchKey", "The specified key does not exist", path);
         return;
       }
       S3RangeParseResult ranges;
       if (method == "GET") {
         ranges = parse_s3_byte_ranges(header_get(headers, "range"), st.size);
         if (ranges.unsatisfiable) {
-          write_s3_error(*sock, 416, "InvalidRange", "Requested range not satisfiable", path);
+          write_s3_error(conn, 416, "InvalidRange", "Requested range not satisfiable", path);
           return;
         }
       }
@@ -1391,7 +1410,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
 
       if (method == "HEAD") {
         rh["Content-Length"] = std::to_string(st.size);
-        write_http(*sock, 200, "OK", rh, {});
+        write_http(conn, 200, "OK", rh, {});
         return;
       }
 
@@ -1414,7 +1433,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         for (const auto& br : ranges.ranges) {
           std::string part;
           if (!read_span(br.start, br.end, part)) {
-            write_s3_error(*sock, 500, "InternalError", "read failed", path);
+            write_s3_error(conn, 500, "InternalError", "read failed", path);
             return;
           }
           parts.push_back(std::move(part));
@@ -1425,7 +1444,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         auto body = build_s3_multipart_byteranges(boundary, object_ctype, st.size, ranges.ranges,
                                                   parts);
         rh["Content-Type"] = "multipart/byteranges; boundary=" + boundary;
-        write_http(*sock, 206, "Partial Content", rh, body);
+        write_http(conn, 206, "Partial Content", rh, body);
         return;
       }
 
@@ -1443,7 +1462,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (st.size == 0 && !ranged) {
         out.clear();
       } else if (!read_span(start, end, out)) {
-        write_s3_error(*sock, 500, "InternalError", "read failed", path);
+        write_s3_error(conn, 500, "InternalError", "read failed", path);
         return;
       }
 
@@ -1455,7 +1474,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
                             rdma_reply, rdma_err)) {
           rh["Content-Length"] = std::to_string(out.size());
           rh[kAmzRdmaReply] = rdma_reply;
-          write_http(*sock, 200, "OK", rh, {});
+          write_http(conn, 200, "OK", rh, {});
           return;
         }
         AIOS_LOG_WARN("S3 RDMA GET failed (", rdma_err, "); falling back to TCP body");
@@ -1464,9 +1483,9 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (ranged) {
         rh["Content-Range"] = "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" +
                               std::to_string(st.size);
-        write_http(*sock, 206, "Partial Content", rh, out);
+        write_http(conn, 206, "Partial Content", rh, out);
       } else {
-        write_http(*sock, 200, "OK", rh, out);
+        write_http(conn, 200, "OK", rh, out);
       }
       return;
     }
@@ -1478,19 +1497,19 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       int err = resolve_parent(fs_, bucket, key, false, &parent, &name);
       if (err) {
         // S3 delete is idempotent
-        write_http(*sock, 204, "No Content", {}, {});
+        write_http(conn, 204, "No Content", {}, {});
         return;
       }
       aios_posix_unlink(fs_, parent, name.c_str());
-      write_http(*sock, 204, "No Content", {}, {});
+      write_http(conn, 204, "No Content", {}, {});
       return;
     }
 
-    write_s3_error(*sock, 405, "MethodNotAllowed", "method not supported", path);
+    write_s3_error(conn, 405, "MethodNotAllowed", "method not supported", path);
   } catch (const std::exception& e) {
     AIOS_LOG_WARN("S3 session error: ", e.what());
     try {
-      write_s3_error(*sock, 500, "InternalError", e.what());
+      write_s3_error(conn, 500, "InternalError", e.what());
     } catch (...) {
     }
   }
