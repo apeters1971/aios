@@ -156,8 +156,16 @@ struct Config {
   // sends nothing holds a worker until this expires. 0 disables (not advised:
   // idle keep-alive connections then pin workers indefinitely).
   int http_idle_timeout_ms{30000};
+  // Concurrent long-poll handlers (/watch, /pubsub subscribe) detached from the
+  // worker pool. Beyond this the request is answered 503.
+  int http_max_long_polls{512};
+  // When true, requests with a body must sign a concrete x-aios-content-sha256;
+  // UNSIGNED-PAYLOAD is rejected. Off by default: the kernel client still sends it.
+  bool http_require_signed_payload{false};
   // S3-compatible API listen address; empty disables. Uses libaios_posix on s3_volume.
   std::string s3_listen;
+  // Largest S3 request body buffered in memory (PutObject / UploadPart). Default 64 MiB.
+  std::uint64_t s3_max_body_bytes{64ull * 1024ull * 1024ull};
   // POSIX volume backing S3 buckets (top-level dirs). Default "s3".
   std::string s3_volume{"s3"};
   // AWS SigV4 access key id; secret is always cluster_key.

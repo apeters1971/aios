@@ -4,11 +4,13 @@
 #include "cuobject/cuobject_s3_xfer.hpp"
 #include "http/s3_auth.hpp"
 #include "http/s3_range.hpp"
+#include "http/sock_io.hpp"
 #include "posix/aios_posix.h"
 #include "util/auth.hpp"
 #include "util/log.hpp"
 
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 
 #include <errno.h>
 #include <sys/stat.h>
@@ -19,7 +21,6 @@
 #include <ctime>
 #include <future>
 #include <optional>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -34,9 +35,16 @@ using tcp = boost::asio::ip::tcp;
 constexpr uint64_t kRootIno = 1;
 // Request headers arrive before any authentication, so they need a hard ceiling.
 constexpr std::size_t kMaxRequestHeaderBytes = 64u * 1024u;
+// One thread per live session; beyond this new connections get 503 SlowDown.
+constexpr int kMaxSessions = 256;
 constexpr const char* kMultipartDir = ".s3multipart";
 constexpr const char* kXattrContentType = "user.aios.s3.content-type";
 constexpr const char* kXattrMetaPrefix = "user.aios.s3.meta.";
+constexpr const char* kXattrUploadBucket = "user.aios.s3.upload.bucket";
+constexpr const char* kXattrUploadKey = "user.aios.s3.upload.key";
+constexpr const char* kXattrUploadOwner = "user.aios.s3.upload.owner";
+constexpr const char* kUnsignedPayload = "UNSIGNED-PAYLOAD";
+constexpr const char* kStreamingPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
 
 std::string lower(std::string s) {
   for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -64,7 +72,9 @@ std::string xml_escape(const std::string& s) {
   return o;
 }
 
-std::string url_decode(const std::string& in) {
+// Percent-decoding only for paths ('+' is a literal key byte); query strings
+// additionally read '+' as a space.
+std::string url_decode(const std::string& in, bool plus_is_space = false) {
   std::string out;
   out.reserve(in.size());
   for (std::size_t i = 0; i < in.size(); ++i) {
@@ -78,41 +88,79 @@ std::string url_decode(const std::string& in) {
         continue;
       }
     }
-    if (in[i] == '+') out.push_back(' ');
+    if (plus_is_space && in[i] == '+') out.push_back(' ');
     else out.push_back(in[i]);
   }
   return out;
 }
 
-std::unordered_map<std::string, std::string> parse_query(const std::string& q) {
-  std::unordered_map<std::string, std::string> out;
+// Decoded (key, value) pairs in wire order; duplicates preserved.
+std::vector<std::pair<std::string, std::string>> parse_query_pairs(const std::string& q) {
+  std::vector<std::pair<std::string, std::string>> out;
   std::size_t i = 0;
   while (i < q.size()) {
     auto amp = q.find('&', i);
     if (amp == std::string::npos) amp = q.size();
     auto eq = q.find('=', i);
     if (eq != std::string::npos && eq < amp) {
-      out[url_decode(q.substr(i, eq - i))] = url_decode(q.substr(eq + 1, amp - eq - 1));
+      out.emplace_back(url_decode(q.substr(i, eq - i), true),
+                       url_decode(q.substr(eq + 1, amp - eq - 1), true));
     } else if (amp > i) {
-      out[url_decode(q.substr(i, amp - i))] = "";
+      out.emplace_back(url_decode(q.substr(i, amp - i), true), "");
     }
     i = amp + 1;
   }
   return out;
 }
 
-// SigV4 canonical query: sorted, URI-encoded keys/values, joined with &.
+std::unordered_map<std::string, std::string> parse_query(const std::string& q) {
+  std::unordered_map<std::string, std::string> out;
+  for (auto& [k, v] : parse_query_pairs(q)) out[k] = v;
+  return out;
+}
+
+// SigV4 canonical query: every (key, value) pair URI-encoded, stable-sorted by
+// encoded key then encoded value, joined with &. Duplicate keys stay distinct.
 std::string canonical_query_string(const std::string& raw_query) {
   if (raw_query.empty()) return {};
-  auto q = parse_query(raw_query);
-  std::vector<std::pair<std::string, std::string>> items(q.begin(), q.end());
-  std::sort(items.begin(), items.end());
+  std::vector<std::pair<std::string, std::string>> items;
+  for (const auto& [k, v] : parse_query_pairs(raw_query)) {
+    items.emplace_back(s3_uri_encode(k, true), s3_uri_encode(v, true));
+  }
+  std::stable_sort(items.begin(), items.end());
   std::ostringstream oss;
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (i) oss << '&';
-    oss << s3_uri_encode(items[i].first, true) << '=' << s3_uri_encode(items[i].second, true);
+    oss << items[i].first << '=' << items[i].second;
   }
   return oss.str();
+}
+
+bool is_hex_sha256(const std::string& s) {
+  if (s.size() != 64) return false;
+  return std::all_of(s.begin(), s.end(),
+                     [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+// Reads the header block (through the blank line) with raw recv so SO_RCVTIMEO
+// applies. Bytes past the blank line are returned in `rest`.
+enum class HeaderRead { Ok, TooLarge, Closed };
+HeaderRead read_request_head(int fd, std::string& head, std::string& rest) {
+  std::string buf;
+  char chunk[4096];
+  while (true) {
+    int err = 0;
+    const long n = fd_read_some(fd, chunk, sizeof(chunk), err);
+    if (n <= 0) return HeaderRead::Closed;
+    buf.append(chunk, static_cast<std::size_t>(n));
+    const auto pos = buf.find("\r\n\r\n");
+    if (pos != std::string::npos) {
+      head = buf.substr(0, pos + 4);
+      rest = buf.substr(pos + 4);
+      return HeaderRead::Ok;
+    }
+    if (buf.size() > kMaxRequestHeaderBytes) return HeaderRead::TooLarge;
+  }
 }
 
 std::string md5_hex(const std::uint8_t* data, std::size_t len) {
@@ -165,10 +213,11 @@ void write_http(tcp::socket& sock, int status, const std::string& reason,
   oss << "Connection: close\r\n";
   for (const auto& [k, v] : headers) oss << k << ": " << v << "\r\n";
   oss << "\r\n";
-  boost::system::error_code ec;
   auto head = oss.str();
-  boost::asio::write(sock, boost::asio::buffer(head), ec);
-  if (!ec && !body.empty()) boost::asio::write(sock, boost::asio::buffer(body), ec);
+  const int fd = static_cast<int>(sock.native_handle());
+  int err = 0;
+  if (!fd_write_all(fd, head.data(), head.size(), err)) return;
+  if (!body.empty()) fd_write_all(fd, body.data(), body.size(), err);
 }
 
 void write_s3_error(tcp::socket& sock, int status, const std::string& code,
@@ -343,12 +392,31 @@ bool dir_empty(aios_posix_fs* fs, uint64_t ino) {
   }
 }
 
+// Upload ids are bearer capabilities until the owner check below, so they come
+// from the CSPRNG rather than a seeded mt19937.
 std::string random_upload_id() {
-  static thread_local std::mt19937_64 rng{std::random_device{}()};
-  std::uniform_int_distribution<uint64_t> d;
-  std::ostringstream oss;
-  oss << std::hex << d(rng) << d(rng);
-  return oss.str();
+  unsigned char raw[16];
+  if (RAND_bytes(raw, sizeof(raw)) != 1) return {};
+  static const char* hexd = "0123456789abcdef";
+  std::string out(sizeof(raw) * 2, '\0');
+  for (std::size_t i = 0; i < sizeof(raw); ++i) {
+    out[i * 2] = hexd[raw[i] >> 4];
+    out[i * 2 + 1] = hexd[raw[i] & 0xf];
+  }
+  return out;
+}
+
+std::string get_xattr_string(aios_posix_fs* fs, uint64_t ino, const char* name) {
+  char buf[1024];
+  const int n = aios_posix_getxattr(fs, ino, name, buf, sizeof(buf));
+  if (n < 0) return {};
+  return std::string(buf, static_cast<std::size_t>(n));
+}
+
+// Multipart uploads belong to the access key that created them.
+bool upload_owned_by(aios_posix_fs* fs, uint64_t upload_ino, const std::string& akid) {
+  const auto owner = get_xattr_string(fs, upload_ino, kXattrUploadOwner);
+  return !owner.empty() && owner == akid;
 }
 
 struct ListEntry {
@@ -523,12 +591,19 @@ void S3Server::do_accept() {
     if (!ec && !stopping_.load()) {
       // Run off the io_context thread: handle_session blocks in libaios_posix, which
       // performs synchronous HTTP back to http_listen on the same ioc.
-      sessions_.fetch_add(1);
-      std::thread([this, sock] {
+      set_fd_timeouts(static_cast<int>(sock->native_handle()), cfg_.http_idle_timeout_ms);
+      const int live = sessions_.fetch_add(1) + 1;
+      std::thread([this, sock, live] {
         try {
-          handle_session(sock);
+          if (live > kMaxSessions) {
+            write_s3_error(*sock, 503, "SlowDown", "too many concurrent connections", "/");
+          } else {
+            handle_session(sock);
+          }
         } catch (...) {
         }
+        boost::system::error_code cec;
+        sock->close(cec);
         sessions_.fetch_sub(1);
         stop_cv_.notify_all();
       }).detach();
@@ -539,18 +614,20 @@ void S3Server::do_accept() {
 
 void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
   try {
-    boost::asio::streambuf buf(kMaxRequestHeaderBytes);
-    boost::system::error_code ec;
-    boost::asio::read_until(*sock, buf, "\r\n\r\n", ec);
-    if (ec) {
-      if (ec == boost::asio::error::not_found) {
+    const int fd = static_cast<int>(sock->native_handle());
+    std::string head, rest;
+    switch (read_request_head(fd, head, rest)) {
+      case HeaderRead::Ok:
+        break;
+      case HeaderRead::TooLarge:
         write_s3_error(*sock, 431, "RequestHeaderSectionTooLarge",
                        "Request header section too large", "/");
-      }
-      return;
+        return;
+      case HeaderRead::Closed:
+        return;
     }
 
-    std::istream is(&buf);
+    std::istringstream is(head);
     std::string req_line;
     std::getline(is, req_line);
     if (!req_line.empty() && req_line.back() == '\r') req_line.pop_back();
@@ -582,7 +659,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
     path = url_decode(path);
     auto qmap = parse_query(query);
 
-    // Read body. RDMA PUT uses Content-Length as object size with an empty TCP body.
+    // RDMA PUT uses Content-Length as object size with an empty TCP body.
     const std::string rdma_token = header_get(headers, kAmzRdmaToken);
     std::size_t content_len = 0;
     if (auto cl = header_get(headers, "content-length"); !cl.empty()) {
@@ -597,35 +674,38 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       write_s3_error(*sock, 413, "EntityTooLarge", "Body exceeds max_object_bytes", path);
       return;
     }
+    if (!header_get(headers, "transfer-encoding").empty()) {
+      write_s3_error(*sock, 501, "NotImplemented", "Transfer-Encoding is not supported", path);
+      return;
+    }
     const bool rdma_put =
         method == "PUT" && !rdma_token.empty() && qmap.find("uploadId") == qmap.end();
     std::size_t rdma_object_size = 0;
-    std::string body;
-    if (rdma_put) {
-      rdma_object_size = content_len;
-      // Do not wait for TCP payload bytes.
-    } else {
-      // Grow the buffer with bytes actually received. Pre-sizing to Content-Length
-      // would let an unauthenticated client reserve memory it never sends.
-      const std::size_t already = std::min(buf.size(), content_len);
-      if (already) {
-        body.resize(already);
-        is.read(body.data(), static_cast<std::streamsize>(already));
-        body.resize(static_cast<std::size_t>(is.gcount()));
-      }
-      char chunk[64u * 1024u];
-      while (body.size() < content_len) {
-        const std::size_t want = std::min(sizeof(chunk), content_len - body.size());
-        const auto n = sock->read_some(boost::asio::buffer(chunk, want), ec);
-        if (n) body.append(chunk, n);
-        if (ec) break;
-      }
-    }
+    if (rdma_put) rdma_object_size = content_len;
+    const bool has_tcp_body = !rdma_put && content_len > 0;
 
+    // The payload hash is a signed header, so the signature is checked from the
+    // headers alone; the body is only read (and hashed) for a caller who proved
+    // possession of the secret.
     std::string payload_hash = header_get(headers, "x-amz-content-sha256");
     if (payload_hash.empty()) {
-      payload_hash = sha256_hex(body);
+      if (has_tcp_body) {
+        write_s3_error(*sock, 400, "InvalidRequest",
+                       "x-amz-content-sha256 is required for requests with a body", path);
+        return;
+      }
+      payload_hash = sha256_hex(std::string{});
       headers["x-amz-content-sha256"] = payload_hash;
+    }
+    const bool streaming_payload = payload_hash.rfind(kStreamingPayload, 0) == 0;
+    if (!streaming_payload && payload_hash != kUnsignedPayload && !is_hex_sha256(payload_hash)) {
+      write_s3_error(*sock, 400, "InvalidArgument", "Invalid x-amz-content-sha256", path);
+      return;
+    }
+    if (has_tcp_body && content_len > cfg_.s3_max_body_bytes) {
+      write_s3_error(*sock, 413, "EntityTooLarge",
+                     "Body exceeds s3_max_body_bytes; use multipart upload", path);
+      return;
     }
 
     // Canonical URI: encode path but keep slashes (S3 style).
@@ -681,6 +761,47 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       write_s3_error(*sock, 403, "SignatureDoesNotMatch", auth.error, path);
       return;
     }
+
+    // Body: only now, and only up to the buffered ceiling checked above.
+    std::string body;
+    if (has_tcp_body) {
+      if (streaming_payload) {
+        write_s3_error(*sock, 501, "NotImplemented",
+                       "aws-chunked (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) uploads are not "
+                       "supported; send a concrete x-amz-content-sha256 or UNSIGNED-PAYLOAD",
+                       path);
+        return;
+      }
+      body = std::move(rest);
+      if (body.size() > content_len) body.resize(content_len);
+      body.reserve(content_len);
+      char chunk[64u * 1024u];
+      while (body.size() < content_len) {
+        const std::size_t want = std::min(sizeof(chunk), content_len - body.size());
+        int rerr = 0;
+        const long n = fd_read_some(fd, chunk, want, rerr);
+        if (n <= 0) return;
+        body.append(chunk, static_cast<std::size_t>(n));
+      }
+      if (payload_hash != kUnsignedPayload && lower(payload_hash) != sha256_hex(body)) {
+        write_s3_error(*sock, 400, "XAmzContentSHA256Mismatch",
+                       "The provided 'x-amz-content-sha256' header does not match what was "
+                       "computed.",
+                       path);
+        return;
+      }
+    }
+
+    // Every logical write ends with fsync so the inode size is published before
+    // the 200 goes out; other mounts otherwise read the object back as size 0.
+    auto fsync_or_fail = [&](uint64_t ino) -> bool {
+      const int ferr = aios_posix_fsync(fs_, ino);
+      if (ferr == 0) return true;
+      if (!write_posix_err(*sock, ferr, path))
+        write_s3_error(*sock, 500, "InternalError", "fsync failed", path);
+      return false;
+    };
+
     const bool set_owner = !is_root && iam_cred.has_value();
     const uint32_t own_uid = set_owner ? iam_cred->uid : 0;
     const uint32_t own_gid = set_owner ? iam_cred->gid : 0;
@@ -881,6 +1002,10 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         return;
       }
       std::string upload_id = random_upload_id();
+      if (upload_id.empty()) {
+        write_s3_error(*sock, 500, "InternalError", "multipart init failed", path);
+        return;
+      }
       aios_posix_stat mst{};
       aios_posix_lookup(fs_, kRootIno, kMultipartDir, &mst);
       aios_posix_stat ust{};
@@ -889,10 +1014,15 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 500, "InternalError", "multipart init failed", path);
         return;
       }
-      // Store target key as xattr on upload dir
-      aios_posix_setxattr(fs_, ust.ino, "user.aios.s3.upload.bucket", bucket.data(), bucket.size(),
-                          0);
-      aios_posix_setxattr(fs_, ust.ino, "user.aios.s3.upload.key", key.data(), key.size(), 0);
+      // Target key and owner live on the upload dir; UploadPart/Complete/Abort
+      // check the owner so an uploadId is not a bearer token.
+      aios_posix_setxattr(fs_, ust.ino, kXattrUploadBucket, bucket.data(), bucket.size(), 0);
+      aios_posix_setxattr(fs_, ust.ino, kXattrUploadKey, key.data(), key.size(), 0);
+      if (aios_posix_setxattr(fs_, ust.ino, kXattrUploadOwner, akid.data(), akid.size(), 0) != 0) {
+        aios_posix_rmdir(fs_, mst.ino, upload_id.c_str());
+        write_s3_error(*sock, 500, "InternalError", "multipart init failed", path);
+        return;
+      }
       std::ostringstream xml;
       xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
           << "<InitiateMultipartUploadResult>"
@@ -913,6 +1043,20 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 404, "NoSuchUpload", "upload not found", path);
         return;
       }
+      if (!upload_owned_by(fs_, ust.ino, akid)) {
+        write_s3_error(*sock, 403, "AccessDenied", "upload belongs to another principal", path);
+        return;
+      }
+      int pn = 0;
+      try {
+        pn = std::stoi(part);
+      } catch (...) {
+        pn = 0;
+      }
+      if (pn < 1 || pn > 10000 || std::to_string(pn) != part) {
+        write_s3_error(*sock, 400, "InvalidArgument", "partNumber must be 1..10000", path);
+        return;
+      }
       uint64_t fino = 0;
       int err = ensure_file(fs_, ust.ino, part.c_str(), &fino);
       if (err) {
@@ -926,6 +1070,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 500, "InternalError", "part write failed", path);
         return;
       }
+      if (!fsync_or_fail(fino)) return;
       auto etag = md5_hex(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
       write_http(*sock, 200, "OK", {{"ETag", "\"" + etag + "\""}}, {});
       return;
@@ -940,14 +1085,23 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 404, "NoSuchUpload", "upload not found", path);
         return;
       }
-      char bbuf[256]{}, kbuf[1024]{};
-      int blen = aios_posix_getxattr(fs_, ust.ino, "user.aios.s3.upload.bucket", bbuf, sizeof(bbuf));
-      int klen = aios_posix_getxattr(fs_, ust.ino, "user.aios.s3.upload.key", kbuf, sizeof(kbuf));
-      if (blen < 0 || klen < 0) {
+      if (!upload_owned_by(fs_, ust.ino, akid)) {
+        write_s3_error(*sock, 403, "AccessDenied", "upload belongs to another principal", path);
+        return;
+      }
+      const std::string tbucket = get_xattr_string(fs_, ust.ino, kXattrUploadBucket);
+      const std::string tkey = get_xattr_string(fs_, ust.ino, kXattrUploadKey);
+      if (tbucket.empty() || tkey.empty()) {
         write_s3_error(*sock, 500, "InternalError", "upload meta missing", path);
         return;
       }
-      std::string tbucket(bbuf, blen), tkey(kbuf, klen);
+      // The target may differ from the request path; the principal's bucket
+      // allow-list applies to where the object lands.
+      if (!allow_bucket(tbucket)) {
+        write_s3_error(*sock, 403, "AccessDenied", "target bucket not allowed for this access key",
+                       path);
+        return;
+      }
       // Collect part files sorted by name (part numbers)
       std::vector<std::pair<int, uint64_t>> parts;
       uint64_t off = 0;
@@ -1004,6 +1158,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 500, "InternalError", "assemble failed", path);
         return;
       }
+      if (!fsync_or_fail(fino)) return;
       // Cleanup multipart dir
       off = 0;
       for (;;) {
@@ -1030,6 +1185,10 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
       aios_posix_stat mst{}, ust{};
       if (aios_posix_lookup(fs_, kRootIno, kMultipartDir, &mst) == 0 &&
           aios_posix_lookup(fs_, mst.ino, upload_id.c_str(), &ust) == 0) {
+        if (!upload_owned_by(fs_, ust.ino, akid)) {
+          write_s3_error(*sock, 403, "AccessDenied", "upload belongs to another principal", path);
+          return;
+        }
         uint64_t off = 0;
         aios_posix_dirent ents[64];
         for (;;) {
@@ -1105,6 +1264,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_s3_error(*sock, 500, "InternalError", "copy failed", path);
         return;
       }
+      if (!fsync_or_fail(dino)) return;
       std::ostringstream xml;
       xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
           << "<CopyObjectResult><LastModified>" << iso8601_from_ns(sst.mtime_ns)
@@ -1176,6 +1336,7 @@ void S3Server::handle_session(std::shared_ptr<tcp::socket> sock) {
           write_s3_error(*sock, 500, "InternalError", "write failed", path);
         return;
       }
+      if (!fsync_or_fail(ino)) return;
       if (auto ct = header_get(headers, "content-type"); !ct.empty()) {
         aios_posix_setxattr(fs_, ino, kXattrContentType, ct.data(), ct.size(), 0);
       }

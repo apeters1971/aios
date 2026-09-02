@@ -96,6 +96,8 @@ std::string http_canonical(const std::string& method, const std::string& path_wi
     oss << n << ':' << header_get(headers, n) << '\n';
   }
   oss << signed_headers << '\n' << payload_hash_hex;
+  const std::string nonce = header_get(headers, kHttpNonceHeader);
+  if (!nonce.empty()) oss << '\n' << kHttpNonceHeader << ':' << nonce;
   return oss.str();
 }
 
@@ -103,10 +105,59 @@ std::string http_sign(const std::string& cluster_key, const std::string& canonic
   return hmac_sha256_hex(cluster_key, canonical);
 }
 
+bool HttpReplayCache::check_and_insert(const std::string& key, std::int64_t expires_at_ms,
+                                       std::int64_t now) {
+  std::lock_guard lock(mu_);
+  if (++inserts_since_sweep_ >= 1024 || entries_.size() >= kMaxEntries) {
+    evict_expired(now);
+    inserts_since_sweep_ = 0;
+  }
+  auto it = entries_.find(key);
+  if (it != entries_.end()) {
+    if (it->second > now) return false;
+    it->second = expires_at_ms;
+    return true;
+  }
+  while (entries_.size() >= kMaxEntries) entries_.erase(entries_.begin());
+  entries_.emplace(key, expires_at_ms);
+  return true;
+}
+
+void HttpReplayCache::clear() {
+  std::lock_guard lock(mu_);
+  entries_.clear();
+}
+
+std::size_t HttpReplayCache::size() const {
+  std::lock_guard lock(mu_);
+  return entries_.size();
+}
+
+void HttpReplayCache::evict_expired(std::int64_t now) {
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    if (it->second <= now) it = entries_.erase(it);
+    else ++it;
+  }
+}
+
+HttpReplayCache& http_replay_cache() {
+  static HttpReplayCache cache;
+  return cache;
+}
+
 HttpAuthResult http_auth_verify(const std::string& method, const std::string& path_with_query,
                                 const std::unordered_map<std::string, std::string>& headers,
                                 const std::string& payload_hash_hex,
                                 const std::string& cluster_key, int skew_ms) {
+  return http_auth_verify(method, path_with_query, headers, payload_hash_hex, cluster_key,
+                          skew_ms, &http_replay_cache());
+}
+
+HttpAuthResult http_auth_verify(const std::string& method, const std::string& path_with_query,
+                                const std::unordered_map<std::string, std::string>& headers,
+                                const std::string& payload_hash_hex,
+                                const std::string& cluster_key, int skew_ms,
+                                HttpReplayCache* replay) {
   HttpAuthResult r;
   const std::string auth = header_get(headers, "authorization");
   if (auth.rfind("AIOS-HMAC-SHA256 ", 0) != 0) {
@@ -148,7 +199,8 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
     r.error = "unparsable date";
     return r;
   }
-  if (std::llabs(now_ms() - ts) > skew_ms) {
+  const std::int64_t now = now_ms();
+  if (std::llabs(now - ts) > skew_ms) {
     r.error = "date skew too large";
     return r;
   }
@@ -159,6 +211,23 @@ HttpAuthResult http_auth_verify(const std::string& method, const std::string& pa
   if (!const_time_eq(expect, signature)) {
     r.error = "bad signature";
     return r;
+  }
+
+  if (replay) {
+    const std::string nonce = header_get(headers, kHttpNonceHeader);
+    const bool mutating = method == "PUT" || method == "POST" || method == "DELETE";
+    const bool signed_body = payload_hash_hex != "UNSIGNED-PAYLOAD";
+    std::string key;
+    if (!nonce.empty()) {
+      key = "n\n" + date + '\n' + nonce + '\n' + signature;
+    } else if (mutating && signed_body) {
+      key = "r\n" + method + '\n' + path_with_query + '\n' + date + '\n' + signature;
+    }
+    // A replay stays inside the skew window for at most skew_ms past its date.
+    if (!key.empty() && !replay->check_and_insert(key, ts + skew_ms + 1000, now)) {
+      r.error = "replayed request";
+      return r;
+    }
   }
   r.ok = true;
   r.credential = credential;

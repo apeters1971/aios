@@ -16,10 +16,12 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace aios {
@@ -73,8 +75,14 @@ class HttpServer {
   // so the worker is freed. Those threads hold references to this server and to
   // ObjectService, so close_sessions() has to wait for them. Call detached_begin()
   // on the worker before spawning, and hold a DetachedGuard inside the thread.
-  void detached_begin();
+  // Returns false (nothing reserved) once cfg_.http_max_long_polls are running.
+  bool detached_begin();
   void detached_end();
+  // Admin login throttle: after kLoginMaxFailures from one source address the
+  // endpoint answers 429 for kLoginLockoutMs.
+  bool login_throttled(const std::string& peer);
+  void note_login_failure(const std::string& peer);
+  void note_login_success(const std::string& peer);
   nlohmann::json admin_status_json() const;
   nlohmann::json admin_config_json() const;
   nlohmann::json admin_lifecycle_json() const;
@@ -106,6 +114,13 @@ class HttpServer {
   std::mutex detached_mu_;
   std::condition_variable detached_cv_;
   int detached_{0};
+  struct LoginFailures {
+    int count{0};
+    std::int64_t locked_until_ms{0};
+    std::int64_t last_ms{0};
+  };
+  std::mutex login_mu_;
+  std::unordered_map<std::string, LoginFailures> login_failures_;
 };
 
 }  // namespace aios

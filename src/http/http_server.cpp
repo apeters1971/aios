@@ -3,11 +3,13 @@
 #include "cluster/lifecycle.hpp"
 #include "fs/aios_scan.hpp"
 #include "http/http_auth.hpp"
+#include "http/sock_io.hpp"
 #include "metrics/app_label.hpp"
 #include "metrics/frontend_io.hpp"
 #include "net/framing.hpp"
 #include "object/object_layout.hpp"
 #include "object/pubsub.hpp"
+#include "object/archive_bag.hpp"
 #include "object/archive_pack.hpp"
 #include "object/archive_tape.hpp"
 #include "object/backup.hpp"
@@ -27,12 +29,14 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #ifdef __APPLE__
+#include <mach-o/dyld.h>
 #include <sys/uio.h>
 #else
 #include <sys/sendfile.h>
 #endif
 
 #include <cerrno>
+#include <cstring>
 
 #include <algorithm>
 #include <cctype>
@@ -63,10 +67,7 @@ namespace {
 
 using tcp = boost::asio::ip::tcp;
 
-std::string sha256_hex(const std::uint8_t* data, std::size_t len) {
-  unsigned char md[EVP_MAX_MD_SIZE];
-  unsigned int md_len = 0;
-  EVP_Digest(data, len, md, &md_len, EVP_sha256(), nullptr);
+std::string hex_digest(const unsigned char* md, unsigned int md_len) {
   static const char* hexd = "0123456789abcdef";
   std::string out(md_len * 2, '\0');
   for (unsigned int i = 0; i < md_len; ++i) {
@@ -76,7 +77,54 @@ std::string sha256_hex(const std::uint8_t* data, std::size_t len) {
   return out;
 }
 
-std::string url_decode(const std::string& in) {
+std::string sha256_hex(const std::uint8_t* data, std::size_t len) {
+  unsigned char md[EVP_MAX_MD_SIZE];
+  unsigned int md_len = 0;
+  EVP_Digest(data, len, md, &md_len, EVP_sha256(), nullptr);
+  return hex_digest(md, md_len);
+}
+
+// Incremental sha256 for bodies that are streamed to disk or the pipeline.
+class Sha256Stream {
+ public:
+  Sha256Stream() : ctx_(EVP_MD_CTX_new()) {
+    if (ctx_) EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr);
+  }
+  ~Sha256Stream() {
+    if (ctx_) EVP_MD_CTX_free(ctx_);
+  }
+  Sha256Stream(const Sha256Stream&) = delete;
+  Sha256Stream& operator=(const Sha256Stream&) = delete;
+  void update(const std::uint8_t* data, std::size_t len) {
+    if (ctx_) EVP_DigestUpdate(ctx_, data, len);
+  }
+  std::string hex() {
+    if (!ctx_) return {};
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int md_len = 0;
+    EVP_DigestFinal_ex(ctx_, md, &md_len);
+    return hex_digest(md, md_len);
+  }
+
+ private:
+  EVP_MD_CTX* ctx_;
+};
+
+// A concrete x-aios-content-sha256 value: 64 hex digits, normalised to lowercase.
+bool parse_hex_sha256(const std::string& in, std::string& out) {
+  if (in.size() != 64) return false;
+  out.clear();
+  out.reserve(64);
+  for (unsigned char c : in) {
+    if (!std::isxdigit(c)) return false;
+    out.push_back(static_cast<char>(std::tolower(c)));
+  }
+  return true;
+}
+
+// Percent-decoding only. '+' is a literal byte in a path segment; only query
+// strings (application/x-www-form-urlencoded) read it as a space.
+std::string url_decode(const std::string& in, bool plus_is_space = false) {
   std::string out;
   out.reserve(in.size());
   for (std::size_t i = 0; i < in.size(); ++i) {
@@ -90,10 +138,31 @@ std::string url_decode(const std::string& in) {
         continue;
       }
     }
-    if (in[i] == '+') out.push_back(' ');
+    if (plus_is_space && in[i] == '+') out.push_back(' ');
     else out.push_back(in[i]);
   }
   return out;
+}
+
+// nlohmann::json::dump throws on invalid UTF-8; oids and attribute values are
+// arbitrary bytes, so every response body goes through this instead.
+std::string json_dump(const nlohmann::json& j) {
+  return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+// Attributes owned by the archive/backup daemons. Clients can neither set nor
+// clear them; a PUT that names one is rejected before it reaches the store.
+bool is_reserved_attr(const std::string& name) {
+  if (name == kFrozenAttr || name == kArchiveStateAttr || name == kContentSha256Attr) return true;
+  return name.rfind("aios.tape_", 0) == 0 || name.rfind("aios.bag_", 0) == 0 ||
+         name.rfind("aios.bag.", 0) == 0;
+}
+
+std::string first_reserved_attr(const std::unordered_map<std::string, std::string>& attrs) {
+  for (const auto& [k, v] : attrs) {
+    if (is_reserved_attr(k)) return k;
+  }
+  return {};
 }
 
 std::string url_encode_path(const std::string& in) {
@@ -146,9 +215,9 @@ std::unordered_map<std::string, std::string> parse_query(const std::string& q) {
     if (amp == std::string::npos) amp = q.size();
     auto eq = q.find('=', i);
     if (eq != std::string::npos && eq < amp) {
-      out[url_decode(q.substr(i, eq - i))] = url_decode(q.substr(eq + 1, amp - eq - 1));
+      out[url_decode(q.substr(i, eq - i), true)] = url_decode(q.substr(eq + 1, amp - eq - 1), true);
     } else if (amp > i) {
-      out[url_decode(q.substr(i, amp - i))] = "";
+      out[url_decode(q.substr(i, amp - i), true)] = "";
     }
     i = amp + 1;
   }
@@ -291,65 +360,31 @@ std::size_t http_worker_count(const Config& cfg) {
 // idle keep-alive client (one that connects and never sends, or that stops reading
 // a large response) owns its worker forever, and a handful of them starve the pool.
 void set_session_timeouts(tcp::socket& sock, int idle_ms) {
-  if (idle_ms <= 0) return;
-  const int fd = static_cast<int>(sock.native_handle());
-  // recv/send have to actually block for SO_*TIMEO to mean anything.
-  const int fl = ::fcntl(fd, F_GETFL, 0);
-  if (fl >= 0 && (fl & O_NONBLOCK)) ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
-  struct timeval tv;
-  tv.tv_sec = idle_ms / 1000;
-  tv.tv_usec = (idle_ms % 1000) * 1000;
-  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  set_fd_timeouts(static_cast<int>(sock.native_handle()), idle_ms);
 }
 
-// Asio's synchronous read/write carry no deadline of their own: on SO_RCVTIMEO
-// expiry recv reports EAGAIN, which asio reads as "not ready yet" and answers with
-// another unbounded poll. The timeout is only observable from the raw syscall.
+// See sock_io.hpp: SO_RCVTIMEO is only observable from the raw syscall.
 bool sock_read_exact(tcp::socket& sock, void* out, std::size_t n,
                      boost::system::error_code& ec) {
-  const int fd = static_cast<int>(sock.native_handle());
-  auto* p = static_cast<char*>(out);
-  std::size_t done = 0;
-  while (done < n) {
-    const auto r = ::recv(fd, p + done, n - done, 0);
-    if (r > 0) {
-      done += static_cast<std::size_t>(r);
-      continue;
-    }
-    if (r == 0) {
-      ec = boost::asio::error::eof;
-      return false;
-    }
-    if (errno == EINTR) continue;
-    ec = boost::system::error_code(errno, boost::system::system_category());
-    return false;
+  int err = 0;
+  if (fd_read_exact(static_cast<int>(sock.native_handle()), out, n, err)) {
+    ec = {};
+    return true;
   }
-  ec = {};
-  return true;
+  ec = err == 0 ? boost::system::error_code(boost::asio::error::eof)
+                : boost::system::error_code(err, boost::system::system_category());
+  return false;
 }
 
 bool sock_write_all(tcp::socket& sock, const void* in, std::size_t n,
                     boost::system::error_code& ec) {
-  const int fd = static_cast<int>(sock.native_handle());
-  const auto* p = static_cast<const char*>(in);
-  std::size_t done = 0;
-  while (done < n) {
-#ifdef MSG_NOSIGNAL
-    const auto r = ::send(fd, p + done, n - done, MSG_NOSIGNAL);
-#else
-    const auto r = ::send(fd, p + done, n - done, 0);
-#endif
-    if (r > 0) {
-      done += static_cast<std::size_t>(r);
-      continue;
-    }
-    if (r < 0 && errno == EINTR) continue;
-    ec = boost::system::error_code(r == 0 ? EPIPE : errno, boost::system::system_category());
-    return false;
+  int err = 0;
+  if (fd_write_all(static_cast<int>(sock.native_handle()), in, n, err)) {
+    ec = {};
+    return true;
   }
-  ec = {};
-  return true;
+  ec = boost::system::error_code(err, boost::system::system_category());
+  return false;
 }
 
 bool write_response(tcp::socket& sock, int status, const std::string& reason,
@@ -384,7 +419,7 @@ bool write_100_continue(tcp::socket& sock) {
 
 void write_json(tcp::socket& sock, int status, const std::string& reason,
                 const nlohmann::json& j, bool keep_alive) {
-  const auto body = j.dump();
+  const auto body = json_dump(j);
   write_response(sock, status, reason, {{"Content-Type", "application/json"}},
                  reinterpret_cast<const std::uint8_t*>(body.data()), body.size(), keep_alive);
 }
@@ -419,11 +454,11 @@ void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
                          {"code", r.code},
                          {"epoch", r.epoch},
                          {"acting_set", acting}};
-  const auto body_s = body.dump();
+  const auto body_s = json_dump(body);
   std::unordered_map<std::string, std::string> headers = {
       {"Content-Type", "application/json"},
       {"Location", location},
-      {"x-aios-acting-set", acting.dump()},
+      {"x-aios-acting-set", json_dump(acting)},
   };
   if (!r.placement.acting_set.empty()) {
     headers["x-aios-primary"] = r.placement.acting_set[0].node_id;
@@ -645,7 +680,7 @@ void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& p
   }
   if (r.code == "restoring") {
     const auto j =
-        nlohmann::json({{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}).dump();
+        json_dump(nlohmann::json({{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}));
     write_response(sock, 503, "Service Unavailable",
                    {{"Content-Type", "application/json"}, {"Retry-After", "30"}},
                    reinterpret_cast<const std::uint8_t*>(j.data()), j.size(), keep_alive);
@@ -653,6 +688,32 @@ void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& p
   }
   write_json(sock, status_for(r), "Error",
              {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
+}
+
+void write_long_poll_busy(tcp::socket& sock, bool keep_alive) {
+  const auto j = json_dump(nlohmann::json{{"error", "too many concurrent long polls"},
+                                          {"code", "long_poll_limit"}});
+  write_response(sock, 503, "Service Unavailable",
+                 {{"Content-Type", "application/json"}, {"Retry-After", "1"}},
+                 reinterpret_cast<const std::uint8_t*>(j.data()), j.size(), keep_alive);
+}
+
+// Body of a detached long-poll thread. An exception here would otherwise call
+// std::terminate and take the daemon down with it.
+template <typename Fn>
+void detached_body(tcp::socket& sock, Fn&& fn) {
+  try {
+    fn();
+  } catch (const std::exception& e) {
+    AIOS_LOG_WARN("http long poll: ", e.what());
+    try {
+      write_json(sock, 500, "Error", {{"error", "internal error"}, {"code", "internal_error"}},
+                 false);
+    } catch (...) {
+    }
+  } catch (...) {
+    AIOS_LOG_WARN("http long poll: unknown exception");
+  }
 }
 
 bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& ec) {
@@ -683,14 +744,15 @@ PeerAdminResult peer_admin_request(const Config& cfg, const std::string& http_ad
   }
   std::unordered_map<std::string, std::string> headers;
   const std::string date = std::to_string(now_ms());
+  const std::string payload_hash =
+      sha256_hex(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
   headers["x-aios-date"] = date;
-  headers["x-aios-content-sha256"] = "UNSIGNED-PAYLOAD";
+  headers["x-aios-content-sha256"] = payload_hash;
   headers["content-type"] = "application/json";
   headers["content-length"] = std::to_string(body.size());
   headers["connection"] = "close";
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
-  const auto canon =
-      http_canonical(method, path, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
+  const auto canon = http_canonical(method, path, date, signed_headers, headers, payload_hash);
   const auto sig = http_sign(cfg.cluster_key, canon);
   headers["authorization"] = "AIOS-HMAC-SHA256 Credential=admin-proxy, SignedHeaders=" +
                              signed_headers + ", Signature=" + sig;
@@ -800,6 +862,10 @@ void write_peer_admin(tcp::socket& sock, bool keep_alive, const PeerAdminResult&
 
 constexpr std::int64_t kAdminSessionTtlMs = 12LL * 60 * 60 * 1000;
 constexpr const char* kAdminCookie = "aios_admin";
+// Cookie-authenticated PUT/POST/DELETE on /admin/api/* must carry this header.
+constexpr const char* kAdminCsrfHeader = "x-aios-admin";
+// Ceiling for request bodies on every endpoint that is not an object write.
+constexpr std::size_t kNonObjectBodyMax = 1u * 1024u * 1024u;
 
 bool const_time_eq(const std::string& a, const std::string& b) {
   if (a.size() != b.size()) return false;
@@ -852,6 +918,23 @@ bool verify_admin_session(const std::string& token, const std::string& cluster_k
   return const_time_eq(expect, sig);
 }
 
+// Directory of the running executable, or empty if it cannot be determined.
+std::filesystem::path executable_dir() {
+  std::error_code ec;
+#if defined(__APPLE__)
+  std::uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  std::string buf(size, '\0');
+  if (size == 0 || _NSGetExecutablePath(buf.data(), &size) != 0) return {};
+  buf.resize(std::strlen(buf.c_str()));
+  auto p = std::filesystem::weakly_canonical(std::filesystem::path(buf), ec);
+#else
+  auto p = std::filesystem::read_symlink("/proc/self/exe", ec);
+#endif
+  if (ec || p.empty()) return {};
+  return p.parent_path();
+}
+
 std::filesystem::path find_admin_web_root() {
   if (const char* env = std::getenv("AIOS_ADMIN_WEB"); env && *env) {
     std::filesystem::path p(env);
@@ -861,6 +944,18 @@ std::filesystem::path find_admin_web_root() {
   if (defaults && *defaults) {
     std::filesystem::path p(defaults);
     if (std::filesystem::is_directory(p)) return p;
+  }
+  // Relative to the binary: <prefix>/bin/aiosd → <prefix>/share/aios/admin for
+  // installs, <build>/aiosd → <src>/web/admin for in-tree builds. Independent of
+  // the daemon's cwd (systemd starts services from /).
+  if (const auto exe = executable_dir(); !exe.empty()) {
+    for (const auto& cand : {exe / "../share/aios/admin", exe / "share/aios/admin",
+                             exe / "../web/admin", exe / "web/admin"}) {
+      std::error_code ec;
+      if (std::filesystem::is_directory(cand, ec)) {
+        return std::filesystem::weakly_canonical(cand, ec);
+      }
+    }
   }
   for (const char* cand : {"web/admin", "../web/admin", "share/aios/admin",
                            "../share/aios/admin"}) {
@@ -1180,9 +1275,58 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService&
   AIOS_LOG_INFO("http listening on ", ep.address().to_string(), ":", ep.port());
 }
 
-void HttpServer::detached_begin() {
+bool HttpServer::detached_begin() {
   std::lock_guard lock(detached_mu_);
+  if (detached_ >= std::max(1, cfg_.http_max_long_polls)) return false;
   ++detached_;
+  return true;
+}
+
+namespace {
+constexpr int kLoginMaxFailures = 5;
+constexpr std::int64_t kLoginLockoutMs = 30000;
+constexpr std::size_t kLoginTrackedPeers = 4096;
+}  // namespace
+
+bool HttpServer::login_throttled(const std::string& peer) {
+  std::lock_guard lock(login_mu_);
+  auto it = login_failures_.find(peer);
+  if (it == login_failures_.end()) return false;
+  const auto now = now_ms();
+  if (it->second.locked_until_ms > now) return true;
+  if (it->second.locked_until_ms != 0 && it->second.locked_until_ms <= now) {
+    login_failures_.erase(it);
+  }
+  return false;
+}
+
+void HttpServer::note_login_failure(const std::string& peer) {
+  std::lock_guard lock(login_mu_);
+  const auto now = now_ms();
+  if (login_failures_.size() >= kLoginTrackedPeers) {
+    for (auto it = login_failures_.begin(); it != login_failures_.end();) {
+      const bool stale = it->second.locked_until_ms < now &&
+                         now - it->second.last_ms > kLoginLockoutMs;
+      if (stale) it = login_failures_.erase(it);
+      else ++it;
+    }
+    // Still full: a flood from many addresses. Drop arbitrary entries rather than
+    // stop tracking, so the attacker at least cannot exempt itself by volume.
+    while (login_failures_.size() >= kLoginTrackedPeers) {
+      login_failures_.erase(login_failures_.begin());
+    }
+  }
+  auto& f = login_failures_[peer];
+  f.last_ms = now;
+  if (++f.count >= kLoginMaxFailures) {
+    f.locked_until_ms = now + kLoginLockoutMs;
+    f.count = 0;
+  }
+}
+
+void HttpServer::note_login_success(const std::string& peer) {
+  std::lock_guard lock(login_mu_);
+  login_failures_.erase(peer);
 }
 
 void HttpServer::detached_end() {
@@ -1278,7 +1422,18 @@ void HttpServer::do_accept() {
           // Session I/O is synchronous; run off ioc_ so parallel browser connections
           // (HTML + CSS + JS) are not stalled by keep-alive reads.
           boost::asio::post(workers_, [this, sock] {
-            handle_session(sock);
+            try {
+              handle_session(sock);
+            } catch (const std::exception& e) {
+              AIOS_LOG_WARN("http session: ", e.what());
+              try {
+                write_json(*sock, 500, "Error",
+                           {{"error", "internal error"}, {"code", "internal_error"}}, false);
+              } catch (...) {
+              }
+            } catch (...) {
+              AIOS_LOG_WARN("http session: unknown exception");
+            }
             std::lock_guard lock(sessions_mu_);
             sessions_.erase(sock);
           });
@@ -1378,8 +1533,30 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     const bool admin_api = path.rfind("/admin/api/", 0) == 0;
     const bool skip_hmac = metrics_public || admin_static || admin_login || admin_logout;
 
+    // Only object bodies may exceed the in-memory threshold and be staged on disk:
+    // PUT /o/{oid}, POST /o/{oid}/append, PUT /txn/{id}/o/{oid}. Everything else
+    // (admin JSON, pubsub messages, unauthenticated login attempts) is small by
+    // construction and gets a hard ceiling so anonymous clients cannot make the
+    // server spool gigabytes to its temp directory.
+    const bool object_body_endpoint =
+        !skip_hmac && ((method == "PUT" && path.rfind("/o/", 0) == 0) ||
+                       (method == "POST" && path.rfind("/o/", 0) == 0 &&
+                        path.size() >= 7 && path.compare(path.size() - 7, 7, "/append") == 0) ||
+                       (method == "PUT" && path.rfind("/txn/", 0) == 0));
+    if (!object_body_endpoint && content_length > kNonObjectBodyMax) {
+      write_json(*sock, 413, "Payload Too Large",
+                 {{"error", "body too large for this endpoint"}, {"code", "payload_too_large"}},
+                 false);
+      return;
+    }
+
+    // Cookie sessions may only drive state-changing admin calls when the request
+    // carries x-aios-admin, which a cross-site form or fetch cannot add without a
+    // CORS preflight this server never grants. HMAC-signed calls are unaffected.
+    int auth_status = 401;
     auto write_unauth = [&](const std::string& err) {
-      write_json(*sock, 401, "Unauthorized", {{"error", err}}, false);
+      write_json(*sock, auth_status, auth_status == 403 ? "Forbidden" : "Unauthorized",
+                 {{"error", err}}, false);
     };
     auto try_auth = [&](const std::string& payload_hash, std::string& err_out) -> bool {
       if (skip_hmac) return true;
@@ -1388,7 +1565,15 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       if (auth.ok) return true;
       if (admin_api && cfg_.admin) {
         const auto tok = cookie_get(headers, kAdminCookie);
-        if (!tok.empty() && verify_admin_session(tok, cfg_.cluster_key)) return true;
+        if (!tok.empty() && verify_admin_session(tok, cfg_.cluster_key)) {
+          const bool mutating = method != "GET" && method != "HEAD";
+          if (mutating && header_get(headers, kAdminCsrfHeader).empty()) {
+            auth_status = 403;
+            err_out = std::string("missing ") + kAdminCsrfHeader + " header";
+            return false;
+          }
+          return true;
+        }
         err_out = auth.error.empty() ? "login required" : auth.error;
         return false;
       }
@@ -1417,24 +1602,56 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         upload_path.clear();
       }
     };
+    // Every exit from this iteration (continue, return, throw) drops the staged
+    // body; paths that committed it have already cleared upload_path.
+    struct UploadScopeGuard {
+      decltype(cleanup_upload)& fn;
+      ~UploadScopeGuard() { fn(); }
+    };
+    UploadScopeGuard upload_guard{cleanup_upload};
 
-    if (content_length > 0 && content_length > kMemThreshold && !skip_hmac) {
-      if (header_get(headers, "x-aios-content-sha256") != "UNSIGNED-PAYLOAD") {
+    // x-aios-content-sha256 as sent: UNSIGNED-PAYLOAD, or a concrete hash that is
+    // checked against the received bytes (streamed or in memory).
+    const std::string content_sha_hdr = header_get(headers, "x-aios-content-sha256");
+    std::string expected_body_sha;
+    const bool unsigned_payload = content_sha_hdr == "UNSIGNED-PAYLOAD";
+    const bool concrete_sha = parse_hex_sha256(content_sha_hdr, expected_body_sha);
+    if (!skip_hmac && content_length > 0) {
+      if (!content_sha_hdr.empty() && !unsigned_payload && !concrete_sha) {
         write_json(*sock, 400, "Bad Request",
-                   {{"error", "streamed PUT requires x-aios-content-sha256: UNSIGNED-PAYLOAD"},
-                    {"code", "unsigned_payload_required"}},
+                   {{"error", "x-aios-content-sha256 must be UNSIGNED-PAYLOAD or 64 hex digits"},
+                    {"code", "bad_content_sha256"}},
+                   false);
+        return;
+      }
+      if (cfg_.http_require_signed_payload && !concrete_sha) {
+        write_json(*sock, 401, "Unauthorized",
+                   {{"error", "this cluster requires a signed payload hash"},
+                    {"code", "signed_payload_required"}},
+                   false);
+        return;
+      }
+    }
+    std::string received_body_sha;
+    const bool stage_body = content_length > kMemThreshold && object_body_endpoint;
+
+    if (stage_body) {
+      if (!unsigned_payload && !concrete_sha) {
+        write_json(*sock, 400, "Bad Request",
+                   {{"error", "streamed PUT requires x-aios-content-sha256"},
+                    {"code", "content_sha256_required"}},
                    false);
         return;
       }
       std::string aerr;
-      if (!try_auth("UNSIGNED-PAYLOAD", aerr)) {
+      if (!try_auth(unsigned_payload ? "UNSIGNED-PAYLOAD" : expected_body_sha, aerr)) {
         write_unauth(aerr);
         return;
       }
       authed = true;
     }
 
-    if (content_length > 0 && content_length > kMemThreshold) {
+    if (stage_body) {
       // Prefer store-local staging for plain PUT /o/{oid} so place() is a rename,
       // not a cross-volume copy out of the process temp directory.
       // With Expect: 100-continue, reject non-primary before the client sends the body.
@@ -1514,12 +1731,14 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         bool write_ok = true;
         PipelineStager stager(objects_);
         bool have_remote = false;
+        Sha256Stream body_sha;
         while (left > 0) {
           const auto n = std::min(left, fill->size());
           if (!sock_read_exact(*sock, fill->data(), n, ec)) {
             write_ok = false;
             break;
           }
+          if (concrete_sha) body_sha.update(fill->data(), n);
           // Local pwrite of this chunk while the previous chunk's remotes run.
           if (!stager.submit_local(upload_pipeline_oid, offset, fill->data(), n)) {
             write_ok = false;
@@ -1549,6 +1768,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                      {{"error", "upload failed"}, {"code", "upload_failed"}}, false);
           return;
         }
+        if (concrete_sha) received_body_sha = body_sha.hex();
       } else {
         int tmp_fd = -1;
         if (upload_path.empty()) {
@@ -1577,12 +1797,14 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         upload_crc = 0;
         std::uint32_t crc = 0;
         bool write_ok = true;
+        Sha256Stream body_sha;
         while (left > 0) {
           const auto n = std::min(left, buf.size());
           if (!sock_read_exact(*sock, buf.data(), n, ec)) {
             write_ok = false;
             break;
           }
+          if (concrete_sha) body_sha.update(buf.data(), n);
           std::size_t off = 0;
           while (off < n) {
             const auto w = ::write(tmp_fd, buf.data() + off, n - off);
@@ -1604,11 +1826,13 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           return;
         }
         upload_crc = crc;
+        if (concrete_sha) received_body_sha = body_sha.hex();
       }
     } else if (content_length > 0) {
       if (want_continue && !write_100_continue(*sock)) return;
       body.resize(content_length);
       if (!sock_read_exact(*sock, body.data(), body.size(), ec)) return;
+      if (concrete_sha) received_body_sha = sha256_hex(body.data(), body.size());
     }
 
     // Optional client workload label (for OPS / future QoS).
@@ -1627,22 +1851,42 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     objects_.ops().note_http_request();
 
     if (!authed) {
-      const bool unsigned_payload =
-          header_get(headers, "x-aios-content-sha256") == "UNSIGNED-PAYLOAD";
       const std::string payload_hash =
           unsigned_payload ? "UNSIGNED-PAYLOAD" : sha256_hex(body.data(), body.size());
       std::string aerr;
       if (!try_auth(payload_hash, aerr)) {
         cleanup_upload();
-        write_json(*sock, 401, "Unauthorized", {{"error", aerr}}, keep_alive);
+        write_json(*sock, auth_status, auth_status == 403 ? "Forbidden" : "Unauthorized",
+                   {{"error", aerr}}, keep_alive);
         continue;
       }
       authed = true;
     }
     (void)authed;
 
+    // The signature covered the declared hash; the bytes that arrived must match it.
+    if (!skip_hmac && concrete_sha && content_length > 0 && received_body_sha != expected_body_sha) {
+      cleanup_upload();
+      write_json(*sock, 400, "Bad Request",
+                 {{"error", "body does not match x-aios-content-sha256"},
+                  {"code", "content_sha256_mismatch"}},
+                 keep_alive);
+      continue;
+    }
+
     auto preds = parse_preconditions(headers);
     auto attrs = parse_attrs(headers);
+    if (!skip_hmac && (method == "PUT" || method == "POST")) {
+      const auto reserved = first_reserved_attr(attrs);
+      if (!reserved.empty()) {
+        cleanup_upload();
+        write_json(*sock, 400, "Bad Request",
+                   {{"error", "attribute is reserved for the daemon: " + reserved},
+                    {"code", "reserved_attr"}},
+                   keep_alive);
+        continue;
+      }
+    }
 
     // Admin console API / web UI (only when node started with admin: true / --admin).
     // Lifecycle GET/PUT is HMAC-authenticated on every node so the console can
@@ -1661,6 +1905,21 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       }
 
       if (admin_login) {
+        std::string peer;
+        {
+          boost::system::error_code pec;
+          const auto ep = sock->remote_endpoint(pec);
+          peer = pec ? std::string("unknown") : ep.address().to_string();
+        }
+        if (login_throttled(peer)) {
+          const auto j = json_dump(nlohmann::json{{"error", "too many login attempts"},
+                                                  {"code", "login_throttled"}});
+          write_response(*sock, 429, "Too Many Requests",
+                         {{"Content-Type", "application/json"},
+                          {"Retry-After", std::to_string(kLoginLockoutMs / 1000)}},
+                         reinterpret_cast<const std::uint8_t*>(j.data()), j.size(), keep_alive);
+          continue;
+        }
         std::string key;
         try {
           const std::string raw = body.empty()
@@ -1671,13 +1930,16 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           if (j.contains("cluster_key") && j["cluster_key"].is_string())
             key = j["cluster_key"].get<std::string>();
         } catch (...) {
+          note_login_failure(peer);
           write_json(*sock, 400, "Bad Request", {{"error", "invalid JSON"}}, keep_alive);
           continue;
         }
         if (!const_time_eq(key, cfg_.cluster_key)) {
+          note_login_failure(peer);
           write_json(*sock, 401, "Unauthorized", {{"error", "invalid cluster key"}}, keep_alive);
           continue;
         }
+        note_login_success(peer);
         const auto token = make_admin_session(cfg_.cluster_key);
         write_response(*sock, 200, "OK",
                        {{"Content-Type", "application/json"},
@@ -2768,26 +3030,31 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       const std::string target_copy = target;
       const std::string label_copy = app_label;
       ObjectService* svc = &objects_;
-      detached_begin();
+      if (!detached_begin()) {
+        write_long_poll_busy(*sock, keep_alive);
+        continue;
+      }
       std::thread([this, sock_ptr, svc, prefix, timeout_ms, target_copy, label_copy]() {
         DetachedGuard guard{this};
-        AppLabelScope scope(label_copy);
-        auto r = svc->api_watch_prefix(prefix, timeout_ms);
-        if (!r.ok) {
-          write_api_error(*sock_ptr, r, target_copy, false);
-          return;
-        }
-        if (r.code == "timeout") {
-          write_response(*sock_ptr, 204, "No Content",
-                         {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
-          return;
-        }
-        nlohmann::json arr = nlohmann::json::array();
-        for (const auto& e : r.watch_events) {
-          arr.push_back(
-              {{"oid", e.oid}, {"seq", e.seq}, {"op", e.op}, {"ts_ms", e.ts_ms}});
-        }
-        write_json(*sock_ptr, 200, "OK", {{"events", arr}}, false);
+        detached_body(*sock_ptr, [&] {
+          AppLabelScope scope(label_copy);
+          auto r = svc->api_watch_prefix(prefix, timeout_ms);
+          if (!r.ok) {
+            write_api_error(*sock_ptr, r, target_copy, false);
+            return;
+          }
+          if (r.code == "timeout") {
+            write_response(*sock_ptr, 204, "No Content",
+                           {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
+            return;
+          }
+          nlohmann::json arr = nlohmann::json::array();
+          for (const auto& e : r.watch_events) {
+            arr.push_back(
+                {{"oid", e.oid}, {"seq", e.seq}, {"op", e.op}, {"ts_ms", e.ts_ms}});
+          }
+          write_json(*sock_ptr, 200, "OK", {{"events", arr}}, false);
+        });
       }).detach();
       return;
     }
@@ -2938,29 +3205,34 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         const std::string target_copy = target;
         const std::string label_copy = app_label;
         ObjectService* svc = &objects_;
-        detached_begin();
+        if (!detached_begin()) {
+          write_long_poll_busy(*sock, keep_alive);
+          continue;
+        }
         std::thread([this, sock_ptr, svc, topic, after_id, after_set, timeout_ms, target_copy,
                      label_copy]() {
           DetachedGuard guard{this};
-          AppLabelScope scope(label_copy);
-          auto r = svc->api_pubsub_subscribe(topic, after_id, after_set, timeout_ms);
-          if (!r.ok) {
-            write_api_error(*sock_ptr, r, target_copy, false);
-            return;
-          }
-          if (r.code == "timeout") {
-            write_response(*sock_ptr, 204, "No Content",
-                           {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
-            return;
-          }
-          nlohmann::json arr = nlohmann::json::array();
-          for (const auto& m : r.pub_messages) {
-            arr.push_back({{"id", m.id},
-                           {"ts_ms", m.ts_ms},
-                           {"content_type", m.content_type},
-                           {"data_b64", base64_encode(m.data)}});
-          }
-          write_json(*sock_ptr, 200, "OK", {{"topic", topic}, {"messages", arr}}, false);
+          detached_body(*sock_ptr, [&] {
+            AppLabelScope scope(label_copy);
+            auto r = svc->api_pubsub_subscribe(topic, after_id, after_set, timeout_ms);
+            if (!r.ok) {
+              write_api_error(*sock_ptr, r, target_copy, false);
+              return;
+            }
+            if (r.code == "timeout") {
+              write_response(*sock_ptr, 204, "No Content",
+                             {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
+              return;
+            }
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& m : r.pub_messages) {
+              arr.push_back({{"id", m.id},
+                             {"ts_ms", m.ts_ms},
+                             {"content_type", m.content_type},
+                             {"data_b64", base64_encode(m.data)}});
+            }
+            write_json(*sock_ptr, 200, "OK", {{"topic", topic}, {"messages", arr}}, false);
+          });
         }).detach();
         return;
       }
@@ -3032,6 +3304,12 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         const std::string oid = url_decode(txn_sub.substr(2));
         if (oid.empty()) {
           write_json(*sock, 400, "Bad Request", {{"error", "empty oid"}}, keep_alive);
+          continue;
+        }
+        if (is_archive_bag_oid(oid)) {
+          write_json(*sock, 403, "Forbidden",
+                     {{"error", "archive bags are daemon-owned"}, {"code", "archive_bag_oid"}},
+                     keep_alive);
           continue;
         }
         if (method == "PUT") {
@@ -3136,6 +3414,14 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
       const std::string oid = url_decode(oid_raw);
       if (oid.empty()) {
         write_json(*sock, 400, "Bad Request", {{"error", "empty oid"}}, keep_alive);
+        continue;
+      }
+      if (is_archive_bag_oid(oid) &&
+          (method == "PUT" || method == "DELETE" ||
+           (method == "POST" && (sub == "append" || sub == "purge")))) {
+        write_json(*sock, 403, "Forbidden",
+                   {{"error", "archive bags are daemon-owned"}, {"code", "archive_bag_oid"}},
+                   keep_alive);
         continue;
       }
 
@@ -3340,24 +3626,29 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         const std::string target_copy = target;
         const std::string label_copy = app_label;
         ObjectService* svc = &objects_;
-        detached_begin();
+        if (!detached_begin()) {
+          write_long_poll_busy(*sock, keep_alive);
+          continue;
+        }
         std::thread([this, sock_ptr, svc, oid, after_seq, timeout_ms, target_copy, label_copy]() {
           DetachedGuard guard{this};
-          AppLabelScope scope(label_copy);
-          auto r = svc->api_watch_oid(oid, after_seq, timeout_ms);
-          if (!r.ok) {
-            write_api_error(*sock_ptr, r, target_copy, false);
-            return;
-          }
-          if (r.code == "timeout") {
-            write_response(*sock_ptr, 204, "No Content",
-                           {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
-            return;
-          }
-          const auto& e = *r.watch_event;
-          write_json(*sock_ptr, 200, "OK",
-                     {{"oid", e.oid}, {"seq", e.seq}, {"op", e.op}, {"ts_ms", e.ts_ms}},
-                     false);
+          detached_body(*sock_ptr, [&] {
+            AppLabelScope scope(label_copy);
+            auto r = svc->api_watch_oid(oid, after_seq, timeout_ms);
+            if (!r.ok) {
+              write_api_error(*sock_ptr, r, target_copy, false);
+              return;
+            }
+            if (r.code == "timeout") {
+              write_response(*sock_ptr, 204, "No Content",
+                             {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, false);
+              return;
+            }
+            const auto& e = *r.watch_event;
+            write_json(*sock_ptr, 200, "OK",
+                       {{"oid", e.oid}, {"seq", e.seq}, {"op", e.op}, {"ts_ms", e.ts_ms}},
+                       false);
+          });
         }).detach();
         return;
       }

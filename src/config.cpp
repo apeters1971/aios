@@ -396,7 +396,12 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["http_idle_timeout_ms"]) {
       cfg.http_idle_timeout_ms = root["http_idle_timeout_ms"].as<int>();
     }
+    if (root["http_max_long_polls"]) cfg.http_max_long_polls = root["http_max_long_polls"].as<int>();
+    if (root["http_require_signed_payload"])
+      cfg.http_require_signed_payload = root["http_require_signed_payload"].as<bool>();
     if (root["s3_listen"]) cfg.s3_listen = root["s3_listen"].as<std::string>();
+    if (root["s3_max_body_bytes"])
+      cfg.s3_max_body_bytes = root["s3_max_body_bytes"].as<std::uint64_t>();
     if (root["s3_volume"]) cfg.s3_volume = root["s3_volume"].as<std::string>();
     if (root["s3_access_key"]) cfg.s3_access_key = root["s3_access_key"].as<std::string>();
     if (root["cuobject_listen"]) cfg.cuobject_listen = root["cuobject_listen"].as<std::string>();
@@ -820,6 +825,14 @@ bool normalize_config(Config& cfg, std::string& err) {
   }
   if (cfg.http_idle_timeout_ms < 0) {
     err = "http_idle_timeout_ms must be >= 0 (0 = no timeout)";
+    return false;
+  }
+  if (cfg.http_max_long_polls < 1) {
+    err = "http_max_long_polls must be >= 1";
+    return false;
+  }
+  if (cfg.s3_max_body_bytes == 0) {
+    err = "s3_max_body_bytes must be > 0";
     return false;
   }
   if (cfg.write_quorum < 0) {

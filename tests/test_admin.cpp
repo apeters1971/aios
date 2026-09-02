@@ -251,9 +251,16 @@ using namespace aios;
         EXPECT_TRUE(false) << "api status json";
       }
 
-      auto settings = http_request(
+      // Cookie-authenticated mutations without the CSRF header are refused (HTTP-10).
+      auto no_csrf = http_request(
           "127.0.0.1", "19381", "POST", "/admin/api/settings",
           {{"cookie", cookie}, {"content-type", "application/json"}},
+          R"({"admin_metrics_public":false})", key, /*auth=*/false);
+      EXPECT_TRUE(no_csrf.status == 403) << "settings toggle without x-aios-admin";
+
+      auto settings = http_request(
+          "127.0.0.1", "19381", "POST", "/admin/api/settings",
+          {{"cookie", cookie}, {"content-type", "application/json"}, {"x-aios-admin", "1"}},
           R"({"admin_metrics_public":false})", key, /*auth=*/false);
       EXPECT_TRUE(settings.status == 200) << "settings toggle";
       auto met_priv = http_request("127.0.0.1", "19381", "GET", "/metrics", {}, "", key,
@@ -261,7 +268,7 @@ using namespace aios;
       EXPECT_TRUE(met_priv.status == 401) << "metrics private after toggle";
       // restore public for cleanliness
       http_request("127.0.0.1", "19381", "POST", "/admin/api/settings",
-                   {{"cookie", cookie}, {"content-type", "application/json"}},
+                   {{"cookie", cookie}, {"content-type", "application/json"}, {"x-aios-admin", "1"}},
                    R"({"admin_metrics_public":true})", key, /*auth=*/false);
     }
 

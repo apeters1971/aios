@@ -1274,7 +1274,10 @@ nlohmann::json HttpBenchJob::start(const nlohmann::json& req) {
   join_worker();
   const auto body = req.is_object() ? req : nlohmann::json::object();
   HttpBenchConfig c = http_bench_from_json(body);
-  if (c.endpoint.empty()) c.endpoint = default_endpoint_;
+  // The admin console is not allowed to point this node's bench client (which
+  // signs with the cluster key) at an arbitrary host: the target is always the
+  // local HTTP listener.
+  c.endpoint = default_endpoint_;
   c.cluster_key = cluster_key_;
   if (!body.contains("ops")) c.ops = 50;
   if (!body.contains("warmup")) c.warmup = 5;

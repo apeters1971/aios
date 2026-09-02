@@ -18,9 +18,11 @@
   };
 
   async function api(path, opts = {}) {
+    // x-aios-admin is the CSRF token: cookie-authenticated PUT/POST/DELETE are
+    // rejected without it, and a cross-site page cannot add a custom header.
     const res = await fetch(path, {
       credentials: "same-origin",
-      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      headers: { "Content-Type": "application/json", "x-aios-admin": "1", ...(opts.headers || {}) },
       ...opts,
     });
     const text = await res.text();
@@ -272,8 +274,8 @@
   }
 
   function badge(text, kind) {
-    const k = kind ? ` ${kind}` : "";
-    return `<span class="badge${k}">${text}</span>`;
+    const k = kind ? ` ${esc(kind)}` : "";
+    return `<span class="badge${k}">${esc(text)}</span>`;
   }
 
   function stateBadge(state) {
@@ -364,7 +366,7 @@
             const mem = members.find((m) => m.node_id === id);
             const memState = String((mem && mem.state) || "").toLowerCase();
             const cls = memState === "offline" ? "off" : d.kind;
-            return `<span class="node-chip ${cls}"><span class="dot"></span>${id} · ${d.label}</span>`;
+            return `<span class="node-chip ${cls}"><span class="dot"></span>${esc(id)} · ${d.label}</span>`;
           })
           .join("") || `<span class="muted">No members yet</span>`;
     }
@@ -399,7 +401,7 @@
       cards
         .map(
           ([label, value]) =>
-            `<div class="card"><span class="label">${label}</span><div class="value">${fmt(value)}</div></div>`
+            `<div class="card"><span class="label">${label}</span><div class="value">${esc(fmt(value))}</div></div>`
         )
         .join("");
     document.getElementById("overview-cards").innerHTML = cardsHtml;
@@ -410,7 +412,7 @@
     const ops = (opsPayload && opsPayload.ops) || {};
     const rows = Object.keys(ops)
       .sort()
-      .map((k) => `<tr><td>${k}</td><td>${fmt(ops[k])}</td></tr>`)
+      .map((k) => `<tr><td>${esc(k)}</td><td>${esc(fmt(ops[k]))}</td></tr>`)
       .join("");
     document.getElementById("ops-table").innerHTML =
       `<table><thead><tr><th>Counter</th><th>Value</th></tr></thead><tbody>${rows}</tbody></table>`;
@@ -445,16 +447,16 @@
     const frows = keys
       .map((k) => {
         const c = fe[k] || {};
-        return `<tr><td>${k}</td><td>${fmt(c.read_ops)}</td><td>${fmt(c.write_ops)}</td><td>${fmt(
+        return `<tr><td>${esc(k)}</td><td>${fmt(c.read_ops)}</td><td>${fmt(c.write_ops)}</td><td>${fmt(
           c.read_bytes
-        )}</td><td>${fmt(c.write_bytes)}</td><td>${c.source || "—"}</td></tr>`;
+        )}</td><td>${fmt(c.write_bytes)}</td><td>${esc(c.source || "—")}</td></tr>`;
       })
       .join("");
     const vbd = (opsPayload && opsPayload.io_frontends && opsPayload.io_frontends.vbd_devices) || [];
     const vrows = vbd
       .map(
         (d) =>
-          `<tr><td>aiosvd${d.dev_id}</td><td>${d.pool}/${d.name}</td><td>${fmt(
+          `<tr><td>aiosvd${esc(d.dev_id)}</td><td>${esc(d.pool)}/${esc(d.name)}</td><td>${fmt(
             d.ops_read
           )}</td><td>${fmt(d.ops_write)}</td><td>${fmt(d.bytes_read)}</td><td>${fmt(
             d.bytes_written
@@ -483,11 +485,11 @@
         const d = diskKind(byNode.get(m.node_id));
         const self = p.self || m.node_id === st.node_id;
         return `<tr>
-          <td>${m.node_id || ""}${self ? badge("self", "self") : ""}</td>
+          <td>${esc(m.node_id || "")}${self ? badge("self", "self") : ""}</td>
           <td>${stateBadge(m.state)}</td>
           <td>${badge(d.label, d.kind)}</td>
-          <td>${m.addr || p.addr || ""}</td>
-          <td>${m.http_addr || p.http_addr || ""}</td>
+          <td>${esc(m.addr || p.addr || "")}</td>
+          <td>${esc(m.http_addr || p.http_addr || "")}</td>
         </tr>`;
       })
       .join("");
@@ -504,8 +506,8 @@
         const buckets = Array.isArray(c.buckets) ? c.buckets.join(", ") : "";
         const id = c.access_key_id || "";
         return `<tr>
-          <td>${id}</td><td>${fmt(c.uid)}</td><td>${fmt(c.gid)}</td><td>${buckets}</td>
-          <td><button type="button" class="btn ghost s3-del" data-id="${id}">Delete</button></td>
+          <td>${esc(id)}</td><td>${esc(fmt(c.uid))}</td><td>${esc(fmt(c.gid))}</td><td>${esc(buckets)}</td>
+          <td><button type="button" class="btn ghost s3-del" data-id="${esc(id)}">Delete</button></td>
         </tr>`;
       })
       .join("");
@@ -577,7 +579,7 @@
     const urows = ((q && q.volume_uids) || [])
       .map(
         (r) =>
-          `<tr><td>${r.uid}</td><td>${fmt(r.used_bytes)}</td><td>${
+          `<tr><td>${esc(r.uid)}</td><td>${fmt(r.used_bytes)}</td><td>${
             r.limit_bytes == null ? "—" : fmt(r.limit_bytes)
           }</td></tr>`
       )
@@ -590,7 +592,7 @@
         const grows = ((q && q.volume_gids) || [])
           .map(
             (r) =>
-              `<tr><td>${r.gid}</td><td>${fmt(r.used_bytes)}</td><td>${
+              `<tr><td>${esc(r.gid)}</td><td>${fmt(r.used_bytes)}</td><td>${
                 r.limit_bytes == null ? "—" : fmt(r.limit_bytes)
               }</td></tr>`
           )
@@ -602,10 +604,10 @@
     const prows = ((q && q.projects) || [])
       .map(
         (p) =>
-          `<tr><td>${p.id}</td><td>${p.name || ""}</td><td>${p.root_ino}</td><td>${fmt(
+          `<tr><td>${esc(p.id)}</td><td>${esc(p.name || "")}</td><td>${esc(p.root_ino)}</td><td>${fmt(
             p.used_bytes
           )}</td><td>${p.limit_bytes == null ? "—" : fmt(p.limit_bytes)}</td>
-          <td><button type="button" class="btn ghost quota-del" data-id="${p.id}">Delete</button></td></tr>`
+          <td><button type="button" class="btn ghost quota-del" data-id="${esc(p.id)}">Delete</button></td></tr>`
       )
       .join("");
     document.getElementById("quota-proj-table").innerHTML =
@@ -673,7 +675,7 @@
     const urows = ((q && q.volume_uids) || [])
       .map(
         (r) =>
-          `<tr><td>${r.uid}</td><td>${r.limit_iops == null ? "—" : r.limit_iops}</td><td>${
+          `<tr><td>${esc(r.uid)}</td><td>${r.limit_iops == null ? "—" : esc(r.limit_iops)}</td><td>${
             r.limit_bps == null ? "—" : fmt(r.limit_bps)
           }</td></tr>`
       )
@@ -681,7 +683,7 @@
     const grows = ((q && q.volume_gids) || [])
       .map(
         (r) =>
-          `<tr><td>${r.gid}</td><td>${r.limit_iops == null ? "—" : r.limit_iops}</td><td>${
+          `<tr><td>${esc(r.gid)}</td><td>${r.limit_iops == null ? "—" : esc(r.limit_iops)}</td><td>${
             r.limit_bps == null ? "—" : fmt(r.limit_bps)
           }</td></tr>`
       )
@@ -696,9 +698,9 @@
     const prows = ((q && q.projects) || [])
       .map((p) => {
         const u = (p.uids || [])
-          .map((x) => `uid ${x.uid}: ${x.limit_iops ?? "—"} iops / ${x.limit_bps == null ? "—" : fmt(x.limit_bps)}`)
+          .map((x) => `uid ${esc(x.uid)}: ${esc(x.limit_iops ?? "—")} iops / ${x.limit_bps == null ? "—" : fmt(x.limit_bps)}`)
           .join("; ");
-        return `<tr><td>${p.id}</td><td>${p.limit_iops == null ? "—" : p.limit_iops}</td><td>${
+        return `<tr><td>${esc(p.id)}</td><td>${p.limit_iops == null ? "—" : esc(p.limit_iops)}</td><td>${
           p.limit_bps == null ? "—" : fmt(p.limit_bps)
         }</td><td>${u || "—"}</td></tr>`;
       })
@@ -1010,8 +1012,8 @@
         const meta = r.meta || {};
         const data = r.data || {};
         const fmt = (s) =>
-          [s.layout || "—", s.storage_class || "—"].join(" / ");
-        return `<tr><td>${r.path || "/"}</td><td>${r.volume || "*"}</td><td>${fmt(
+          esc([s.layout || "—", s.storage_class || "—"].join(" / "));
+        return `<tr><td>${esc(r.path || "/")}</td><td>${esc(r.volume || "*")}</td><td>${fmt(
           meta
         )}</td><td>${fmt(data)}</td></tr>`;
       })
@@ -1363,9 +1365,9 @@
       .map((r) => {
         const n = (x, d) => (x == null ? "—" : Number(x).toFixed(d));
         if (stl) {
-          return `<tr><td>${esc(r.stl_type || "—")}</td><td>${esc(r.stl_sync || "—")}</td><td>${esc(r.size_label || r.size)}</td><td>${esc(r.op)}</td><td class="num">${r.ok ?? 0}</td><td class="num">${r.err ?? 0}</td><td class="num">${n(r.iops, 1)}</td><td class="num">${n(r.p50_ms, 2)}</td><td class="num">${n(r.p95_ms, 2)}</td><td class="num">${n(r.p99_ms, 2)}</td></tr>`;
+          return `<tr><td>${esc(r.stl_type || "—")}</td><td>${esc(r.stl_sync || "—")}</td><td>${esc(r.size_label || r.size)}</td><td>${esc(r.op)}</td><td class="num">${esc(r.ok ?? 0)}</td><td class="num">${esc(r.err ?? 0)}</td><td class="num">${n(r.iops, 1)}</td><td class="num">${n(r.p50_ms, 2)}</td><td class="num">${n(r.p95_ms, 2)}</td><td class="num">${n(r.p99_ms, 2)}</td></tr>`;
         }
-        return `<tr><td>${esc(r.size_label || r.size)}</td><td>${esc(r.op)}</td><td class="num">${r.ok ?? 0}</td><td class="num">${r.err ?? 0}</td><td class="num">${n(r.iops, 1)}</td><td class="num">${n(r.mib_s, 2)}</td><td class="num">${n(r.p50_ms, 2)}</td><td class="num">${n(r.p95_ms, 2)}</td><td class="num">${n(r.p99_ms, 2)}</td></tr>`;
+        return `<tr><td>${esc(r.size_label || r.size)}</td><td>${esc(r.op)}</td><td class="num">${esc(r.ok ?? 0)}</td><td class="num">${esc(r.err ?? 0)}</td><td class="num">${n(r.iops, 1)}</td><td class="num">${n(r.mib_s, 2)}</td><td class="num">${n(r.p50_ms, 2)}</td><td class="num">${n(r.p95_ms, 2)}</td><td class="num">${n(r.p99_ms, 2)}</td></tr>`;
       })
       .join("");
     document.getElementById("bench-table").innerHTML =
@@ -1713,12 +1715,12 @@
       const en = p.enabled === false ? " (off)" : "";
       const id = p.id || "";
       html += `<tr>
-        <td><code>${id}</code>${en}</td>
-        <td>${p.volume || ""}</td>
-        <td>${p.path || "/"}</td>
-        <td>${at} UTC</td>
-        <td>${kd}d / ${km}mo</td>
-        <td><button type="button" class="btn bp-del" data-id="${id}">Delete</button></td>
+        <td><code>${esc(id)}</code>${en}</td>
+        <td>${esc(p.volume || "")}</td>
+        <td>${esc(p.path || "/")}</td>
+        <td>${esc(at)} UTC</td>
+        <td>${esc(kd)}d / ${esc(km)}mo</td>
+        <td><button type="button" class="btn bp-del" data-id="${esc(id)}">Delete</button></td>
       </tr>`;
     }
     html += "</tbody></table>";
