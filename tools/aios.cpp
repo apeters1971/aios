@@ -2,6 +2,7 @@
 #include "metrics/ops_counters.hpp"
 #include "util/log.hpp"
 
+#include <aios_version.hpp>
 #include <nlohmann/json.hpp>
 
 #include <boost/asio.hpp>
@@ -27,6 +28,7 @@
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +56,7 @@ void usage() {
   std::cout
       << "usage: aios --cluster-key KEY [--endpoint HOST:PORT] [--app-label LABEL]\n"
       << "            <cmd> [args]\n"
+      << "       aios --version\n"
       << "\n"
       << "Commands:\n"
       << "  put  OID FILE\n"
@@ -1804,6 +1807,12 @@ int cmd_testbed(const std::string& cluster_key, const char* argv0, bool no_fsync
 }  // namespace
 
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::string_view(argv[i]) == "--version" || std::string_view(argv[i]) == "-V") {
+      std::cout << "aios " << AIOS_VERSION_FULL << "\n";
+      return 0;
+    }
+  }
   Args args;
   if (!parse_args(argc, argv, args)) {
     usage();

@@ -11,8 +11,8 @@ were re-checked against the source by hand and are marked ✓ below; the rest ca
 the reviewer's own confidence rating. Keep this document as the audit trail; do
 not treat open wording in the finding bodies as current status.
 
-An interactive version of this document lives in `CODE_REVIEW.canvas.tsx`. To
-open it, copy that file into
+An interactive version of this document lives next to it in
+`docs/dev/CODE_REVIEW.canvas.tsx`. To open it, copy that file into
 `~/.cursor/projects/Users-apeters-Software-aios/canvases/` and open it from
 there — Cursor only renders canvases from that directory.
 

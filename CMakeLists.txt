@@ -12,7 +12,31 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew" "/usr/local" "/opt/homebrew/opt/sqlite")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(GNUInstallDirs)
+include(AiosBuildOptions)          # AIOS_WERROR, AIOS_SANITIZE
+include(macos-homebrew)            # no-op except on APPLE; sets AIOS_HOMEBREW_PREFIX
+
+list(APPEND CMAKE_PREFIX_PATH "/usr/local")
+
+# Version header: build/generated/include/aios_version.hpp (AIOS_VERSION_STRING, …).
+find_package(Git QUIET)
+set(AIOS_GIT_DESCRIBE "")
+if(Git_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" describe --always --dirty --tags
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE AIOS_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+endif()
+if(AIOS_GIT_DESCRIBE)
+  set(AIOS_VERSION_FULL "${PROJECT_VERSION} (${AIOS_GIT_DESCRIBE})")
+else()
+  set(AIOS_VERSION_FULL "${PROJECT_VERSION}")
+endif()
+set(AIOS_GENERATED_INCLUDE_DIR "${CMAKE_BINARY_DIR}/generated/include")
+configure_file(cmake/aios_version.hpp.in "${AIOS_GENERATED_INCLUDE_DIR}/aios_version.hpp" @ONLY)
 
 # CMake 3.30+ removed FindBoost module; prefer BoostConfig.
 if(POLICY CMP0167)
@@ -33,14 +57,24 @@ endif()
 
 include(FetchContent)
 
+# Third-party sources are pinned to the commit behind each release tag so a moved
+# or deleted tag cannot change what gets built. Commit hashes cannot be fetched
+# with a shallow clone, hence GIT_SHALLOW FALSE. To build offline, pre-populate
+# the sources and configure with -DFETCHCONTENT_FULLY_DISCONNECTED=ON, or point
+# -DFETCHCONTENT_SOURCE_DIR_<NAME>=... at a local checkout (see README "Build").
+#
+#   yaml-cpp      0.8.0   f7320141120f720aecc4c32be25586e7da9eb978
+#   nlohmann/json v3.11.3 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03
+#   googletest    v1.15.2 b514bdc898e2951020cbdca1304b75f5950d1f59
+
 # yaml-cpp 0.8.0 still declares an old cmake_minimum_required; allow configure on CMake 4+.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 FetchContent_Declare(
   yaml-cpp
   GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-  GIT_TAG 0.8.0
-  GIT_SHALLOW TRUE
+  GIT_TAG f7320141120f720aecc4c32be25586e7da9eb978   # 0.8.0
+  GIT_SHALLOW FALSE
 )
 set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -50,8 +84,8 @@ FetchContent_MakeAvailable(yaml-cpp)
 FetchContent_Declare(
   nlohmann_json
   GIT_REPOSITORY https://github.com/nlohmann/json.git
-  GIT_TAG v3.11.3
-  GIT_SHALLOW TRUE
+  GIT_TAG 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03   # v3.11.3
+  GIT_SHALLOW FALSE
 )
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nlohmann_json)
@@ -59,12 +93,22 @@ FetchContent_MakeAvailable(nlohmann_json)
 FetchContent_Declare(
   googletest
   GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.15.2
-  GIT_SHALLOW TRUE
+  GIT_TAG b514bdc898e2951020cbdca1304b75f5950d1f59   # v1.15.2
+  GIT_SHALLOW FALSE
 )
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
+
+# Treat dependency headers as system headers so their warnings never trip AIOS_WERROR.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.25)
+  foreach(_dep yaml-cpp nlohmann_json gtest gtest_main gmock gmock_main)
+    if(TARGET ${_dep})
+      set_target_properties(${_dep} PROPERTIES SYSTEM ON)
+    endif()
+  endforeach()
+  unset(_dep)
+endif()
 
 # Optional Intel ISA-L for Reed–Solomon EC (m>1). XOR (m=1) always available.
 option(AIOS_WITH_ISAL "Enable Intel ISA-L Reed-Solomon erasure coding when found" ON)
@@ -79,9 +123,9 @@ if(AIOS_WITH_ISAL)
     message(STATUS "ISA-L: enabled (pkg-config)")
   else()
     find_path(ISAL_INCLUDE_DIR NAMES isa-l.h
-      PATHS /opt/homebrew/include /usr/local/include /usr/include)
+      PATHS ${AIOS_HOMEBREW_PREFIX}/include /usr/local/include /usr/include)
     find_library(ISAL_LIBRARY NAMES isal
-      PATHS /opt/homebrew/lib /usr/local/lib /usr/lib)
+      PATHS ${AIOS_HOMEBREW_PREFIX}/lib /usr/local/lib /usr/lib)
     if(ISAL_INCLUDE_DIR AND ISAL_LIBRARY)
       set(AIOS_HAVE_ISAL ON)
       message(STATUS "ISA-L: enabled (${ISAL_LIBRARY})")
@@ -129,9 +173,9 @@ if(AIOS_WITH_ZSTD)
     message(STATUS "ZSTD: enabled (pkg-config)")
   else()
     find_path(ZSTD_INCLUDE_DIR NAMES zstd.h
-      PATHS /opt/homebrew/include /usr/local/include /usr/include)
+      PATHS ${AIOS_HOMEBREW_PREFIX}/include /usr/local/include /usr/include)
     find_library(ZSTD_LIBRARY NAMES zstd
-      PATHS /opt/homebrew/lib /usr/local/lib /usr/lib)
+      PATHS ${AIOS_HOMEBREW_PREFIX}/lib /usr/local/lib /usr/lib)
     if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
       set(AIOS_HAVE_ZSTD ON)
       message(STATUS "ZSTD: enabled (${ZSTD_LIBRARY})")
@@ -142,6 +186,7 @@ if(AIOS_WITH_ZSTD)
 endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
+aios_apply_werror()   # -Werror only for AIOS targets (declared below), never for _deps
 
 add_library(aios_core STATIC
   src/config.cpp
@@ -197,9 +242,14 @@ add_library(aios_core STATIC
 target_include_directories(aios_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}
+  $<BUILD_INTERFACE:${AIOS_GENERATED_INCLUDE_DIR}>
 )
+# Compiled-in fallback for the admin SPA: the *installed* location, not the source
+# tree (a binary must not depend on its build checkout). Development builds still
+# find web/admin through the AIOS_ADMIN_WEB env var or the cwd-relative probes in
+# find_admin_web_root() (src/http/http_server.cpp).
 target_compile_definitions(aios_core PRIVATE
-  "AIOS_ADMIN_WEB_DEFAULT=\"${CMAKE_CURRENT_SOURCE_DIR}/web/admin\""
+  "AIOS_ADMIN_WEB_DEFAULT=\"${CMAKE_INSTALL_FULL_DATADIR}/aios/admin\""
 )
 target_link_libraries(aios_core PUBLIC
   Threads::Threads
@@ -300,9 +350,9 @@ if(AIOS_WITH_FUSE)
     message(STATUS "FUSE3: enabled (pkg-config)")
   else()
     find_path(FUSE3_INCLUDE_DIR NAMES fuse3/fuse.h
-      PATHS /opt/homebrew/include /usr/local/include /usr/include)
+      PATHS ${AIOS_HOMEBREW_PREFIX}/include /usr/local/include /usr/include)
     find_library(FUSE3_LIBRARY NAMES fuse3
-      PATHS /opt/homebrew/lib /usr/local/lib /usr/lib)
+      PATHS ${AIOS_HOMEBREW_PREFIX}/lib /usr/local/lib /usr/lib)
     if(FUSE3_INCLUDE_DIR AND FUSE3_LIBRARY)
       set(AIOS_HAVE_FUSE ON)
       message(STATUS "FUSE3: enabled (${FUSE3_LIBRARY})")
@@ -326,7 +376,7 @@ target_link_libraries(aios PRIVATE aios_core)
 
 add_executable(aios-cuobj-s3 tools/aios_cuobj_s3.cpp)
 target_link_libraries(aios-cuobj-s3 PRIVATE aios_core aios_cuobject)
-install(TARGETS aios-cuobj-s3 RUNTIME DESTINATION bin)
+install(TARGETS aios-cuobj-s3 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(AIOS_HAVE_FUSE)
   add_executable(aios-fuse
@@ -340,67 +390,96 @@ if(AIOS_HAVE_FUSE)
     target_include_directories(aios-fuse PRIVATE ${FUSE3_INCLUDE_DIR})
     target_link_libraries(aios-fuse PRIVATE ${FUSE3_LIBRARY})
   endif()
-  install(TARGETS aios-fuse RUNTIME DESTINATION bin)
+  install(TARGETS aios-fuse RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # Optional XRootD OSS plugin (libXrdAios) over libaios_posix.
 option(AIOS_WITH_XROOTD "Build XrdAios OSS plugin when XRootD is available" ON)
 set(AIOS_HAVE_XROOTD OFF)
 if(AIOS_WITH_XROOTD)
-  if(DEFINED ENV{XRootD_ROOT} AND NOT XRootD_ROOT)
+  # Lookup order:
+  #   1. XRootD_ROOT / XROOTD_ROOT (-D or environment) — an install prefix
+  #      (include/xrootd, lib64) *or* a source+build checkout (src/, build/src, build/lib)
+  #   2. find_package(XRootD CONFIG) — XRootD ≥ 5 installs XRootDConfig.cmake
+  #   3. pkg-config `xrootd`
+  #   4. system prefixes and the Homebrew prefix
+  # The per-component cache variables XROOTD_INCLUDE_DIR / XROOTD_VERSION_INCLUDE_DIR /
+  # XROOTD_UTILS_LIBRARY / XROOTD_SERVER_LIBRARY can always be set explicitly.
+  set(XRootD_ROOT "" CACHE PATH "XRootD install prefix or source+build tree (also XROOTD_ROOT / \$XRootD_ROOT)")
+  if(NOT XRootD_ROOT AND XROOTD_ROOT)
+    set(XRootD_ROOT "${XROOTD_ROOT}")
+  endif()
+  if(NOT XRootD_ROOT AND DEFINED ENV{XRootD_ROOT} AND NOT "$ENV{XRootD_ROOT}" STREQUAL "")
     set(XRootD_ROOT "$ENV{XRootD_ROOT}")
   endif()
-  if(DEFINED ENV{XROOTD_ROOT} AND NOT XRootD_ROOT)
+  if(NOT XRootD_ROOT AND DEFINED ENV{XROOTD_ROOT} AND NOT "$ENV{XROOTD_ROOT}" STREQUAL "")
     set(XRootD_ROOT "$ENV{XROOTD_ROOT}")
   endif()
+
+  set(_xrd_inc_hints "")
+  set(_xrd_lib_hints "")
+  if(XRootD_ROOT)
+    list(APPEND _xrd_inc_hints
+      "${XRootD_ROOT}/include/xrootd" "${XRootD_ROOT}/include"
+      "${XRootD_ROOT}/src" "${XRootD_ROOT}/build/src")
+    list(APPEND _xrd_lib_hints
+      "${XRootD_ROOT}/lib64" "${XRootD_ROOT}/lib" "${XRootD_ROOT}/build/lib")
+  endif()
+
+  if(NOT XRootD_ROOT)
+    find_package(XRootD CONFIG QUIET)
+    if(XRootD_FOUND)
+      if(XRootD_INCLUDE_DIRS)
+        list(APPEND _xrd_inc_hints ${XRootD_INCLUDE_DIRS})
+      endif()
+      if(XRootD_LIBRARY_DIRS)
+        list(APPEND _xrd_lib_hints ${XRootD_LIBRARY_DIRS})
+      endif()
+      if(TARGET XRootD::XrdUtils)
+        get_target_property(_xrd_utils_loc XRootD::XrdUtils LOCATION)
+        if(_xrd_utils_loc)
+          get_filename_component(_xrd_utils_dir "${_xrd_utils_loc}" DIRECTORY)
+          list(APPEND _xrd_lib_hints "${_xrd_utils_dir}")
+        endif()
+      endif()
+    endif()
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(XROOTD_PC QUIET xrootd)
+      if(XROOTD_PC_FOUND)
+        list(APPEND _xrd_inc_hints ${XROOTD_PC_INCLUDE_DIRS})
+        list(APPEND _xrd_lib_hints ${XROOTD_PC_LIBRARY_DIRS})
+      endif()
+    endif()
+  endif()
+
   find_path(XROOTD_INCLUDE_DIR NAMES XrdOss/XrdOss.hh
-    HINTS
-      ${XRootD_ROOT}/include/xrootd
-      ${XRootD_ROOT}/include
-      ${XRootD_ROOT}/src
-      ${CMAKE_SOURCE_DIR}/../xrootd/src
-      /usr/include/xrootd
-      /usr/local/include/xrootd
-      /opt/homebrew/include/xrootd
+    HINTS ${_xrd_inc_hints}
+    PATHS /usr/include/xrootd /usr/local/include/xrootd ${AIOS_HOMEBREW_PREFIX}/include/xrootd
   )
   find_path(XROOTD_VERSION_INCLUDE_DIR NAMES XrdVersion.hh
-    HINTS
-      ${XRootD_ROOT}/include/xrootd
-      ${XRootD_ROOT}/include
-      ${XRootD_ROOT}/build/src
-      ${CMAKE_SOURCE_DIR}/../xrootd/build/src
-      ${XROOTD_INCLUDE_DIR}
-      /usr/include/xrootd
-      /usr/local/include/xrootd
+    HINTS ${_xrd_inc_hints} ${XROOTD_INCLUDE_DIR}
+    PATHS /usr/include/xrootd /usr/local/include/xrootd ${AIOS_HOMEBREW_PREFIX}/include/xrootd
   )
   find_library(XROOTD_UTILS_LIBRARY NAMES XrdUtils
-    HINTS
-      ${XRootD_ROOT}/lib64
-      ${XRootD_ROOT}/lib
-      ${XRootD_ROOT}/build/lib
-      ${CMAKE_SOURCE_DIR}/../xrootd/build/lib
-      /usr/lib64
-      /usr/lib
-      /usr/local/lib
-      /opt/homebrew/lib
+    HINTS ${_xrd_lib_hints}
+    PATHS /usr/lib64 /usr/lib /usr/local/lib ${AIOS_HOMEBREW_PREFIX}/lib
   )
   find_library(XROOTD_SERVER_LIBRARY NAMES XrdServer
-    HINTS
-      ${XRootD_ROOT}/lib64
-      ${XRootD_ROOT}/lib
-      ${XRootD_ROOT}/build/lib
-      ${CMAKE_SOURCE_DIR}/../xrootd/build/lib
-      /usr/lib64
-      /usr/lib
-      /usr/local/lib
-      /opt/homebrew/lib
+    HINTS ${_xrd_lib_hints}
+    PATHS /usr/lib64 /usr/lib /usr/local/lib ${AIOS_HOMEBREW_PREFIX}/lib
   )
+  unset(_xrd_inc_hints)
+  unset(_xrd_lib_hints)
+
   if(XROOTD_INCLUDE_DIR AND XROOTD_VERSION_INCLUDE_DIR AND XROOTD_UTILS_LIBRARY
      AND XROOTD_SERVER_LIBRARY)
     set(AIOS_HAVE_XROOTD ON)
-    message(STATUS "XRootD: enabled (${XROOTD_UTILS_LIBRARY})")
+    message(STATUS "XRootD: enabled (headers ${XROOTD_INCLUDE_DIR}; ${XROOTD_SERVER_LIBRARY})")
   else()
-    message(STATUS "XRootD: not found (libXrdAios disabled; set XRootD_ROOT)")
+    message(STATUS "XRootD: not found — libXrdAios.so will NOT be built "
+      "(AIOS_WITH_XROOTD=ON is the default; pass -DXRootD_ROOT=<prefix or source+build tree>, "
+      "or -DAIOS_WITH_XROOTD=OFF to silence this)")
   endif()
 endif()
 
@@ -414,8 +493,9 @@ if(AIOS_HAVE_XROOTD)
     src/xrd/XrdAiosDF.cpp
     src/xrd/XrdAiosUtil.cpp
   )
-  target_include_directories(XrdAios PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  target_include_directories(XrdAios PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  # XRootD headers have unused-parameter warnings; keep them out of AIOS_WERROR.
+  target_include_directories(XrdAios SYSTEM PRIVATE
     ${XROOTD_INCLUDE_DIR}
     ${XROOTD_VERSION_INCLUDE_DIR}
   )
@@ -426,8 +506,8 @@ if(AIOS_HAVE_XROOTD)
     SUFFIX ".so"
     OUTPUT_NAME "XrdAios"
   )
-  install(TARGETS XrdAios LIBRARY DESTINATION lib)
-  install(FILES config/xrootd.aios.example.cf DESTINATION share/aios)
+  install(TARGETS XrdAios LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(FILES config/xrootd.aios.example.cf DESTINATION ${CMAKE_INSTALL_DATADIR}/aios)
 endif()
 
 # Userspace bridge for the AlmaLinux 9 aiosfs kernel prototype (kernel/aiosfs).
@@ -439,8 +519,8 @@ if(AIOS_WITH_KBRIDGE)
     ${CMAKE_CURRENT_SOURCE_DIR}/kernel
   )
   target_link_libraries(aios-kbridge PRIVATE aios_posix)
-  install(TARGETS aios-kbridge RUNTIME DESTINATION bin)
-  install(FILES kernel/aios_kabi.h DESTINATION include/aios)
+  install(TARGETS aios-kbridge RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(FILES kernel/aios_kabi.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
 endif()
 
 # Userspace control for aiosvd.ko (AIOS Volume Device).
@@ -450,8 +530,8 @@ target_include_directories(aios-vd PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(aios-vd PRIVATE aios_client)
-install(TARGETS aios-vd RUNTIME DESTINATION bin)
-install(FILES kernel/aiosvd_uapi.h DESTINATION include/aios)
+install(TARGETS aios-vd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES kernel/aiosvd_uapi.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
 
 enable_testing()
 add_executable(aios_tests
@@ -501,6 +581,11 @@ add_executable(aios_tests
   tests/test_code_review_regressions.cpp
   tests/test_code_review_more.cpp
   tests/test_session_wire.cpp
+  tests/test_review2_object.cpp
+  tests/test_review2_http.cpp
+  tests/test_review2_store.cpp
+  tests/test_review2_posix.cpp
+  tests/test_review2_kabi.cpp
 )
 target_include_directories(aios_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)
@@ -509,8 +594,17 @@ gtest_discover_tests(aios_tests
   PROPERTIES RUN_SERIAL TRUE
 )
 
-install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION bin)
-install(TARGETS aios_client aios_posix ARCHIVE DESTINATION lib)
-install(FILES src/posix/aios_posix.h DESTINATION include/aios)
-install(FILES config/aiosd.example.yaml DESTINATION share/aios)
-install(DIRECTORY web/admin DESTINATION share/aios)
+install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# aios_client and aios_posix are static and depend on aios_core (HTTP HMAC helpers,
+# config, JSON); install all three so the installed archives are linkable:
+#   -laios_posix -laios_client -laios_core + yaml-cpp, sqlite3, crypto, pthread
+#   (+ zstd / isal when enabled) — see README "STL-like C++ client → Build / link".
+install(TARGETS aios_core aios_client aios_posix ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES src/posix/aios_posix.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
+# Public client headers keep their "client/…" include spelling: add -I<prefix>/include/aios.
+install(DIRECTORY src/client/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios/client
+  FILES_MATCHING PATTERN "*.hpp"
+  PATTERN "vbd_registry_client.hpp" EXCLUDE)   # pulls in daemon-side object_service.hpp
+install(FILES "${AIOS_GENERATED_INCLUDE_DIR}/aios_version.hpp" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
+install(FILES config/aiosd.example.yaml DESTINATION ${CMAKE_INSTALL_DATADIR}/aios)
+install(DIRECTORY web/admin DESTINATION ${CMAKE_INSTALL_DATADIR}/aios)

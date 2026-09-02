@@ -1,0 +1,43 @@
+# https://editorconfig.org — matches .clang-format and CONTRIBUTING.md
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.{cpp,hpp,cc,hh,h}]
+indent_size = 2
+max_line_length = 100
+
+# Linux kernel modules: kernel coding style.
+[kernel/**.{c,h}]
+indent_style = tab
+indent_size = 8
+tab_width = 8
+max_line_length = 80
+
+[{Makefile,**/Makefile,*.mk}]
+indent_style = tab
+
+[*.{cmake,txt}]
+indent_size = 2
+
+[*.{json,yml,yaml}]
+indent_size = 2
+
+[*.{js,html,css}]
+indent_size = 2
+
+[*.sh]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = off
+
+[*.py]
+indent_size = 4

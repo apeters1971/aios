@@ -1,0 +1,45 @@
+# Normalise line endings: everything git detects as text is stored with LF.
+* text=auto eol=lf
+
+# Always-text sources (explicit so odd detection never flips them to binary).
+*.cpp text
+*.hpp text
+*.cc  text
+*.hh  text
+*.c   text
+*.h   text
+*.cmake text
+CMakeLists.txt text
+*.json text
+*.yml  text
+*.yaml text
+*.md   text
+*.js   text
+*.html text
+*.css  text
+*.sh   text eol=lf
+Makefile text
+*.cf   text
+*.conf text
+
+# Binary assets.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+*.ko   binary
+*.a    binary
+*.so   binary
+*.dylib binary
+*.sqlite binary
+*.db   binary
+
+# Nicer diffs.
+*.cpp diff=cpp
+*.hpp diff=cpp
+*.c   diff=cpp
+*.h   diff=cpp
+*.md  diff=markdown

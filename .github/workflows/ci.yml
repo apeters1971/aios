@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # ctest RUN_SERIAL is set on every test; the suite binds fixed loopback ports.
+  CTEST_OUTPUT_ON_FAILURE: 1
+
+jobs:
+  linux:
+    name: linux (gcc, -Werror)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ pkg-config \
+            libboost-dev libssl-dev libsqlite3-dev libzstd-dev libfuse3-dev
+
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build-ci/_deps
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure (preset ci → AIOS_WERROR=ON)
+        run: cmake --preset ci -G Ninja
+
+      - name: Build
+        run: cmake --build --preset ci --parallel
+
+      - name: Test
+        run: ctest --preset ci --output-on-failure
+
+      - name: Install (smoke)
+        run: cmake --install build-ci --prefix "$RUNNER_TEMP/aios-prefix" && ls -R "$RUNNER_TEMP/aios-prefix" | head -50
+
+  macos:
+    name: macos (AppleClang, -Werror)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # No libfuse on the runner: aios-fuse is skipped automatically.
+        run: brew install boost openssl@3 sqlite zstd isa-l ninja pkg-config
+
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build-ci/_deps
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure (preset ci → AIOS_WERROR=ON)
+        # Homebrew prefixes come from cmake/macos-homebrew.cmake; nothing machine-specific here.
+        run: cmake --preset ci -G Ninja
+
+      - name: Build
+        run: cmake --build --preset ci --parallel
+
+      - name: Test
+        run: ctest --preset ci --output-on-failure
+
+  sanitizers:
+    name: ${{ matrix.preset }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan-ubsan, tsan]
+    # TSan is advisory until the known data races (OBJ-9, POS-8, …) are fixed;
+    # asan-ubsan is required to pass.
+    continue-on-error: ${{ matrix.preset == 'tsan' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ pkg-config \
+            libboost-dev libssl-dev libsqlite3-dev libzstd-dev libfuse3-dev
+
+      - name: Lower ASLR entropy (sanitizer runtimes need vm.mmap_rnd_bits <= 28)
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: build-${{ matrix.preset == 'asan-ubsan' && 'asan' || 'tsan' }}/_deps
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure (preset ${{ matrix.preset }})
+        run: cmake --preset ${{ matrix.preset }} -G Ninja
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure --timeout 600
+
+  kernel:
+    name: kernel modules (AlmaLinux 9)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: almalinux:9
+    steps:
+      - name: Install kernel-devel and toolchain
+        run: |
+          dnf install -y kernel-devel kernel-headers gcc make elfutils-libelf-devel git kmod
+          ls /usr/src/kernels
+
+      - uses: actions/checkout@v4
+
+      - name: Build aios_http.ko, aiosfs.ko, aiosvd.ko
+        # kernel/Makefile and the per-module Makefiles use `KDIR ?= /lib/modules/$(uname -r)/build`;
+        # the container has no running el9 kernel, so point KDIR at the installed kernel-devel tree.
+        # KCFLAGS=-Werror turns CONFIG_FRAME_WARN (2 KiB on x86_64) and every other kbuild warning
+        # into a build failure.
+        run: |
+          KDIR="/usr/src/kernels/$(ls /usr/src/kernels | head -1)"
+          echo "KDIR=$KDIR"
+          make -C kernel KDIR="$KDIR" KCFLAGS="-Werror"
+          ls -l kernel/aios_http/*.ko kernel/aiosfs/*.ko kernel/aiosvd/*.ko
+          modinfo kernel/aios_http/aios_http.ko kernel/aiosfs/aiosfs.ko kernel/aiosvd/aiosvd.ko

@@ -1,16 +1,44 @@
+# Build trees (build/, build-ci/, build-asan/, build-tsan/, build-<anything>/)
 /build/
+/build-*/
 /cmake-build-*/
+/out/
 /.cache/
 compile_commands.json
+CMakeUserPresets.json
+Testing/
+
+# Compiler / linker output
 *.o
 *.a
 *.dylib
 *.so
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+
+# Local object stores, test scratch data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# NOTE: `.aios` marker files are operator data (storage target descriptors) — never ignore them.
+
+# Editor / OS
 .DS_Store
-/aiosd
 *.user
 .vscode/
 .idea/
+*.swp
+
+# Secrets and local state
+/aiosd
 /.token
 *.pem
 *.key

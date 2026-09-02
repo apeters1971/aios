@@ -79,7 +79,9 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - [Kernel prototype (AlmaLinux 9)](#kernel-prototype-almalinux-9)
 - [Export aiosfs via NFS (nfsd)](#export-aiosfs-via-nfs-nfsd)
 - [Authentication](#authentication)
+- [Security model and limitations](#security-model-and-limitations)
 - [Logging](#logging)
+- [Testing & CI](#testing--ci)
 - [Documentation](#documentation)
 
 ---
@@ -172,25 +174,74 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 
 **Requirements**
 
-- CMake ≥ 3.24
-- C++20 compiler
-- Boost (Asio headers)
-- OpenSSL (HMAC-SHA256)
+- CMake ≥ 3.24 (≥ 3.25 for `cmake --preset`)
+- C++20 compiler (GCC 11+, Clang 14+, AppleClang 14+)
+- Boost ≥ 1.70 (Asio headers only)
+- OpenSSL (HMAC-SHA256, AES-256-GCM)
 - SQLite3
-- Network on first configure (FetchContent: yaml-cpp, nlohmann/json)
-- Optional: [ISA-L](https://github.com/intel/isa-l) for Reed–Solomon EC (`m > 1`)
+- Network on first configure — FetchContent clones pinned commits of
+  [yaml-cpp 0.8.0](https://github.com/jbeder/yaml-cpp), [nlohmann/json v3.11.3](https://github.com/nlohmann/json)
+  and [googletest v1.15.2](https://github.com/google/googletest) into `<build>/_deps`
+  (offline: `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<checkout>` or `-DFETCHCONTENT_FULLY_DISCONNECTED=ON` on a populated build dir)
+
+Optional (auto-detected; each prints a `-- <dep>: enabled|not found` line at configure time):
+
+| Dependency | Enables | Switch |
+|------------|---------|--------|
+| [ISA-L](https://github.com/intel/isa-l) | Reed–Solomon EC with `m > 1` (XOR `m = 1` always works) | `AIOS_WITH_ISAL` |
+| libzstd | `compression: zstd`, `bag_compression: zstd` | `AIOS_WITH_ZSTD` |
+| libfuse3 | `aios-fuse` | `AIOS_WITH_FUSE` |
+| XRootD ≥ 5 | `libXrdAios.so` OSS plugin | `AIOS_WITH_XROOTD`, `XRootD_ROOT` |
+| NVIDIA cuObjServer SDK | S3 GPUDirect / RDMA offload | `AIOS_WITH_CUOBJECT`, `CUOBJECT_ROOT` |
+| AlmaLinux 9 `kernel-devel` | `aios_http.ko` / `aiosfs.ko` / `aiosvd.ko` (separate `make -C kernel`) | — |
+
+**Linux** (Debian/Ubuntu package names; el9: `boost-devel openssl-devel sqlite-devel libzstd-devel fuse3-devel`):
 
 ```bash
-export PATH="/opt/homebrew/bin:$PATH"   # macOS Homebrew
-# Optional for RS EC: brew install isa-l
+sudo apt-get install -y cmake ninja-build g++ pkg-config \
+  libboost-dev libssl-dev libsqlite3-dev libzstd-dev libfuse3-dev
 
-cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_PREFIX_PATH="/opt/homebrew;/opt/homebrew/opt/sqlite;/opt/homebrew/opt/openssl@3;/opt/homebrew/opt/isa-l"
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+cmake --preset default            # → build/, RelWithDebInfo
+cmake --build --preset default -j
+ctest --preset default
 ```
 
+**macOS (Homebrew)** — `cmake/macos-homebrew.cmake` adds the Homebrew prefix (and the keg-only
+`sqlite`, `openssl@3`, `isa-l`, `zstd` kegs) to `CMAKE_PREFIX_PATH` automatically, so no
+`-DCMAKE_PREFIX_PATH` is needed. Override with `-DAIOS_HOMEBREW_PREFIX=/path` (or `""` to disable).
+
+```bash
+brew install cmake boost openssl@3 sqlite zstd isa-l pkg-config
+cmake --preset default && cmake --build --preset default -j && ctest --preset default
+```
+
+Without presets the equivalent is `cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo`.
+
+**XRootD plugin.** `AIOS_WITH_XROOTD` defaults to `ON`; when XRootD is not found the configure log
+says so and `libXrdAios.so` is simply skipped. Point CMake at an install prefix *or* a source+build
+checkout with `-DXRootD_ROOT=…` (environment `XRootD_ROOT` / `XROOTD_ROOT` also work; `find_package(XRootD CONFIG)`
+and pkg-config are tried as well):
+
+```bash
+cmake --preset default -DXRootD_ROOT=/usr                       # distro package
+cmake --preset default -DXRootD_ROOT=$HOME/Software/xrootd      # checkout with build/ inside
+# or fully explicit:
+cmake --preset default -DXROOTD_INCLUDE_DIR=…/xrootd/src -DXROOTD_VERSION_INCLUDE_DIR=…/xrootd/build/src \
+  -DXROOTD_UTILS_LIBRARY=…/build/lib/libXrdUtils.so -DXROOTD_SERVER_LIBRARY=…/build/lib/libXrdServer.so
+```
+
+**Build options**
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `CMAKE_BUILD_TYPE` | `RelWithDebInfo` | |
+| `AIOS_WERROR` | `OFF` | `-Werror` on AIOS targets (not on fetched dependencies); the `ci` preset turns it on |
+| `AIOS_SANITIZE` | `off` | `asan-ubsan` or `tsan`; instruments every target including dependencies (see [Testing & CI](#testing--ci)) |
+| `AIOS_WITH_*` | `ON` | Per-dependency opt-outs listed above |
+| `CMAKE_INSTALL_PREFIX` | `/usr/local` | `cmake --install build` puts binaries in `bin/`, `libaios_{core,client,posix}.a` in `lib/`, headers in `include/aios/`, the admin SPA and example configs in `share/aios/` |
+
 Outputs: `build/aiosd`, `build/aios`, `build/aios-bench`, `build/aios-store-bench`, `build/libaios_client.a`, `build/aios_tests`.
+The configure step also generates `build/generated/include/aios_version.hpp` (`AIOS_VERSION_STRING`, `AIOS_VERSION_FULL` with `git describe`); `aiosd --version` / `aios --version` will print it once wired up.
 
 ---
 
@@ -932,11 +983,79 @@ Skew window: `auth_skew_ms` (default 60s). This is shared-secret clustering, not
 
 ---
 
+## Security model and limitations
+
+Read this before exposing any port. AIOS is designed for a **trusted, private network**; the
+authentication above is there to keep accidental clients out, not to defend against an adversary
+who can reach the ports or observe the wire.
+
+| Property | Current state |
+|----------|---------------|
+| **Transport** | Plaintext everywhere: gossip/RPC (TCP++), HTTP object API, admin UI/API, S3 gateway, kernel modules. No TLS, no mutual authentication. Anyone on the path can read every object body, every admin session cookie, and the S3 traffic. |
+| **One shared secret** | `cluster_key` is simultaneously the **node** secret (join the cluster, receive replicas, participate in placement), the **client** secret (HTTP object API), the **admin password** (web UI login) and the **S3 root secret** (`s3_access_key` / `cluster_key`). Consequently *any* S3 root client or HTTP client can join as a storage node, read or rewrite any object, and log in to the admin console. Per-bucket S3 IAM keys are the only scoped credential and they exist only on the S3 surface. |
+| **Integrity of bodies** | HMAC-SHA256 covers the canonical request/frame metadata. Streamed bodies are covered only when the client sends a content hash: HTTP PUTs above 256 KiB are currently signed as `UNSIGNED-PAYLOAD`, and replica RPC frames carry the body as an unsigned trailer with a CRC32C (being fixed — see `CHANGELOG.md` OBJ-13 / POS-11). Until then, an on-path party can substitute object contents while the signature still verifies. |
+| **Replay** | Requests are valid for the `auth_skew_ms` window (default **60 s**). RPC frames have a nonce + replay cache; HTTP requests currently do not (HTTP-4). Clocks must be synchronised (NTP) across nodes and clients. |
+| **Key rotation** | None. Changing `cluster_key` means restarting every node and client with the new value; there is no dual-key grace period. Per-bucket IAM secrets can be deleted and recreated individually. |
+| **Authorization** | There is no per-object ACL on the HTTP object API: a valid `cluster_key` grants everything. POSIX uid/gid checks apply on the FUSE/S3/XRootD paths only. |
+| **Admin UI** | Cookie session (`HttpOnly; SameSite=Strict`), constant-time password compare; no CSRF token, no login rate limiting, no TLS. |
+
+**Recommendations**
+
+- Run all nodes on a **private / isolated network** (VLAN, VPC, WireGuard); firewall `listen`, `http_listen`, `s3_listen`, `cuobject_listen` so only nodes and trusted clients reach them.
+- Put a **TLS-terminating reverse proxy** (nginx, HAProxy, Envoy) in front of the HTTP API, admin UI and S3 gateway for anything that leaves that network; bind the daemon ports to loopback or the private interface.
+- Use **per-bucket IAM keys** for S3 users; never hand out `cluster_key` to an application.
+- Treat `cluster_key` as a root credential: keep it out of shell history and process listings (`--config` file with mode `0600` rather than `--cluster-key` on the command line).
+- Keep NTP running; a skewed clock is indistinguishable from an attack and is rejected with `401`.
+
+The findings referenced above (OBJ-*, HTTP-*, STO-*, POS-*, KRN-*) are tracked in [`CHANGELOG.md`](CHANGELOG.md) and [`docs/dev/CODE_REVIEW.md`](docs/dev/CODE_REVIEW.md).
+
+---
+
 ## Logging
 
 ```bash
 AIOS_LOG=debug|info|warn|error   # default: info
 ```
+
+---
+
+## Testing & CI
+
+The whole suite is one GoogleTest binary, `aios_tests`, registered with CTest one test per
+`TEST` (`gtest_discover_tests`, `RUN_SERIAL` because tests bind fixed loopback ports).
+
+```bash
+cmake --preset default && cmake --build --preset default -j
+ctest --preset default                                  # everything, output on failure
+ctest --preset default -R 'SessionWire'                 # by regex
+./build/aios_tests --gtest_filter='S3Iam.*:HttpEc.*'    # gtest filter, fastest turnaround
+./build/aios_tests --gtest_filter='SessionWireC6.*' --gtest_repeat=30 --gtest_break_on_failure
+```
+
+**Presets** (`CMakePresets.json`; each has matching build/test/workflow presets):
+
+| Preset | Build dir | What it sets |
+|--------|-----------|--------------|
+| `default` | `build/` | `RelWithDebInfo` |
+| `ci` | `build-ci/` | + `AIOS_WERROR=ON` (what GitHub Actions runs on Linux and macOS) |
+| `asan-ubsan` | `build-asan/` | `AIOS_SANITIZE=asan-ubsan`: `-fsanitize=address,undefined -fno-omit-frame-pointer`, `halt_on_error=1`; XRootD plugin off |
+| `tsan` | `build-tsan/` | `AIOS_SANITIZE=tsan`: `-fsanitize=thread`; XRootD plugin off |
+
+```bash
+cmake --workflow --preset asan-ubsan     # configure + build + ctest in one go
+cmake --preset tsan && cmake --build --preset tsan -j && ctest --preset tsan --timeout 600
+```
+
+Sanitizer flags apply to every target including the fetched dependencies, so the runtime sees
+consistent instrumentation. On Linux with a recent kernel set `sudo sysctl vm.mmap_rnd_bits=28`
+first, otherwise ASan/TSan may abort at startup.
+
+**GitHub Actions** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `linux` (gcc, `ci` preset), `macos`
+(AppleClang, `ci` preset), `sanitizers` (`asan-ubsan` required, `tsan` advisory while known races are fixed),
+and `kernel` (the three modules against AlmaLinux 9 `kernel-devel` with `KCFLAGS=-Werror`; advisory until the
+current kernel compile fix lands). FetchContent sources are cached between runs.
+
+Contributor workflow, style and commit conventions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
@@ -960,12 +1079,8 @@ AIOS_LOG=debug|info|warn|error   # default: info
 | [`kernel/README.md`](kernel/README.md) | AlmaLinux 9 modules: `aios_http` / `aiosfs` / `aiosvd`, DKMS |
 | [`config/aiosd.example.yaml`](config/aiosd.example.yaml) | Daemon config reference |
 | [`config/xrootd.aios.example.cf`](config/xrootd.aios.example.cf) | Example XRootD config for `libXrdAios` |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build, test, sanitizer presets, style, commit messages |
+| [`CHANGELOG.md`](CHANGELOG.md) | Unreleased fixes by area (OBJ-*, HTTP-*, STO-*, POS-*, KRN-*) |
+| [`docs/dev/`](docs/dev/) | Review audit trail (`CODE_REVIEW.md`) and development statistics (`STATS.md`) |
 
-Run the GoogleTest suite after changes:
-
-```bash
-./build/aios_tests
-./build/aios_tests --gtest_filter='S3Iam.*:HttpEc.*'
-# or (each TEST is registered with CTest; RUN_SERIAL avoids port clashes)
-ctest --test-dir build --output-on-failure
-```
+Run the GoogleTest suite after changes — see [Testing & CI](#testing--ci).

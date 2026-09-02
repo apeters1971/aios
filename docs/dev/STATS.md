@@ -4,7 +4,7 @@ Snapshot generated **2026-08-06** from git history and the Cursor agent transcri
 [`4ae526f1-a71a-4795-b75c-1e40ff32bf86`](https://cursor.com).
 
 Sources of uncertainty are called out inline. Token totals below come from the
-Cursor usage dashboard (`tokens.png`); dollar figures are approximate.
+Cursor usage dashboard (`docs/dev/tokens.png`, next to this file); dollar figures are approximate.
 
 ---
 
@@ -41,7 +41,7 @@ agent work.
 Cursor usage dashboard (model `cursor-grok-4.5-high-fast`), cumulative over the
 billing window that covers this chat:
 
-![Token usage Jul 31 – Aug 6 (Cursor dashboard)](tokens.png)
+![Token usage Jul 31 – Aug 6 (Cursor dashboard)](./tokens.png)
 
 | Metric | Value | Notes |
 |--------|------:|-------|

@@ -6,6 +6,7 @@
 #include "membership.hpp"
 #include "util/log.hpp"
 
+#include <aios_version.hpp>
 #include <boost/asio.hpp>
 
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <csignal>
 #include <iostream>
 #include <memory>
+#include <string_view>
 #include <thread>
 
 namespace {
@@ -47,6 +49,13 @@ struct IoStopper {
 int main(int argc, char** argv) {
   using namespace aios;
 
+  for (int i = 1; i < argc; ++i) {
+    if (std::string_view(argv[i]) == "--version" || std::string_view(argv[i]) == "-V") {
+      std::cout << "aiosd " << AIOS_VERSION_FULL << "\n";
+      return 0;
+    }
+  }
+
   Config cfg;
   std::string err;
   bool help = false;
@@ -62,7 +71,7 @@ int main(int argc, char** argv) {
         << "             [--replica-count N] [--write-quorum N]\n"
         << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
         << "             [--s3-listen HOST:PORT] [--s3-volume NAME] [--s3-access-key ID]\n"
-        << "             [--no-fsync]\n"
+        << "             [--no-fsync] [--version]\n"
         << "\n"
         << "Standalone AIOS daemon: gossip membership, .aios discovery,\n"
         << "server-side primary replication, HTTP object API, and optional S3 API.\n"

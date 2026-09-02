@@ -1,0 +1,42 @@
+# AIOS C++ style: Google base, 2-space indent, 100 columns.
+# Do NOT reformat whole files you are not otherwise changing — format touched lines only
+# (git clang-format). See CONTRIBUTING.md.
+---
+Language: Cpp
+BasedOnStyle: Google
+Standard: c++20
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+ColumnLimit: 100
+AccessModifierOffset: -1
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AlignAfterOpenBracket: Align
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBraces: Attach
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve
+SortIncludes: CaseSensitive
+InsertNewlineAtEOF: true
+---
+# Kernel modules keep Linux kernel style (tabs, 80 columns).
+Language: C
+BasedOnStyle: LLVM
+IndentWidth: 8
+TabWidth: 8
+UseTab: Always
+ColumnLimit: 80
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AlignConsecutiveMacros: true
+---
+Language: JavaScript
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 100
+...
