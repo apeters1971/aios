@@ -18,9 +18,10 @@ mutex::~mutex() {
   unlock();
 }
 
-void mutex::maybe_renew() {
+void mutex::maybe_renew() const {
   if (token_.empty() || expires_ms_ <= 0) return;
   const auto now = now_ms();
+  if (now >= expires_ms_) return;  // lapsed; a renew would only mask the loss
   const auto renew_at = expires_ms_ - static_cast<std::int64_t>(ttl_ms_ / 3);
   if (now < renew_at) return;
   try {
@@ -31,6 +32,7 @@ void mutex::maybe_renew() {
 
 bool mutex::owns_lock() const {
   if (token_.empty()) return false;
+  maybe_renew();
   if (expires_ms_ > 0 && now_ms() >= expires_ms_) return false;
   return true;
 }

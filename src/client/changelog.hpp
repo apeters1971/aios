@@ -4,9 +4,11 @@
 #include "client/mode.hpp"
 #include "client/session.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -16,6 +18,11 @@ namespace changelog {
 inline constexpr std::uint32_t kMagic = 0x6b504f41u;  // 'AOPk' LE
 inline constexpr int kMetaVersion = 2;
 inline constexpr std::uint64_t kAutoCompactBytes = 1u * 1024u * 1024u;
+// An op id reserved in meta but never appended (writer crashed between the CAS
+// and the append) is a hole. pull() stops at a hole until this Log has observed
+// it for kGapGrace, then treats it as filled so later records are applied.
+// Sized to the lock TTL / socket timeout: a live appender lands well inside it.
+inline constexpr auto kGapGrace = std::chrono::milliseconds(30000);
 
 enum class Op : std::uint32_t {
   Put = 1,
@@ -84,10 +91,18 @@ class Log {
   // and return snapshot_json + applied_op), then write the snapshot and truncate
   // the log. Building the snapshot under the lock closes the race where a peer
   // append lands after a stale snapshot was taken but before truncate.
-  void compact(sync_mode mode,
+  // Returns false (nothing written) when the log holds records beyond a hole the
+  // rebuild could not apply yet: truncating would destroy them.
+  bool compact(sync_mode mode,
                const std::function<std::pair<std::string, std::uint64_t>()>& rebuild);
 
   std::string load_snapshot_body();
+
+  // Highest op_id present in the log body (0 when empty).
+  std::uint64_t max_logged_op();
+
+  void set_gap_grace(std::chrono::milliseconds grace) { gap_grace_ = grace; }
+  std::chrono::milliseconds gap_grace() const { return gap_grace_; }
 
  private:
   void ensure_meta(Meta& m, sync_mode mode);
@@ -101,6 +116,9 @@ class Log {
   std::string meta_oid_;
   std::string log_oid_;
   std::string snap_oid_;
+  std::chrono::milliseconds gap_grace_{kGapGrace};
+  // First time this Log saw each hole (keyed by the missing op_id).
+  std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> gap_first_seen_;
 };
 
 }  // namespace changelog

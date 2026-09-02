@@ -65,14 +65,23 @@ int XrdAiosFile::Open(const char* path, int Oflag, mode_t Mode, XrdOucEnv& env) 
 }
 
 int XrdAiosFile::Close(long long* retsz) {
-  if (retsz && open_ && oss_ && oss_->fs()) {
-    aios_posix_stat st{};
-    if (aios_posix_getattr(oss_->fs(), ino_, &st) == 0) *retsz = static_cast<long long>(st.size);
+  int rc = XrdOssOK;
+  if (open_ && oss_ && oss_->fs()) {
+    // Land the deferred size/mtime PUT now so the file is complete for other
+    // clients as soon as Close returns, and surface a failed flush to the caller.
+    if (caller_set_) aios_posix_set_caller(oss_->fs(), uid_, gid_);
+    rc = aios_posix_fsync(oss_->fs(), ino_);
+    if (retsz) {
+      aios_posix_stat st{};
+      if (aios_posix_getattr(oss_->fs(), ino_, &st) == 0) {
+        *retsz = static_cast<long long>(st.size);
+      }
+    }
   }
   open_ = false;
   ino_ = 0;
   caller_set_ = false;
-  return XrdOssOK;
+  return rc;
 }
 
 int XrdAiosFile::restore_caller() const {

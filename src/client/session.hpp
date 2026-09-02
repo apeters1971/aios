@@ -3,8 +3,10 @@
 #include "client/error.hpp"
 #include "client/put_layout.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -20,6 +22,7 @@ struct SessionConfig {
   std::string app_label{};
   // Per-socket read/write deadline. Applied as SO_RCVTIMEO / SO_SNDTIMEO on a
   // blocking native fd; I/O uses recv/send so Asio cannot swallow the timeout.
+  // Also bounds name resolution + TCP connect for a new pooled connection.
   int socket_timeout_ms{30000};
   // Extra host:port values absolute 307/301/302 Location targets may use.
   // The configured endpoint is always allowed. Relative Locations stay on the
@@ -149,6 +152,7 @@ class Session {
   void parse_endpoint();
   void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
                 const std::string& target, const std::string& body) const;
+  static std::string next_nonce();
   static void validate_header_value(const std::string& value, const char* what);
   static ObjectSnapshot parse_object_meta(const HttpResponse& resp, bool with_body);
 
@@ -162,9 +166,12 @@ class Session {
   SessionConfig cfg_;
   std::string host_;
   std::string port_;
+  // One Session is shared by every FUSE/S3/XRootD worker thread; the allowlist
+  // is read on each redirect and grown by the one-shot cluster refresh.
+  mutable std::mutex allow_mu_;
   std::unordered_set<std::string> redirect_allow_;
-  bool redirect_refreshed_{false};
-  bool refreshing_allowlist_{false};
+  std::atomic<bool> redirect_refreshed_{false};
+  std::atomic<bool> refreshing_allowlist_{false};
   struct ConnPool;
   std::unique_ptr<ConnPool> pool_;
 };

@@ -109,17 +109,26 @@ void flush_rstats(FsState& st) {
   }
 }
 
+// One maintenance thread per mount: a short tick lands deferred inode PUTs
+// (size/mtime) within ~kDirtyFlushAge even when no further write, fsync or
+// unmount follows (S3 gateway, XRootD); rstats and the quota tick keep their own,
+// much longer cadence (rstat_interval_ms; <= 0 disables only those).
 void start_rstat_thread(FsState& st) {
-  if (st.rstat_interval_ms <= 0) return;
   if (st.rstat_thread.joinable()) return;
   st.rstat_stop.store(false);
   const int interval = st.rstat_interval_ms;
   st.rstat_thread = std::thread([&st, interval] {
+    using clock = std::chrono::steady_clock;
+    auto next_rstat = clock::now() + std::chrono::milliseconds(interval > 0 ? interval : 0);
     while (!st.rstat_stop.load()) {
-      for (int i = 0; i < interval / 50 && !st.rstat_stop.load(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      }
+      std::this_thread::sleep_for(kDirtyFlushTick);
       if (st.rstat_stop.load()) break;
+      try {
+        flush_all_dirty_inodes(st, kDirtyFlushAge);
+      } catch (...) {
+      }
+      if (interval <= 0 || clock::now() < next_rstat) continue;
+      next_rstat = clock::now() + std::chrono::milliseconds(interval);
       try {
         flush_rstats(st);
         if (st.quota) st.quota->tick();

@@ -23,7 +23,9 @@ typedef struct aios_posix_config {
   uint32_t stripe_width;    /* 0 => 4 (max in-flight chunk ops) */
   uint32_t uid;             /* default owner / caller when unset on thread */
   uint32_t gid;
-  int rstat_interval_ms;    /* recursive dir stats flush; 0 disables; typical 60000 */
+  int rstat_interval_ms;    /* recursive dir stats flush; 0 disables; typical 60000.
+                               The deferred inode flusher (see aios_posix_write) runs
+                               regardless of this value. */
 } aios_posix_config;
 
 /* Per-request caller identity (thread-local for this mount). */
@@ -77,7 +79,11 @@ int aios_posix_lookup(aios_posix_fs* fs, uint64_t parent, const char* name,
 int aios_posix_getattr(aios_posix_fs* fs, uint64_t ino, aios_posix_stat* st_out);
 
 /* readdir: fill up to max_entries starting at *offset (0-based).
- * Returns number of entries written (>=0), or -errno. Advances *offset. */
+ * Returns number of entries written (>=0), or -errno. Advances *offset.
+ * *offset is a positional index into the directory's name-sorted listing,
+ * which is re-read and re-sorted on every call. Entries created or removed
+ * between calls may therefore be skipped or repeated; callers wanting a
+ * stable listing should drain the directory in one pass (offset 0 .. done). */
 int aios_posix_readdir(aios_posix_fs* fs, uint64_t ino, uint64_t* offset,
                        aios_posix_dirent* buf, size_t max_entries);
 
@@ -114,11 +120,17 @@ int aios_posix_readlink(aios_posix_fs* fs, uint64_t ino, char* buf, size_t size)
 
 int aios_posix_read(aios_posix_fs* fs, uint64_t ino, uint64_t offset, void* buf,
                     size_t len, size_t* out_len);
+/* Data is durable on the cluster when write returns. The inode's size/mtime
+ * update is deferred and batched: it is visible to this mount immediately, and
+ * to other clients (other mounts, S3, XRootD, the kernel client) within ~100 ms
+ * via the mount's background flusher, or as soon as aios_posix_fsync returns.
+ * Gateways that must publish a complete file on close call aios_posix_fsync. */
 int aios_posix_write(aios_posix_fs* fs, uint64_t ino, uint64_t offset, const void* buf,
                      size_t len, size_t* out_len);
 int aios_posix_truncate(aios_posix_fs* fs, uint64_t ino, uint64_t size);
 int aios_posix_setattr(aios_posix_fs* fs, uint64_t ino, const aios_posix_stat* st,
                        uint32_t to_set);
+/* Flush the deferred size/mtime for ino (see aios_posix_write). */
 int aios_posix_fsync(aios_posix_fs* fs, uint64_t ino);
 
 /* to_set bits for setattr */

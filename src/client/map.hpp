@@ -69,8 +69,11 @@ class basic_map : public detail::StlBase {
     }
     if (!local_valid_) load();
     if (!impl_->pending.empty()) {
-      impl_->applied_op = impl_->log.append_ops(impl_->pending, mode());
+      const std::uint64_t before = impl_->applied_op;
+      const std::uint64_t last = impl_->log.append_ops(impl_->pending, mode());
+      const std::uint64_t first = last + 1 - impl_->pending.size();
       impl_->pending.clear();
+      note_appended(before, first, last);
     }
     pull();
     clear_dirty();
@@ -79,13 +82,14 @@ class basic_map : public detail::StlBase {
 
   void compact() {
     if (mode() == sync_mode::async && dirty()) flush();
-    impl_->log.compact(mode(), [this] {
+    const bool compacted = impl_->log.compact(mode(), [this] {
       impl_->applied_op = 0;
       local_.clear();
       pull();
       local_valid_ = true;
       return std::make_pair(wire::make_map_doc(to_wire(local_), mode()).dump(), impl_->applied_op);
     });
+    if (!compacted) return;
     auto m = impl_->log.load_meta();
     impl_->applied_op = m.snapshot_op;
   }
@@ -209,9 +213,23 @@ class basic_map : public detail::StlBase {
       mark_dirty();
       return;
     }
+    const std::uint64_t before = impl_->applied_op;
     const auto id = impl_->log.append_op(op, std::move(args), mode());
-    impl_->applied_op = id;
+    note_appended(before, id, id);
     maybe_compact();
+  }
+
+  // Our records got ids [first, last]. Peers may have reserved ids in
+  // (before, first) since our last pull; claiming `last` as applied would skip
+  // them forever. Only a contiguous append advances the cursor directly —
+  // otherwise local state is rebuilt from the tip on the next pull.
+  void note_appended(std::uint64_t before, std::uint64_t first, std::uint64_t last) {
+    if (first == before + 1) {
+      impl_->applied_op = last;
+      return;
+    }
+    impl_->applied_op = 0;
+    local_.clear();
   }
 
   void maybe_compact() {

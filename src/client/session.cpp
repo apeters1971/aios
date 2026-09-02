@@ -8,9 +8,11 @@
 
 #include <boost/asio.hpp>
 
+#include <atomic>
 #include <cctype>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <utility>
 
@@ -204,11 +206,31 @@ std::uint64_t apply_posix_cas_headers(Session& session, const std::string& oid,
   return new_cas;
 }
 
+// What the transport saw before an exchange failed. A pooled connection the
+// server closed while idle fails with a peer-closed error and no response bytes;
+// anything else (timeout, partial response) means the request may have run.
+struct ExchangeIo {
+  std::size_t received{0};
+  bool peer_closed{false};
+};
+
+bool is_peer_closed(const boost::system::error_code& ec) {
+  if (ec == boost::asio::error::eof) return true;
+#ifndef _WIN32
+  return ec.value() == ECONNRESET || ec.value() == EPIPE;
+#else
+  return ec == boost::asio::error::connection_reset;
+#endif
+}
+
 HttpResponse exchange_http(tcp::socket& sock, std::string& leftover, const std::string& method,
                            const std::string& path, const std::string& host,
                            const std::string& port,
                            const std::unordered_map<std::string, std::string>& headers,
-                           const std::string& body, bool* close_out) {
+                           const std::string& body, bool* close_out, ExchangeIo* io = nullptr) {
+  ExchangeIo local_io;
+  ExchangeIo& st = io ? *io : local_io;
+  st = {};
   std::ostringstream req;
   req << method << ' ' << path << " HTTP/1.1\r\n";
   req << "Host: " << host << ':' << port << "\r\n";
@@ -217,16 +239,26 @@ HttpResponse exchange_http(tcp::socket& sock, std::string& leftover, const std::
   req << "\r\n";
   const auto head = req.str();
   boost::system::error_code ec;
-  if (!timed_write(sock, head.data(), head.size(), ec)) throw_sock("write", ec);
+  if (!timed_write(sock, head.data(), head.size(), ec)) {
+    st.peer_closed = is_peer_closed(ec);
+    throw_sock("write", ec);
+  }
   if (!body.empty() && !timed_write(sock, body.data(), body.size(), ec)) {
+    st.peer_closed = is_peer_closed(ec);
     throw_sock("write", ec);
   }
 
   std::string wire = std::move(leftover);
   leftover.clear();
+  st.received = wire.size();
   if (wire.find("\r\n\r\n") == std::string::npos) {
-    if (!timed_read_until(sock, wire, "\r\n\r\n", ec)) throw_sock("read headers", ec);
+    if (!timed_read_until(sock, wire, "\r\n\r\n", ec)) {
+      st.received = wire.size();
+      st.peer_closed = is_peer_closed(ec);
+      throw_sock("read headers", ec);
+    }
   }
+  st.received = wire.size();
   const auto hdr_end = wire.find("\r\n\r\n");
   std::istringstream is(wire.substr(0, hdr_end + 4));
   std::string status_line;
@@ -349,12 +381,45 @@ struct Session::ConnPool {
     }
     if (reused) *reused = false;
     c = std::make_unique<Conn>();
-    boost::system::error_code ec;
+    // Resolve + connect under one deadline: a black-holed peer must fail in
+    // socket_timeout_ms, not hang in a synchronous connect for the TCP SYN timeout.
     boost::asio::ip::tcp::resolver resolver(c->ioc);
-    auto endpoints = resolver.resolve(host, port, ec);
-    if (ec) throw client_error("http", "resolve: " + ec.message());
-    boost::asio::connect(c->sock, endpoints, ec);
-    if (ec) throw client_error("http", "connect: " + ec.message());
+    boost::asio::steady_timer deadline(c->ioc);
+    boost::system::error_code resolve_ec = boost::asio::error::operation_aborted;
+    boost::system::error_code connect_ec = boost::asio::error::operation_aborted;
+    bool timed_out = false;
+    bool finished = false;
+    if (timeout_ms > 0) {
+      deadline.expires_after(std::chrono::milliseconds(timeout_ms));
+      deadline.async_wait([&](const boost::system::error_code& e) {
+        if (e || finished) return;
+        timed_out = true;
+        resolver.cancel();
+        boost::system::error_code ignore;
+        c->sock.close(ignore);
+      });
+    }
+    resolver.async_resolve(
+        host, port,
+        [&](const boost::system::error_code& e, tcp::resolver::results_type results) {
+          resolve_ec = e;
+          if (e) {
+            finished = true;
+            deadline.cancel();
+            return;
+          }
+          boost::asio::async_connect(
+              c->sock, results, [&](const boost::system::error_code& ce, const tcp::endpoint&) {
+                connect_ec = ce;
+                finished = true;
+                deadline.cancel();
+              });
+        });
+    c->ioc.run();
+    c->ioc.restart();
+    if (timed_out) throw client_error("http", "connect: timeout");
+    if (resolve_ec) throw client_error("http", "resolve: " + resolve_ec.message());
+    if (connect_ec) throw client_error("http", "connect: " + connect_ec.message());
     apply_socket_deadlines(c->sock, timeout_ms);
     c->host = host;
     c->port = port;
@@ -398,18 +463,22 @@ std::string Session::normalize_host_port(std::string host, std::string port) {
 
 void Session::allow_redirect_peer(const std::string& http_addr) {
   if (http_addr.empty()) return;
+  std::string key;
   auto colon = http_addr.rfind(':');
   if (colon == std::string::npos || colon == 0 || colon + 1 >= http_addr.size()) {
     // host only → default HTTP port
-    redirect_allow_.insert(normalize_host_port(http_addr, "80"));
-    return;
+    key = normalize_host_port(http_addr, "80");
+  } else {
+    key = normalize_host_port(http_addr.substr(0, colon), http_addr.substr(colon + 1));
   }
-  redirect_allow_.insert(
-      normalize_host_port(http_addr.substr(0, colon), http_addr.substr(colon + 1)));
+  std::lock_guard lock(allow_mu_);
+  redirect_allow_.insert(std::move(key));
 }
 
 bool Session::redirect_allowed(const std::string& host, const std::string& port) const {
-  return redirect_allow_.count(normalize_host_port(host, port)) > 0;
+  const auto key = normalize_host_port(host, port);
+  std::lock_guard lock(allow_mu_);
+  return redirect_allow_.count(key) > 0;
 }
 
 HttpResponse Session::bootstrap_get(const std::string& path) {
@@ -424,15 +493,16 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
       pool_->put(std::move(conn), false);
       conn = pool_->take(host_, port_, cfg_.socket_timeout_ms, &reused);
     }
+    ExchangeIo io;
     try {
       bool close_conn = false;
       auto r = exchange_http(conn->sock, conn->leftover, "GET", path, host_, port_, headers, {},
-                             &close_conn);
+                             &close_conn, &io);
       pool_->put(std::move(conn), !close_conn);
       return r;
     } catch (const client_error&) {
       pool_->put(std::move(conn), false);
-      if (!reused) throw;
+      if (!reused || !io.peer_closed || io.received != 0) throw;
       bool ignored = false;
       auto fresh = pool_->take(host_, port_, cfg_.socket_timeout_ms, &ignored);
       try {
@@ -451,13 +521,15 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
 }
 
 void Session::refresh_redirect_allowlist() {
-  if (redirect_refreshed_ || refreshing_allowlist_) return;
-  redirect_refreshed_ = true;
-  refreshing_allowlist_ = true;
+  if (redirect_refreshed_.load()) return;
+  // Exactly one thread performs the one-shot refresh; concurrent callers return
+  // and re-check the allowlist (still the bootstrap set until the refresh lands).
+  if (refreshing_allowlist_.exchange(true)) return;
   struct Clear {
-    bool& f;
-    ~Clear() { f = false; }
+    std::atomic<bool>& f;
+    ~Clear() { f.store(false); }
   } clear{refreshing_allowlist_};
+  if (redirect_refreshed_.exchange(true)) return;
 
   try {
     auto resp = bootstrap_get("/admin/cluster");
@@ -490,14 +562,32 @@ void Session::validate_header_value(const std::string& value, const char* what) 
   }
 }
 
+std::string Session::next_nonce() {
+  static const std::uint64_t salt = [] {
+    std::random_device rd;
+    return (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+  }();
+  static std::atomic<std::uint64_t> seq{0};
+  std::ostringstream oss;
+  oss << std::hex << salt << '-' << static_cast<unsigned long>(::getpid()) << '-'
+      << seq.fetch_add(1, std::memory_order_relaxed);
+  return oss.str();
+}
+
 void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
                        const std::string& method, const std::string& target,
                        const std::string& body) const {
   const std::string date = std::to_string(now_ms());
   headers["x-aios-date"] = date;
-  const std::string payload_hash =
-      body.size() > kHttpStreamBodyBytes ? std::string("UNSIGNED-PAYLOAD") : sha256_hex(body);
+  // The body is fully in memory here, so every request signs its real digest;
+  // the server verifies a concrete hash even for bodies it streams to disk.
+  const std::string payload_hash = sha256_hex(body);
   headers["x-aios-content-sha256"] = payload_hash;
+  // The server's replay cache keys signed mutating requests on
+  // (method, target, date, signature); two clients issuing an identical request
+  // (e.g. POST .../lock with an empty body) in the same millisecond would
+  // collide. A per-request nonce makes every signature unique.
+  headers[kHttpNonceHeader] = next_nonce();
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
   const auto canon =
       http_canonical(method, target, date, signed_headers, headers, payload_hash);
@@ -530,20 +620,33 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
     if (!cfg_.app_label.empty()) headers["x-aios-app-label"] = cfg_.app_label;
     add_auth(headers, method, path, body);
 
+    // A pooled keep-alive socket may have been closed by the server while idle.
+    // Only that exact signature (peer closed, zero response bytes) on a reused
+    // connection is replayed, and only for requests whose second execution is
+    // harmless: GET/HEAD/DELETE, and PUT (full-object writes are idempotent; a
+    // CAS-guarded PUT that already landed fails closed with 412). POST (lock,
+    // append, txn) is never replayed — a timeout or a half-answered request is
+    // surfaced so the caller does not run a non-idempotent operation twice.
+    const bool idempotent =
+        method == "GET" || method == "HEAD" || method == "DELETE" || method == "PUT";
     auto try_hop = [&]() -> HttpResponse {
       bool reused = false;
       auto conn = pool_->take(host, port, cfg_.socket_timeout_ms, &reused);
+      ExchangeIo io;
       try {
         bool close_conn = false;
         auto r = exchange_http(conn->sock, conn->leftover, method, path, host, port, headers, body,
-                               &close_conn);
+                               &close_conn, &io);
         pool_->put(std::move(conn), !close_conn);
         return r;
       } catch (const client_error&) {
         pool_->put(std::move(conn), false);
-        if (!reused) throw;
+        if (!reused || !idempotent || !io.peer_closed || io.received != 0) throw;
         bool ignored = false;
         auto fresh = pool_->take(host, port, cfg_.socket_timeout_ms, &ignored);
+        // Fresh date/nonce: if the first attempt did land server-side, the
+        // replay cache would otherwise reject this one as a duplicate.
+        add_auth(headers, method, path, body);
         try {
           bool close_conn = false;
           auto r = exchange_http(fresh->sock, fresh->leftover, method, path, host, port, headers,

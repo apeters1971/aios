@@ -1,5 +1,6 @@
 #include "posix/fuse3_ops.hpp"
 #include "posix/aios_posix.h"
+#include "posix/flock_owners.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -19,6 +20,13 @@
 #endif
 
 namespace {
+
+// fi->fh is the inode, shared by every open of the file; fi->lock_owner tells
+// the opens apart so release() only drops a flock this open actually took.
+aios::posix::FlockOwners& flock_owners() {
+  static aios::posix::FlockOwners owners;
+  return owners;
+}
 
 template <typename F>
 int guard(F&& f) {
@@ -377,7 +385,9 @@ int posix_release(const char* /*path*/, struct fuse_file_info* fi) {
     auto* fs = fs_handle();
     if (!fi) return -EIO;
     int rc = aios_posix_fsync(fs, fi->fh);
-    (void)aios_posix_flock(fs, fi->fh, LOCK_UN);
+    if (flock_owners().note_unlocked(fi->fh, fi->lock_owner)) {
+      (void)aios_posix_flock(fs, fi->fh, LOCK_UN);
+    }
     return rc;
   });
 }
@@ -656,7 +666,17 @@ int posix_flock(const char* path, struct fuse_file_info* fi, int op) {
     auto* fs = fs_handle();
     const uint64_t ino = path_ino(fs, path, fi);
     if (!ino) return -ENOENT;
-    return aios_posix_flock(fs, ino, op);
+    const uint64_t owner = fi ? fi->lock_owner : 0;
+    const int cmd = op & (LOCK_SH | LOCK_EX | LOCK_UN);
+    if (cmd == LOCK_UN) {
+      // Another open of this inode may still hold the mount's single cluster lock.
+      const bool was_holder = flock_owners().note_unlocked(ino, owner);
+      if (!was_holder) return 0;
+      return aios_posix_flock(fs, ino, op);
+    }
+    int rc = aios_posix_flock(fs, ino, op);
+    if (rc == 0) flock_owners().note_locked(ino, owner);
+    return rc;
   });
 }
 

@@ -130,6 +130,7 @@ int map_error(const client_error& e) {
   if (e.code() == "bad_request") return -EINVAL;
   if (e.code() == "payload_too_large") return -EFBIG;
   if (e.code() == "no_targets") return -ENOSPC;
+  AIOS_LOG_DEBUG("posix: client error mapped to EIO code=", e.code(), " what=", e.what());
   return -EIO;
 }
 
@@ -357,6 +358,7 @@ void DirTable::publish_cache() {
   e.loaded = std::chrono::steady_clock::now();
   std::lock_guard lock(cache_->mu);
   cache_->dir_cache[ino_] = std::move(e);
+  dir_cache_evict_locked(*cache_);
 }
 
 void DirTable::load(bool allow_cache) {
@@ -528,6 +530,82 @@ bool DirTable::link_if_absent(const std::string& name, uint64_t child) {
 
 void DirTable::unlink(const std::string& name) { append_ops({{kOpUnlink, {name}}}); }
 
+int DirTable::unlink_if(const std::string& name, uint64_t expected_ino,
+                        std::vector<std::string> extra_locks,
+                        const std::function<int()>& guard) {
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    HeldLocks locks;
+    locks.session = &session_;
+    std::vector<std::string> oids = {meta_oid_, log_oid_, snap_oid_};
+    oids.insert(oids.end(), extra_locks.begin(), extra_locks.end());
+    try {
+      locks.acquire_sorted(std::move(oids));
+    } catch (const client_error& e) {
+      if (e.code() == "lock_held") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      throw;
+    }
+    load(false);
+    auto it = entries_.find(name);
+    if (it == entries_.end() || it->second != expected_ino) {
+      publish_cache();
+      return -ENOENT;
+    }
+    if (guard) {
+      if (int rc = guard()) return rc;
+    }
+
+    const uint64_t start = next_op_;
+    changelog::Record r;
+    r.op_id = start;
+    r.op = static_cast<changelog::Op>(kOpUnlink);
+    r.args = {name};
+    const std::string batch = changelog::encode_record(r);
+    try {
+      next_op_ = start + 1;
+      auto ar = session_.append(log_oid_, batch, locks.token_for(log_oid_));
+      log_bytes_ = ar.size;
+      meta_cas_ = session_.put_bytes(
+          meta_oid_,
+          nlohmann::json{{"aios_posix_dir", 1},
+                         {"next_op", next_op_},
+                         {"log_bytes", log_bytes_},
+                         {"snapshot_op", snapshot_op_},
+                         {"snapshot_oid", snap_oid_}}
+              .dump(),
+          {}, meta_cas_, locks.token_for(meta_oid_), put_layout_);
+      apply_record(0, kOpUnlink, r.args);
+      if (log_bytes_ >= changelog::kAutoCompactBytes) {
+        std::string txn_id;
+        try {
+          txn_id = session_.txn_begin();
+          txn_put_dir(session_, txn_id, *this, locks);
+          session_.txn_commit(txn_id);
+          txn_id.clear();
+          snapshot_op_ = next_op_ > 0 ? next_op_ - 1 : 0;
+          log_bytes_ = 0;
+          meta_cas_ += 1;
+        } catch (const client_error&) {
+          if (!txn_id.empty()) {
+            try {
+              session_.txn_abort(txn_id);
+            } catch (...) {
+            }
+          }
+        }
+      }
+      publish_cache();
+      return 0;
+    } catch (const client_error& e) {
+      if (e.code() == "conflict" || e.code() == "lock_held") continue;
+      throw;
+    }
+  }
+  throw client_error("conflict", "dir unlink_if exhausted retries");
+}
+
 void DirTable::rename_same(const std::string& old_name, const std::string& new_name) {
   append_ops({{kOpRename, {old_name, new_name}}});
 }
@@ -589,6 +667,21 @@ void DirTable::plan_compact_bodies(std::string& meta_out, std::string& snap_out,
                  .dump();
 }
 
+// True when `ino` is `dir` itself or appears on dir's parent chain up to the root.
+// Bypasses the inode cache so a stale parent_ino cannot hide a cycle.
+bool is_ancestor_of(FsState& st, uint64_t ino, uint64_t dir) {
+  uint64_t cur = dir;
+  for (int guard = 0; guard < 1024 && cur != 0; ++guard) {
+    if (cur == ino) return true;
+    if (cur == kRootIno) return false;
+    auto snap = st.session.get_object(ino_oid(st.volume, cur));
+    if (!snap.exists) return false;
+    const auto m = inode_from_json(snap.body, cas_from_attrs(snap.attrs));
+    cur = m.parent_ino == 0 ? kRootIno : m.parent_ino;
+  }
+  return false;
+}
+
 int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_name,
                      uint64_t new_parent, const std::string& new_name) {
   if (int rc = validate_dentry_name(old_name.c_str())) return rc;
@@ -607,6 +700,7 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
 
     auto moved = load_inode(st, ino);
     if (!moved.exists) return -ENOENT;
+    if (S_ISDIR(moved.mode) && is_ancestor_of(st, ino, new_parent)) return -EINVAL;
 
     uint64_t victim_ino = 0;
     InodeMeta victim;
@@ -720,13 +814,13 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
       }
       {
         std::lock_guard lock(st.mu);
-        st.inode_cache[old_parent] = old_p;
-        st.inode_cache[new_parent] = new_p;
+        cache_inode_locked(st, old_p);
+        cache_inode_locked(st, new_p);
         if (victim_ino && victim_ino != ino) {
           if (delete_victim) {
-            st.inode_cache.erase(victim_ino);
+            cache_erase_locked(st, victim_ino);
           } else if (victim.exists) {
-            st.inode_cache[victim_ino] = victim;
+            cache_inode_locked(st, victim);
           }
         }
       }
@@ -888,12 +982,12 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
       }
       {
         std::lock_guard lock(st.mu);
-        st.inode_cache[parent] = pmeta;
+        cache_inode_locked(st, pmeta);
         if (victim_ino && victim_ino != ino) {
           if (delete_victim) {
-            st.inode_cache.erase(victim_ino);
+            cache_erase_locked(st, victim_ino);
           } else if (victim.exists) {
-            st.inode_cache[victim_ino] = victim;
+            cache_inode_locked(st, victim);
           }
         }
       }
@@ -921,22 +1015,91 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
   return -EAGAIN;
 }
 
+namespace {
+
+// Pending deferred write state must survive any refresh of the cached record.
+void merge_dirty_locked(const FsState& st, InodeMeta& m) {
+  auto it = st.dirty_sizes.find(m.ino);
+  if (it == st.dirty_sizes.end()) return;
+  const DirtySize& d = it->second;
+  m.size = std::max(m.size, d.size);
+  m.mtime_ns = std::max(m.mtime_ns, d.mtime_ns);
+  m.ctime_ns = std::max(m.ctime_ns, d.ctime_ns);
+}
+
+void inode_cache_evict_locked(FsState& st) {
+  if (st.inode_cache.size() <= kInodeCacheMaxEntries) return;
+  // Amortized: drop the least recently used clean entries down to 7/8 of the bound.
+  std::vector<std::pair<uint64_t, uint64_t>> clean;  // lru, ino
+  clean.reserve(st.inode_cache.size());
+  for (const auto& [ino, e] : st.inode_cache) {
+    if (st.dirty_sizes.count(ino)) continue;
+    clean.emplace_back(e.lru, ino);
+  }
+  const size_t target = kInodeCacheMaxEntries - kInodeCacheMaxEntries / 8;
+  if (st.inode_cache.size() <= target) return;
+  const size_t want = std::min(clean.size(), st.inode_cache.size() - target);
+  std::partial_sort(clean.begin(), clean.begin() + static_cast<std::ptrdiff_t>(want), clean.end());
+  for (size_t i = 0; i < want; ++i) st.inode_cache.erase(clean[i].second);
+}
+
+}  // namespace
+
+void cache_inode_locked(FsState& st, const InodeMeta& m) {
+  auto& e = st.inode_cache[m.ino];
+  e.meta = m;
+  merge_dirty_locked(st, e.meta);
+  e.loaded = std::chrono::steady_clock::now();
+  e.lru = ++st.inode_cache_clock;
+  inode_cache_evict_locked(st);
+}
+
+void cache_erase_locked(FsState& st, uint64_t ino) { st.inode_cache.erase(ino); }
+
+void dir_cache_evict_locked(FsState& st) {
+  if (st.dir_cache.size() <= kDirCacheMaxEntries) return;
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = st.dir_cache.begin(); it != st.dir_cache.end();) {
+    if (now - it->second.loaded >= kDirCacheTtl) {
+      it = st.dir_cache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (st.dir_cache.size() <= kDirCacheMaxEntries) return;
+  std::vector<std::pair<std::chrono::steady_clock::time_point, uint64_t>> order;
+  order.reserve(st.dir_cache.size());
+  for (const auto& [ino, e] : st.dir_cache) order.emplace_back(e.loaded, ino);
+  const size_t target = kDirCacheMaxEntries - kDirCacheMaxEntries / 8;
+  const size_t want = st.dir_cache.size() - target;
+  std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(want), order.end());
+  for (size_t i = 0; i < want; ++i) st.dir_cache.erase(order[i].second);
+}
+
 InodeMeta load_inode(FsState& st, uint64_t ino) {
   {
     std::lock_guard lock(st.mu);
     auto it = st.inode_cache.find(ino);
-    if (it != st.inode_cache.end()) return it->second;
+    if (it != st.inode_cache.end() &&
+        std::chrono::steady_clock::now() - it->second.loaded < kInodeCacheTtl) {
+      it->second.lru = ++st.inode_cache_clock;
+      return it->second.meta;
+    }
   }
   auto snap = st.session.get_object(ino_oid(st.volume, ino));
   if (!snap.exists) {
     InodeMeta m;
     m.ino = ino;
+    std::lock_guard lock(st.mu);
+    // A deferred write against a record another client removed has nothing to land
+    // on; the pending entry is dropped by the flusher when it observes !exists.
+    cache_erase_locked(st, ino);
     return m;
   }
   auto m = inode_from_json(snap.body, cas_from_attrs(snap.attrs));
   std::lock_guard lock(st.mu);
-  st.inode_cache[ino] = m;
-  return m;
+  cache_inode_locked(st, m);
+  return st.inode_cache[ino].meta;
 }
 
 void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& path_for_layout,
@@ -949,8 +1112,11 @@ void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& pa
                                    std::nullopt, layout);
       m.exists = true;
       std::lock_guard lock(st.mu);
-      st.inode_cache[m.ino] = m;
-      st.dirty_sizes.erase(m.ino);
+      // The PUT covered the deferred size only if it was at least as large; a write
+      // that raced in between keeps its dirty entry for the next flush.
+      auto dit = st.dirty_sizes.find(m.ino);
+      if (dit != st.dirty_sizes.end() && dit->second.size <= m.size) st.dirty_sizes.erase(dit);
+      cache_inode_locked(st, m);
       return;
     } catch (const client_error& e) {
       if (e.code() != "conflict") throw;
@@ -966,6 +1132,10 @@ void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& pa
       InodeMeta next = inode_from_json(fresh.body, cas_from_attrs(fresh.attrs));
       next.ino = m.ino;
       reapply(next);
+      {
+        std::lock_guard lock(st.mu);
+        merge_dirty_locked(st, next);
+      }
       m = std::move(next);
     }
   }
@@ -987,21 +1157,26 @@ void flush_dirty_inode(FsState& st, uint64_t ino) {
     return;
   }
   m.size = std::max(m.size, d.size);
-  m.mtime_ns = d.mtime_ns;
-  m.ctime_ns = d.ctime_ns;
+  m.mtime_ns = std::max(m.mtime_ns, d.mtime_ns);
+  m.ctime_ns = std::max(m.ctime_ns, d.ctime_ns);
   store_inode(st, m, std::nullopt, [d](InodeMeta& next) {
     next.size = std::max(next.size, d.size);
-    next.mtime_ns = d.mtime_ns;
-    next.ctime_ns = d.ctime_ns;
+    next.mtime_ns = std::max(next.mtime_ns, d.mtime_ns);
+    next.ctime_ns = std::max(next.ctime_ns, d.ctime_ns);
   });
 }
 
-void flush_all_dirty_inodes(FsState& st) {
+void flush_all_dirty_inodes(FsState& st,
+                            std::optional<std::chrono::steady_clock::duration> min_age) {
   std::vector<uint64_t> inos;
   {
     std::lock_guard lock(st.mu);
+    const auto now = std::chrono::steady_clock::now();
     inos.reserve(st.dirty_sizes.size());
-    for (const auto& [ino, _] : st.dirty_sizes) inos.push_back(ino);
+    for (const auto& [ino, d] : st.dirty_sizes) {
+      if (min_age && now - d.since < *min_age) continue;
+      inos.push_back(ino);
+    }
   }
   for (uint64_t ino : inos) {
     try {
@@ -1014,12 +1189,16 @@ void flush_all_dirty_inodes(FsState& st) {
 void ensure_super(FsState& st) {
   {
     std::lock_guard lock(st.mu);
-    if (st.super.exists) return;
+    if (st.super.exists &&
+        std::chrono::steady_clock::now() - st.super_loaded < kInodeCacheTtl) {
+      return;
+    }
   }
   auto snap = st.session.get_object(super_oid(st.volume));
   if (snap.exists) {
     std::lock_guard lock(st.mu);
     st.super = super_from_json(snap.body, cas_from_attrs(snap.attrs));
+    st.super_loaded = std::chrono::steady_clock::now();
     return;
   }
   SuperMeta m;
@@ -1032,6 +1211,7 @@ void ensure_super(FsState& st) {
   m.exists = true;
   std::lock_guard lock(st.mu);
   st.super = m;
+  st.super_loaded = std::chrono::steady_clock::now();
 }
 
 uint64_t alloc_ino(FsState& st) {
@@ -1049,6 +1229,7 @@ uint64_t alloc_ino(FsState& st) {
       m.exists = true;
       std::lock_guard lock(st.mu);
       st.super = m;
+      st.super_loaded = std::chrono::steady_clock::now();
       return id;
     } catch (const client_error& e) {
       if (e.code() != "conflict") throw;
@@ -1056,6 +1237,7 @@ uint64_t alloc_ino(FsState& st) {
       if (snap.exists) {
         std::lock_guard lock(st.mu);
         st.super = super_from_json(snap.body, cas_from_attrs(snap.attrs));
+        st.super_loaded = std::chrono::steady_clock::now();
       }
     }
   }
@@ -1155,20 +1337,20 @@ int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len,
     const uint64_t chunk_end = std::min(end, (chunk + 1) * unit);
     const size_t n = static_cast<size_t>(chunk_end - pos);
     try {
-      std::string body;
       uint64_t cas = 0;
-      if (!st.chunk_cache.lookup(ino, chunk, body, cas)) {
+      ChunkCache::Body body = st.chunk_cache.lookup(ino, chunk, cas);
+      if (!body) {
         auto snap = st.session.get_object(chunk_oid(st.volume, ino, chunk));
         if (snap.exists) {
-          body = std::move(snap.body);
+          body = std::make_shared<const std::string>(std::move(snap.body));
           cas = cas_from_attrs(snap.attrs);
           st.chunk_cache.store(ino, chunk, body, cas);
         }
       }
-      if (chunk_off < body.size()) {
-        const size_t avail = static_cast<size_t>(body.size() - chunk_off);
+      if (body && chunk_off < body->size()) {
+        const size_t avail = static_cast<size_t>(body->size() - chunk_off);
         const size_t take = std::min(n, avail);
-        std::memcpy(out + written, body.data() + chunk_off, take);
+        std::memcpy(out + written, body->data() + chunk_off, take);
       }
     } catch (const client_error& e) {
       return map_error(e);
@@ -1206,11 +1388,17 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
     const size_t n = std::min(static_cast<size_t>(unit - chunk_off), len - done);
     const std::string oid = chunk_oid(st.volume, ino, chunk);
     int chunk_rc = -EAGAIN;
-    for (int attempt = 0; attempt < 8; ++attempt) {
+    std::lock_guard chunk_guard(st.chunk_lock(ino, chunk));
+    for (int attempt = 0; attempt < kChunkWriteRetries; ++attempt) {
+      if (attempt > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1 + (attempt % 4)));
+      }
       try {
         std::string body;
         uint64_t cas = 0;
-        if (!st.chunk_cache.lookup(ino, chunk, body, cas)) {
+        if (auto cached = st.chunk_cache.lookup(ino, chunk, cas)) {
+          body = *cached;
+        } else {
           auto existing = st.session.get_object(oid);
           if (existing.exists) {
             body = std::move(existing.body);
@@ -1235,23 +1423,36 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
     done += n;
   }
 
-  const uint64_t old_size = meta.size;
-  const uint64_t new_size = std::max(meta.size, offset + static_cast<uint64_t>(len));
+  // Concurrent writers to one inode each hold a pre-write snapshot; the shared
+  // cached record and the deferred size must be merged (max), never replaced, and
+  // the quota delta measured against the cached size so growth is counted once.
+  const uint64_t write_end = offset + static_cast<uint64_t>(len);
   const uint64_t ts = now_ns();
-  meta.size = new_size;
-  meta.mtime_ns = meta.ctime_ns = ts;
   bool flush_now = false;
+  std::int64_t quota_delta = 0;
   {
     std::lock_guard lock(st.mu);
-    st.inode_cache[meta.ino] = meta;
-    auto& d = st.dirty_sizes[meta.ino];
+    auto cit = st.inode_cache.find(ino);
+    if (cit == st.inode_cache.end()) {
+      cache_inode_locked(st, meta);
+      cit = st.inode_cache.find(ino);
+    }
+    InodeMeta& c = cit != st.inode_cache.end() ? cit->second.meta : meta;
+    const uint64_t before = c.size;
+    const uint64_t after = std::max(before, write_end);
+    c.size = after;
+    c.mtime_ns = std::max(c.mtime_ns, ts);
+    c.ctime_ns = std::max(c.ctime_ns, ts);
+    if (cit != st.inode_cache.end()) cit->second.lru = ++st.inode_cache_clock;
+    auto& d = st.dirty_sizes[ino];
     const auto now = std::chrono::steady_clock::now();
     if (d.dirty_bytes == 0) d.since = now;
-    d.size = meta.size;
-    d.mtime_ns = meta.mtime_ns;
-    d.ctime_ns = meta.ctime_ns;
+    d.size = std::max(d.size, after);
+    d.mtime_ns = std::max(d.mtime_ns, ts);
+    d.ctime_ns = std::max(d.ctime_ns, ts);
     d.dirty_bytes += static_cast<uint64_t>(len);
     flush_now = d.dirty_bytes >= kDirtyFlushBytes || (now - d.since) >= kDirtyFlushAge;
+    quota_delta = static_cast<std::int64_t>(after) - static_cast<std::int64_t>(before);
   }
   if (flush_now) {
     try {
@@ -1260,9 +1461,8 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
       return map_error(e);
     }
   }
-  if (st.quota && new_size != old_size) {
-    st.quota->note_delta(meta.project_id, meta.uid, meta.gid,
-                         static_cast<std::int64_t>(new_size) - static_cast<std::int64_t>(old_size));
+  if (st.quota && quota_delta != 0) {
+    st.quota->note_delta(meta.project_id, meta.uid, meta.gid, quota_delta);
   }
   if (meta.parent_ino != 0) mark_rstat_dirty(st, meta.parent_ino);
   if (out_len) *out_len = len;
@@ -1313,6 +1513,11 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
   const uint64_t ts = now_ns();
   meta.size = size;
   meta.mtime_ns = meta.ctime_ns = ts;
+  {
+    // The truncate supersedes any deferred size still waiting to be flushed.
+    std::lock_guard lock(st.mu);
+    st.dirty_sizes.erase(ino);
+  }
   try {
     store_inode(st, meta, std::nullopt, [size, ts](InodeMeta& next) {
       next.size = size;
@@ -1747,13 +1952,10 @@ int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name) {
     if (m.exists) {
       if (int ac = aios::posix::check_sticky_unlink(cred, pmeta, m)) return ac;
     }
-    if (m.exists && m.nlink > 1) {
-      aios::posix::drop_nlink(*fs->st, ino);
-      dir.unlink(name);
-    } else {
-      dir.unlink(name);
-      if (m.exists) aios::posix::drop_nlink(*fs->st, ino);
-    }
+    // Remove the dentry only while it still points at the inode we inspected; a
+    // peer that unlinked and recreated the name in between must not lose its file.
+    if (int rc = dir.unlink_if(name, ino)) return rc;
+    if (m.exists) aios::posix::drop_nlink(*fs->st, ino);
     aios::posix::mark_rstat_dirty(*fs->st, parent);
     return 0;
   } catch (const aios::client_error& e) {
@@ -1766,8 +1968,8 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
                     uint64_t new_parent, const char* new_name) {
   if (!fs || !old_name || !new_name) return -EINVAL;
   if (int rc = aios::posix::validate_dentry_name(new_name)) return rc;
-  if (int fr = ensure_not_frozen(fs)) return fr;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     const auto cred = effective_caller(fs);
     auto op = aios::posix::load_inode(*fs->st, old_parent);
     if (!op.exists) return -ENOENT;
@@ -1844,7 +2046,14 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     child.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, ino));
     child.load();
     if (!child.entries().empty()) return -ENOTEMPTY;
-    dir.unlink(name);
+    // Re-check emptiness with the child's tip locked so a concurrent create in it
+    // cannot slip between the check and the removal.
+    int rc = dir.unlink_if(name, ino, {child.meta_oid(), child.log_oid(), child.snap_oid()},
+                           [&child]() -> int {
+                             child.load(false);
+                             return child.entries().empty() ? 0 : -ENOTEMPTY;
+                           });
+    if (rc) return rc;
     fs->st->session.delete_object(aios::posix::ino_oid(fs->st->volume, ino));
     pmeta = aios::posix::load_inode(*fs->st, parent);
     if (pmeta.exists && pmeta.nlink > 2) {
@@ -1876,8 +2085,8 @@ int aios_posix_rename2(aios_posix_fs* fs, uint64_t old_parent, const char* old_n
                        uint64_t new_parent, const char* new_name, unsigned flags) {
   if (!fs || !old_name || !new_name) return -EINVAL;
   if (flags & (AIOS_POSIX_RENAME_EXCHANGE | AIOS_POSIX_RENAME_WHITEOUT)) return -EINVAL;
-  if (int fr = ensure_not_frozen(fs)) return fr;
   try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
     const auto cred = effective_caller(fs);
     auto op_meta = aios::posix::load_inode(*fs->st, old_parent);
     if (!op_meta.exists) return -ENOENT;
@@ -2196,6 +2405,8 @@ int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name) {
   AIOS_POSIX_CATCH_ALL
 }
 
+}  // extern "C"
+
 namespace {
 
 std::string normalize_snap_path(const char* path) {
@@ -2263,6 +2474,8 @@ void collect_subtree_oids_session(aios::posix::FsState& st, uint64_t root_ino,
 }
 
 }  // namespace
+
+extern "C" {
 
 int aios_posix_snapshot(aios_posix_fs* fs, char* snap_id_out, size_t snap_id_len) {
   return aios_posix_snapshot_at(fs, "/", snap_id_out, snap_id_len);

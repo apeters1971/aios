@@ -178,8 +178,19 @@ TEST(SessionWireC7b, NegativeContentLengthIsRejected) {
   }
 }
 
+// The stub accepts the request and never answers until released. The assertions
+// that matter are on the *outcome* — a `client_error` with code "http" whose
+// message names the timeout — not on how long it took. The elapsed-time checks
+// are deliberately loose: the lower bound proves the timeout was actually
+// applied (a failure before ~one timeout would be a different error path), the
+// upper bound only proves the client did not wait for the stub's release, and
+// is generous enough to absorb a loaded CI runner.
 TEST(SessionWireC6, SocketTimeoutSurfacesAsHttpError) {
   using namespace aios;
+  constexpr int kTimeoutMs = 200;
+  constexpr int kLowerBoundMs = kTimeoutMs / 2;   // scheduler slack; must not be 0
+  constexpr int kUpperBoundMs = 5000;             // << the "forever" the stub would hang
+
   std::atomic<bool> hang{true};
   StubServer stub([&](const std::string&) {
     while (hang.load()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -189,22 +200,30 @@ TEST(SessionWireC6, SocketTimeoutSurfacesAsHttpError) {
   SessionConfig cfg;
   cfg.endpoint = "127.0.0.1:" + stub.port;
   cfg.cluster_key = "550e8400-e29b-41d4-a716-446655440000";
-  cfg.socket_timeout_ms = 200;
+  cfg.socket_timeout_ms = kTimeoutMs;
   Session s(cfg);
 
   const auto t0 = std::chrono::steady_clock::now();
+  bool threw = false;
+  std::string code;
+  std::string what;
   try {
     s.request("GET", "/objects/x");
-    FAIL() << "expected timeout";
   } catch (const client_error& e) {
-    EXPECT_EQ(e.code(), "http");
-    EXPECT_NE(std::string(e.what()).find("timeout"), std::string::npos) << e.what();
+    threw = true;
+    code = e.code();
+    what = e.what();
   }
-  hang.store(false);
   const auto ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
           .count();
-  EXPECT_LT(ms, 3000) << "must not hang for the full stub sleep";
+  hang.store(false);   // release the stub thread before any assertion can abort the test
+
+  ASSERT_TRUE(threw) << "expected client_error on socket timeout";
+  EXPECT_EQ(code, "http") << what;
+  EXPECT_NE(what.find("timeout"), std::string::npos) << what;
+  EXPECT_GE(ms, kLowerBoundMs) << "failed before the socket timeout could have fired: " << what;
+  EXPECT_LE(ms, kUpperBoundMs) << "must not wait for the stub to answer";
 }
 
 TEST(SessionWireC8, RequestBodyIsContentSha256Hashed) {
@@ -228,7 +247,9 @@ TEST(SessionWireC8, RequestBodyIsContentSha256Hashed) {
       << "request missing x-aios-content-sha256=" << expect;
 }
 
-TEST(SessionWireC8, StreamedRequestBodyUsesUnsignedPayload) {
+// Large bodies used to be sent as UNSIGNED-PAYLOAD; since POS-11 every body is
+// covered by the signature via its real SHA-256.
+TEST(SessionWireC8, StreamedRequestBodyIsSignedWithRealSha256) {
   using namespace aios;
   StubServer stub([](const std::string&) { return http_response(200, "ok"); });
 
@@ -243,7 +264,10 @@ TEST(SessionWireC8, StreamedRequestBodyUsesUnsignedPayload) {
 
   auto lower = stub.last_request;
   for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  EXPECT_NE(lower.find("x-aios-content-sha256: unsigned-payload"), std::string::npos)
+  EXPECT_EQ(lower.find("unsigned-payload"), std::string::npos)
+      << stub.last_request.substr(0, 800);
+  const auto expect = sha256_hex(body);
+  EXPECT_NE(lower.find("x-aios-content-sha256: " + expect), std::string::npos)
       << stub.last_request.substr(0, 800);
 }
 

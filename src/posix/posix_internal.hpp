@@ -31,39 +31,61 @@ inline constexpr uint32_t kDefaultStripeWidth = 4;
 inline constexpr const char* kCasAttr = "aios.posix.cas";
 inline constexpr size_t kChunkCacheSlots = 8;
 inline constexpr auto kDirCacheTtl = std::chrono::milliseconds(250);
+inline constexpr size_t kDirCacheMaxEntries = 4096;
+// Cached inode records are revalidated (GET + merge) once this old; a pending
+// deferred size (dirty_sizes) always wins over the server copy during the merge.
+inline constexpr auto kInodeCacheTtl = std::chrono::milliseconds(1000);
+inline constexpr size_t kInodeCacheMaxEntries = 65536;
 inline constexpr uint64_t kDirtyFlushBytes = 4ull * 1024ull * 1024ull;
 inline constexpr auto kDirtyFlushAge = std::chrono::milliseconds(100);
+inline constexpr auto kDirtyFlushTick = std::chrono::milliseconds(50);
 inline constexpr size_t kMaxSymlinkBytes = 4095;
+inline constexpr size_t kChunkLockStripes = 64;
+inline constexpr int kChunkWriteRetries = 16;
 
 // Last-N stripe bodies so 128 KiB FUSE I/O does not re-GET the same 1 MiB chunk.
+// Bodies are shared immutable buffers so a lookup hands out a pointer instead of
+// copying 1 MiB per 128 KiB read.
 struct ChunkCache {
+  using Body = std::shared_ptr<const std::string>;
+
   struct Slot {
     uint64_t ino{0};
     uint64_t chunk{std::numeric_limits<uint64_t>::max()};
     uint64_t cas{0};
     uint64_t lru{0};
-    std::string body;
+    Body body;
   };
 
-  bool lookup(uint64_t ino, uint64_t chunk, std::string& body, uint64_t& cas) {
+  Body lookup(uint64_t ino, uint64_t chunk, uint64_t& cas) {
     std::lock_guard lock(mu);
     for (auto& e : slots) {
-      if (e.ino == ino && e.chunk == chunk) {
+      if (e.ino == ino && e.chunk == chunk && e.body) {
         e.lru = ++clock;
-        body = e.body;
         cas = e.cas;
-        return true;
+        return e.body;
       }
     }
-    return false;
+    return nullptr;
   }
 
   void store(uint64_t ino, uint64_t chunk, std::string body, uint64_t cas) {
+    store(ino, chunk, std::make_shared<const std::string>(std::move(body)), cas);
+  }
+
+  // A slot already holding the same or a newer version (cas) is kept: a reader
+  // that fetched v1 must not clobber v2 stored by a writer that raced it.
+  void store(uint64_t ino, uint64_t chunk, Body body, uint64_t cas) {
+    if (!body) return;
     std::lock_guard lock(mu);
     Slot* victim = nullptr;
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
     for (auto& e : slots) {
       if (e.ino == ino && e.chunk == chunk) {
+        if (e.body && e.cas >= cas) {
+          e.lru = ++clock;
+          return;
+        }
         e.body = std::move(body);
         e.cas = cas;
         e.lru = ++clock;
@@ -96,6 +118,15 @@ struct ChunkCache {
     }
   }
 
+  // Cached version of (ino, chunk) or 0 when absent; for tests and diagnostics.
+  uint64_t cached_cas(uint64_t ino, uint64_t chunk) {
+    std::lock_guard lock(mu);
+    for (const auto& e : slots) {
+      if (e.ino == ino && e.chunk == chunk && e.body) return e.cas;
+    }
+    return 0;
+  }
+
   std::mutex mu;
   uint64_t clock{0};
   std::array<Slot, kChunkCacheSlots> slots{};
@@ -124,6 +155,12 @@ struct InodeMeta {
   bool exists{false};
   std::unordered_map<std::string, std::string> xattrs;  // name → raw bytes
   std::string symlink;                                  // target when S_IFLNK
+};
+
+struct InodeCacheEnt {
+  InodeMeta meta;
+  std::chrono::steady_clock::time_point loaded{};
+  uint64_t lru{0};
 };
 
 struct DirCacheEnt {
@@ -191,6 +228,13 @@ class DirTable {
   // Returns false when the name is already present (caller should orphan `child`).
   bool link_if_absent(const std::string& name, uint64_t child);
   void unlink(const std::string& name);
+  // Lock the directory tip (plus extra_locks, e.g. a child directory's tip), reload,
+  // and remove `name` only while it still maps to expected_ino. `guard` runs under
+  // the locks after the reload and may veto with -errno (rmdir emptiness check).
+  // Returns 0, -ENOENT when the dentry changed underneath the caller, or guard's rc.
+  int unlink_if(const std::string& name, uint64_t expected_ino,
+                std::vector<std::string> extra_locks = {},
+                const std::function<int()>& guard = nullptr);
   void rename_same(const std::string& old_name, const std::string& new_name);
   void compact_if_needed();
   void set_put_layout(PutLayout layout) { put_layout_ = std::move(layout); }
@@ -238,7 +282,9 @@ struct FsState {
   std::string frontend_label{"fs"};  // s3 | fs | custom (for IO monitoring)
   std::mutex mu;  // super, inode_cache, flock_tokens, rstat_dirty, dir_cache, dirty_sizes
   SuperMeta super;
-  std::unordered_map<uint64_t, InodeMeta> inode_cache;
+  std::chrono::steady_clock::time_point super_loaded{};
+  std::unordered_map<uint64_t, InodeCacheEnt> inode_cache;
+  uint64_t inode_cache_clock{0};
   std::unordered_map<uint64_t, std::string> flock_tokens;  // ino → lock token
   std::unordered_set<uint64_t> rstat_dirty;
   int rstat_interval_ms{60000};
@@ -254,6 +300,14 @@ struct FsState {
   ChunkCache chunk_cache;
   std::unordered_map<uint64_t, DirCacheEnt> dir_cache;
   std::unordered_map<uint64_t, DirtySize> dirty_sizes;
+  // Serializes in-process read-modify-write of one (ino, chunk) so only cross-client
+  // conflicts reach the server's CAS check.
+  std::array<std::mutex, kChunkLockStripes> chunk_locks;
+
+  std::mutex& chunk_lock(uint64_t ino, uint64_t chunk) {
+    const uint64_t h = (ino * 0x9E3779B97F4A7C15ull) ^ (chunk + 0x7F4A7C15ull);
+    return chunk_locks[static_cast<size_t>(h % kChunkLockStripes)];
+  }
 
   explicit FsState(SessionConfig cfg)
       : session(std::move(cfg)) {}
@@ -272,7 +326,17 @@ inline DirTable make_dir(FsState& st, uint64_t ino) {
 }
 
 void flush_dirty_inode(FsState& st, uint64_t ino);
-void flush_all_dirty_inodes(FsState& st);
+// min_age: only entries dirty at least this long (nullopt = all).
+void flush_all_dirty_inodes(FsState& st,
+                            std::optional<std::chrono::steady_clock::duration> min_age = std::nullopt);
+
+// Inode cache maintenance; all require st.mu held by the caller.
+// cache_inode_locked replaces the record wholesale (fresh server copy or a PUT we
+// just made). cache_touch_size_locked merges a larger size/newer times without
+// disturbing other fields, which is what concurrent writers must use.
+void cache_inode_locked(FsState& st, const InodeMeta& m);
+void cache_erase_locked(FsState& st, uint64_t ino);
+void dir_cache_evict_locked(FsState& st);
 
 // Cross-directory rename via /txn (compact rewrite of both dir tips under locks).
 int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_name,

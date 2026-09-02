@@ -300,12 +300,29 @@ Meta Log::pull(std::uint64_t* applied_op,
   }
   std::sort(recs.begin(), recs.end(),
             [](const Record& a, const Record& b) { return a.op_id < b.op_id; });
+  const auto now = std::chrono::steady_clock::now();
   for (const auto& r : recs) {
     if (r.op_id <= *applied_op) continue;
     if (r.op_id == 0 || r.op_id >= m.next_op) {
       throw client_error("bad_request", "changelog invalid op_id");
     }
-    if (r.op_id != *applied_op + 1) break;
+    if (r.op_id != *applied_op + 1) {
+      // Hole: ids (*applied_op, r.op_id) were reserved but never appended. Wait
+      // for the appender until the grace has elapsed since we first saw it, then
+      // treat the hole as filled so the records behind it are not stalled forever.
+      const std::uint64_t hole = *applied_op + 1;
+      auto seen = gap_first_seen_.find(hole);
+      if (seen == gap_first_seen_.end()) {
+        gap_first_seen_.emplace(hole, now);
+        break;
+      }
+      if (now - seen->second < gap_grace_) break;
+      // Keep the entry: a rebuild that re-pulls from 0 must skip this hole again
+      // without waiting for a second grace period.
+      *applied_op = r.op_id - 1;
+    } else {
+      gap_first_seen_.erase(r.op_id);  // the hole filled in after all
+    }
     if (r.op == Op::Compact) {
       *applied_op = r.op_id;
       continue;
@@ -313,8 +330,29 @@ Meta Log::pull(std::uint64_t* applied_op,
     apply(r);
     *applied_op = r.op_id;
   }
+  // Holes folded into a snapshot can never be re-pulled; drop their entries.
+  for (auto it = gap_first_seen_.begin(); it != gap_first_seen_.end();) {
+    if (it->first <= m.snapshot_op) {
+      it = gap_first_seen_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   m.log_bytes = log_size;
   return m;
+}
+
+std::uint64_t Log::max_logged_op() {
+  auto head = session_->head_object(log_oid_);
+  const std::uint64_t log_size = head.exists ? head.size : 0;
+  if (log_size == 0) return 0;
+  auto ranged = session_->get_range(log_oid_, 0, log_size - 1);
+  if (!ranged.exists) return 0;
+  std::vector<Record> recs;
+  decode_records(ranged.body, recs);
+  std::uint64_t max_id = 0;
+  for (const auto& r : recs) max_id = std::max(max_id, r.op_id);
+  return max_id;
 }
 
 std::uint64_t Log::append_op(Op op, std::vector<std::string> args, sync_mode mode) {
@@ -416,7 +454,7 @@ std::uint64_t Log::append_ops(std::vector<Record> records, sync_mode mode) {
   throw client_error("conflict", "changelog append_ops exhausted retries");
 }
 
-void Log::compact(sync_mode mode,
+bool Log::compact(sync_mode mode,
                   const std::function<std::pair<std::string, std::uint64_t>()>& rebuild) {
   LogLockGuard log_lock(*session_, log_oid_);
   const std::optional<std::string> lock_token = log_lock.token;
@@ -426,6 +464,11 @@ void Log::compact(sync_mode mode,
 
   // Peer appends are blocked by the log lock; rebuild sees a stable tip.
   const auto [snapshot_json, applied_op] = rebuild();
+
+  // Records behind a hole the rebuild could not apply yet would be destroyed by
+  // the truncate below. Leave the log alone; once the hole ages past the grace
+  // (or the appender lands) a later compaction rebuilds from everything.
+  if (max_logged_op() > applied_op) return false;
 
   auto snap_head = session_->head_object(snap_oid_);
   session_->put_object(snap_oid_, snapshot_json, type_, snap_head.cas, lock_token, 1);
@@ -451,6 +494,7 @@ void Log::compact(sync_mode mode,
   cur.snapshot_op = snap_op;
   if (cur.next_op < new_next) cur.next_op = new_next;
   cas_put_meta(cur, mode, lock_token);
+  return true;
 }
 
 }  // namespace changelog

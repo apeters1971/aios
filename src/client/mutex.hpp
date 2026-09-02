@@ -23,20 +23,23 @@ class mutex {
   bool try_lock();
   void unlock() noexcept;
   void renew();
+  // True while this handle holds an unexpired lease. Called on the holder's
+  // path it also renews the lease once less than a third of the TTL remains, so a
+  // long critical section that keeps checking ownership does not silently lapse.
   bool owns_lock() const;
 
   const std::string& name() const { return name_; }
   const std::string& oid() const { return oid_; }
 
  private:
-  void maybe_renew();
+  void maybe_renew() const;
 
   Session* session_;
   std::string name_;
   std::string oid_;
   int ttl_ms_;
   std::string token_;
-  std::int64_t expires_ms_{0};
+  mutable std::int64_t expires_ms_{0};
 };
 
 }  // namespace aios
