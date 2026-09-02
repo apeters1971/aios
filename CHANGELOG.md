@@ -57,6 +57,47 @@ current fix cycle — check the regression test of the same name before relying 
 - Tests: `tests/test_s3_tls.cpp` (context loading errors, startup refusal, SigV4 PUT/GET over TLS
   with a generated certificate, plaintext-on-TLS-port and TLS-on-plain-port both fail cleanly).
 
+### Changed — `aiosfs` in-kernel HTTP backend: caching, concurrency, fewer round trips
+
+Findings `K-1`…`K-19` of the 2026-09-02 kernel client review. Wire format and server API are
+unchanged; a mount made with the previous module reads the same objects.
+
+- **Data path off the global lock.** Read, readahead, writeback, O_DIRECT, punch and metadata
+  revalidation take a connection from the `aios_http` pool (`pool=N` mount option, default 4)
+  instead of serializing on the single namespace connection; `http_mu` now only covers
+  create/unlink/rename/mkdir. Per-inode metadata updates (size, mtime, xattrs) serialize on a new
+  `meta_mu` in the inode aux instead.
+- **Partial chunk writes are ranged PUTs.** `write`, writeback and `fallocate(PUNCH_HOLE)` send
+  `Content-Range` PUTs for the touched bytes; only when the server rejects it (EC / compressed
+  layouts, `400` → `-EOPNOTSUPP`) does the client fall back to GET-modify-PUT. `truncate` down
+  trims the last partial chunk the same way.
+- **Readahead.** New `.readahead` aop issues one ranged GET per contiguous run per chunk instead of
+  a full-chunk GET per page; `readpage` only fetches the page it needs.
+- **Pipelined writeback.** `writepages` collects dirty pages into rounds grouped by chunk and
+  keeps `AIOS_HTTP_WB_INFLIGHT` rounds in flight across pool workers; the size/mtime update is
+  written once at the end instead of once per page.
+- **Parallel O_DIRECT.** Chunk-aligned segments of a DIO request are dispatched to the pool in
+  parallel and reassembled in order.
+- **Metadata caching.** `stat`, `getxattr`, `listxattr` and `readdir` `d_type` are served from
+  the in-core inode while it is within `actimeo=` (default 1 s, was hard-wired); revalidation is a
+  `HEAD` with the cached CAS tag and re-`GET`s only on change. `HEAD` responses no longer stall
+  the client on `Content-Length` (`aios_http/client.c`).
+- **Directory updates append to the changelog** (`POST /o/{oid}/append` under the meta lock,
+  same `AOPk` records as `libaios_posix`) instead of rewriting the full table on every
+  create/unlink/rename, and compact when the log passes `AIOS_HTTP_LOG_COMPACT_BYTES` or an
+  append lands past the committed `log_bytes`. Parent `mtime`/`nlink` updates retry on CAS
+  conflicts (`touch_parent`). `unlink` no longer re-GETs the child to check for a directory —
+  the VFS already did.
+- **Inode numbers** are allocated in batches of `AIOSFS_INO_BATCH` from the volume super object
+  under `ino_mu`, with exponential backoff on CAS conflicts, instead of one CAS round trip per
+  create.
+- **Deferred deletion.** Chunk objects of unlinked files are deleted by workqueue items striped
+  across pool connections after `evict`; `truncate` deletes dropped chunks in parallel and only
+  after `truncate_setsize` has drained in-flight writeback, and sizes the drop range from the
+  largest size this client has seen rather than the (lazily flushed) size on the server, so a
+  shrink followed by a re-extension reads zeros instead of stale chunk bytes.
+- Mount options `pool=` and `actimeo=` (`kernel/README.md`).
+
 ### Security model (documented, not yet changed)
 
 - README gained a *Security model and limitations* section: plaintext transport, one shared

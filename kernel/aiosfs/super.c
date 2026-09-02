@@ -20,6 +20,8 @@ enum {
 	Opt_backend,
 	Opt_principal,
 	Opt_key,
+	Opt_pool,
+	Opt_actimeo,
 	Opt_err,
 };
 
@@ -36,6 +38,9 @@ static const match_table_t aios_tokens = {
 	{ Opt_uid, "uid=%u" },
 	{ Opt_gid, "gid=%u" },
 	{ Opt_backend, "backend=%s" },
+	/* http backend: connections per mount, attribute/dentry cache TTL (ms). */
+	{ Opt_pool, "pool=%u" },
+	{ Opt_actimeo, "actimeo=%u" },
 	{ Opt_err, NULL },
 };
 
@@ -103,6 +108,26 @@ static int aios_parse_options(char *options, struct aios_sb_info *info)
 			if (match_uint(&args[0], &v))
 				return -EINVAL;
 			info->gid = v;
+			break;
+		}
+		case Opt_pool: {
+			unsigned int v;
+
+			if (match_uint(&args[0], &v) || v < 1 || v > AIOSFS_HTTP_POOL_MAX) {
+				pr_err("aiosfs: pool= must be 1..%u\n", AIOSFS_HTTP_POOL_MAX);
+				return -EINVAL;
+			}
+			info->pool_size = v;
+			break;
+		}
+		case Opt_actimeo: {
+			unsigned int v;
+
+			if (match_uint(&args[0], &v) || v < 1) {
+				pr_err("aiosfs: actimeo= must be >= 1 (milliseconds)\n");
+				return -EINVAL;
+			}
+			info->attr_ttl_ms = v;
 			break;
 		}
 		case Opt_backend: {
@@ -200,6 +225,10 @@ int aios_show_options(struct seq_file *m, struct dentry *root)
 			   (unsigned long long)info->stripe_unit);
 	if (info->stripe_width)
 		seq_printf(m, ",stripe_width=%u", info->stripe_width);
+	if (info->backend == AIOS_BACKEND_HTTP) {
+		seq_printf(m, ",pool=%u", info->pool_size);
+		seq_printf(m, ",actimeo=%u", aios_attr_ttl_ms(root->d_sb));
+	}
 	return 0;
 }
 

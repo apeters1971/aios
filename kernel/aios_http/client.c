@@ -454,7 +454,16 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 		keep = false;
 
 	already = have - header_bytes;
-	if (resp_body && content_length > 0) {
+	if (!strcmp(method, "HEAD")) {
+		/*
+		 * HEAD carries the entity's Content-Length but no body, so
+		 * neither the body read nor the drain below may run: they would
+		 * wait for bytes that never arrive. Anything after the headers
+		 * is a framing error on this connection.
+		 */
+		if (already)
+			keep = false;
+	} else if (resp_body && content_length > 0) {
 		if (content_length > AIOS_HTTP_MAX_BODY) {
 			err = -EFBIG;
 			goto fail_sock;

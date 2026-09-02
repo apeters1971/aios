@@ -14,7 +14,9 @@
 #include <linux/delay.h>
 #include <linux/mm.h>
 #include <linux/namei.h>
+#include <linux/backing-dev.h>
 #include <linux/pagemap.h>
+#include <linux/random.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
@@ -35,19 +37,51 @@
 #define AIOS_HTTP_MAX_XATTRS 128
 #define AIOS_HTTP_MAX_XATTR_VALUE AIOS_KABI_XATTR_VALUE_MAX
 #define AIOS_DIR_CACHE_SLOTS 16
-#define AIOS_DIR_CACHE_TTL_MS 250
 #define AIOS_DIRTY_FLUSH_BYTES (4ull * 1024 * 1024)
 #define AIOS_DIRTY_FLUSH_MS 100
+/* Directory changelog is compacted into a snapshot past this size (matches
+ * changelog::kAutoCompactBytes in libaios_posix). */
+#define AIOS_HTTP_LOG_COMPACT_BYTES (1024ull * 1024ull)
 
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1U << 0)
 #endif
 
-#define AIOS_HTTP_DIR_RETRIES 8
+/* Contended directory ops back off exponentially up to this many attempts
+ * (~3 s worst case) and then fail with -EBUSY, never -EAGAIN. */
+#define AIOS_HTTP_DIR_RETRIES 20
 #define AIOS_HTTP_TXN_ID_LEN 128
+#define AIOS_HTTP_META_RETRIES 8
 
 static char *extract_xattrs_object(const char *js);
 static void http_clear_size_dirty(struct inode *inode, u64 size);
+
+static struct aios_http_client *http_client_get(struct aios_sb_info *info)
+{
+	return aios_http_pool_get(info->http_pool);
+}
+
+static void http_client_put(struct aios_sb_info *info, struct aios_http_client *c)
+{
+	aios_http_pool_put(info->http_pool, c);
+}
+
+/* Sleep before retry @attempt of a contended directory / CAS operation. */
+static void http_retry_backoff(int attempt)
+{
+	unsigned int ms = 2u << min(attempt, 6); /* 2, 4, ... 128 */
+
+	ms += get_random_u32() % (ms + 1);
+	msleep(min(ms, 250u));
+}
+
+/* -EAGAIN is what the HTTP layer returns for CAS / lock conflicts; it is not
+ * a valid result for open/unlink/rename, so once retries are exhausted callers
+ * report -EBUSY instead. */
+static int http_no_eagain(int err)
+{
+	return err == -EAGAIN ? -EBUSY : err;
+}
 
 struct aios_dir_ent {
 	char name[AIOS_KABI_NAME_MAX + 1];
@@ -362,18 +396,24 @@ static int parse_entries(const char *json, struct aios_dir_table *dt)
 
 static bool read_le32(const char **pp, const char *end, u32 *v)
 {
+	__le32 raw;
+
 	if (*pp + 4 > end)
 		return false;
-	memcpy(v, *pp, 4);
+	memcpy(&raw, *pp, 4);
+	*v = le32_to_cpu(raw);
 	*pp += 4;
 	return true;
 }
 
 static bool read_le64(const char **pp, const char *end, u64 *v)
 {
+	__le64 raw;
+
 	if (*pp + 8 > end)
 		return false;
-	memcpy(v, *pp, 8);
+	memcpy(&raw, *pp, 8);
+	*v = le64_to_cpu(raw);
 	*pp += 8;
 	return true;
 }
@@ -443,7 +483,7 @@ static int decode_and_apply_log(struct aios_dir_table *dt, const char *buf, size
 		const char *pay;
 		const char *pend;
 		char a0[AIOS_KABI_NAME_MAX + 1];
-		char a1[64];
+		char a1[AIOS_KABI_NAME_MAX + 1]; /* ino string, or new name for RENAME */
 		unsigned int nargs = 0;
 
 		if (!read_le32(&p, end, &magic) || magic != AIOS_HTTP_AOPK_MAGIC)
@@ -521,11 +561,19 @@ static void dir_cache_publish(struct aios_sb_info *info, const struct aios_dir_t
 {
 	struct aios_dir_cache_slot *slot;
 	struct aios_dir_ent *copy = NULL;
+	struct aios_dir_ent *old;
 	unsigned int i, victim = 0;
 	unsigned long oldest;
 
 	if (!info->dir_cache || !dt->ents)
 		return;
+	/* Copy outside the lock; only the pointer swap happens under it. */
+	if (dt->count) {
+		copy = kmemdup(dt->ents, dt->count * sizeof(*dt->ents), GFP_KERNEL);
+		if (!copy)
+			return;
+	}
+	mutex_lock(&info->dir_cache_mu);
 	oldest = info->dir_cache->slots[0].loaded;
 	for (i = 0; i < AIOS_DIR_CACHE_SLOTS; i++) {
 		slot = &info->dir_cache->slots[i];
@@ -542,13 +590,8 @@ static void dir_cache_publish(struct aios_sb_info *info, const struct aios_dir_t
 			victim = i;
 		}
 	}
-	if (dt->count) {
-		copy = kmemdup(dt->ents, dt->count * sizeof(*dt->ents), GFP_KERNEL);
-		if (!copy)
-			return;
-	}
 	slot = &info->dir_cache->slots[victim];
-	kfree(slot->ents);
+	old = slot->ents;
 	slot->ino = dt->ino;
 	slot->ents = copy;
 	slot->count = dt->count;
@@ -557,32 +600,63 @@ static void dir_cache_publish(struct aios_sb_info *info, const struct aios_dir_t
 	slot->snapshot_op = dt->snapshot_op;
 	slot->meta_cas = dt->meta_cas;
 	slot->loaded = jiffies;
+	mutex_unlock(&info->dir_cache_mu);
+	kfree(old);
+}
+
+/* Forget a directory so the next load goes to the server (after a mutation
+ * whose resulting table we do not have, e.g. a compaction race). */
+static void dir_cache_invalidate(struct aios_sb_info *info, u64 ino)
+{
+	struct aios_dir_ent *old = NULL;
+	unsigned int i;
+
+	if (!info->dir_cache)
+		return;
+	mutex_lock(&info->dir_cache_mu);
+	for (i = 0; i < AIOS_DIR_CACHE_SLOTS; i++) {
+		struct aios_dir_cache_slot *slot = &info->dir_cache->slots[i];
+
+		if (slot->ino == ino) {
+			old = slot->ents;
+			memset(slot, 0, sizeof(*slot));
+			break;
+		}
+	}
+	mutex_unlock(&info->dir_cache_mu);
+	kfree(old);
 }
 
 static bool dir_cache_lookup(struct aios_sb_info *info, struct aios_dir_table *dt)
 {
 	unsigned int i;
+	bool hit = false;
 
 	if (!info->dir_cache)
 		return false;
+	mutex_lock(&info->dir_cache_mu);
 	for (i = 0; i < AIOS_DIR_CACHE_SLOTS; i++) {
 		struct aios_dir_cache_slot *slot = &info->dir_cache->slots[i];
 
 		if (!slot->ino || slot->ino != dt->ino)
 			continue;
-		if (!time_before(jiffies, slot->loaded + msecs_to_jiffies(AIOS_DIR_CACHE_TTL_MS)))
+		if (!time_before(jiffies, slot->loaded +
+					      msecs_to_jiffies(info->attr_ttl_ms)))
 			continue;
 		if (slot->count > AIOS_HTTP_MAX_DIR_ENTS)
-			return false;
-		memcpy(dt->ents, slot->ents, slot->count * sizeof(*slot->ents));
+			break;
+		if (slot->count)
+			memcpy(dt->ents, slot->ents, slot->count * sizeof(*slot->ents));
 		dt->count = slot->count;
 		dt->next_op = slot->next_op;
 		dt->log_bytes = slot->log_bytes;
 		dt->snapshot_op = slot->snapshot_op;
 		dt->meta_cas = slot->meta_cas;
-		return true;
+		hit = true;
+		break;
 	}
-	return false;
+	mutex_unlock(&info->dir_cache_mu);
+	return hit;
 }
 
 static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt, bool allow_cache)
@@ -816,12 +890,121 @@ out:
 
 static int dir_find(struct aios_dir_table *dt, const char *name, u64 *ino_out);
 
+static int dir_meta_json(const struct aios_dir_table *dt, char *out, size_t cap)
+{
+	int w = snprintf(out, cap,
+			 "{\"aios_posix_dir\":1,\"next_op\":%llu,\"log_bytes\":%llu,"
+			 "\"snapshot_op\":%llu,\"snapshot_oid\":\"%s\"}",
+			 (unsigned long long)dt->next_op, (unsigned long long)dt->log_bytes,
+			 (unsigned long long)dt->snapshot_op, dt->snap_oid);
+
+	return (w < 0 || (size_t)w >= cap) ? -EOVERFLOW : w;
+}
+
+static void put_le32(u8 **p, u32 v)
+{
+	__le32 raw = cpu_to_le32(v);
+
+	memcpy(*p, &raw, 4);
+	*p += 4;
+}
+
+static void put_le64(u8 **p, u64 v)
+{
+	__le64 raw = cpu_to_le64(v);
+
+	memcpy(*p, &raw, 8);
+	*p += 8;
+}
+
 /*
- * Commit one directory operation as a compact rewrite of the directory tip
- * (snapshot + empty log + meta) under the directory's object locks and a
- * /txn, the same protocol userspace libaios_posix uses. The table is reloaded
- * under the locks so a peer's append between the caller's load and here is
- * not lost, and the meta CAS conflict (-EAGAIN) is retried a few times.
+ * One changelog record in the format libaios_posix's changelog::encode_record
+ * produces and decode_and_apply_log above consumes:
+ *   u32 magic 'AOPk', u32 header_len (16), { u64 op_id, u32 op, u32 payload_len },
+ *   payload = [ u32 len, bytes ]* for each argument.
+ * UNLINK carries a0 only; LINK / RENAME carry a0 and a1.
+ */
+static size_t dir_encode_record(u64 op_id, u32 op, const char *a0, const char *a1, u8 *out,
+				size_t cap)
+{
+	const size_t l0 = strlen(a0);
+	const size_t l1 = a1 ? strlen(a1) : 0;
+	const size_t payload = 4 + l0 + (a1 ? 4 + l1 : 0);
+	const size_t total = 8 + 16 + payload;
+	u8 *p = out;
+
+	if (total > cap)
+		return 0;
+	put_le32(&p, AIOS_HTTP_AOPK_MAGIC);
+	put_le32(&p, 16);
+	put_le64(&p, op_id);
+	put_le32(&p, op);
+	put_le32(&p, (u32)payload);
+	put_le32(&p, (u32)l0);
+	memcpy(p, a0, l0);
+	p += l0;
+	if (a1) {
+		put_le32(&p, (u32)l1);
+		memcpy(p, a1, l1);
+		p += l1;
+	}
+	return total;
+}
+
+/*
+ * Compact the directory tip under all three object locks and a /txn: snapshot
+ * of the in-memory table, empty log, meta. dt already reflects the state to
+ * publish (including any op the caller just applied). locks[0] is the meta
+ * lock the caller holds; log and snap are acquired here and released before
+ * returning. Returns -EAGAIN when a lock or the meta CAS is contended.
+ */
+static int dir_compact_locked(struct aios_sb_info *info, struct aios_dir_table *dt,
+			      struct aios_held_lock *locks, char *txn_id)
+{
+	unsigned int nlocks = 3;
+	int err;
+
+	strscpy(locks[1].oid, dt->log_oid, sizeof(locks[1].oid));
+	strscpy(locks[2].oid, dt->snap_oid, sizeof(locks[2].oid));
+	locks[1].token[0] = locks[2].token[0] = '\0';
+	err = aios_http_lock_acquire(info->http, locks[1].oid, 30000, locks[1].token,
+				     sizeof(locks[1].token));
+	if (err)
+		return err;
+	err = aios_http_lock_acquire(info->http, locks[2].oid, 30000, locks[2].token,
+				     sizeof(locks[2].token));
+	if (err) {
+		release_held_locks(info, &locks[1], 1);
+		return err;
+	}
+
+	txn_id[0] = '\0';
+	err = aios_http_txn_begin(info->http, txn_id, AIOS_HTTP_TXN_ID_LEN);
+	if (!err)
+		err = txn_put_dir(info, txn_id, dt, locks, nlocks);
+	if (!err)
+		err = aios_http_txn_commit(info->http, txn_id);
+	if (err && txn_id[0])
+		aios_http_txn_abort(info->http, txn_id);
+	txn_id[0] = '\0';
+	release_held_locks(info, &locks[1], 2);
+	return err;
+}
+
+/*
+ * Commit one directory operation: append a changelog record and advance meta
+ * under the directory's meta lock (the same protocol libaios_posix's
+ * DirTable::link_if_absent / unlink_if use), so the common case costs one
+ * lock, the reload, one append and one CAS PUT instead of a full snapshot
+ * rewrite through a transaction. The table is reloaded under the lock so a
+ * peer's commit between the caller's load and here is not lost.
+ *
+ * A record whose append landed beyond the committed log_bytes has garbage in
+ * front of it (a writer died between append and meta PUT, or a lock-free
+ * peer is mid-commit). Publishing log_bytes past that garbage would replay it
+ * on every load, so that case, and a log past AIOS_HTTP_LOG_COMPACT_BYTES,
+ * are committed as a compaction instead: the snapshot carries the table, the
+ * log is emptied, and whatever sat in it is gone.
  *
  * must_be_absent: LINK fails with -EEXIST if a0 already exists.
  * UNLINK / RENAME fail with -ENOENT if a0 vanished under the lock.
@@ -829,31 +1012,32 @@ static int dir_find(struct aios_dir_table *dt, const char *name, u64 *ino_out);
 static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u32 op,
 			 const char *a0, const char *a1, bool must_be_absent)
 {
-	struct aios_held_lock *locks;
-	char *txn_id;
-	unsigned int nlocks;
+	struct {
+		struct aios_held_lock locks[3];
+		char txn_id[AIOS_HTTP_TXN_ID_LEN];
+		char meta[512];
+		char extra[192];
+		u8 rec[8 + 16 + 8 + 2 * (AIOS_KABI_NAME_MAX + 1)];
+	} *b;
 	int attempt;
 	int err = -EAGAIN;
 
-	locks = kcalloc(3, sizeof(*locks), GFP_KERNEL);
-	txn_id = kzalloc(AIOS_HTTP_TXN_ID_LEN, GFP_KERNEL);
-	if (!locks || !txn_id) {
-		kfree(locks);
-		kfree(txn_id);
+	b = kzalloc(sizeof(*b), GFP_KERNEL);
+	if (!b)
 		return -ENOMEM;
-	}
 
 	for (attempt = 0; attempt < AIOS_HTTP_DIR_RETRIES; attempt++) {
-		nlocks = 3;
-		strscpy(locks[0].oid, dt->meta_oid, sizeof(locks[0].oid));
-		strscpy(locks[1].oid, dt->log_oid, sizeof(locks[1].oid));
-		strscpy(locks[2].oid, dt->snap_oid, sizeof(locks[2].oid));
-		locks[0].token[0] = locks[1].token[0] = locks[2].token[0] = '\0';
-		txn_id[0] = '\0';
+		size_t rec_len;
+		u64 new_size = 0;
+		u64 cas;
+		int mlen;
 
-		err = acquire_sorted_locks(info, locks, &nlocks);
+		strscpy(b->locks[0].oid, dt->meta_oid, sizeof(b->locks[0].oid));
+		b->locks[0].token[0] = '\0';
+		err = aios_http_lock_acquire(info->http, b->locks[0].oid, 30000,
+					     b->locks[0].token, sizeof(b->locks[0].token));
 		if (err == -EAGAIN) {
-			msleep(20);
+			http_retry_backoff(attempt);
 			continue;
 		}
 		if (err)
@@ -871,38 +1055,69 @@ static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u
 			err = -ENOENT;
 			goto unlock;
 		}
+
+		rec_len = dir_encode_record(dt->next_op, op,
+					    a0, op == AIOS_HTTP_OP_UNLINK ? NULL : a1, b->rec,
+					    sizeof(b->rec));
+		if (!rec_len) {
+			err = -ENAMETOOLONG;
+			goto unlock;
+		}
+		err = aios_http_append(info->http, dt->log_oid, b->rec, rec_len, NULL, &new_size);
+		if (err)
+			goto retry_or_fail;
+
 		err = apply_dir_op(dt, op, a0, a1);
 		if (err)
 			goto unlock;
+		dt->next_op += 1;
 
-		err = aios_http_txn_begin(info->http, txn_id, AIOS_HTTP_TXN_ID_LEN);
-		if (err)
-			goto unlock;
-		err = txn_put_dir(info, txn_id, dt, locks, nlocks);
-		if (!err)
-			err = aios_http_txn_commit(info->http, txn_id);
-		if (err) {
-			aios_http_txn_abort(info->http, txn_id);
-			txn_id[0] = '\0';
-			release_held_locks(info, locks, nlocks);
-			if (err == -EAGAIN) {
-				msleep(20);
-				continue;
-			}
-			break;
+		if (new_size - rec_len != dt->log_bytes ||
+		    new_size >= AIOS_HTTP_LOG_COMPACT_BYTES) {
+			err = dir_compact_locked(info, dt, b->locks, b->txn_id);
+			if (err)
+				goto retry_or_fail;
+			/* txn_put_dir advanced dt (next_op, log_bytes = 0, snapshot_op, meta_cas). */
+			goto committed;
 		}
+
+		dt->log_bytes = new_size;
+		mlen = dir_meta_json(dt, b->meta, sizeof(b->meta));
+		if (mlen < 0) {
+			err = mlen;
+			goto unlock;
+		}
+		snprintf(b->extra, sizeof(b->extra), "x-aios-lock-token: %s\r\n",
+			 b->locks[0].token);
+		cas = dt->meta_cas;
+		err = aios_http_put(info->http, dt->meta_oid, b->meta, mlen, b->extra, &cas);
+		if (err)
+			goto retry_or_fail;
+		dt->meta_cas = cas;
+
+committed:
 		dir_cache_publish(info, dt);
-		release_held_locks(info, locks, nlocks);
+		release_held_locks(info, b->locks, 1);
 		err = 0;
 		break;
 
+retry_or_fail:
+		release_held_locks(info, b->locks, 1);
+		if (err == -EAGAIN) {
+			http_retry_backoff(attempt);
+			continue;
+		}
+		break;
+
 unlock:
-		release_held_locks(info, locks, nlocks);
+		release_held_locks(info, b->locks, 1);
 		break;
 	}
-	kfree(locks);
-	kfree(txn_id);
-	return err;
+	/* The cached table is stale if we gave up after appending anything. */
+	if (err)
+		dir_cache_invalidate(info, dt->ino);
+	kfree(b);
+	return http_no_eagain(err);
 }
 
 static int dir_find(struct aios_dir_table *dt, const char *name, u64 *ino_out)
@@ -1388,7 +1603,9 @@ static int inode_to_json_full(struct aios_sb_info *info, struct aios_inode_meta 
 	return 0;
 }
 
-static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta *m)
+/* GET the inode object on an explicit client (pool client on the data path). */
+static int load_inode_c(struct aios_sb_info *info, struct aios_http_client *c, u64 ino,
+			struct aios_inode_meta *m)
 {
 	char oid[160];
 	struct aios_http_buf body = { 0 };
@@ -1397,7 +1614,7 @@ static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta
 	int err;
 
 	oid_ino(info->volume, ino, oid, sizeof(oid));
-	err = aios_http_get(info->http, oid, &body, &cas);
+	err = aios_http_get(c, oid, &body, &cas);
 	if (err == -ENOENT) {
 		inode_meta_reset(m);
 		return -ENOENT;
@@ -1418,7 +1635,15 @@ static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta
 	return 0;
 }
 
-static int store_inode(struct aios_sb_info *info, struct aios_inode_meta *m)
+static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta *m)
+{
+	return load_inode_c(info, info->http, ino, m);
+}
+
+/* CAS PUT of the inode object on an explicit client. m must have extras
+ * loaded (inode_to_json_full would otherwise GET on info->http). */
+static int store_inode_c(struct aios_sb_info *info, struct aios_http_client *c,
+			 struct aios_inode_meta *m)
 {
 	char oid[160];
 	char *js = NULL;
@@ -1429,9 +1654,14 @@ static int store_inode(struct aios_sb_info *info, struct aios_inode_meta *m)
 	if (err)
 		return err;
 	oid_ino(info->volume, m->ino, oid, sizeof(oid));
-	err = aios_http_put(info->http, oid, js, jslen, NULL, &m->cas);
+	err = aios_http_put(c, oid, js, jslen, NULL, &m->cas);
 	kfree(js);
 	return err;
+}
+
+static int store_inode(struct aios_sb_info *info, struct aios_inode_meta *m)
+{
+	return store_inode_c(info, info->http, m);
 }
 
 static void meta_to_stat(const struct aios_inode_meta *m, struct aios_kabi_stat *st)
@@ -1459,6 +1689,7 @@ static void attach_iinfo(struct inode *inode, const struct aios_inode_meta *m)
 	ii->cas = m->cas;
 	ii->stripe_unit = m->stripe_unit;
 	ii->stripe_width = m->stripe_width;
+	ii->meta_jiffies = jiffies;
 	if (fresh)
 		ii->last_synced_size = m->size;
 	if (m->extras_loaded) {
@@ -1494,24 +1725,42 @@ static void attach_iinfo(struct inode *inode, const struct aios_inode_meta *m)
 	}
 }
 
-/* Copy aux->symlink under extras_lock. Returns NULL if unset or on ENOMEM. */
-static char *aux_symlink_dup(struct aios_inode_aux *aux)
+/*
+ * Copy one of the aux extras (symlink target or xattrs object) under
+ * extras_lock. *valid_out reports whether the extras were loaded at all (and,
+ * when max_age is non-zero, loaded within that many jiffies); the string is
+ * NULL when the field is unset or on ENOMEM.
+ */
+static char *aux_extra_dup(struct aios_inode_aux *aux, bool want_symlink, unsigned long max_age,
+			   bool *valid_out)
 {
 	char *s = NULL;
 	size_t cap = 0;
 
+	if (valid_out)
+		*valid_out = false;
 	for (;;) {
+		const char *src;
 		size_t len;
 
 		spin_lock(&aux->extras_lock);
-		if (!aux->symlink) {
+		if (!aux->extras_valid ||
+		    (max_age && !time_before(jiffies, aux->meta_jiffies + max_age))) {
 			spin_unlock(&aux->extras_lock);
 			kfree(s);
 			return NULL;
 		}
-		len = strlen(aux->symlink);
+		if (valid_out)
+			*valid_out = true;
+		src = want_symlink ? aux->symlink : aux->xattrs_obj;
+		if (!src) {
+			spin_unlock(&aux->extras_lock);
+			kfree(s);
+			return NULL;
+		}
+		len = strlen(src);
 		if (s && len < cap) {
-			memcpy(s, aux->symlink, len + 1);
+			memcpy(s, src, len + 1);
 			spin_unlock(&aux->extras_lock);
 			return s;
 		}
@@ -1519,9 +1768,19 @@ static char *aux_symlink_dup(struct aios_inode_aux *aux)
 		kfree(s);
 		cap = len + 1;
 		s = kmalloc(cap, GFP_KERNEL);
-		if (!s)
+		if (!s) {
+			/* Not "no xattrs": make the caller take the slow path. */
+			if (valid_out)
+				*valid_out = false;
 			return NULL;
+		}
 	}
+}
+
+/* Copy aux->symlink under extras_lock. Returns NULL if unset or on ENOMEM. */
+static char *aux_symlink_dup(struct aios_inode_aux *aux)
+{
+	return aux_extra_dup(aux, true, 0, NULL);
 }
 
 static struct inode *aios_http_iget(struct super_block *sb, const struct aios_inode_meta *m)
@@ -1583,10 +1842,18 @@ static int ensure_super(struct aios_sb_info *info)
 	return err;
 }
 
-static int alloc_ino(struct aios_sb_info *info, u64 *ino_out)
+/*
+ * Reserve AIOSFS_INO_BATCH inode numbers with one CAS on the super object.
+ * Numbers left unused at unmount are simply skipped; inode numbers only need
+ * to be unique, not dense, and this turns two round trips per create into
+ * two per 256 creates. The same field is what libaios_posix's alloc_ino
+ * advances one at a time, so both allocators stay disjoint.
+ */
+static int alloc_ino_range(struct aios_sb_info *info)
 {
 	char oid[160];
 	int attempt;
+	int err = -EAGAIN;
 
 	oid_super(info->volume, oid, sizeof(oid));
 	for (attempt = 0; attempt < 16; attempt++) {
@@ -1595,7 +1862,6 @@ static int alloc_ino(struct aios_sb_info *info, u64 *ino_out)
 		char out[256];
 		u64 cas = 0, next = 2, stripe = AIOS_HTTP_DEFAULT_STRIPE_UNIT;
 		u32 width = AIOS_HTTP_DEFAULT_STRIPE_WIDTH;
-		int err;
 
 		err = aios_http_get(info->http, oid, &body, &cas);
 		if (err)
@@ -1613,19 +1879,35 @@ static int alloc_ino(struct aios_sb_info *info, u64 *ino_out)
 		kfree(js);
 		aios_http_buf_free(&body);
 
-		*ino_out = next++;
 		snprintf(out, sizeof(out),
 			 "{\"aios_posix_super\":1,\"next_ino\":%llu,\"stripe_unit\":%llu,"
 			 "\"stripe_width\":%u,\"uuid\":\"fs-%s\"}",
-			 (unsigned long long)next, (unsigned long long)stripe, width,
-			 info->volume);
+			 (unsigned long long)(next + AIOSFS_INO_BATCH), (unsigned long long)stripe,
+			 width, info->volume);
 		err = aios_http_put(info->http, oid, out, strlen(out), NULL, &cas);
-		if (!err)
+		if (!err) {
+			info->ino_next = next;
+			info->ino_end = next + AIOSFS_INO_BATCH;
 			return 0;
+		}
 		if (err != -EAGAIN)
 			return err;
+		http_retry_backoff(attempt);
 	}
-	return -EAGAIN;
+	return http_no_eagain(err);
+}
+
+static int alloc_ino(struct aios_sb_info *info, u64 *ino_out)
+{
+	int err = 0;
+
+	mutex_lock(&info->ino_mu);
+	if (info->ino_next >= info->ino_end)
+		err = alloc_ino_range(info);
+	if (!err)
+		*ino_out = info->ino_next++;
+	mutex_unlock(&info->ino_mu);
+	return err;
 }
 
 static int ensure_root(struct aios_sb_info *info)
@@ -1659,6 +1941,35 @@ static int ensure_root(struct aios_sb_info *info)
 	return err;
 }
 
+/*
+ * Update a directory inode's mtime/ctime (and nlink by @nlink_delta) after a
+ * namespace change. @pm is the caller's already-loaded copy; a CAS conflict
+ * means a peer touched the directory meanwhile, so reload and apply again
+ * rather than lose a subdirectory link count.
+ */
+static int touch_parent(struct aios_sb_info *info, struct aios_inode_meta *pm, u64 ts,
+			int nlink_delta)
+{
+	int attempt;
+	int err = -EAGAIN;
+
+	for (attempt = 0; attempt < AIOS_HTTP_META_RETRIES && err == -EAGAIN; attempt++) {
+		if (attempt) {
+			http_retry_backoff(attempt);
+			err = load_inode(info, pm->ino, pm);
+			if (err)
+				break;
+		}
+		if (nlink_delta < 0 && pm->nlink > 2)
+			pm->nlink -= 1;
+		else if (nlink_delta > 0)
+			pm->nlink += 1;
+		pm->mtime_ns = pm->ctime_ns = ts;
+		err = store_inode(info, pm);
+	}
+	return http_no_eagain(err);
+}
+
 static void delete_dir_objects(struct aios_sb_info *info, u64 ino)
 {
 	char oid[160];
@@ -1673,20 +1984,85 @@ static void delete_dir_objects(struct aios_sb_info *info, u64 ino)
 	aios_http_delete(info->http, oid);
 }
 
-/* Delete every chunk object of a regular file up to @size bytes. */
-static void delete_file_chunks(struct aios_sb_info *info, u64 ino, u64 unit, u64 size)
-{
-	u64 chunks;
-	u64 c;
-	char oid[160];
+/*
+ * Chunk deletion runs on wb_wq, striped over up to pool_size workers, so
+ * unlink+close and truncate return after the metadata update instead of after
+ * one DELETE round trip per chunk. Object deletion is idempotent, so a worker
+ * that dies with the mount simply leaves chunks for a later sweep; put_super
+ * drains the queue before the pool goes away.
+ */
+struct aios_chunk_del_work {
+	struct work_struct work;
+	struct aios_sb_info *info;
+	u64 ino;
+	u64 first;
+	u64 end;
+	u64 stride;
+};
 
+static void delete_chunk_stripe(struct aios_sb_info *info, struct aios_http_client *c, u64 ino,
+				u64 first, u64 end, u64 stride)
+{
+	char oid[160];
+	u64 i;
+
+	for (i = first; i < end; i += stride) {
+		oid_chunk(info->volume, ino, i, oid, sizeof(oid));
+		aios_http_delete(c, oid);
+	}
+}
+
+static void chunk_del_worker(struct work_struct *w)
+{
+	struct aios_chunk_del_work *dw = container_of(w, struct aios_chunk_del_work, work);
+	struct aios_http_client *c = http_client_get(dw->info);
+
+	delete_chunk_stripe(dw->info, c, dw->ino, dw->first, dw->end, dw->stride);
+	http_client_put(dw->info, c);
+	kfree(dw);
+}
+
+/* Delete chunk objects [first, end) of @ino. @c is used for the synchronous
+ * fallback when a work item cannot be allocated. */
+static void delete_chunks_deferred(struct aios_sb_info *info, struct aios_http_client *c,
+				   u64 ino, u64 first, u64 end)
+{
+	u64 n = end > first ? end - first : 0;
+	unsigned int workers, w;
+
+	if (!n)
+		return;
+	if (!info->wb_wq) {
+		delete_chunk_stripe(info, c, ino, first, end, 1);
+		return;
+	}
+	workers = (unsigned int)min_t(u64, info->pool_size, (n + 15) / 16);
+	if (!workers)
+		workers = 1;
+	for (w = 0; w < workers; w++) {
+		struct aios_chunk_del_work *dw = kmalloc(sizeof(*dw), GFP_KERNEL);
+
+		if (!dw) {
+			delete_chunk_stripe(info, c, ino, first + w, end, workers);
+			continue;
+		}
+		INIT_WORK(&dw->work, chunk_del_worker);
+		dw->info = info;
+		dw->ino = ino;
+		dw->first = first + w;
+		dw->end = end;
+		dw->stride = workers;
+		queue_work(info->wb_wq, &dw->work);
+	}
+}
+
+/* Delete every chunk object of a regular file up to @size bytes. */
+static void delete_file_chunks(struct aios_sb_info *info, struct aios_http_client *c, u64 ino,
+			       u64 unit, u64 size)
+{
 	if (!unit)
 		unit = AIOS_HTTP_DEFAULT_STRIPE_UNIT;
-	chunks = (size + unit - 1) / unit;
-	for (c = 0; c < chunks; c++) {
-		oid_chunk(info->volume, ino, c, oid, sizeof(oid));
-		aios_http_delete(info->http, oid);
-	}
+	delete_chunks_deferred(info, c, ino, 0, (size + unit - 1) / unit);
 }
 
 /*
@@ -1700,23 +2076,32 @@ static void delete_file_chunks(struct aios_sb_info *info, u64 ino, u64 unit, u64
 static int aios_http_drop_link(struct aios_sb_info *info, u64 ino)
 {
 	struct aios_inode_meta m = { 0 };
-	int err;
+	int attempt;
+	int err = -EAGAIN;
 
-	err = load_inode(info, ino, &m);
-	if (err == -ENOENT)
-		return 0;
-	if (err)
-		return err;
-	if (S_ISDIR(m.mode)) {
-		inode_meta_reset(&m);
-		delete_dir_objects(info, ino);
-		return 0;
+	/* The inode object is also written by size flushes and setattr on
+	 * pool clients; a CAS conflict just means reload and apply again. */
+	for (attempt = 0; attempt < AIOS_HTTP_META_RETRIES && err == -EAGAIN; attempt++) {
+		if (attempt)
+			http_retry_backoff(attempt);
+		err = load_inode(info, ino, &m);
+		if (err == -ENOENT) {
+			err = 0;
+			break;
+		}
+		if (err)
+			break;
+		if (S_ISDIR(m.mode)) {
+			delete_dir_objects(info, ino);
+			err = 0;
+			break;
+		}
+		m.nlink = m.nlink ? m.nlink - 1 : 0;
+		m.ctime_ns = now_ns();
+		err = store_inode(info, &m);
 	}
-	m.nlink = m.nlink ? m.nlink - 1 : 0;
-	m.ctime_ns = now_ns();
-	err = store_inode(info, &m);
 	inode_meta_reset(&m);
-	return err;
+	return http_no_eagain(err);
 }
 
 void aios_http_evict_unlinked(struct inode *inode)
@@ -1729,10 +2114,12 @@ void aios_http_evict_unlinked(struct inode *inode)
 	u64 unit;
 	int err;
 
-	if (!info || !info->http)
+	struct aios_http_client *c;
+
+	if (!info || !info->http_pool)
 		return;
-	mutex_lock(&info->http_mu);
-	err = load_inode(info, inode->i_ino, &m);
+	c = http_client_get(info);
+	err = load_inode_c(info, c, inode->i_ino, &m);
 	if (err && err != -ENOENT)
 		goto out;
 	if (!err && m.nlink > 0) {
@@ -1748,23 +2135,48 @@ void aios_http_evict_unlinked(struct inode *inode)
 	}
 	if (aux && aux->last_synced_size > size)
 		size = aux->last_synced_size;
-	if (S_ISREG(inode->i_mode))
-		delete_file_chunks(info, inode->i_ino, unit, size);
+	/* Inode object first (one round trip), chunks in the background. */
 	oid_ino(info->volume, inode->i_ino, oid, sizeof(oid));
-	aios_http_delete(info->http, oid);
+	aios_http_delete(c, oid);
+	if (S_ISREG(inode->i_mode))
+		delete_file_chunks(info, c, inode->i_ino, unit, size);
 out:
 	inode_meta_reset(&m);
-	mutex_unlock(&info->http_mu);
+	http_client_put(info, c);
 }
 
+/*
+ * Bring the in-core inode up to date from the server. When the cached CAS is
+ * known, a HEAD first compares the server's aios.posix.cas with it: unchanged
+ * means nothing to fetch (headers only), so a stat() storm past the TTL costs
+ * a HEAD per TTL instead of a full inode GET + JSON parse. Uses a pool client
+ * and no http_mu, so it never queues behind a namespace operation.
+ */
 static int http_refresh(struct inode *inode)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_inode_aux *aux = inode->i_private;
 	struct aios_inode_meta m = { 0 };
 	struct aios_kabi_stat st;
+	struct aios_http_client *c;
 	int err;
 
-	err = load_inode(info, inode->i_ino, &m);
+	c = http_client_get(info);
+	if (aux && aux->cas) {
+		char oid[160];
+		u64 size = 0, cas = 0;
+
+		oid_ino(info->volume, inode->i_ino, oid, sizeof(oid));
+		err = aios_http_head(c, oid, &size, &cas);
+		if (!err && cas && cas == aux->cas) {
+			aux->meta_jiffies = jiffies;
+			http_client_put(info, c);
+			return 0;
+		}
+		/* Changed, missing or HEAD failed: the GET below is authoritative. */
+	}
+	err = load_inode_c(info, c, inode->i_ino, &m);
+	http_client_put(info, c);
 	if (err)
 		return err;
 	meta_to_stat(&m, &st);
@@ -1895,10 +2307,7 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 		aios_http_delete(info->http, oid);
 		goto out_dt;
 	}
-	pmeta.mtime_ns = pmeta.ctime_ns = ts;
-	if (is_dir)
-		pmeta.nlink += 1;
-	err = store_inode(info, &pmeta);
+	err = touch_parent(info, &pmeta, ts, is_dir ? 1 : 0);
 	if (err)
 		goto out_dt;
 	inode = aios_http_iget(dir->i_sb, &m);
@@ -1941,7 +2350,6 @@ static int http_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct aios_sb_info *info = AIOS_SB(dir->i_sb);
 	struct aios_dir_table dt;
-	struct aios_inode_meta m = { 0 };
 	char name[AIOS_KABI_NAME_MAX + 1];
 	u64 child;
 	int err;
@@ -1955,17 +2363,15 @@ static int http_unlink(struct inode *dir, struct dentry *dentry)
 	err = dir_table_init(&dt, info->volume, dir->i_ino);
 	if (err)
 		goto out;
-	err = dir_load(info, &dt, false);
+	/* The cached table is enough to find the child: dir_commit_op reloads
+	 * under the directory lock and fails with -ENOENT if the name is gone.
+	 * The VFS already rejected directories (may_delete → -EISDIR). */
+	err = dir_load(info, &dt, true);
 	if (err)
 		goto out_dt;
 	err = dir_find(&dt, name, &child);
 	if (err)
 		goto out_dt;
-	err = load_inode(info, child, &m);
-	if (!err && S_ISDIR(m.mode)) {
-		err = -EISDIR;
-		goto out_dt;
-	}
 	err = dir_commit_op(info, &dt, AIOS_HTTP_OP_UNLINK, name, NULL, false);
 	if (err)
 		goto out_dt;
@@ -1974,7 +2380,6 @@ static int http_unlink(struct inode *dir, struct dentry *dentry)
 	d_drop(dentry);
 out_dt:
 	dir_table_free(&dt);
-	inode_meta_reset(&m);
 out:
 	mutex_unlock(&info->http_mu);
 	return err;
@@ -2030,12 +2435,8 @@ static int http_rmdir(struct inode *dir, struct dentry *dentry)
 	if (err)
 		goto out_dt;
 	err = load_inode(info, dir->i_ino, &pmeta);
-	if (!err) {
-		if (pmeta.nlink > 2)
-			pmeta.nlink -= 1;
-		pmeta.mtime_ns = pmeta.ctime_ns = now_ns();
-		store_inode(info, &pmeta);
-	}
+	if (!err)
+		touch_parent(info, &pmeta, now_ns(), -1);
 	delete_dir_objects(info, child);
 	clear_nlink(d_inode(dentry));
 	drop_nlink(dir);
@@ -2377,10 +2778,10 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 						 new_name, noreplace);
 		if (err != -EAGAIN)
 			break;
-		msleep(20);
+		http_retry_backoff(attempt);
 	}
 	kfree(rc);
-	return err;
+	return http_no_eagain(err);
 }
 
 static int http_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
@@ -2524,31 +2925,127 @@ static int http_getattr(AIOS_IDMAP *mnt_userns, const struct path *path,
 
 		if (err)
 			return err;
+		aios_d_mark_fresh(path->dentry);
 	}
 	aios_fillattr(mnt_userns, inode, stat);
 	return 0;
 }
 
-static int truncate_file(struct aios_sb_info *info, struct aios_inode_aux *aux,
-			 struct aios_inode_meta *m, u64 size)
+/*
+ * Wait for a set of deferred chunk deletions. Truncate must not return while
+ * its dropped chunks are still being deleted: a write that re-extends the file
+ * could otherwise land in a chunk the worker deletes a moment later.
+ */
+struct aios_chunk_del_sync {
+	atomic_t pending;
+	struct completion done;
+};
+
+struct aios_chunk_del_sync_work {
+	struct work_struct work;
+	struct aios_sb_info *info;
+	struct aios_chunk_del_sync *sync;
+	u64 ino;
+	u64 first;
+	u64 end;
+	u64 stride;
+};
+
+static void chunk_del_sync_worker(struct work_struct *w)
+{
+	struct aios_chunk_del_sync_work *dw =
+		container_of(w, struct aios_chunk_del_sync_work, work);
+	struct aios_http_client *c = http_client_get(dw->info);
+
+	delete_chunk_stripe(dw->info, c, dw->ino, dw->first, dw->end, dw->stride);
+	http_client_put(dw->info, c);
+	if (atomic_dec_and_test(&dw->sync->pending))
+		complete(&dw->sync->done);
+	kfree(dw);
+}
+
+/* Delete chunks [first, end) of @ino in parallel over the pool and wait. The
+ * chunks below @first are untouched, so no stripe lock is needed: callers
+ * have already cut the page cache back and hold the inode lock, so nothing
+ * writes at or beyond @first while this runs. */
+static void delete_chunks_parallel(struct aios_sb_info *info, u64 ino, u64 first, u64 end)
+{
+	struct aios_chunk_del_sync sync;
+	u64 n = end > first ? end - first : 0;
+	unsigned int workers, w;
+
+	if (!n)
+		return;
+	workers = (unsigned int)min_t(u64, info->pool_size, (n + 15) / 16);
+	if (workers <= 1 || !info->wb_wq) {
+		struct aios_http_client *c = http_client_get(info);
+
+		delete_chunk_stripe(info, c, ino, first, end, 1);
+		http_client_put(info, c);
+		return;
+	}
+	init_completion(&sync.done);
+	/* Our own reference keeps a worker from ever completing while we might
+	 * still return early; only the last dropper touches sync.done. The
+	 * caller must not hold a pool client here: the workers each take one. */
+	atomic_set(&sync.pending, 1);
+	for (w = 0; w < workers; w++) {
+		struct aios_chunk_del_sync_work *dw = kmalloc(sizeof(*dw), GFP_KERNEL);
+
+		if (!dw) {
+			struct aios_http_client *c = http_client_get(info);
+
+			delete_chunk_stripe(info, c, ino, first + w, end, workers);
+			http_client_put(info, c);
+			continue;
+		}
+		INIT_WORK(&dw->work, chunk_del_sync_worker);
+		dw->info = info;
+		dw->sync = &sync;
+		dw->ino = ino;
+		dw->first = first + w;
+		dw->end = end;
+		dw->stride = workers;
+		atomic_inc(&sync.pending);
+		queue_work(info->wb_wq, &dw->work);
+	}
+	if (!atomic_dec_and_test(&sync.pending))
+		wait_for_completion(&sync.done);
+}
+
+/*
+ * Set the file size on the server: drop whole chunks past the new end, trim
+ * the last partial chunk, then CAS PUT the inode object. Grow is metadata
+ * only. The stripe lock on the trimmed chunk keeps a writeback of pages below
+ * the new end from being lost between the GET and the PUT.
+ *
+ * @old_local is the largest size this client has seen for the file: chunk
+ * data is PUT by writeback at once while the inode object's size is flushed
+ * lazily, so the server's m->size may lag behind the chunks that exist. The
+ * drop range is computed from the larger of the two, or a later extension
+ * would read the stale bytes back instead of zeros.
+ *
+ * *cp is released while the drop runs on pool workers (they each need a
+ * client) and reacquired afterwards.
+ */
+static int truncate_file(struct aios_sb_info *info, struct aios_http_client **cp,
+			 struct aios_inode_aux *aux, struct aios_inode_meta *m, u64 size,
+			 u64 old_local)
 {
 	u64 unit = m->stripe_unit ? m->stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+	u64 old = max_t(u64, m->size, old_local);
+	struct aios_http_client *c = *cp;
 	char oid[160];
 	int err;
 
-	if (size < m->size) {
+	if (size < old) {
 		u64 first_drop = (size + unit - 1) / unit;
-		u64 old_chunks = (m->size + unit - 1) / unit;
-		u64 c;
+		u64 old_chunks = (old + unit - 1) / unit;
 
-		for (c = first_drop; c < old_chunks; c++) {
-			struct mutex *mu = aios_chunk_lock(aux, c);
-
-			oid_chunk(info->volume, m->ino, c, oid, sizeof(oid));
-			mutex_lock(mu);
-			aios_http_delete(info->http, oid);
-			mutex_unlock(mu);
-		}
+		http_client_put(info, c);
+		delete_chunks_parallel(info, m->ino, first_drop, old_chunks);
+		c = http_client_get(info);
+		*cp = c;
 		if (size > 0) {
 			u64 last = (size - 1) / unit;
 			u64 keep = size - last * unit;
@@ -2557,9 +3054,9 @@ static int truncate_file(struct aios_sb_info *info, struct aios_inode_aux *aux,
 
 			oid_chunk(info->volume, m->ino, last, oid, sizeof(oid));
 			mutex_lock(mu);
-			err = aios_http_get(info->http, oid, &body, NULL);
+			err = aios_http_get(c, oid, &body, NULL);
 			if (!err && body.len > keep)
-				err = aios_http_put(info->http, oid, body.data, keep, NULL, NULL);
+				err = aios_http_put(c, oid, body.data, keep, NULL, NULL);
 			else if (err == -ENOENT)
 				err = 0;
 			aios_http_buf_free(&body);
@@ -2570,9 +3067,18 @@ static int truncate_file(struct aios_sb_info *info, struct aios_inode_aux *aux,
 	}
 	m->size = size;
 	m->mtime_ns = m->ctime_ns = now_ns();
-	return store_inode(info, m);
+	return store_inode_c(info, c, m);
 }
 
+/*
+ * chmod / chown / utimes / truncate. Runs on a pool client under the inode's
+ * meta_mu (not http_mu), so it neither waits for nor blocks namespace
+ * operations; a CAS conflict with a concurrent nlink change or deferred size
+ * flush is retried on a fresh load. For a truncate the page cache is cut
+ * back first: truncate_setsize waits for writeback of the pages it removes,
+ * so no in-flight chunk write can resurrect data past the new end after the
+ * server-side delete.
+ */
 static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 			struct iattr *attr)
 {
@@ -2580,6 +3086,9 @@ static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	struct aios_inode_meta m = { 0 };
 	struct aios_inode_aux *aux;
+	struct aios_http_client *c;
+	u64 old_local = 0;
+	int attempt;
 	int err;
 
 	err = setattr_prepare(mnt_userns, dentry, attr);
@@ -2589,23 +3098,30 @@ static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 	if (!aux)
 		return -ENOMEM;
 
-	mutex_lock(&info->http_mu);
-	err = load_inode(info, inode->i_ino, &m);
-	if (err)
-		goto out;
-	if (attr->ia_valid & ATTR_MODE)
-		m.mode = (m.mode & S_IFMT) | (attr->ia_mode & 07777);
-	if (attr->ia_valid & ATTR_UID)
-		m.uid = aios_iattr_uid(mnt_userns, attr);
-	if (attr->ia_valid & ATTR_GID)
-		m.gid = aios_iattr_gid(mnt_userns, attr);
 	if (attr->ia_valid & ATTR_SIZE) {
-		err = truncate_file(info, aux, &m, attr->ia_size);
-		if (err)
-			goto out;
+		old_local = max_t(u64, (u64)i_size_read(inode), aux->last_synced_size);
 		truncate_setsize(inode, attr->ia_size);
-	} else {
-		if (attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID | ATTR_MTIME | ATTR_ATIME)) {
+	}
+
+	c = http_client_get(info);
+	mutex_lock(&aux->meta_mu);
+	err = -EAGAIN;
+	for (attempt = 0; attempt < AIOS_HTTP_META_RETRIES && err == -EAGAIN; attempt++) {
+		if (attempt)
+			http_retry_backoff(attempt);
+		err = load_inode_c(info, c, inode->i_ino, &m);
+		if (err)
+			break;
+		if (attr->ia_valid & ATTR_MODE)
+			m.mode = (m.mode & S_IFMT) | (attr->ia_mode & 07777);
+		if (attr->ia_valid & ATTR_UID)
+			m.uid = aios_iattr_uid(mnt_userns, attr);
+		if (attr->ia_valid & ATTR_GID)
+			m.gid = aios_iattr_gid(mnt_userns, attr);
+		if (attr->ia_valid & ATTR_SIZE) {
+			err = truncate_file(info, &c, aux, &m, (u64)attr->ia_size, old_local);
+		} else if (attr->ia_valid &
+			   (ATTR_MODE | ATTR_UID | ATTR_GID | ATTR_MTIME | ATTR_ATIME)) {
 			if (attr->ia_valid & ATTR_MTIME)
 				m.mtime_ns = (u64)attr->ia_mtime.tv_sec * 1000000000ull +
 					     attr->ia_mtime.tv_nsec;
@@ -2613,11 +3129,13 @@ static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 				m.atime_ns = (u64)attr->ia_atime.tv_sec * 1000000000ull +
 					     attr->ia_atime.tv_nsec;
 			m.ctime_ns = now_ns();
-			err = store_inode(info, &m);
-			if (err)
-				goto out;
+			err = store_inode_c(info, c, &m);
+		} else {
+			err = 0;
 		}
 	}
+	if (err)
+		goto out;
 	{
 		struct aios_kabi_stat st;
 
@@ -2633,9 +3151,10 @@ static int http_setattr(AIOS_IDMAP *mnt_userns, struct dentry *dentry,
 	setattr_copy(mnt_userns, inode, attr);
 	mark_inode_dirty(inode);
 out:
+	mutex_unlock(&aux->meta_mu);
+	http_client_put(info, c);
 	inode_meta_reset(&m);
-	mutex_unlock(&info->http_mu);
-	return err;
+	return http_no_eagain(err);
 }
 
 static void http_kfree_link(void *p)
@@ -2717,8 +3236,7 @@ static int http_symlink(AIOS_IDMAP *mnt_userns, struct inode *dir, struct dentry
 		aios_http_delete(info->http, oid);
 		goto out_dt;
 	}
-	pmeta.mtime_ns = pmeta.ctime_ns = ts;
-	err = store_inode(info, &pmeta);
+	err = touch_parent(info, &pmeta, ts, 0);
 	if (err)
 		goto out_dt;
 	inode = aios_http_iget(dir->i_sb, &m);
@@ -2834,23 +3352,22 @@ static int http_readdir(struct file *file, struct dir_context *ctx)
 	if (err)
 		goto out_dt;
 
-	/* pos 0,1 are . and ..; entries start at pos 2 */
+	/* pos 0,1 are . and ..; entries start at pos 2. d_type comes from the
+	 * in-core inode when we have one (a GET per entry would make a listing
+	 * cost N round trips); otherwise DT_UNKNOWN, which is what POSIX
+	 * readdir permits and what ls/find handle by stat()ing on demand. */
 	for (i = 0; i < dt.count; i++) {
 		loff_t pos = (loff_t)i + 2;
-		struct aios_inode_meta m = { 0 };
 		unsigned char type = DT_UNKNOWN;
+		struct inode *child;
 
 		if (ctx->pos > pos)
 			continue;
-		if (!load_inode(info, dt.ents[i].ino, &m)) {
-			if (S_ISDIR(m.mode))
-				type = DT_DIR;
-			else if (S_ISREG(m.mode))
-				type = DT_REG;
-			else if (S_ISLNK(m.mode))
-				type = DT_LNK;
+		child = ilookup(inode->i_sb, dt.ents[i].ino);
+		if (child) {
+			type = fs_umode_to_dtype(child->i_mode);
+			iput(child);
 		}
-		inode_meta_reset(&m);
 		if (!dir_emit(ctx, dt.ents[i].name, strlen(dt.ents[i].name), dt.ents[i].ino,
 			      type))
 			break;
@@ -2869,40 +3386,49 @@ const struct file_operations aios_http_dir_ops = {
 	.llseek = generic_file_llseek,
 };
 
-int aios_http_io_read(struct inode *inode, loff_t pos, void *buf, size_t len, size_t *out_len)
+/*
+ * Stripe unit of a regular file. The aux is filled by every inode load
+ * (lookup, getattr, create), so this is normally a field read; the GET only
+ * happens for an inode whose aux was never populated.
+ */
+static int http_file_unit(struct aios_sb_info *info, struct aios_http_client *c,
+			  struct inode *inode, struct aios_inode_aux *aux, u64 *unit_out)
 {
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	struct aios_inode_meta m = { 0 };
-	struct aios_inode_aux *ii = inode->i_private;
-	u64 unit, p, end, file_size;
-	size_t written = 0;
 	int err;
 
-	if (out_len)
-		*out_len = 0;
-	if (!len)
+	if (aux && aux->stripe_unit) {
+		*unit_out = aux->stripe_unit;
 		return 0;
-
-	mutex_lock(&info->http_mu);
-	err = load_inode(info, inode->i_ino, &m);
+	}
+	err = load_inode_c(info, c, inode->i_ino, &m);
 	if (err)
-		goto out;
+		return err;
 	if (!S_ISREG(m.mode)) {
-		err = -EISDIR;
-		goto out;
+		inode_meta_reset(&m);
+		return -EISDIR;
 	}
-	/* Chunks may already be written for data whose size bump is still
-	 * pending (deferred size flush); trust the larger of the two. */
-	file_size = max_t(u64, m.size, (u64)i_size_read(inode));
-	if ((u64)pos >= file_size) {
-		err = 0;
-		goto out;
-	}
-	end = min_t(u64, (u64)pos + len, file_size);
-	unit = m.stripe_unit ? m.stripe_unit :
-			       (ii && ii->stripe_unit ? ii->stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT);
-	p = (u64)pos;
-	memset(buf, 0, len);
+	attach_iinfo(inode, &m);
+	*unit_out = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+	inode_meta_reset(&m);
+	return 0;
+}
+
+/*
+ * Read [pos, pos+len) into buf: one ranged GET per chunk touched, on a pool
+ * client, without http_mu. The size is the local i_size: the VFS bounds reads
+ * by it, our own writes advance it before they return, and getattr refreshes
+ * it from the server within the attribute TTL. Bytes past what the server
+ * holds (a chunk not yet written or shorter than the file) read as zeros.
+ */
+/* Ranged GET per chunk into buf (pre-zeroed by the caller) on client @c;
+ * [pos, end) must already be clipped to the file size. */
+static int http_read_range(struct aios_sb_info *info, struct aios_http_client *c, u64 ino,
+			   u64 unit, u64 pos, u64 end, char *buf)
+{
+	u64 p = pos;
+	int err = 0;
+
 	while (p < end) {
 		u64 chunk = p / unit;
 		u64 chunk_off = p % unit;
@@ -2911,34 +3437,166 @@ int aios_http_io_read(struct inode *inode, loff_t pos, void *buf, size_t len, si
 		char oid[160];
 		struct aios_http_buf body = { 0 };
 
-		oid_chunk(info->volume, m.ino, chunk, oid, sizeof(oid));
-		err = aios_http_get(info->http, oid, &body, NULL);
-		if (!err && chunk_off < body.len) {
-			size_t avail = (size_t)(body.len - chunk_off);
-			size_t take = min(n, avail);
-
-			memcpy((char *)buf + written, (char *)body.data + chunk_off, take);
-		} else if (err && err != -ENOENT) {
+		oid_chunk(info->volume, ino, chunk, oid, sizeof(oid));
+		err = aios_http_get_range(c, oid, chunk_off, chunk_off + n - 1, &body);
+		if (!err && body.len)
+			memcpy(buf + (p - pos), body.data, min(n, body.len));
+		else if (err && err != -ENOENT && err != -ERANGE) {
 			aios_http_buf_free(&body);
-			goto out;
+			return err;
 		}
 		aios_http_buf_free(&body);
 		p += n;
-		written += n;
 		err = 0;
 	}
+	return 0;
+}
+
+int aios_http_io_read(struct inode *inode, loff_t pos, void *buf, size_t len, size_t *out_len)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_inode_aux *aux = inode->i_private;
+	struct aios_http_client *c;
+	u64 unit, end, file_size;
+	int err;
+
 	if (out_len)
-		*out_len = written;
-out:
-	mutex_unlock(&info->http_mu);
+		*out_len = 0;
+	if (!len)
+		return 0;
+	memset(buf, 0, len);
+	file_size = (u64)i_size_read(inode);
+	if ((u64)pos >= file_size)
+		return 0;
+	end = min_t(u64, (u64)pos + len, file_size);
+
+	c = http_client_get(info);
+	err = http_file_unit(info, c, inode, aux, &unit);
+	if (!err)
+		err = http_read_range(info, c, inode->i_ino, unit, (u64)pos, end, buf);
+	http_client_put(info, c);
+	if (!err && out_len)
+		*out_len = (size_t)(end - (u64)pos);
 	return err;
 }
 
 /*
- * Chunk RMW using an explicit client (no http_mu). The inode's stripe mutex
- * for each chunk is held across GET → patch → PUT; every chunk writer
- * (buffered writeback workers, writepage, O_DIRECT, punch, truncate) takes the
- * same lock so concurrent partial updates to one chunk cannot lose each other.
+ * Read-ahead: the VFS hands us a batch of locked, not-uptodate pages that are
+ * contiguous in the file. One aios_http_io_read call issues one ranged GET
+ * per chunk the batch touches (a whole batch inside a chunk is a single GET),
+ * instead of the per-page GET ->readpage would do. bdi ra_pages is set to the
+ * stripe unit so a sequential reader fetches whole chunks per round trip.
+ */
+void aios_http_readahead(struct readahead_control *rac)
+{
+	struct inode *inode = rac->mapping->host;
+	loff_t pos = readahead_pos(rac);
+	size_t len = readahead_length(rac);
+	size_t got = 0;
+	size_t off = 0;
+	char *buf;
+	int err;
+
+	if (!len)
+		return;
+	buf = kvmalloc(len, GFP_KERNEL);
+	if (!buf) {
+		/* Leave the pages !uptodate; ->readpage fills them on demand. */
+		return;
+	}
+	err = aios_http_io_read(inode, pos, buf, len, &got);
+	/* aios_http_io_read zero-fills whatever the server did not return, so
+	 * every byte of buf is valid once it succeeds. */
+#ifdef AIOS_HAS_FOLIO_AOPS
+	{
+		struct folio *folio;
+
+		/* readahead_folio() drops the reference; we only unlock. */
+		while ((folio = readahead_folio(rac))) {
+			struct page *page = folio_page(folio, 0);
+
+			if (!err) {
+				void *kaddr = kmap(page);
+
+				memcpy(kaddr, buf + off, min_t(size_t, PAGE_SIZE, len - off));
+				kunmap(page);
+				flush_dcache_page(page);
+				folio_mark_uptodate(folio);
+			}
+			off += PAGE_SIZE;
+			folio_unlock(folio);
+		}
+	}
+#else
+	{
+		struct page *page;
+
+		while ((page = readahead_page(rac))) {
+			if (!err) {
+				void *kaddr = kmap(page);
+
+				memcpy(kaddr, buf + off, min_t(size_t, PAGE_SIZE, len - off));
+				kunmap(page);
+				flush_dcache_page(page);
+				SetPageUptodate(page);
+			}
+			off += PAGE_SIZE;
+			unlock_page(page);
+			put_page(page);
+		}
+	}
+#endif
+	kvfree(buf);
+}
+
+/*
+ * Write @n bytes at @chunk_off into one chunk object on client @c. Callers hold
+ * the chunk's stripe mutex. A write covering the whole chunk is a plain PUT;
+ * anything smaller is a Content-Range PUT that the server patches in place
+ * (zero-filling any gap), so a small write costs one round trip and moves only
+ * its own bytes instead of GET + full-chunk PUT. Erasure-coded or compressed
+ * tips cannot be patched (-EOPNOTSUPP); those fall back to the GET → patch →
+ * PUT rewrite.
+ */
+static int http_chunk_put(struct aios_http_client *c, const char *oid, u64 unit, u64 chunk_off,
+			  const void *data, size_t n)
+{
+	struct aios_http_buf body = { 0 };
+	size_t nlen;
+	char *nb;
+	int err;
+
+	if (chunk_off == 0 && n >= unit)
+		return aios_http_put(c, oid, data, n, NULL, NULL);
+	err = aios_http_put_range(c, oid, chunk_off, data, n, NULL);
+	if (err != -EOPNOTSUPP)
+		return err;
+
+	err = aios_http_get(c, oid, &body, NULL);
+	if (err && err != -ENOENT)
+		return err;
+	nlen = max_t(size_t, body.len, chunk_off + n);
+	nb = kvmalloc(nlen, GFP_KERNEL);
+	if (!nb) {
+		aios_http_buf_free(&body);
+		return -ENOMEM;
+	}
+	memset(nb, 0, nlen);
+	if (body.len)
+		memcpy(nb, body.data, body.len);
+	aios_http_buf_free(&body);
+	memcpy(nb + chunk_off, data, n);
+	err = aios_http_put(c, oid, nb, nlen, NULL, NULL);
+	kvfree(nb);
+	return err;
+}
+
+/*
+ * Write a byte range across chunks using an explicit client (no http_mu). The
+ * inode's stripe mutex for each chunk is held across the update; every chunk
+ * writer (buffered writeback workers, writepage, O_DIRECT, punch, truncate)
+ * takes the same lock so concurrent partial updates to one chunk cannot lose
+ * each other.
  */
 static int http_chunk_write(struct aios_http_client *c, struct aios_inode_aux *aux,
 			    const char *volume, u64 ino, u64 unit, u64 pos, const void *buf,
@@ -2954,31 +3612,10 @@ static int http_chunk_write(struct aios_http_client *c, struct aios_inode_aux *a
 		size_t n = min_t(size_t, (size_t)(unit - chunk_off), len - done);
 		struct mutex *mu = aios_chunk_lock(aux, chunk);
 		char oid[160];
-		struct aios_http_buf body = { 0 };
-		char *nb;
-		size_t nlen;
 
 		oid_chunk(volume, ino, chunk, oid, sizeof(oid));
 		mutex_lock(mu);
-		err = aios_http_get(c, oid, &body, NULL);
-		if (err && err != -ENOENT) {
-			mutex_unlock(mu);
-			return err;
-		}
-		nlen = max_t(size_t, body.len, chunk_off + n);
-		nb = kvmalloc(nlen, GFP_KERNEL);
-		if (!nb) {
-			aios_http_buf_free(&body);
-			mutex_unlock(mu);
-			return -ENOMEM;
-		}
-		memset(nb, 0, nlen);
-		if (body.len)
-			memcpy(nb, body.data, body.len);
-		aios_http_buf_free(&body);
-		memcpy(nb + chunk_off, (char *)buf + done, n);
-		err = aios_http_put(c, oid, nb, nlen, NULL, NULL);
-		kvfree(nb);
+		err = http_chunk_put(c, oid, unit, chunk_off, (const char *)buf + done, n);
 		mutex_unlock(mu);
 		if (err)
 			return err;
@@ -2988,11 +3625,14 @@ static int http_chunk_write(struct aios_http_client *c, struct aios_inode_aux *a
 	return 0;
 }
 
+/* Account @wrote bytes of chunk data whose size/mtime is not yet on the
+ * server; grow i_size to @new_size if that is larger (0 = leave i_size). */
 static void mark_http_size_dirty(struct inode *inode, u64 new_size, size_t wrote)
 {
 	struct aios_inode_aux *aux = inode->i_private;
 
-	i_size_write(inode, new_size);
+	if (new_size > (u64)i_size_read(inode))
+		i_size_write(inode, new_size);
 	inode->i_mtime = inode->i_ctime = current_time(inode);
 	aios_set_inode_blocks(inode);
 	if (aux) {
@@ -3023,11 +3663,72 @@ static void http_clear_size_dirty(struct inode *inode, u64 size)
 	aux->dirty_since = 0;
 }
 
+/*
+ * Push size/mtime to the inode object after chunk writes. Serialised per inode
+ * by aux->meta_mu against setattr / xattr writers on other clients of this
+ * mount; a CAS conflict with a namespace op (link count change) is retried
+ * with a fresh load. The server copy only grows: another client may have
+ * extended the file meanwhile, and an explicit shrink goes through setattr.
+ * Not an error path for the data: chunks are already durable, so a failure
+ * leaves the size dirty for the next write_inode / evict to retry.
+ */
+static int http_flush_size(struct aios_sb_info *info, struct aios_http_client *c,
+			   struct inode *inode, struct aios_inode_aux *aux, u64 size)
+{
+	struct aios_inode_meta m = { 0 };
+	int attempt;
+	int err = -EAGAIN;
+
+	mutex_lock(&aux->meta_mu);
+	for (attempt = 0; attempt < AIOS_HTTP_META_RETRIES && err == -EAGAIN; attempt++) {
+		err = load_inode_c(info, c, inode->i_ino, &m);
+		if (err)
+			break;
+		if (!S_ISREG(m.mode)) {
+			err = -EISDIR;
+			break;
+		}
+		if (m.size >= size) {
+			/* Nothing to publish (a peer or an earlier flush got there). */
+			attach_iinfo(inode, &m);
+			http_clear_size_dirty(inode, m.size);
+			err = 0;
+			break;
+		}
+		m.size = size;
+		m.mtime_ns = m.ctime_ns = now_ns();
+		err = store_inode_c(info, c, &m);
+		if (!err) {
+			attach_iinfo(inode, &m);
+			http_clear_size_dirty(inode, m.size);
+		} else if (err == -EAGAIN) {
+			http_retry_backoff(attempt);
+		}
+	}
+	mutex_unlock(&aux->meta_mu);
+	inode_meta_reset(&m);
+	return err;
+}
+
+/* After chunk data landed: bump the local size/mtime and flush the inode
+ * object if enough bytes or time accumulated since the last flush. */
+static int http_note_written(struct aios_sb_info *info, struct aios_http_client *c,
+			     struct inode *inode, struct aios_inode_aux *aux, u64 end,
+			     size_t wrote)
+{
+	u64 size = max_t(u64, (u64)i_size_read(inode), end);
+
+	mark_http_size_dirty(inode, size, wrote);
+	if (!http_should_flush_size(aux))
+		return 0;
+	return http_flush_size(info, c, inode, aux, size);
+}
+
 int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t len)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m = { 0 };
 	struct aios_inode_aux *aux;
+	struct aios_http_client *c;
 	u64 unit;
 	int err;
 
@@ -3038,98 +3739,366 @@ int aios_http_io_write(struct inode *inode, loff_t pos, const void *buf, size_t 
 	if (!aux)
 		return -ENOMEM;
 
-	mutex_lock(&info->http_mu);
-	err = load_inode(info, inode->i_ino, &m);
+	c = http_client_get(info);
+	err = http_file_unit(info, c, inode, aux, &unit);
 	if (err)
 		goto out;
-	if (!S_ISREG(m.mode)) {
-		err = -EISDIR;
-		goto out;
-	}
-	unit = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
-	err = http_chunk_write(info->http, aux, info->volume, m.ino, unit, (u64)pos, buf, len);
+	err = http_chunk_write(c, aux, info->volume, inode->i_ino, unit, (u64)pos, buf, len);
 	if (err)
 		goto out;
-	m.size = max_t(u64, m.size, (u64)pos + len);
-	m.mtime_ns = m.ctime_ns = now_ns();
-	attach_iinfo(inode, &m);
-	mark_http_size_dirty(inode, m.size, len);
-	if (http_should_flush_size(aux)) {
-		err = store_inode(info, &m);
-		if (!err)
-			http_clear_size_dirty(inode, m.size);
-	}
+	err = http_note_written(info, c, inode, aux, (u64)pos + len, len);
 out:
-	inode_meta_reset(&m);
-	mutex_unlock(&info->http_mu);
+	http_client_put(info, c);
 	return err;
 }
 
-#define AIOS_HTTP_WB_MAX 64
-/* Upper bound on collect/flush rounds per ->writepages call; each round that
- * makes no progress or fails terminates the loop earlier. */
-#define AIOS_HTTP_WB_MAX_ROUNDS 4096
+/*
+ * O_DIRECT. The request is cut at chunk boundaries and up to pool_size
+ * segments (capped at AIOS_HTTP_DIO_WINDOW bytes of buffers) are in flight
+ * at once on wb_wq, each on its own pool client, so a large direct read or
+ * write moves at the pool's aggregate rate rather than one chunk per round
+ * trip. User memory is copied in the caller's context (workers have no mm);
+ * segments complete in file order so a short or failed segment truncates the
+ * result at exactly the bytes that are known to have landed / arrived.
+ */
+#define AIOS_HTTP_DIO_WINDOW (16u * 1024u * 1024u)
 
-struct aios_http_wb_page {
-	struct page *page;
-	loff_t pos;
-	size_t len;
-	void *data;
-};
-
-struct aios_http_wb_chunk {
+struct aios_dio_seg {
 	struct work_struct work;
 	struct aios_sb_info *info;
 	struct aios_inode_aux *aux;
 	u64 ino;
 	u64 unit;
-	u64 chunk;
-	struct aios_http_wb_page *pages;
-	unsigned int npages;
+	u64 pos;
+	size_t len;
+	char *buf;
+	bool write;
 	int err;
-	struct completion done;
+	atomic_t *pending;
+	struct completion *done;
 };
 
-static int aios_http_wb_cmp(const void *a, const void *b)
+static void aios_dio_seg_work(struct work_struct *w)
 {
-	const struct aios_http_wb_page *pa = a, *pb = b;
+	struct aios_dio_seg *s = container_of(w, struct aios_dio_seg, work);
+	struct aios_http_client *c = http_client_get(s->info);
 
-	if (pa->pos < pb->pos)
-		return -1;
-	if (pa->pos > pb->pos)
-		return 1;
-	return 0;
+	if (s->write)
+		s->err = http_chunk_write(c, s->aux, s->info->volume, s->ino, s->unit, s->pos,
+					  s->buf, s->len);
+	else
+		s->err = http_read_range(s->info, c, s->ino, s->unit, s->pos, s->pos + s->len,
+					 s->buf);
+	http_client_put(s->info, c);
+	if (atomic_dec_and_test(s->pending))
+		complete(s->done);
+}
+
+ssize_t aios_http_dio(struct inode *inode, loff_t pos, struct iov_iter *iter, bool write)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_inode_aux *aux;
+	struct aios_http_client *c;
+	struct aios_dio_seg *segs;
+	struct completion done;
+	atomic_t pending;
+	unsigned int nseg_max, i;
+	u64 unit, cur = (u64)pos;
+	u64 limit = write ? U64_MAX : (u64)i_size_read(inode);
+	ssize_t total = 0;
+	int err;
+
+	if (!iov_iter_count(iter))
+		return 0;
+	if (!write && cur >= limit)
+		return 0;
+	aux = aios_inode_aux_get(inode, NULL);
+	if (!aux)
+		return -ENOMEM;
+	/* Never hold a pool client while waiting for workers that need one:
+	 * with every client owned by a waiting caller the workers would block
+	 * in aios_http_pool_get forever. */
+	c = http_client_get(info);
+	err = http_file_unit(info, c, inode, aux, &unit);
+	http_client_put(info, c);
+	if (err)
+		return err;
+	nseg_max = clamp_t(u64, AIOS_HTTP_DIO_WINDOW / unit, 1, info->pool_size);
+	segs = kcalloc(nseg_max, sizeof(*segs), GFP_KERNEL);
+	if (!segs)
+		return -ENOMEM;
+	init_completion(&done);
+
+	while (iov_iter_count(iter) && cur < limit && !err) {
+		unsigned int nseg = 0;
+		bool stop = false;
+
+		/* Fill a window of chunk-aligned segments. */
+		while (nseg < nseg_max && iov_iter_count(iter) && cur < limit) {
+			struct aios_dio_seg *s = &segs[nseg];
+			size_t n = min_t(u64, unit - (cur % unit), iov_iter_count(iter));
+
+			n = min_t(u64, n, limit - cur);
+			s->buf = write ? kvmalloc(n, GFP_KERNEL) : kvzalloc(n, GFP_KERNEL);
+			if (!s->buf) {
+				err = -ENOMEM;
+				break;
+			}
+			if (write && copy_from_iter(s->buf, n, iter) != n) {
+				kvfree(s->buf);
+				s->buf = NULL;
+				err = -EFAULT;
+				break;
+			}
+			s->info = info;
+			s->aux = aux;
+			s->ino = inode->i_ino;
+			s->unit = unit;
+			s->pos = cur;
+			s->len = n;
+			s->write = write;
+			s->err = 0;
+			s->pending = &pending;
+			s->done = &done;
+			INIT_WORK(&s->work, aios_dio_seg_work);
+			cur += n;
+			nseg++;
+		}
+		if (!nseg)
+			break;
+
+		reinit_completion(&done);
+		atomic_set(&pending, nseg);
+		for (i = 0; i < nseg; i++)
+			queue_work(info->wb_wq, &segs[i].work);
+		wait_for_completion(&done);
+
+		/* Consume in order; the first failure ends the transfer there. */
+		for (i = 0; i < nseg; i++) {
+			struct aios_dio_seg *s = &segs[i];
+
+			if (!stop && s->err) {
+				if (!err)
+					err = s->err;
+				stop = true;
+			}
+			if (!stop && !write && copy_to_iter(s->buf, s->len, iter) != s->len) {
+				err = -EFAULT;
+				stop = true;
+			}
+			if (!stop)
+				total += s->len;
+			kvfree(s->buf);
+			s->buf = NULL;
+		}
+		if (stop)
+			break;
+	}
+	kfree(segs);
+
+	if (write && total > 0) {
+		int serr;
+
+		c = http_client_get(info);
+		serr = http_note_written(info, c, inode, aux, (u64)pos + total, total);
+		http_client_put(info, c);
+		if (serr && !err)
+			err = serr;
+	}
+	if (total > 0)
+		return total;
+	return err ? err : 0;
 }
 
 /*
- * Apply every page of one work item to its chunk with a single GET → patch →
- * PUT under the stripe lock. All pages in cw belong to cw->chunk.
+ * Buffered writeback.
+ *
+ * write_cache_pages hands us dirty pages in file order. They are copied into
+ * a round buffer sized to one stripe unit (so a sequential writer's round is
+ * exactly one chunk), grouped by chunk, and each chunk group is queued to
+ * wb_wq. Up to AIOS_HTTP_WB_INFLIGHT rounds are in flight at once: the
+ * collector keeps copying the next round while earlier ones are on the wire,
+ * so the pool is busy instead of idling between rounds.
+ *
+ * A worker ends writeback on its own pages as soon as its chunk landed. That
+ * matters for WB_SYNC_ALL, where write_cache_pages waits for a page that is
+ * still under writeback: it must not wait on this thread, which is the one
+ * collecting. It also gives the ordering guarantee for two rounds touching one
+ * chunk: a page can only be in a later round after its earlier writeback
+ * ended, i.e. after that chunk's earlier PUT completed.
+ *
+ * Contiguous pages in a round are contiguous in the round buffer, so a full
+ * chunk is one PUT straight from the buffer and a partial run is one ranged
+ * PUT. A chunk with more than a few disjoint runs is patched with one GET/PUT.
+ */
+#define AIOS_HTTP_WB_MIN_PAGES 64
+#define AIOS_HTTP_WB_MAX_PAGES 1024 /* 4 MiB rounds with 4 KiB pages */
+#define AIOS_HTTP_WB_INFLIGHT 4
+#define AIOS_HTTP_WB_MAX_RUNS 4
+/* Upper bound on collect rounds per ->writepages call; each round that
+ * makes no progress or fails terminates the loop earlier. */
+#define AIOS_HTTP_WB_MAX_ROUNDS 65536
+
+struct aios_http_wb_page {
+	struct page *page;
+	loff_t pos;
+	size_t len; /* bytes below i_size; 0 = nothing to write */
+	char *data; /* slot in the round buffer */
+};
+
+struct aios_http_wb_round;
+
+struct aios_http_wb_chunk {
+	struct work_struct work;
+	struct aios_http_wb_round *round;
+	u64 chunk;
+	struct aios_http_wb_page *pages; /* ascending pos, all in this chunk */
+	unsigned int npages;
+	int err;
+};
+
+struct aios_http_wb_round {
+	struct aios_sb_info *info;
+	struct aios_inode_aux *aux;
+	struct address_space *mapping;
+	struct writeback_control *wbc;
+	u64 ino;
+	u64 unit;
+	unsigned int cap; /* pages per round */
+	unsigned int n; /* pages collected */
+	char *buf; /* cap * PAGE_SIZE */
+	struct aios_http_wb_page *pages;
+	struct aios_http_wb_chunk *chunks;
+	unsigned int nchunks;
+	atomic_t pending; /* chunk works not yet finished */
+	struct completion done;
+	u64 max_end; /* highest file offset written by this round */
+	size_t wrote;
+	int err;
+};
+
+static void aios_http_wb_round_free(struct aios_http_wb_round *r)
+{
+	if (!r)
+		return;
+	kfree(r->chunks);
+	kvfree(r->buf);
+	kfree(r->pages);
+	kfree(r);
+}
+
+static struct aios_http_wb_round *aios_http_wb_round_alloc(struct address_space *mapping,
+							   struct writeback_control *wbc,
+							   struct aios_inode_aux *aux, u64 unit)
+{
+	struct inode *inode = mapping->host;
+	struct aios_http_wb_round *r;
+
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return NULL;
+	r->info = AIOS_SB(inode->i_sb);
+	r->aux = aux;
+	r->mapping = mapping;
+	r->wbc = wbc;
+	r->ino = inode->i_ino;
+	r->unit = unit;
+	r->cap = clamp_t(u64, unit / PAGE_SIZE, AIOS_HTTP_WB_MIN_PAGES, AIOS_HTTP_WB_MAX_PAGES);
+	r->pages = kcalloc(r->cap, sizeof(*r->pages), GFP_KERNEL);
+	r->buf = kvmalloc((size_t)r->cap * PAGE_SIZE, GFP_KERNEL);
+	if (!r->pages || !r->buf) {
+		aios_http_wb_round_free(r);
+		return NULL;
+	}
+	init_completion(&r->done);
+	return r;
+}
+
+/* Finish one page after its chunk was written (or failed). */
+static void aios_http_wb_end_page(struct aios_http_wb_round *r, struct aios_http_wb_page *wp,
+				  int err)
+{
+	if (err) {
+		SetPageError(wp->page);
+		mapping_set_error(r->mapping, err);
+		redirty_page_for_writepage(r->wbc, wp->page);
+	} else {
+		ClearPageError(wp->page);
+	}
+	end_page_writeback(wp->page);
+}
+
+/* Write pages[i..j) — a contiguous run inside one chunk — from the round buffer. */
+static int aios_http_wb_put_run(struct aios_http_client *c, struct aios_http_wb_round *r,
+				const char *oid, struct aios_http_wb_page *pages, unsigned int i,
+				unsigned int j)
+{
+	u64 base = pages[i].pos - (pages[i].pos % r->unit);
+	u64 off = (u64)pages[i].pos - base;
+	size_t len = (size_t)((u64)pages[j - 1].pos + pages[j - 1].len - (u64)pages[i].pos);
+
+	return http_chunk_put(c, oid, r->unit, off, pages[i].data, len);
+}
+
+/*
+ * Apply every page of one work item to its chunk under the stripe lock. The
+ * pages arrive in ascending order and belong to cw->chunk; zero-length pages
+ * (beyond i_size at collect time) are skipped.
  */
 static int aios_http_wb_chunk_apply(struct aios_http_client *c, struct aios_http_wb_chunk *cw)
 {
-	struct mutex *mu = aios_chunk_lock(cw->aux, cw->chunk);
+	struct aios_http_wb_round *r = cw->round;
+	struct mutex *mu = aios_chunk_lock(r->aux, cw->chunk);
+	struct aios_http_wb_page *pg = cw->pages;
 	struct aios_http_buf body = { 0 };
-	u64 base = cw->chunk * cw->unit;
+	u64 base = cw->chunk * r->unit;
+	unsigned int runs = 0, i, j;
 	size_t nlen = 0;
 	char oid[160];
 	char *nb;
-	unsigned int i;
-	int err;
+	int err = 0;
 
-	for (i = 0; i < cw->npages; i++) {
+	/* Count runs and the extent this chunk needs. */
+	for (i = 0; i < cw->npages; i = j) {
 		u64 end;
 
-		if (!cw->pages[i].len)
+		if (!pg[i].len) {
+			j = i + 1;
 			continue;
-		end = (u64)cw->pages[i].pos + cw->pages[i].len - base;
+		}
+		for (j = i + 1; j < cw->npages; j++) {
+			if (!pg[j].len || pg[j].pos != pg[j - 1].pos + PAGE_SIZE ||
+			    pg[j - 1].len != PAGE_SIZE)
+				break;
+		}
+		runs++;
+		end = (u64)pg[j - 1].pos + pg[j - 1].len - base;
 		if (end > nlen)
 			nlen = (size_t)end;
 	}
-	if (!nlen)
+	if (!runs)
 		return 0;
 
-	oid_chunk(cw->info->volume, cw->ino, cw->chunk, oid, sizeof(oid));
+	oid_chunk(r->info->volume, r->ino, cw->chunk, oid, sizeof(oid));
 	mutex_lock(mu);
+	if (runs <= AIOS_HTTP_WB_MAX_RUNS) {
+		for (i = 0; i < cw->npages && !err; i = j) {
+			if (!pg[i].len) {
+				j = i + 1;
+				continue;
+			}
+			for (j = i + 1; j < cw->npages; j++) {
+				if (!pg[j].len || pg[j].pos != pg[j - 1].pos + PAGE_SIZE ||
+				    pg[j - 1].len != PAGE_SIZE)
+					break;
+			}
+			err = aios_http_wb_put_run(c, r, oid, pg, i, j);
+		}
+		mutex_unlock(mu);
+		return err;
+	}
+
+	/* Many scattered pages: one GET → patch → PUT. */
 	err = aios_http_get(c, oid, &body, NULL);
 	if (err && err != -ENOENT) {
 		mutex_unlock(mu);
@@ -3148,9 +4117,9 @@ static int aios_http_wb_chunk_apply(struct aios_http_client *c, struct aios_http
 		memcpy(nb, body.data, body.len);
 	aios_http_buf_free(&body);
 	for (i = 0; i < cw->npages; i++) {
-		if (!cw->pages[i].len)
+		if (!pg[i].len)
 			continue;
-		memcpy(nb + ((u64)cw->pages[i].pos - base), cw->pages[i].data, cw->pages[i].len);
+		memcpy(nb + ((u64)pg[i].pos - base), pg[i].data, pg[i].len);
 	}
 	err = aios_http_put(c, oid, nb, nlen, NULL, NULL);
 	kvfree(nb);
@@ -3161,8 +4130,10 @@ static int aios_http_wb_chunk_apply(struct aios_http_client *c, struct aios_http
 static void aios_http_wb_chunk_work(struct work_struct *work)
 {
 	struct aios_http_wb_chunk *cw = container_of(work, struct aios_http_wb_chunk, work);
+	struct aios_http_wb_round *r = cw->round;
 	struct aios_http_client *c;
 	unsigned int noio;
+	unsigned int i;
 	int err;
 
 	/* This is writeback: every allocation below, including the ones inside
@@ -3170,18 +4141,15 @@ static void aios_http_wb_chunk_work(struct work_struct *work)
 	 * very pages this item was queued to write out. The flag is per-task, so
 	 * it has to be set here rather than inherited from the caller. */
 	noio = memalloc_noio_save();
-	c = aios_http_pool_get(cw->info->http_pool);
-	if (!c) {
-		memalloc_noio_restore(noio);
-		cw->err = -ENOMEM;
-		complete(&cw->done);
-		return;
-	}
+	c = http_client_get(r->info);
 	err = aios_http_wb_chunk_apply(c, cw);
-	aios_http_pool_put(cw->info->http_pool, c);
+	http_client_put(r->info, c);
 	memalloc_noio_restore(noio);
 	cw->err = err;
-	complete(&cw->done);
+	for (i = 0; i < cw->npages; i++)
+		aios_http_wb_end_page(r, &cw->pages[i], err);
+	if (atomic_dec_and_test(&r->pending))
+		complete(&r->done);
 }
 
 #ifdef AIOS_HAS_FOLIO_AOPS
@@ -3192,169 +4160,162 @@ static int aios_http_wb_collect(struct folio *folio, struct writeback_control *w
 static int aios_http_wb_collect(struct page *page, struct writeback_control *wbc, void *data)
 {
 #endif
-	struct aios_http_wb_page **pp = data;
-	struct aios_http_wb_page *batch = *pp;
+	struct aios_http_wb_round *r = data;
 	struct inode *inode = page->mapping->host;
 	loff_t pos = page_offset(page);
 	loff_t i_size = i_size_read(inode);
+	struct aios_http_wb_page *wp;
 	void *kaddr;
-	void *copy;
-	unsigned int n = 0;
 
-	while (n < AIOS_HTTP_WB_MAX && batch[n].page)
-		n++;
-	if (n >= AIOS_HTTP_WB_MAX) {
-		/* Batch full — leave dirty; the next round picks it up. */
+	if (r->n >= r->cap) {
+		/* Round full — leave dirty; the next round picks it up. */
 		redirty_page_for_writepage(wbc, page);
 		unlock_page(page);
 		return 0;
 	}
 
-	copy = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!copy) {
-		redirty_page_for_writepage(wbc, page);
-		unlock_page(page);
-		return -ENOMEM;
-	}
-
 	set_page_writeback(page);
-	batch[n].page = page;
-	batch[n].pos = pos;
-	batch[n].len = 0;
-	batch[n].data = copy;
+	wp = &r->pages[r->n];
+	wp->page = page;
+	wp->pos = pos;
+	wp->len = 0;
+	wp->data = r->buf + (size_t)r->n * PAGE_SIZE;
 	if (pos < i_size) {
-		batch[n].len = min_t(loff_t, PAGE_SIZE, i_size - pos);
+		wp->len = min_t(loff_t, PAGE_SIZE, i_size - pos);
 		kaddr = kmap(page);
-		memcpy(batch[n].data, kaddr, batch[n].len);
+		memcpy(wp->data, kaddr, wp->len);
 		kunmap(page);
 	}
+	r->n++;
 	unlock_page(page);
 	return 0;
 }
 
 /*
- * Write one collected batch (all pages are under writeback). On any failure
- * every page is redirtied so the data is not dropped, then writeback ends.
+ * Group a collected round by chunk and queue one work item per chunk. On
+ * failure to even start, every page is finished with the error (redirtied).
  */
-static int aios_http_wb_flush_batch(struct address_space *mapping, struct writeback_control *wbc,
-				    struct aios_inode_aux *aux, struct aios_http_wb_page *batch,
-				    unsigned int n)
+static int aios_http_wb_round_dispatch(struct aios_http_wb_round *r)
 {
-	struct inode *inode = mapping->host;
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m = { 0 };
-	struct aios_http_wb_chunk *chunks = NULL;
-	unsigned int nchunks = 0, i, c;
-	u64 unit, max_end = 0;
-	size_t wrote = 0;
-	int err;
+	unsigned int i, c;
 
-	sort(batch, n, sizeof(*batch), aios_http_wb_cmp, NULL);
-	for (i = 0; i < n; i++) {
-		if (batch[i].len) {
-			max_end = max_t(u64, max_end, (u64)batch[i].pos + batch[i].len);
-			wrote += batch[i].len;
+	for (i = 0; i < r->n; i++) {
+		if (r->pages[i].len) {
+			r->max_end = max_t(u64, r->max_end, (u64)r->pages[i].pos + r->pages[i].len);
+			r->wrote += r->pages[i].len;
 		}
 	}
-
-	mutex_lock(&info->http_mu);
-	err = load_inode(info, inode->i_ino, &m);
-	unit = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
-	inode_meta_reset(&m);
-	mutex_unlock(&info->http_mu);
-	if (err)
-		goto finish;
-
-	nchunks = 1;
-	for (i = 1; i < n; i++) {
-		if (batch[i].pos / unit != batch[i - 1].pos / unit)
-			nchunks++;
+	r->nchunks = 1;
+	for (i = 1; i < r->n; i++) {
+		if (r->pages[i].pos / r->unit != r->pages[i - 1].pos / r->unit)
+			r->nchunks++;
 	}
-	chunks = kcalloc(nchunks, sizeof(*chunks), GFP_KERNEL);
-	if (!chunks) {
-		err = -ENOMEM;
-		goto finish;
+	r->chunks = kcalloc(r->nchunks, sizeof(*r->chunks), GFP_KERNEL);
+	if (!r->chunks) {
+		for (i = 0; i < r->n; i++)
+			aios_http_wb_end_page(r, &r->pages[i], -ENOMEM);
+		r->err = -ENOMEM;
+		complete(&r->done);
+		return -ENOMEM;
 	}
-
 	c = 0;
-	for (i = 0; i < n; i++) {
-		u64 ch = batch[i].pos / unit;
+	for (i = 0; i < r->n; i++) {
+		u64 ch = r->pages[i].pos / r->unit;
 
-		if (i && ch == chunks[c].chunk) {
-			chunks[c].npages++;
+		if (i && ch == r->chunks[c].chunk) {
+			r->chunks[c].npages++;
 			continue;
 		}
 		if (i)
 			c++;
-		chunks[c].info = info;
-		chunks[c].aux = aux;
-		chunks[c].ino = inode->i_ino;
-		chunks[c].unit = unit;
-		chunks[c].chunk = ch;
-		chunks[c].pages = &batch[i];
-		chunks[c].npages = 1;
-		init_completion(&chunks[c].done);
-		INIT_WORK(&chunks[c].work, aios_http_wb_chunk_work);
+		r->chunks[c].round = r;
+		r->chunks[c].chunk = ch;
+		r->chunks[c].pages = &r->pages[i];
+		r->chunks[c].npages = 1;
+		INIT_WORK(&r->chunks[c].work, aios_http_wb_chunk_work);
 	}
+	atomic_set(&r->pending, r->nchunks);
+	for (i = 0; i < r->nchunks; i++)
+		queue_work(r->info->wb_wq, &r->chunks[i].work);
+	return 0;
+}
 
-	for (i = 0; i < nchunks; i++)
-		queue_work(info->wb_wq, &chunks[i].work);
-	for (i = 0; i < nchunks; i++) {
-		wait_for_completion(&chunks[i].done);
-		if (chunks[i].err && !err)
-			err = chunks[i].err;
-	}
+/* Wait for a dispatched round; returns its first error. */
+static int aios_http_wb_round_wait(struct aios_http_wb_round *r)
+{
+	unsigned int i;
 
-	if (!err && max_end) {
-		mutex_lock(&info->http_mu);
-		if (!load_inode(info, inode->i_ino, &m) && S_ISREG(m.mode)) {
-			m.size = max_t(u64, m.size, max_end);
-			m.mtime_ns = m.ctime_ns = now_ns();
-			attach_iinfo(inode, &m);
-			mark_http_size_dirty(inode, m.size, wrote);
-			if (http_should_flush_size(aux)) {
-				err = store_inode(info, &m);
-				if (!err)
-					http_clear_size_dirty(inode, m.size);
-			}
-		}
-		inode_meta_reset(&m);
-		mutex_unlock(&info->http_mu);
+	wait_for_completion(&r->done);
+	if (r->err)
+		return r->err;
+	for (i = 0; i < r->nchunks; i++) {
+		if (r->chunks[i].err)
+			return r->chunks[i].err;
 	}
+	return 0;
+}
 
-finish:
-	for (i = 0; i < n; i++) {
-		if (err) {
-			SetPageError(batch[i].page);
-			mapping_set_error(mapping, err);
-			redirty_page_for_writepage(wbc, batch[i].page);
-		} else {
-			ClearPageError(batch[i].page);
-		}
-		end_page_writeback(batch[i].page);
-	}
-	kfree(chunks);
-	for (i = 0; i < n; i++)
-		kfree(batch[i].data);
+/*
+ * Collect one round of dirty pages. write_cache_pages is driven in
+ * WB_SYNC_NONE mode with nr_to_write = the round capacity so the scan stops
+ * as soon as the round is full instead of walking (and redirtying) every
+ * remaining dirty page of a large file each round. For a WB_SYNC_ALL caller
+ * tagged_writepages keeps the TOWRITE tagging (pages dirtied after the sync
+ * began are not chased) and pages under writeback from our earlier rounds are
+ * skipped rather than waited for: the caller's filemap_fdatawait covers them.
+ * The caller's nr_to_write is charged for what was collected.
+ */
+static int aios_http_wb_collect_round(struct address_space *mapping,
+				      struct writeback_control *wbc,
+				      struct aios_http_wb_round *r, bool *full)
+{
+	const enum writeback_sync_modes saved_mode = wbc->sync_mode;
+	const long saved_nr = wbc->nr_to_write;
+	const unsigned int saved_tagged = wbc->tagged_writepages;
+	long budget = r->cap;
+	int err;
+
+	if (saved_mode == WB_SYNC_NONE && saved_nr < budget)
+		budget = saved_nr;
+	*full = false;
+	if (budget <= 0)
+		return 0;
+
+	wbc->sync_mode = WB_SYNC_NONE;
+	wbc->nr_to_write = budget;
+	if (saved_mode != WB_SYNC_NONE)
+		wbc->tagged_writepages = 1;
+	err = write_cache_pages(mapping, wbc, aios_http_wb_collect, r);
+	*full = wbc->nr_to_write <= 0;
+	wbc->sync_mode = saved_mode;
+	wbc->tagged_writepages = saved_tagged;
+	wbc->nr_to_write = saved_mode == WB_SYNC_NONE ? saved_nr - (budget - wbc->nr_to_write) :
+							saved_nr;
 	return err;
 }
 
 /*
  * ->writepages is called once by do_writepages; for WB_SYNC_ALL (fsync,
- * sync) every dirty page in the range must be written before returning, so
- * collect/flush rounds continue until write_cache_pages finds nothing more.
- * For WB_SYNC_NONE the loop stops once wbc->nr_to_write is exhausted (which
- * write_cache_pages accounts). A failed round leaves its pages redirtied and
- * terminates the loop so an erroring server cannot spin us forever.
+ * sync) every page dirty at the start must be written before returning, so
+ * rounds continue until a scan finds nothing more (bounded by the number of
+ * cached pages, so a writer racing the fsync cannot keep us here). For
+ * WB_SYNC_NONE the loop stops once wbc->nr_to_write is exhausted. A failed
+ * round leaves its pages redirtied and terminates the loop so an erroring
+ * server cannot spin us forever. The size is pushed to the inode object once
+ * at the end (or when the dirty budget says so), not per round.
  */
 static int aios_http_writepages_noio(struct address_space *mapping,
 				     struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_http_wb_round *ring[AIOS_HTTP_WB_INFLIGHT] = { NULL };
 	struct aios_inode_aux *aux;
-	struct aios_http_wb_page *batch;
-	unsigned int round;
+	struct aios_http_client *c;
+	unsigned int head = 0, tail = 0, inflight = 0, round, depth;
+	unsigned long max_rounds;
+	u64 unit, max_end = 0;
+	size_t wrote = 0;
 	int err = 0;
 
 	if (!info->http_pool || !info->wb_wq)
@@ -3362,35 +4323,104 @@ static int aios_http_writepages_noio(struct address_space *mapping,
 	aux = aios_inode_aux_get(inode, NULL);
 	if (!aux)
 		return -ENOMEM;
-	batch = kcalloc(AIOS_HTTP_WB_MAX, sizeof(*batch), GFP_KERNEL);
-	if (!batch)
-		return -ENOMEM;
+	/* Do not sit on a pool client while the ring waits for workers that
+	 * each need one (see aios_http_dio). */
+	c = http_client_get(info);
+	err = http_file_unit(info, c, inode, aux, &unit);
+	http_client_put(info, c);
+	if (err)
+		return err;
+	depth = clamp_t(unsigned int, info->pool_size, 1, AIOS_HTTP_WB_INFLIGHT);
+	max_rounds = mapping->nrpages / AIOS_HTTP_WB_MIN_PAGES + 2;
+	if (max_rounds > AIOS_HTTP_WB_MAX_ROUNDS)
+		max_rounds = AIOS_HTTP_WB_MAX_ROUNDS;
 
-	for (round = 0; round < AIOS_HTTP_WB_MAX_ROUNDS; round++) {
-		unsigned int n = 0;
+	for (round = 0; round < max_rounds; round++) {
+		struct aios_http_wb_round *r;
+		bool full;
 		int cerr;
 
-		memset(batch, 0, AIOS_HTTP_WB_MAX * sizeof(*batch));
-		cerr = write_cache_pages(mapping, wbc, aios_http_wb_collect, &batch);
-		while (n < AIOS_HTTP_WB_MAX && batch[n].page)
-			n++;
-		if (!n) {
+		if (wbc->sync_mode == WB_SYNC_NONE && wbc->nr_to_write <= 0)
+			break;
+		r = aios_http_wb_round_alloc(mapping, wbc, aux, unit);
+		if (!r) {
+			err = -ENOMEM;
+			break;
+		}
+		cerr = aios_http_wb_collect_round(mapping, wbc, r, &full);
+		if (!r->n) {
+			aios_http_wb_round_free(r);
 			err = cerr;
 			break;
 		}
-		err = aios_http_wb_flush_batch(mapping, wbc, aux, batch, n);
-		if (!err)
+		if (aios_http_wb_round_dispatch(r)) {
+			aios_http_wb_round_free(r);
+			err = -ENOMEM;
+			break;
+		}
+		ring[tail] = r;
+		tail = (tail + 1) % AIOS_HTTP_WB_INFLIGHT;
+		inflight++;
+		if (inflight == depth) {
+			struct aios_http_wb_round *old = ring[head];
+
+			ring[head] = NULL;
+			head = (head + 1) % AIOS_HTTP_WB_INFLIGHT;
+			inflight--;
+			err = aios_http_wb_round_wait(old);
+			if (!err) {
+				max_end = max(max_end, old->max_end);
+				wrote += old->wrote;
+			}
+			aios_http_wb_round_free(old);
+			if (err)
+				break;
+		}
+		if (cerr) {
 			err = cerr;
-		if (err)
 			break;
-		/* A batch that did not fill up means write_cache_pages saw the
-		 * whole range without us skipping anything. */
-		if (n < AIOS_HTTP_WB_MAX)
-			break;
-		if (wbc->sync_mode == WB_SYNC_NONE && wbc->nr_to_write <= 0)
+		}
+		/* A round that did not fill up means the scan saw the whole
+		 * range without us skipping anything. */
+		if (!full)
 			break;
 	}
-	kfree(batch);
+
+	while (inflight) {
+		struct aios_http_wb_round *old = ring[head];
+		int werr;
+
+		ring[head] = NULL;
+		head = (head + 1) % AIOS_HTTP_WB_INFLIGHT;
+		inflight--;
+		werr = aios_http_wb_round_wait(old);
+		if (!werr) {
+			max_end = max(max_end, old->max_end);
+			wrote += old->wrote;
+		} else if (!err) {
+			err = werr;
+		}
+		aios_http_wb_round_free(old);
+	}
+
+	if (max_end) {
+		int serr;
+
+		/* The pages' writeback has ended, so a truncate may already have
+		 * shrunk i_size below max_end: never grow i_size from here, only
+		 * publish whatever it is now. On fsync/sync publish it always;
+		 * otherwise let the dirty budget decide, as for direct writes. */
+		mark_http_size_dirty(inode, 0, wrote);
+		if (wbc->sync_mode == WB_SYNC_ALL || http_should_flush_size(aux)) {
+			c = http_client_get(info);
+			serr = http_flush_size(info, c, inode, aux, (u64)i_size_read(inode));
+			http_client_put(info, c);
+		} else {
+			serr = 0;
+		}
+		if (serr && !err)
+			err = serr;
+	}
 	return err;
 }
 
@@ -3417,46 +4447,36 @@ int aios_http_writepages(struct address_space *mapping, struct writeback_control
 int aios_http_io_set_size(struct inode *inode, loff_t size)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_inode_meta m = { 0 };
 	struct aios_inode_aux *aux;
+	struct aios_http_client *c;
 	int err;
 
 	aux = aios_inode_aux_get(inode, NULL);
 	if (!aux)
 		return -ENOMEM;
-
-	mutex_lock(&info->http_mu);
-	err = load_inode(info, inode->i_ino, &m);
-	if (err)
-		goto out;
-	if (!S_ISREG(m.mode)) {
-		err = -EISDIR;
-		goto out;
-	}
-	if ((u64)size <= m.size) {
-		err = 0;
-		attach_iinfo(inode, &m);
-		http_clear_size_dirty(inode, m.size);
-		goto out;
-	}
-	err = truncate_file(info, aux, &m, (u64)size);
-	if (!err) {
-		attach_iinfo(inode, &m);
-		http_clear_size_dirty(inode, m.size);
-	}
-out:
-	inode_meta_reset(&m);
-	mutex_unlock(&info->http_mu);
+	c = http_client_get(info);
+	err = http_flush_size(info, c, inode, aux, (u64)size);
+	http_client_put(info, c);
 	return err;
 }
 
-/* Best-effort punch hole with KEEP_SIZE: zero overlapping chunk ranges. */
+/*
+ * Best-effort punch hole with KEEP_SIZE: zero overlapping chunk ranges. A
+ * fully covered chunk is deleted (reads of a missing chunk are zeros); a
+ * partial one gets a ranged PUT of zeros, so the hole costs one round trip
+ * per chunk and moves only the punched bytes. Runs on a pool client under
+ * the stripe locks and meta_mu, never http_mu.
+ */
 int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len)
 {
 	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	struct aios_inode_meta m = { 0 };
 	struct aios_inode_aux *aux;
+	struct aios_http_client *c;
 	u64 unit, start, end, p;
+	char *zeros = NULL;
+	size_t zeros_len = 0;
+	int attempt;
 	int err;
 
 	if (offset < 0 || len <= 0)
@@ -3465,21 +4485,12 @@ int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len)
 	if (!aux)
 		return -ENOMEM;
 
-	mutex_lock(&info->http_mu);
-	err = load_inode(info, inode->i_ino, &m);
+	c = http_client_get(info);
+	err = http_file_unit(info, c, inode, aux, &unit);
 	if (err)
 		goto out;
-	if (!S_ISREG(m.mode)) {
-		err = -EISDIR;
-		goto out;
-	}
-	if ((u64)offset >= m.size) {
-		err = 0;
-		goto out;
-	}
-	unit = m.stripe_unit ? m.stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
 	start = (u64)offset;
-	end = min_t(u64, (u64)offset + (u64)len, m.size);
+	end = min_t(u64, (u64)offset + (u64)len, (u64)i_size_read(inode));
 	p = start;
 	while (p < end) {
 		u64 chunk = p / unit;
@@ -3488,15 +4499,11 @@ int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len)
 		size_t n = (size_t)(chunk_end - p);
 		struct mutex *mu = aios_chunk_lock(aux, chunk);
 		char oid[160];
-		struct aios_http_buf body = { 0 };
-		char *nb;
-		size_t nlen;
 
-		oid_chunk(info->volume, m.ino, chunk, oid, sizeof(oid));
-		mutex_lock(mu);
+		oid_chunk(info->volume, inode->i_ino, chunk, oid, sizeof(oid));
 		if (chunk_off == 0 && n == unit) {
-			/* Entire chunk punched — delete object. */
-			err = aios_http_delete(info->http, oid);
+			mutex_lock(mu);
+			err = aios_http_delete(c, oid);
 			mutex_unlock(mu);
 			if (err && err != -ENOENT)
 				goto out;
@@ -3504,126 +4511,145 @@ int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len)
 			p += n;
 			continue;
 		}
-		err = aios_http_get(info->http, oid, &body, NULL);
-		if (err == -ENOENT) {
-			mutex_unlock(mu);
-			err = 0;
-			p += n;
-			continue;
+		if (zeros_len < n) {
+			kvfree(zeros);
+			zeros = kvzalloc(n, GFP_KERNEL);
+			if (!zeros) {
+				err = -ENOMEM;
+				goto out;
+			}
+			zeros_len = n;
 		}
-		if (err) {
-			mutex_unlock(mu);
-			goto out;
-		}
-		nlen = body.len;
-		if (chunk_off + n > nlen)
-			nlen = chunk_off + n;
-		nb = kvmalloc(nlen, GFP_KERNEL);
-		if (!nb) {
-			aios_http_buf_free(&body);
-			mutex_unlock(mu);
-			err = -ENOMEM;
-			goto out;
-		}
-		memset(nb, 0, nlen);
-		if (body.len)
-			memcpy(nb, body.data, body.len);
-		aios_http_buf_free(&body);
-		memset(nb + chunk_off, 0, n);
-		err = aios_http_put(info->http, oid, nb, nlen, NULL, NULL);
-		kvfree(nb);
+		mutex_lock(mu);
+		err = http_chunk_put(c, oid, unit, chunk_off, zeros, n);
 		mutex_unlock(mu);
 		if (err)
 			goto out;
 		p += n;
 	}
-	m.ctime_ns = now_ns();
-	err = store_inode(info, &m);
-	if (!err)
-		attach_iinfo(inode, &m);
+
+	mutex_lock(&aux->meta_mu);
+	err = -EAGAIN;
+	for (attempt = 0; attempt < AIOS_HTTP_META_RETRIES && err == -EAGAIN; attempt++) {
+		if (attempt)
+			http_retry_backoff(attempt);
+		err = load_inode_c(info, c, inode->i_ino, &m);
+		if (err)
+			break;
+		m.ctime_ns = now_ns();
+		err = store_inode_c(info, c, &m);
+		if (!err)
+			attach_iinfo(inode, &m);
+	}
+	mutex_unlock(&aux->meta_mu);
 out:
+	kvfree(zeros);
 	inode_meta_reset(&m);
-	mutex_unlock(&info->http_mu);
-	return err;
+	http_client_put(info, c);
+	return http_no_eagain(err);
 }
 
-static int http_load_xattrs(struct aios_sb_info *info, u64 ino, struct aios_xa_ent **ents,
-			    unsigned int *n, u64 *cas_out, char **raw_js_out)
+/*
+ * Xattrs travel inside the inode object, which every lookup / getattr /
+ * setattr already loads into the aux, so a getxattr or listxattr within the
+ * attribute TTL is served from that copy without a round trip (the same
+ * window in which getattr trusts its cached attributes). Past the TTL, or when
+ * the aux was never filled, one GET on a pool client refreshes both.
+ */
+static int http_xattrs_read(struct inode *inode, struct aios_xa_ent **ents, unsigned int *n)
 {
-	char oid[160];
-	struct aios_http_buf body = { 0 };
-	char *js;
-	char *xobj;
-	u64 cas = 0;
-	int err;
-
-	oid_ino(info->volume, ino, oid, sizeof(oid));
-	err = aios_http_get(info->http, oid, &body, &cas);
-	if (err)
-		return err;
-	js = kmalloc(body.len + 1, GFP_KERNEL);
-	if (!js) {
-		aios_http_buf_free(&body);
-		return -ENOMEM;
-	}
-	memcpy(js, body.data, body.len);
-	js[body.len] = '\0';
-	aios_http_buf_free(&body);
-	xobj = extract_xattrs_object(js);
-	err = parse_xattrs_object(xobj, ents, n);
-	kfree(xobj);
-	if (err) {
-		kfree(js);
-		return err;
-	}
-	if (cas_out)
-		*cas_out = cas;
-	if (raw_js_out)
-		*raw_js_out = js;
-	else
-		kfree(js);
-	return 0;
-}
-
-static int http_store_xattrs(struct aios_sb_info *info, u64 ino, struct aios_xa_ent *ents,
-			     unsigned int n, u64 cas, const char *raw_js)
-{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_inode_aux *aux = inode->i_private;
 	struct aios_inode_meta m = { 0 };
-	char *full = NULL;
-	size_t flen = 0;
-	char oid[160];
+	struct aios_http_client *c;
+	char *xobj;
+	bool fresh = false;
 	int err;
 
-	err = inode_from_json(raw_js, cas, &m);
-	if (err)
-		return err;
-	inode_load_extras(raw_js, &m);
-	kfree(m.xattrs_obj);
-	m.xattrs_obj = NULL;
-	m.ctime_ns = now_ns();
-	if (n) {
-		err = build_xattrs_object(ents, n, &m.xattrs_obj);
-		if (err) {
-			inode_meta_reset(&m);
+	if (aux) {
+		xobj = aux_extra_dup(aux, false, msecs_to_jiffies(aios_attr_ttl_ms(inode->i_sb)),
+				     &fresh);
+		if (fresh) {
+			err = parse_xattrs_object(xobj, ents, n);
+			kfree(xobj);
 			return err;
 		}
 	}
-	m.extras_loaded = true;
-	err = inode_to_json_full(info, &m, &full, &flen);
-	if (err) {
-		inode_meta_reset(&m);
+	c = http_client_get(info);
+	err = load_inode_c(info, c, inode->i_ino, &m);
+	http_client_put(info, c);
+	if (err)
 		return err;
-	}
-	oid_ino(info->volume, ino, oid, sizeof(oid));
-	err = aios_http_put(info->http, oid, full, flen, NULL, &cas);
-	kfree(full);
+	attach_iinfo(inode, &m);
+	err = parse_xattrs_object(m.xattrs_obj, ents, n);
 	inode_meta_reset(&m);
 	return err;
+}
+
+/*
+ * Load → edit → CAS PUT the inode object's xattrs on a pool client under
+ * meta_mu; @edit mutates the entry array and returns 0, or -errno to abort.
+ * A CAS conflict (nlink change, size flush) is retried on a fresh load.
+ */
+static int http_xattrs_update(struct inode *inode,
+			      int (*edit)(struct aios_xa_ent *ents, unsigned int *n, void *arg),
+			      void *arg)
+{
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+	struct aios_inode_meta m = { 0 };
+	struct aios_inode_aux *aux;
+	struct aios_http_client *c;
+	int attempt;
+	int err = -EAGAIN;
+
+	aux = aios_inode_aux_get(inode, NULL);
+	if (!aux)
+		return -ENOMEM;
+	c = http_client_get(info);
+	mutex_lock(&aux->meta_mu);
+	for (attempt = 0; attempt < AIOS_HTTP_META_RETRIES && err == -EAGAIN; attempt++) {
+		struct aios_xa_ent *ents = NULL;
+		unsigned int n = 0;
+
+		if (attempt)
+			http_retry_backoff(attempt);
+		err = load_inode_c(info, c, inode->i_ino, &m);
+		if (err)
+			break;
+		err = parse_xattrs_object(m.xattrs_obj, &ents, &n);
+		if (err)
+			break;
+		if (!ents) {
+			ents = kcalloc(AIOS_HTTP_MAX_XATTRS, sizeof(*ents), GFP_KERNEL);
+			if (!ents) {
+				err = -ENOMEM;
+				break;
+			}
+		}
+		err = edit(ents, &n, arg);
+		if (!err) {
+			kfree(m.xattrs_obj);
+			m.xattrs_obj = NULL;
+			if (n)
+				err = build_xattrs_object(ents, n, &m.xattrs_obj);
+		}
+		free_xa_ents(ents, n);
+		if (err)
+			break;
+		m.extras_loaded = true;
+		m.ctime_ns = now_ns();
+		err = store_inode_c(info, c, &m);
+		if (!err)
+			attach_iinfo(inode, &m);
+	}
+	mutex_unlock(&aux->meta_mu);
+	http_client_put(info, c);
+	inode_meta_reset(&m);
+	return http_no_eagain(err);
 }
 
 int aios_http_getxattr(struct inode *inode, const char *name, void *buf, size_t size)
 {
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	struct aios_xa_ent *ents = NULL;
 	unsigned int n = 0, i;
 	int err;
@@ -3631,10 +4657,9 @@ int aios_http_getxattr(struct inode *inode, const char *name, void *buf, size_t 
 	if (!name || !*name || strlen(name) > AIOS_KABI_NAME_MAX)
 		return -EINVAL;
 
-	mutex_lock(&info->http_mu);
-	err = http_load_xattrs(info, inode->i_ino, &ents, &n, NULL, NULL);
+	err = http_xattrs_read(inode, &ents, &n);
 	if (err)
-		goto out;
+		return err;
 	err = -ENODATA;
 	for (i = 0; i < n; i++) {
 		if (!strcmp(ents[i].name, name)) {
@@ -3651,21 +4676,59 @@ int aios_http_getxattr(struct inode *inode, const char *name, void *buf, size_t 
 		}
 	}
 	free_xa_ents(ents, n);
-out:
-	mutex_unlock(&info->http_mu);
 	return err;
+}
+
+struct http_setxattr_arg {
+	const char *name;
+	const void *buf;
+	size_t size;
+	int flags;
+};
+
+static int http_setxattr_edit(struct aios_xa_ent *ents, unsigned int *n_inout, void *varg)
+{
+	struct http_setxattr_arg *a = varg;
+	unsigned int n = *n_inout, i;
+	bool present = false;
+
+	for (i = 0; i < n; i++) {
+		if (!strcmp(ents[i].name, a->name)) {
+			present = true;
+			break;
+		}
+	}
+	if ((a->flags & AIOS_KABI_XATTR_CREATE) && present)
+		return -EEXIST;
+	if ((a->flags & AIOS_KABI_XATTR_REPLACE) && !present)
+		return -ENODATA;
+	if (!present) {
+		if (n >= AIOS_HTTP_MAX_XATTRS)
+			return -ENOSPC;
+		i = n++;
+		strscpy(ents[i].name, a->name, sizeof(ents[i].name));
+		ents[i].value = NULL;
+		ents[i].value_len = 0;
+	}
+	kfree(ents[i].value);
+	ents[i].value = NULL;
+	ents[i].value_len = 0;
+	if (a->size) {
+		ents[i].value = kmemdup(a->buf, a->size, GFP_KERNEL);
+		if (!ents[i].value) {
+			*n_inout = n;
+			return -ENOMEM;
+		}
+		ents[i].value_len = a->size;
+	}
+	*n_inout = n;
+	return 0;
 }
 
 int aios_http_setxattr(struct inode *inode, const char *name, const void *buf, size_t size,
 		       int flags)
 {
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_xa_ent *ents = NULL;
-	unsigned int n = 0, i;
-	char *raw = NULL;
-	u64 cas = 0;
-	int err;
-	bool present = false;
+	struct http_setxattr_arg a = { .name = name, .buf = buf, .size = size, .flags = flags };
 
 	if (!name || !*name || strlen(name) > AIOS_KABI_NAME_MAX)
 		return -EINVAL;
@@ -3673,75 +4736,19 @@ int aios_http_setxattr(struct inode *inode, const char *name, const void *buf, s
 		return -E2BIG;
 	if (size && !buf)
 		return -EINVAL;
-
-	mutex_lock(&info->http_mu);
-	err = http_load_xattrs(info, inode->i_ino, &ents, &n, &cas, &raw);
-	if (err)
-		goto out;
-	if (!ents) {
-		ents = kcalloc(AIOS_HTTP_MAX_XATTRS, sizeof(*ents), GFP_KERNEL);
-		if (!ents) {
-			err = -ENOMEM;
-			goto out_raw;
-		}
-	}
-	for (i = 0; i < n; i++) {
-		if (!strcmp(ents[i].name, name)) {
-			present = true;
-			break;
-		}
-	}
-	if ((flags & AIOS_KABI_XATTR_CREATE) && present) {
-		err = -EEXIST;
-		goto out_free;
-	}
-	if ((flags & AIOS_KABI_XATTR_REPLACE) && !present) {
-		err = -ENODATA;
-		goto out_free;
-	}
-	if (!present) {
-		if (n >= AIOS_HTTP_MAX_XATTRS) {
-			err = -ENOSPC;
-			goto out_free;
-		}
-		i = n++;
-		strscpy(ents[i].name, name, sizeof(ents[i].name));
-		ents[i].value = NULL;
-		ents[i].value_len = 0;
-	}
-	kfree(ents[i].value);
-	ents[i].value = NULL;
-	ents[i].value_len = 0;
-	if (size) {
-		ents[i].value = kmemdup(buf, size, GFP_KERNEL);
-		if (!ents[i].value) {
-			err = -ENOMEM;
-			goto out_free;
-		}
-		ents[i].value_len = size;
-	}
-	err = http_store_xattrs(info, inode->i_ino, ents, n, cas, raw);
-out_free:
-	free_xa_ents(ents, n);
-out_raw:
-	kfree(raw);
-out:
-	mutex_unlock(&info->http_mu);
-	return err;
+	return http_xattrs_update(inode, http_setxattr_edit, &a);
 }
 
 int aios_http_listxattr(struct inode *inode, char *list, size_t size)
 {
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	struct aios_xa_ent *ents = NULL;
 	unsigned int n = 0, i;
 	size_t need = 0, off = 0;
 	int err;
 
-	mutex_lock(&info->http_mu);
-	err = http_load_xattrs(info, inode->i_ino, &ents, &n, NULL, NULL);
+	err = http_xattrs_read(inode, &ents, &n);
 	if (err)
-		goto out;
+		return err;
 	for (i = 0; i < n; i++)
 		need += strlen(ents[i].name) + 1;
 	if (size == 0) {
@@ -3764,49 +4771,31 @@ int aios_http_listxattr(struct inode *inode, char *list, size_t size)
 	err = (int)need;
 out_free:
 	free_xa_ents(ents, n);
-out:
-	mutex_unlock(&info->http_mu);
 	return err;
 }
 
-int aios_http_removexattr(struct inode *inode, const char *name)
+static int http_removexattr_edit(struct aios_xa_ent *ents, unsigned int *n_inout, void *varg)
 {
-	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
-	struct aios_xa_ent *ents = NULL;
-	unsigned int n = 0, i;
-	char *raw = NULL;
-	u64 cas = 0;
-	int err;
-	bool found = false;
+	const char *name = varg;
+	unsigned int n = *n_inout, i;
 
-	if (!name || !*name || strlen(name) > AIOS_KABI_NAME_MAX)
-		return -EINVAL;
-
-	mutex_lock(&info->http_mu);
-	err = http_load_xattrs(info, inode->i_ino, &ents, &n, &cas, &raw);
-	if (err)
-		goto out;
 	for (i = 0; i < n; i++) {
 		if (!strcmp(ents[i].name, name)) {
 			kfree(ents[i].value);
 			ents[i] = ents[n - 1];
 			ents[n - 1].value = NULL;
-			n--;
-			found = true;
-			break;
+			*n_inout = n - 1;
+			return 0;
 		}
 	}
-	if (!found) {
-		err = -ENODATA;
-		goto out_free;
-	}
-	err = http_store_xattrs(info, inode->i_ino, ents, n, cas, raw);
-out_free:
-	free_xa_ents(ents, n);
-	kfree(raw);
-out:
-	mutex_unlock(&info->http_mu);
-	return err;
+	return -ENODATA;
+}
+
+int aios_http_removexattr(struct inode *inode, const char *name)
+{
+	if (!name || !*name || strlen(name) > AIOS_KABI_NAME_MAX)
+		return -EINVAL;
+	return http_xattrs_update(inode, http_removexattr_edit, (void *)name);
 }
 
 static int http_statfs(struct dentry *dentry, struct kstatfs *buf)
@@ -3882,19 +4871,30 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	info->backend = AIOS_BACKEND_HTTP;
 	info->mount_id = -1;
 	info->conn = NULL;
+	if (!info->pool_size)
+		info->pool_size = AIOSFS_HTTP_POOL_DEFAULT;
+	if (!info->attr_ttl_ms)
+		info->attr_ttl_ms = AIOS_DENTRY_TTL_MS;
 	mutex_init(&info->http_mu);
+	mutex_init(&info->dir_cache_mu);
+	mutex_init(&info->ino_mu);
 	info->dir_cache = kzalloc(sizeof(*info->dir_cache), GFP_KERNEL);
 	if (!info->dir_cache)
 		return -ENOMEM;
 
+	/* One connection is held for namespace operations (info->http); the
+	 * other pool_size serve the data path in parallel. */
 	pool = aios_http_pool_create(info->endpoint, info->cluster_key,
 				     info->app_label[0] ? info->app_label : NULL,
-				     AIOSFS_HTTP_POOL_SIZE, GFP_KERNEL);
+				     info->pool_size + 1, GFP_KERNEL);
 	if (IS_ERR(pool)) {
 		dir_cache_free_all(info);
 		return PTR_ERR(pool);
 	}
 	aios_http_pool_set_timeout_ms(pool, 30000);
+	/* The pool may have clamped the count; everything sized off pool_size
+	 * (workqueue, fan-outs, show_options) must see what really exists. */
+	info->pool_size = aios_http_pool_size(pool) - 1;
 	if (info->principal[0]) {
 		/* Trades the principal key for a ticket now: a wrong key fails the
 		 * mount instead of every later I/O. */
@@ -3911,7 +4911,7 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	/* max_active tracks the client pool: extra workers would only pile up
 	 * blocked in aios_http_pool_get, one kernel stack each. */
 	info->wb_wq = alloc_workqueue("aiosfs-wb", WQ_MEM_RECLAIM | WQ_UNBOUND,
-				      AIOSFS_HTTP_POOL_SIZE);
+				      info->pool_size);
 	if (!info->wb_wq) {
 		aios_http_pool_destroy(pool);
 		info->http_pool = NULL;
@@ -3924,6 +4924,20 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 		goto fail;
 	}
 	info->http = c;
+
+	/* Own bdi so read-ahead is sized to the stripe unit: a sequential
+	 * reader then fetches whole chunks per round trip via ->readahead. */
+	err = super_setup_bdi(sb);
+	if (err)
+		goto fail;
+	{
+		u64 su = info->stripe_unit ? info->stripe_unit : AIOS_HTTP_DEFAULT_STRIPE_UNIT;
+		unsigned long ra = (unsigned long)(su >> PAGE_SHIFT);
+
+		sb->s_bdi->ra_pages = clamp_t(unsigned long, ra, VM_READAHEAD_PAGES,
+					      AIOS_HTTP_WB_MAX_PAGES);
+		sb->s_bdi->io_pages = sb->s_bdi->ra_pages;
+	}
 
 	err = ensure_super(info);
 	if (err)
@@ -3946,7 +4960,8 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	}
 	aios_d_mark_fresh(sb->s_root);
 	inode_meta_reset(&root);
-	pr_info("aiosfs: mounted with backend=http (pool=%u)\n", AIOSFS_HTTP_POOL_SIZE);
+	pr_info("aiosfs: mounted with backend=http (pool=%u actimeo=%ums)\n", info->pool_size,
+		info->attr_ttl_ms);
 	return 0;
 
 fail:

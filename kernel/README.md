@@ -56,6 +56,15 @@ sudo mount -t aios none /mnt/aios \
 
 Prefer a numeric IPv4 `endpoint=` (hostname resolution needs `CONFIG_DNS_RESOLVER`).
 
+HTTP-backend tuning:
+
+- `pool=N` — number of pooled HTTP connections used by the data path (read/readahead,
+  writeback, O_DIRECT, background chunk deletion) and by metadata revalidation. Default 4, max 32.
+  Namespace operations (create/unlink/rename/mkdir) are serialized on their own connection.
+- `actimeo=SECONDS` — attribute / directory / xattr cache lifetime (default 1 s). Within the window
+  `stat`, `readdir`, `getxattr` and `listxattr` are answered from the in-core inode; after it a
+  `HEAD` with the cached CAS tag revalidates the inode (a full `GET` only if it changed).
+
 ## Filesystem — upcall + aios-kbridge
 
 ```bash
@@ -66,7 +75,7 @@ sudo mount -t aios none /mnt/aios \
   -o backend=upcall,endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
 ```
 
-Mount options: `endpoint`, `cluster_key`, `backend=upcall|http`, `volume`, `app_label`, `stripe_unit`, `stripe_width`, `uid`, `gid`.
+Mount options: `endpoint`, `cluster_key`, `backend=upcall|http`, `volume`, `app_label`, `stripe_unit`, `stripe_width`, `uid`, `gid`, `principal`/`key`, `pool` (http), `actimeo` (http).
 
 ## Block device — aiosvd
 

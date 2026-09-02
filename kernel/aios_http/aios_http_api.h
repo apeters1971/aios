@@ -58,9 +58,16 @@ int aios_http_get(struct aios_http_client *c, const char *oid, struct aios_http_
 int aios_http_head(struct aios_http_client *c, const char *oid, u64 *size_out, u64 *cas_out);
 int aios_http_put(struct aios_http_client *c, const char *oid, const void *body, size_t len,
 		  const char *extra_hdrs, u64 *cas_inout /* NULL=unconditional; else CAS */);
-/* Partial PUT via Content-Range (bytes start-end inclusive, '*' for total). */
+/* Partial PUT via Content-Range (bytes start-end inclusive, '*' for total).
+ * The server applies the patch (zero-filling any gap) and creates the object
+ * when missing. -EOPNOTSUPP when the tip is erasure-coded or compressed and
+ * the caller must rewrite the whole object instead. */
 int aios_http_put_range(struct aios_http_client *c, const char *oid, u64 offset,
 			const void *data, size_t len, u64 *cas_inout);
+/* POST /o/{oid}/append: atomic append at tip size. size_out receives the new
+ * object size. lock_token may be NULL. */
+int aios_http_append(struct aios_http_client *c, const char *oid, const void *data, size_t len,
+		     const char *lock_token, u64 *size_out);
 int aios_http_delete(struct aios_http_client *c, const char *oid);
 
 /* Range GET: bytes start-end inclusive. */

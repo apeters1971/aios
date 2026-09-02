@@ -79,7 +79,14 @@ struct aios_http_pool;
 
 #define AIOSFS_NAME "aios"
 #define AIOSFS_MAGIC 0x41494F53 /* AIOS */
-#define AIOSFS_HTTP_POOL_SIZE 4
+/* HTTP connections per mount (pool= mount option). Bounds the parallelism of
+ * reads, writeback, O_DIRECT and deferred deletes. */
+#define AIOSFS_HTTP_POOL_DEFAULT 8
+/* aios_http_pool holds at most BITS_PER_LONG clients and one is reserved for
+ * the namespace path, so at most 63 are available to the data path. */
+#define AIOSFS_HTTP_POOL_MAX 63
+/* Inode numbers reserved per CAS on the super object (K-14). */
+#define AIOSFS_INO_BATCH 256
 
 enum aios_backend {
 	AIOS_BACKEND_UPCALL = 0,
@@ -103,12 +110,18 @@ struct aios_inode_aux {
 	u32 stripe_width;
 	u64 dirty_bytes;
 	unsigned long dirty_since; /* jiffies; 0 if size/mtime is clean */
+	/* jiffies of the last server load that filled cas / extras; the xattr
+	 * cache is served while this is within the attribute TTL. */
+	unsigned long meta_jiffies;
 	/* extras_lock guards xattrs_obj / symlink / extras_valid. */
 	spinlock_t extras_lock;
 	char *xattrs_obj; /* heap `"xattrs"` object `{...}`, or NULL */
 	char *symlink;
 	bool extras_valid;
 	struct mutex chunk_mu[AIOS_CHUNK_LOCK_STRIPES];
+	/* Serialises PUTs of this inode's metadata object from paths that do
+	 * not hold info->http_mu (deferred size flush vs setattr / xattr). */
+	struct mutex meta_mu;
 };
 
 /* Get-or-create inode->i_private. Safe against concurrent callers. */
@@ -121,18 +134,34 @@ static inline struct mutex *aios_chunk_lock(struct aios_inode_aux *aux, u64 chun
 
 struct aios_dir_cache;
 
+/* Default attribute / dentry TTL (actimeo= mount option, milliseconds). */
 #define AIOS_DENTRY_TTL_MS 250
 
 struct aios_sb_info {
 	enum aios_backend backend;
 	struct aios_conn *conn;
+	/*
+	 * Namespace operations (lookup, create, unlink, rename, ...) run under
+	 * http_mu on this client. The data path (reads, writeback, O_DIRECT,
+	 * punch, deferred deletes) and attribute refreshes take a client from
+	 * http_pool per request and never hold http_mu, so a slow chunk transfer
+	 * cannot stall stat() and files are read/written in parallel.
+	 */
 	struct aios_http_client *http;
 	struct aios_http_pool *http_pool;
-	/* Writeback fan-out. Must not be system_wq: these items do socket I/O and
-	 * allocate, so on the reclaim path they need a rescuer to make progress. */
+	unsigned int pool_size;
+	/* Writeback fan-out and deferred chunk deletion. Must not be system_wq:
+	 * these items do socket I/O and allocate, so on the reclaim path they
+	 * need a rescuer to make progress. */
 	struct workqueue_struct *wb_wq;
 	struct mutex http_mu;
+	struct mutex dir_cache_mu;
 	struct aios_dir_cache *dir_cache;
+	/* Locally reserved inode numbers [ino_next, ino_end). */
+	struct mutex ino_mu;
+	u64 ino_next;
+	u64 ino_end;
+	unsigned int attr_ttl_ms;
 	int mount_id;
 	char endpoint[256];
 	/* Shared cluster key, or the principal key when principal[0] is set. */
@@ -183,8 +212,13 @@ int aios_http_io_set_size(struct inode *inode, loff_t size);
 int aios_http_io_punch(struct inode *inode, loff_t offset, loff_t len);
 /* Parallel dirty-page flush using aios_http_pool (chunk-grouped). */
 int aios_http_writepages(struct address_space *mapping, struct writeback_control *wbc);
+/* O_DIRECT: chunk-aligned segments in flight in parallel over the pool.
+ * Returns bytes transferred (>0), 0 at EOF, or -errno. */
+ssize_t aios_http_dio(struct inode *inode, loff_t pos, struct iov_iter *iter, bool write);
 /* Called from evict_inode when i_nlink == 0: remove chunks + inode object. */
 void aios_http_evict_unlinked(struct inode *inode);
+/* Read-ahead: one ranged GET per contiguous run (per chunk). */
+void aios_http_readahead(struct readahead_control *rac);
 
 /* xattrs (HTTP backend) */
 int aios_http_getxattr(struct inode *inode, const char *name, void *buf, size_t size);
@@ -232,10 +266,17 @@ static inline void aios_d_mark_fresh(struct dentry *dentry)
 		dentry->d_time = jiffies;
 }
 
+static inline unsigned int aios_attr_ttl_ms(const struct super_block *sb)
+{
+	const struct aios_sb_info *info = sb ? sb->s_fs_info : NULL;
+
+	return info && info->attr_ttl_ms ? info->attr_ttl_ms : AIOS_DENTRY_TTL_MS;
+}
+
 static inline bool aios_d_is_fresh(const struct dentry *dentry)
 {
 	return dentry && time_before(jiffies, dentry->d_time +
-						     msecs_to_jiffies(AIOS_DENTRY_TTL_MS));
+						     msecs_to_jiffies(aios_attr_ttl_ms(dentry->d_sb)));
 }
 
 #endif /* AIOSFS_H */

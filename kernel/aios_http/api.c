@@ -649,6 +649,15 @@ int aios_http_put_range(struct aios_http_client *c, const char *oid, u64 offset,
 	err = request_with_hdrs(c, "PUT", b->path, b->all, data, len, &status, NULL, NULL, 0);
 	if (err)
 		goto out;
+	/*
+	 * The server refuses Content-Range on erasure-coded or compressed tips
+	 * with 400; report that distinctly so callers can fall back to a full
+	 * object rewrite instead of treating it as a bad request.
+	 */
+	if (status == 400) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
 	err = aios_http_map_status(status);
 	if (err)
 		goto out;
@@ -660,6 +669,63 @@ out:
 	return err;
 }
 EXPORT_SYMBOL_GPL(aios_http_put_range);
+
+int aios_http_append(struct aios_http_client *c, const char *oid, const void *data, size_t len,
+		     const char *lock_token, u64 *size_out)
+{
+	struct {
+		char enc[1024];
+		char path[AIOS_HTTP_PATH_MAX];
+		char extra[256];
+	} *b;
+	struct aios_http_buf body = { 0 };
+	int status = 0;
+	int err;
+	s64 size = 0;
+
+	if (!c || (!data && len))
+		return -EINVAL;
+	b = kmalloc(sizeof(*b), c->gfp);
+	if (!b)
+		return -ENOMEM;
+	err = aios_http_encode_oid(oid, b->enc, sizeof(b->enc));
+	if (err)
+		goto out;
+	if (snprintf(b->path, sizeof(b->path), "/o/%s/append", b->enc) >= (int)sizeof(b->path)) {
+		err = -ENAMETOOLONG;
+		goto out;
+	}
+	if (lock_token && lock_token[0])
+		snprintf(b->extra, sizeof(b->extra),
+			 "Content-Type: application/octet-stream\r\n"
+			 "x-aios-lock-token: %s\r\n",
+			 lock_token);
+	else
+		snprintf(b->extra, sizeof(b->extra), "Content-Type: application/octet-stream\r\n");
+
+	err = aios_http_request(c, "POST", b->path, b->extra, data, len, &status, &body);
+	if (err)
+		goto out;
+	if (status != 200) {
+		aios_http_buf_free(&body);
+		err = aios_http_map_status(status);
+		goto out;
+	}
+	err = aios_http_json_s64(body.data, body.len, "size", &size);
+	aios_http_buf_free(&body);
+	if (err)
+		goto out;
+	if (size < 0) {
+		err = -EIO;
+		goto out;
+	}
+	if (size_out)
+		*size_out = (u64)size;
+out:
+	kfree(b);
+	return err;
+}
+EXPORT_SYMBOL_GPL(aios_http_append);
 
 int aios_http_delete(struct aios_http_client *c, const char *oid)
 {

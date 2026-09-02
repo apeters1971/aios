@@ -123,6 +123,16 @@ static int aios_writepages(struct address_space *mapping, struct writeback_contr
 	return write_cache_pages(mapping, wbc, aios_writepages_cb, NULL);
 }
 
+/* Pages we do not consume are unlocked by the VFS and read via ->readpage. */
+static void aios_readahead(struct readahead_control *rac)
+{
+	struct inode *inode = rac->mapping->host;
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
+
+	if (info->backend == AIOS_BACKEND_HTTP && info->http_pool)
+		aios_http_readahead(rac);
+}
+
 #ifdef AIOS_HAS_FOLIO_AOPS
 static int aios_write_begin(struct file *file, struct address_space *mapping, loff_t pos,
 			    unsigned len, struct page **pagep, void **fsdata)
@@ -217,6 +227,7 @@ const struct address_space_operations aios_aops = {
 	.writepages = aios_writepages,
 	.set_page_dirty = __set_page_dirty_nobuffers,
 #endif
+	.readahead = aios_readahead,
 	.write_begin = aios_write_begin,
 	.write_end = aios_write_end,
 };
@@ -224,6 +235,7 @@ const struct address_space_operations aios_aops = {
 static ssize_t aios_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool write)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	struct aios_sb_info *info = AIOS_SB(inode->i_sb);
 	loff_t pos = iocb->ki_pos;
 	size_t total = iov_iter_count(iter);
 	size_t chunk = min_t(size_t, total, AIOS_DIO_CHUNK);
@@ -233,6 +245,19 @@ static ssize_t aios_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool wr
 
 	if (!total)
 		return 0;
+
+	if (info->backend == AIOS_BACKEND_HTTP && info->http_pool && info->wb_wq) {
+		ssize_t ret = aios_http_dio(inode, pos, iter, write);
+
+		if (ret > 0) {
+			iocb->ki_pos = pos + ret;
+			if (write && iocb->ki_pos > i_size_read(inode)) {
+				i_size_write(inode, iocb->ki_pos);
+				mark_inode_dirty(inode);
+			}
+		}
+		return ret;
+	}
 
 	buf = kvmalloc(chunk, GFP_KERNEL);
 	if (!buf)
@@ -401,6 +426,7 @@ struct aios_inode_aux *aios_inode_aux_get(struct inode *inode, bool *created)
 	if (!fresh)
 		return NULL;
 	spin_lock_init(&fresh->extras_lock);
+	mutex_init(&fresh->meta_mu);
 	for (i = 0; i < AIOS_CHUNK_LOCK_STRIPES; i++)
 		mutex_init(&fresh->chunk_mu[i]);
 	fresh->last_synced_size = (u64)i_size_read(inode);
