@@ -117,8 +117,14 @@ current fix cycle — check the regression test of the same name before relying 
 
 ### Build, CI and repository
 
+- `LICENSE`: GPL-3.0-or-later for the project; `kernel/` modules are GPL-2.0-or-later
+  (`MODULE_LICENSE("GPL")`) because they link against the GPL-2.0-only kernel.
+- `ProcessSmoke.*`: the first process-level tests. They spawn the built `aiosd` and `aios`
+  binaries, bring a single-node daemon up on free loopback ports, and check `--version`, usage
+  errors, PUT/GET/LIST/DELETE over the wire, a wrong-key 401, a CLI round trip, the status file,
+  a clean `SIGTERM` exit and object durability across a daemon restart.
 - GitHub Actions workflow: Linux (gcc) and macOS (AppleClang) with `-Werror`, ASan+UBSan
-  (required) and TSan (advisory) matrix, AlmaLinux 9 kernel-module build (advisory until KRN-1).
+  (required) and TSan (advisory) matrix, AlmaLinux 9 kernel-module build (blocking).
 - `CMakePresets.json` with `default`, `ci`, `asan-ubsan`, `tsan` configure/build/test/workflow
   presets; `AIOS_WERROR` and `AIOS_SANITIZE` options (`cmake/AiosBuildOptions.cmake`).
 - FetchContent dependencies pinned to commit hashes (yaml-cpp 0.8.0, nlohmann/json v3.11.3,

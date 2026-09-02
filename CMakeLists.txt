@@ -586,9 +586,16 @@ add_executable(aios_tests
   tests/test_review2_store.cpp
   tests/test_review2_posix.cpp
   tests/test_review2_kabi.cpp
+  tests/test_process_smoke.cpp
 )
 target_include_directories(aios_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)
+# The process-level smoke test spawns the real daemon and CLI binaries.
+target_compile_definitions(aios_tests PRIVATE
+  AIOS_TEST_AIOSD_PATH="$<TARGET_FILE:aiosd>"
+  AIOS_TEST_AIOS_CLI_PATH="$<TARGET_FILE:aios>"
+)
+add_dependencies(aios_tests aiosd aios)
 gtest_discover_tests(aios_tests
   DISCOVERY_MODE PRE_TEST
   PROPERTIES RUN_SERIAL TRUE
@@ -607,4 +614,5 @@ install(DIRECTORY src/client/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios/clien
   PATTERN "vbd_registry_client.hpp" EXCLUDE)   # pulls in daemon-side object_service.hpp
 install(FILES "${AIOS_GENERATED_INCLUDE_DIR}/aios_version.hpp" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
 install(FILES config/aiosd.example.yaml DESTINATION ${CMAKE_INSTALL_DATADIR}/aios)
+install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/aios)
 install(DIRECTORY web/admin DESTINATION ${CMAKE_INSTALL_DATADIR}/aios)

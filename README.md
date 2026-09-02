@@ -1052,8 +1052,14 @@ first, otherwise ASan/TSan may abort at startup.
 
 **GitHub Actions** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): `linux` (gcc, `ci` preset), `macos`
 (AppleClang, `ci` preset), `sanitizers` (`asan-ubsan` required, `tsan` advisory while known races are fixed),
-and `kernel` (the three modules against AlmaLinux 9 `kernel-devel` with `KCFLAGS=-Werror`; advisory until the
-current kernel compile fix lands). FetchContent sources are cached between runs.
+and `kernel` (the three modules against AlmaLinux 9 `kernel-devel` with `KCFLAGS=-Werror`). FetchContent
+sources are cached between runs.
+
+**Process-level smoke test.** `ProcessSmoke.*` is the one part of the suite that is not in-process: it
+spawns the built `aiosd` and `aios` binaries (paths baked in at configure time), brings a single-node
+daemon up on free loopback ports with a scratch `.aios` target, and checks `--version`, CLI usage errors,
+PUT/GET/LIST/DELETE over the wire, a wrong-key 401, a CLI `put`/`get` round trip, the status file,
+a clean `SIGTERM` exit, and that objects survive a daemon restart on the same disk.
 
 Contributor workflow, style and commit conventions: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -1084,3 +1090,15 @@ Contributor workflow, style and commit conventions: [`CONTRIBUTING.md`](CONTRIBU
 | [`docs/dev/`](docs/dev/) | Review audit trail (`CODE_REVIEW.md`) and development statistics (`STATS.md`) |
 
 Run the GoogleTest suite after changes — see [Testing & CI](#testing--ci).
+
+---
+
+## License
+
+AIOS is free software, licensed under the **GNU General Public License, version 3 or (at your option) any
+later version** — see [`LICENSE`](LICENSE).
+
+The Linux kernel modules under [`kernel/`](kernel/) (`aios_http`, `aiosfs`, `aiosvd`) are the exception: they
+link against the GPL-2.0-only kernel and declare `MODULE_LICENSE("GPL")`, so they are licensed under the
+**GNU General Public License, version 2 or (at your option) any later version**. Contributions to `kernel/`
+must be compatible with GPL-2.0-or-later; everything else is GPL-3.0-or-later.
