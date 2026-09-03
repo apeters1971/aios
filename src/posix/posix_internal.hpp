@@ -183,6 +183,11 @@ struct InodeCacheEnt {
   InodeMeta meta;
   std::chrono::steady_clock::time_point loaded{};
   uint64_t lru{0};
+  // Created under a directory lease: the inode object is not on the server yet.
+  // load_inode must not GET (it would 404 and drop the cache); the lease flusher
+  // PUTs it before the directory Link that names it becomes visible.
+  bool unpublished{false};
+  std::optional<std::string> create_path;
 };
 
 struct DirCacheEnt {
@@ -334,9 +339,10 @@ void txn_put_dir(Session& session, const std::string& txn_id, DirTable& dir,
  * A directory this mount is modifying is leased: we hold the server lock on its
  * meta object and keep renewing it. While the lease lasts nobody else can commit
  * to the directory, so create/unlink/rename only update the lease's in-memory
- * table and queue a changelog record; a flusher thread appends the queue in
- * batches (one append + one CAS PUT of meta per batch) and writes the parent
- * inode's mtime/nlink once per batch. Reads (lookup, readdir) are served from the
+ * table (and the child's in-core inode) and queue a changelog record; a flusher
+ * thread PUTs any unpublished child inodes, then appends the queue in batches
+ * (one append + one CAS PUT of meta per batch) and writes the parent inode's
+ * mtime/nlink once per batch. Reads (lookup, readdir) are served from the
  * lease's table without a round trip.
  *
  * A peer wanting the directory calls lock/break; we see break_requested at the
@@ -461,7 +467,8 @@ struct FsState {
   uint32_t default_uid{0};
   uint32_t default_gid{0};
   std::string frontend_label{"fs"};  // s3 | fs | custom (for IO monitoring)
-  std::mutex mu;  // super, inode_cache, flock_tokens, rstat_dirty, dir_cache, dirty_sizes
+  std::mutex mu;  // super, inode_cache, flock_tokens, rstat_dirty, dir_cache, dirty_sizes,
+                  // unpublished_dropped
   SuperMeta super;
   std::chrono::steady_clock::time_point super_loaded{};
   std::unordered_map<uint64_t, InodeCacheEnt> inode_cache;
@@ -481,6 +488,9 @@ struct FsState {
   ChunkCache chunk_cache;
   std::unordered_map<uint64_t, DirCacheEnt> dir_cache;
   std::unordered_map<uint64_t, DirtySize> dirty_sizes;
+  // Created under a lease then unlinked (or rmdir'd) before the flusher PUT.
+  // publish_inodes must not recreate the object.
+  std::unordered_set<uint64_t> unpublished_dropped;
   // Locally reserved inode numbers [ino_next, ino_end); under mu.
   uint64_t ino_next{0};
   uint64_t ino_end{0};
@@ -524,7 +534,17 @@ void flush_all_dirty_inodes(FsState& st,
 // just made). cache_touch_size_locked merges a larger size/newer times without
 // disturbing other fields, which is what concurrent writers must use.
 void cache_inode_locked(FsState& st, const InodeMeta& m);
+void cache_unpublished_locked(FsState& st, const InodeMeta& m,
+                              const std::optional<std::string>& create_path);
 void cache_erase_locked(FsState& st, uint64_t ino);
+// Path used for the first PUT of an unpublished create (layout rules); nullopt if published.
+std::optional<std::string> unpublished_create_path(FsState& st, uint64_t ino);
+// PUT unpublished child inodes (those named by pending Link records) so a
+// subsequent changelog append cannot publish a name whose inode object is missing.
+void publish_inodes(FsState& st, const std::vector<uint64_t>& inos);
+int commit_new_dentry(FsState& st, DirTable& dir, const std::string& name, InodeMeta& m,
+                      const std::optional<std::string>& path, InodeMeta& pmeta, uint64_t ts,
+                      int nlink_delta);
 void dir_cache_evict_locked(FsState& st);
 
 // Cross-directory rename via /txn (compact rewrite of both dir tips under locks).

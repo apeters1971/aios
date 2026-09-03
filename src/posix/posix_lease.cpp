@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <string>
+#include <vector>
 
 namespace aios {
 namespace posix {
@@ -499,6 +501,7 @@ int DirLeaseManager::flush(DirLease& l) {
     std::string token;
     uint64_t next_op, log_bytes, snapshot_op, meta_cas;
     PutLayout layout;
+    std::vector<uint64_t> child_inos;
     {
       std::lock_guard lock(l.mu);
       for (const auto& op : l.pending) {
@@ -510,6 +513,9 @@ int DirLeaseManager::flush(DirLease& l) {
         if (!batch.empty() && batch.size() + enc.size() > kLeaseBatchBytes) break;
         batch += enc;
         ++n;
+        if (op.op == kOpLink && op.args.size() >= 2) {
+          child_inos.push_back(static_cast<uint64_t>(std::stoull(op.args[1])));
+        }
       }
       pd = l.parent_dirty;
       pts = l.parent_mtime_ns;
@@ -527,6 +533,7 @@ int DirLeaseManager::flush(DirLease& l) {
 
     try {
       if (n) {
+        publish_inodes(st_, child_inos);
         auto ar = st_.session.append(l.log_oid, batch, token);
         if (ar.offset != log_bytes || ar.size >= changelog::kAutoCompactBytes) {
           // Garbage past the committed log_bytes (a peer's failed append, or a
@@ -665,6 +672,9 @@ void DirLeaseManager::replay(DirLease& l) {
       op = l.pending.front();
     }
     try {
+      if (op.op == kOpLink && op.args.size() >= 2) {
+        publish_inodes(st_, {static_cast<uint64_t>(std::stoull(op.args[1]))});
+      }
       raw.append_ops({{op.op, op.args}});
     } catch (const client_error& e) {
       AIOS_LOG_WARN("posix: dir ", l.ino, ": lost lease, op ", op.op, " on \"",

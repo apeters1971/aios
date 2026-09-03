@@ -1166,3 +1166,25 @@ TEST(Review2Posix, NoLeaseFlagCommitsSynchronously) {
   EXPECT_EQ(aios_posix_fsyncdir(fs, 1), 0);
   aios_posix_unmount(fs);
 }
+
+TEST(Review2Posix, DirLeaseUnlinkOfUnpublishedCreateLeavesNoInode) {
+  HttpFixture http("aios-r2p-lease6", 23540);
+  Mount a(http, "lease6", 4096);
+  const uint64_t ino = create_file(a.fs, 1, "tmp");
+  EXPECT_EQ(aios_posix_unlink(a.fs, 1, "tmp"), 0);
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+  {
+    aios::Session s(http.session_cfg());
+    auto snap = s.get_object(aios::posix::ino_oid("lease6", ino));
+    EXPECT_FALSE(snap.exists) << "create+unlink before flush must not leave an inode object";
+  }
+  EXPECT_EQ(server_dir(http, "lease6", 1).count("tmp"), 0u);
+
+  const uint64_t keep = create_file(a.fs, 1, "keep");
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+  {
+    aios::Session s(http.session_cfg());
+    auto snap = s.get_object(aios::posix::ino_oid("lease6", keep));
+    EXPECT_TRUE(snap.exists) << "flusher PUTs the inode before the directory Link";
+  }
+}

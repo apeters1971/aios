@@ -15,7 +15,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <errno.h>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <random>
 #include <sstream>
@@ -1172,7 +1174,7 @@ void inode_cache_evict_locked(FsState& st) {
   std::vector<std::pair<uint64_t, uint64_t>> clean;  // lru, ino
   clean.reserve(st.inode_cache.size());
   for (const auto& [ino, e] : st.inode_cache) {
-    if (st.dirty_sizes.count(ino)) continue;
+    if (e.unpublished || st.dirty_sizes.count(ino)) continue;
     clean.emplace_back(e.lru, ino);
   }
   const size_t target = kInodeCacheMaxEntries - kInodeCacheMaxEntries / 8;
@@ -1187,10 +1189,33 @@ void inode_cache_evict_locked(FsState& st) {
 void cache_inode_locked(FsState& st, const InodeMeta& m) {
   auto& e = st.inode_cache[m.ino];
   e.meta = m;
+  e.unpublished = false;
+  e.create_path.reset();
   merge_dirty_locked(st, e.meta);
   e.loaded = std::chrono::steady_clock::now();
   e.lru = ++st.inode_cache_clock;
   inode_cache_evict_locked(st);
+}
+
+void cache_unpublished_locked(FsState& st, const InodeMeta& m,
+                              const std::optional<std::string>& create_path) {
+  st.unpublished_dropped.erase(m.ino);
+  auto& e = st.inode_cache[m.ino];
+  e.meta = m;
+  e.meta.exists = true;
+  e.unpublished = true;
+  e.create_path = create_path;
+  merge_dirty_locked(st, e.meta);
+  e.loaded = std::chrono::steady_clock::now();
+  e.lru = ++st.inode_cache_clock;
+  inode_cache_evict_locked(st);
+}
+
+std::optional<std::string> unpublished_create_path(FsState& st, uint64_t ino) {
+  std::lock_guard lock(st.mu);
+  auto it = st.inode_cache.find(ino);
+  if (it != st.inode_cache.end() && it->second.unpublished) return it->second.create_path;
+  return std::nullopt;
 }
 
 void cache_erase_locked(FsState& st, uint64_t ino) { st.inode_cache.erase(ino); }
@@ -1220,7 +1245,8 @@ InodeMeta load_inode(FsState& st, uint64_t ino) {
     std::lock_guard lock(st.mu);
     auto it = st.inode_cache.find(ino);
     if (it != st.inode_cache.end() &&
-        std::chrono::steady_clock::now() - it->second.loaded < kInodeCacheTtl) {
+        (it->second.unpublished ||
+         std::chrono::steady_clock::now() - it->second.loaded < kInodeCacheTtl)) {
       it->second.lru = ++st.inode_cache_clock;
       return it->second.meta;
     }
@@ -1248,7 +1274,9 @@ void prefetch_inodes(FsState& st, const std::vector<uint64_t>& inos) {
     const auto now = std::chrono::steady_clock::now();
     for (uint64_t ino : inos) {
       auto it = st.inode_cache.find(ino);
-      if (it != st.inode_cache.end() && now - it->second.loaded < kInodeCacheTtl) continue;
+      if (it != st.inode_cache.end() &&
+          (it->second.unpublished || now - it->second.loaded < kInodeCacheTtl))
+        continue;
       miss.push_back(ino);
     }
   }
@@ -1292,10 +1320,26 @@ void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& pa
       return;
     } catch (const client_error& e) {
       if (e.code() != "conflict") throw;
+      // Another writer published first (typical: lease flusher vs setattr/fsync
+      // on an unpublished create). Adopt the server copy when we have no
+      // reapply, otherwise restated mutation below.
+      if (!reapply) {
+        auto fresh = st.session.get_object(ino_oid(st.volume, m.ino));
+        if (fresh.exists) {
+          InodeMeta next = inode_from_json(fresh.body, cas_from_attrs(fresh.attrs));
+          next.ino = m.ino;
+          std::lock_guard lock(st.mu);
+          merge_dirty_locked(st, next);
+          cache_inode_locked(st, next);
+          m = std::move(next);
+          return;
+        }
+        m.cas = 0;
+        continue;
+      }
       // Another writer changed the record. Re-applying the caller's stale copy would
       // silently discard their fields, so only operations that can restate their own
       // mutation against a fresh record may retry.
-      if (!reapply) throw;
       auto fresh = st.session.get_object(ino_oid(st.volume, m.ino));
       if (!fresh.exists) {
         m.cas = 0;
@@ -1316,11 +1360,14 @@ void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& pa
 
 void flush_dirty_inode(FsState& st, uint64_t ino) {
   DirtySize d;
+  std::optional<std::string> path;
   {
     std::lock_guard lock(st.mu);
     auto it = st.dirty_sizes.find(ino);
     if (it == st.dirty_sizes.end()) return;
     d = it->second;
+    auto cit = st.inode_cache.find(ino);
+    if (cit != st.inode_cache.end() && cit->second.unpublished) path = cit->second.create_path;
   }
   InodeMeta m = load_inode(st, ino);
   if (!m.exists) {
@@ -1331,7 +1378,7 @@ void flush_dirty_inode(FsState& st, uint64_t ino) {
   m.size = std::max(m.size, d.size);
   m.mtime_ns = std::max(m.mtime_ns, d.mtime_ns);
   m.ctime_ns = std::max(m.ctime_ns, d.ctime_ns);
-  store_inode(st, m, std::nullopt, [d](InodeMeta& next) {
+  store_inode(st, m, path, [d](InodeMeta& next) {
     next.size = std::max(next.size, d.size);
     next.mtime_ns = std::max(next.mtime_ns, d.mtime_ns);
     next.ctime_ns = std::max(next.ctime_ns, d.ctime_ns);
@@ -1442,7 +1489,14 @@ void ensure_root(FsState& st) {
 }
 
 void drop_nlink(FsState& st, uint64_t ino) {
-  flush_dirty_inode(st, ino);
+  bool unpublished = false;
+  {
+    std::lock_guard lock(st.mu);
+    auto it = st.inode_cache.find(ino);
+    unpublished = it != st.inode_cache.end() && it->second.unpublished;
+    if (unpublished) st.unpublished_dropped.insert(ino);
+  }
+  if (!unpublished) flush_dirty_inode(st, ino);
   auto m = load_inode(st, ino);
   if (!m.exists) return;
   if (m.nlink > 1) {
@@ -1456,9 +1510,18 @@ void drop_nlink(FsState& st, uint64_t ino) {
     return;
   }
   if (S_ISREG(m.mode)) {
-    truncate_file(st, ino, 0);
+    if (unpublished) {
+      delete_file_chunks(st, ino, m.size, m.stripe_unit, m.project_id, m.uid, m.gid);
+    } else {
+      truncate_file(st, ino, 0);
+    }
   }
-  st.session.delete_object(ino_oid(st.volume, ino));
+  if (!unpublished) {
+    try {
+      st.session.delete_object(ino_oid(st.volume, ino));
+    } catch (...) {
+    }
+  }
   std::string flock_token;
   {
     std::lock_guard lock(st.mu);
@@ -1838,7 +1901,7 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
     st.dirty_sizes.erase(ino);
   }
   try {
-    store_inode(st, meta, std::nullopt, [size, ts](InodeMeta& next) {
+    store_inode(st, meta, unpublished_create_path(st, ino), [size, ts](InodeMeta& next) {
       next.size = size;
       next.mtime_ns = next.ctime_ns = ts;
     });
@@ -1850,6 +1913,116 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
                          static_cast<std::int64_t>(size) - static_cast<std::int64_t>(old_size));
   }
   if (meta.parent_ino != 0) mark_rstat_dirty(st, meta.parent_ino);
+  return 0;
+}
+
+void publish_inodes(FsState& st, const std::vector<uint64_t>& inos) {
+  std::vector<uint64_t> want;
+  want.reserve(inos.size());
+  {
+    std::lock_guard lock(st.mu);
+    for (uint64_t ino : inos) {
+      if (st.unpublished_dropped.count(ino)) continue;
+      auto it = st.inode_cache.find(ino);
+      if (it != st.inode_cache.end() && it->second.unpublished) want.push_back(ino);
+    }
+  }
+  std::sort(want.begin(), want.end());
+  want.erase(std::unique(want.begin(), want.end()), want.end());
+  if (want.empty()) return;
+
+  auto one = [&st](uint64_t ino) {
+    InodeMeta m;
+    std::optional<std::string> path;
+    {
+      std::lock_guard lock(st.mu);
+      if (st.unpublished_dropped.count(ino)) return;
+      auto it = st.inode_cache.find(ino);
+      if (it == st.inode_cache.end() || !it->second.unpublished) return;
+      m = it->second.meta;
+      path = it->second.create_path;
+      merge_dirty_locked(st, m);
+    }
+    store_inode(st, m, path);
+    bool drop = false;
+    {
+      std::lock_guard lock(st.mu);
+      drop = st.unpublished_dropped.erase(ino) > 0;
+      if (drop) {
+        st.inode_cache.erase(ino);
+        st.dirty_sizes.erase(ino);
+      }
+    }
+    if (drop) {
+      try {
+        st.session.delete_object(ino_oid(st.volume, ino));
+      } catch (...) {
+      }
+    }
+  };
+
+  if (want.size() == 1) {
+    one(want[0]);
+    return;
+  }
+  const size_t nthreads = std::min<size_t>(8, want.size());
+  std::atomic<size_t> next{0};
+  std::exception_ptr err;
+  std::mutex err_mu;
+  std::vector<std::thread> workers;
+  workers.reserve(nthreads);
+  for (size_t t = 0; t < nthreads; ++t) {
+    workers.emplace_back([&] {
+      for (;;) {
+        const size_t i = next.fetch_add(1);
+        if (i >= want.size()) return;
+        try {
+          one(want[i]);
+        } catch (...) {
+          std::lock_guard lock(err_mu);
+          if (!err) err = std::current_exception();
+        }
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+  if (err) std::rethrow_exception(err);
+}
+
+int commit_new_dentry(FsState& st, DirTable& dir, const std::string& name, InodeMeta& m,
+                      const std::optional<std::string>& path, InodeMeta& pmeta, uint64_t ts,
+                      int nlink_delta) {
+  m.exists = true;
+  if (st.leases) {
+    auto l = st.leases->get(dir.ino(), dir.put_layout());
+    if (l) {
+      {
+        std::lock_guard lock(st.mu);
+        cache_unpublished_locked(st, m, path);
+      }
+      const int rc = st.leases->queue(*l, kOpLink, {name, std::to_string(m.ino)}, true, 0);
+      if (rc == 0) {
+        dir.load(true);
+        touch_dir_inode(st, dir.ino(), pmeta, ts, nlink_delta);
+        mark_rstat_dirty(st, dir.ino());
+        return 0;
+      }
+      {
+        std::lock_guard lock(st.mu);
+        cache_erase_locked(st, m.ino);
+        st.dirty_sizes.erase(m.ino);
+      }
+      if (rc == -EEXIST) return -EEXIST;
+      st.leases->drop(dir.ino());
+    }
+  }
+  store_inode(st, m, path);
+  if (!dir.link_if_absent(name, m.ino)) {
+    delete_orphan_inode(st, m.ino);
+    return -EEXIST;
+  }
+  touch_dir_inode(st, dir.ino(), pmeta, ts, nlink_delta);
+  mark_rstat_dirty(st, dir.ino());
   return 0;
 }
 
@@ -1920,12 +2093,13 @@ int link_existing_ino(aios_posix_fs* fs, uint64_t ino, uint64_t new_parent, cons
   const uint64_t ts = aios::posix::now_ns();
   m.nlink += 1;
   m.ctime_ns = ts;
-  aios::posix::store_inode(*fs->st, m, std::nullopt, [ts](aios::posix::InodeMeta& next) {
+  const auto path = aios::posix::unpublished_create_path(*fs->st, ino);
+  aios::posix::store_inode(*fs->st, m, path, [ts](aios::posix::InodeMeta& next) {
     next.nlink += 1;
     next.ctime_ns = ts;
   });
   if (!new_dir.link_if_absent(new_name, ino)) {
-    aios::posix::store_inode(*fs->st, m, std::nullopt, [ts](aios::posix::InodeMeta& next) {
+    aios::posix::store_inode(*fs->st, m, path, [ts](aios::posix::InodeMeta& next) {
       if (next.nlink > 0) next.nlink -= 1;
       next.ctime_ns = ts;
     });
@@ -2178,13 +2352,10 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    aios::posix::store_inode(*fs->st, m, aios::posix::child_path_for_layout(*fs->st, parent, name));
-    if (!dir.link_if_absent(name, ino)) {
-      aios::posix::delete_orphan_inode(*fs->st, ino);
-      return -EEXIST;
-    }
-    aios::posix::touch_dir_inode(*fs->st, parent, pmeta, ts, 1);
-    aios::posix::mark_rstat_dirty(*fs->st, parent);
+    if (int rc = aios::posix::commit_new_dentry(
+            *fs->st, dir, name, m, aios::posix::child_path_for_layout(*fs->st, parent, name), pmeta,
+            ts, 1))
+      return rc;
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
   } catch (const aios::client_error& e) {
@@ -2221,13 +2392,10 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    aios::posix::store_inode(*fs->st, m, aios::posix::child_path_for_layout(*fs->st, parent, name));
-    if (!dir.link_if_absent(name, ino)) {
-      aios::posix::delete_orphan_inode(*fs->st, ino);
-      return -EEXIST;
-    }
-    aios::posix::touch_dir_inode(*fs->st, parent, pmeta, ts, 0);
-    aios::posix::mark_rstat_dirty(*fs->st, parent);
+    if (int rc = aios::posix::commit_new_dentry(
+            *fs->st, dir, name, m, aios::posix::child_path_for_layout(*fs->st, parent, name), pmeta,
+            ts, 0))
+      return rc;
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
   } catch (const aios::client_error& e) {
@@ -2268,13 +2436,10 @@ int aios_posix_symlink(aios_posix_fs* fs, uint64_t parent, const char* name, con
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    aios::posix::store_inode(*fs->st, m, aios::posix::child_path_for_layout(*fs->st, parent, name));
-    if (!dir.link_if_absent(name, ino)) {
-      aios::posix::delete_orphan_inode(*fs->st, ino);
-      return -EEXIST;
-    }
-    aios::posix::touch_dir_inode(*fs->st, parent, pmeta, ts, 0);
-    aios::posix::mark_rstat_dirty(*fs->st, parent);
+    if (int rc = aios::posix::commit_new_dentry(
+            *fs->st, dir, name, m, aios::posix::child_path_for_layout(*fs->st, parent, name), pmeta,
+            ts, 0))
+      return rc;
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
   } catch (const aios::client_error& e) {
@@ -2403,6 +2568,13 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
                              return child.entries().empty() ? 0 : -ENOTEMPTY;
                            });
     if (rc) return rc;
+    {
+      std::lock_guard lock(fs->st->mu);
+      auto cit = fs->st->inode_cache.find(ino);
+      if (cit != fs->st->inode_cache.end() && cit->second.unpublished) {
+        fs->st->unpublished_dropped.insert(ino);
+      }
+    }
     fs->st->session.delete_object(aios::posix::ino_oid(fs->st->volume, ino));
     aios::posix::touch_dir_inode(*fs->st, parent, pmeta, aios::posix::now_ns(), -1);
     {
@@ -2587,7 +2759,7 @@ int aios_posix_setattr(aios_posix_fs* fs, uint64_t ino, const aios_posix_stat* s
     if (to_set & AIOS_POSIX_SET_MTIME) m.mtime_ns = st->mtime_ns;
     if (to_set & AIOS_POSIX_SET_ATIME) m.atime_ns = st->atime_ns;
     m.ctime_ns = ts;
-    aios::posix::store_inode(*fs->st, m, std::nullopt,
+    aios::posix::store_inode(*fs->st, m, aios::posix::unpublished_create_path(*fs->st, ino),
                              [to_set, new_mode, new_uid, new_gid, new_mtime, new_atime,
                               ts](aios::posix::InodeMeta& next) {
                                if (to_set & AIOS_POSIX_SET_MODE) {
@@ -2663,7 +2835,7 @@ int aios_posix_setxattr(aios_posix_fs* fs, uint64_t ino, const char* name, const
     const uint64_t ts = aios::posix::now_ns();
     m.xattrs[xname] = xval;
     m.ctime_ns = ts;
-    aios::posix::store_inode(*fs->st, m, std::nullopt,
+    aios::posix::store_inode(*fs->st, m, aios::posix::unpublished_create_path(*fs->st, ino),
                              [xname, xval, ts](aios::posix::InodeMeta& next) {
                                next.xattrs[xname] = xval;
                                next.ctime_ns = ts;
@@ -2750,7 +2922,8 @@ int aios_posix_removexattr(aios_posix_fs* fs, uint64_t ino, const char* name) {
     const std::string xname = name;
     const uint64_t ts = aios::posix::now_ns();
     m.ctime_ns = ts;
-    aios::posix::store_inode(*fs->st, m, std::nullopt, [xname, ts](aios::posix::InodeMeta& next) {
+    aios::posix::store_inode(*fs->st, m, aios::posix::unpublished_create_path(*fs->st, ino),
+                             [xname, ts](aios::posix::InodeMeta& next) {
       next.xattrs.erase(xname);
       next.ctime_ns = ts;
     });

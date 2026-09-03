@@ -80,16 +80,18 @@ mount interoperate on one volume and break each other's leases.
   (and `rmdir`'s parent-side removal) check against and update the lease's in-memory table, update
   the parent inode in-core and queue a changelog record; `lookup`/`readdir` on a leased directory
   are served from that table without a round trip. A flusher thread (woken per op, so cross-mount
-  visibility lags by about one round trip) appends the queue in batches (one `append` + one CAS
-  `PUT` of meta per batch, compaction under log/snap locks when garbage from a peer's refused
-  append is detected or the log exceeds 1 MiB) and writes the parent's mtime/nlink once per batch.
-  A `create` is one synchronous round trip (child inode PUT) instead of about twelve (three lock
-  acquires, reload, append, meta PUT, parent PUT, three releases). `break_requested` seen at a
-  renew flushes and releases within the grace period; a lost lease replays the queue with the
-  synchronous protocol and keeps a sticky error. Same-directory `rename` is one queued record
-  too (the replaced inode is dropped synchronously, as for `unlink`), so create+rename never gives
-  the lease up; cross-directory `rename` and `rmdir` of a leased directory flush and release
-  first, then run the existing `/txn` protocol.
+  visibility lags by about one round trip) PUTs unpublished child inodes, then appends the queue
+  in batches (one `append` + one CAS `PUT` of meta per batch, compaction under log/snap locks
+  when garbage from a peer's refused append is detected or the log exceeds 1 MiB) and writes the
+  parent's mtime/nlink once per batch. After the lease is held, `create`/`mkdir`/`symlink` are
+  local (no child inode PUT on the calling thread) instead of about twelve round trips (three lock
+  acquires, reload, append, meta PUT, parent PUT, three releases). The first mutation of a
+  directory still takes the lock. `break_requested` seen at a renew flushes and releases within
+  the grace period; a lost lease replays the queue with the synchronous protocol and keeps a sticky
+  error. Same-directory `rename` is one queued record too (the replaced inode is dropped
+  synchronously, as for `unlink`), so create+rename never gives the lease up; cross-directory
+  `rename` and `rmdir` of a leased directory flush and release first, then run the existing `/txn`
+  protocol.
 - **ABI.** `aios_posix_fsyncdir(fs, dir_ino)` and `aios_posix_sync(fs)` wait for the queue and
   return the sticky error; unmount flushes and releases every lease.
   `aios_posix_config.flags` with `AIOS_POSIX_F_NOLEASE` (also `AIOS_POSIX_NOLEASE=1` in the
@@ -104,8 +106,9 @@ mount interoperate on one volume and break each other's leases.
   up to 8 parallel GETs instead of serially (d_type needs the mode; the S3 gateway relies on it).
 - `Session::lock_renew` reports `break_requested`.
 - Tests: `Review2Posix.DirLeaseHeldWhileActiveAndReleasedOnUnmount`,
-  `Review2Posix.DirLeaseBatchesManyCreates` (200 creates: ~1.7 s → ~0.6 s against a local daemon),
+  `Review2Posix.DirLeaseBatchesManyCreates` (200 creates: ~1.7 s → ~60 ms against a local daemon),
   `Review2Posix.DirLeaseUnlinkRmdirAndRenameUnderLease`,
+  `Review2Posix.DirLeaseUnlinkOfUnpublishedCreateLeavesNoInode`,
   `Review2Posix.PeerBreaksDirLeaseAndBothMountsConverge`, `Review2Posix.NoLeaseFlagCommitsSynchronously`.
 
 ### Added — directory leases: asynchronous namespace operations in `aiosfs`
