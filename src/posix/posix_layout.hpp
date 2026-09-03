@@ -37,5 +37,11 @@ PutLayout data_layout_for_ino(FsState& st, uint64_t ino);
 
 bool layout_domains_differ(FsState& st, const std::string& path_a, const std::string& path_b);
 
+// False when no layout rules are configured: every placement query is then the
+// default layout and the parent-chain walk of path_of_ino can be skipped.
+bool layout_rules_present(FsState& st);
+// Path of a not-yet-linked child for rule matching; nullopt when there are no rules.
+std::optional<std::string> child_path_for_layout(FsState& st, uint64_t parent, const char* name);
+
 }  // namespace posix
 }  // namespace aios

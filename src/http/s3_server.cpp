@@ -368,6 +368,9 @@ int ensure_file(aios_posix_fs* fs, uint64_t parent, const std::string& name, uin
   if (err == -ENOENT) {
     err = aios_posix_create(fs, parent, name.c_str(), 0644, &st);
     if (err) return err;
+    // S3 promises the key is listable everywhere once we answer 200: commit the
+    // dentry queued under the directory lease before returning.
+    if (int se = aios_posix_fsyncdir(fs, parent)) return se;
     apply_owner(fs, st.ino, set_owner, uid, gid);
   } else if (err) {
     return err;
@@ -895,6 +898,7 @@ void S3Server::handle_session(TlsStream& conn) {
         return;
       }
       err = aios_posix_mkdir(fs_, kRootIno, bucket.c_str(), 0755, &st);
+      if (!err) err = aios_posix_fsyncdir(fs_, kRootIno);
       if (err) {
         write_s3_error(conn, 500, "InternalError", "mkdir failed", path);
         return;
@@ -922,6 +926,7 @@ void S3Server::handle_session(TlsStream& conn) {
         return;
       }
       err = aios_posix_rmdir(fs_, kRootIno, bucket.c_str());
+      if (!err) err = aios_posix_fsyncdir(fs_, kRootIno);
       if (err) {
         write_s3_error(conn, 500, "InternalError", "rmdir failed", path);
         return;
@@ -1501,6 +1506,7 @@ void S3Server::handle_session(TlsStream& conn) {
         return;
       }
       aios_posix_unlink(fs_, parent, name.c_str());
+      (void)aios_posix_fsyncdir(fs_, parent);
       write_http(conn, 204, "No Content", {}, {});
       return;
     }

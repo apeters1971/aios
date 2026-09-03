@@ -27,7 +27,7 @@ ctest --preset default
 (`AIOS_WERROR`, `AIOS_SANITIZE`), `macos-homebrew.cmake` (prefix discovery) and
 `aios_version.hpp.in` (generated into `<build>/generated/include/aios_version.hpp`).
 
-Optional components (`libXrdAios`, `aios-fuse`, ISA-L, zstd, cuObject) are auto-detected and
+Optional components (`libXrdAios`, `aios-fuse` / `aios-fusell`, ISA-L, zstd, cuObject) are auto-detected and
 print one status line each; see the README for `-DXRootD_ROOT=…` and the `AIOS_WITH_*` switches.
 Third-party sources are pinned to commit hashes in `CMakeLists.txt`; bump the hash and the
 comment together.

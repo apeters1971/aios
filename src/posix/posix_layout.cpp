@@ -68,6 +68,14 @@ std::string layout_domain_key(const std::optional<PosixLayoutRule>& rule) {
 
 std::string path_of_ino(FsState& st, uint64_t ino) {
   if (ino == 0 || ino == kRootIno) return "/";
+  {
+    std::lock_guard lock(st.mu);
+    auto it = st.path_cache.find(ino);
+    if (it != st.path_cache.end() &&
+        std::chrono::steady_clock::now() - it->second.second < kInodeCacheTtl) {
+      return it->second.first;
+    }
+  }
   std::vector<std::string> parts;
   uint64_t cur = ino;
   for (int guard = 0; guard < 1024 && cur != 0 && cur != kRootIno; ++guard) {
@@ -94,7 +102,22 @@ std::string path_of_ino(FsState& st, uint64_t ino) {
     if (path.size() > 1) path += "/";
     path += *it;
   }
+  {
+    std::lock_guard lock(st.mu);
+    if (st.path_cache.size() > kInodeCacheMaxEntries) st.path_cache.clear();
+    st.path_cache[ino] = {path, std::chrono::steady_clock::now()};
+  }
   return path;
+}
+
+// Without layout rules every path maps to the default layout, so the parent
+// chain walk (one directory load per level) can be skipped entirely.
+bool layout_rules_present(FsState& st) { return !refresh_layout_rules(st)->empty(); }
+
+std::optional<std::string> child_path_for_layout(FsState& st, uint64_t parent, const char* name) {
+  if (!layout_rules_present(st)) return std::nullopt;
+  const std::string parent_path = path_of_ino(st, parent);
+  return parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
 }
 
 std::shared_ptr<const std::vector<PosixLayoutRule>> refresh_layout_rules(FsState& st) {
@@ -165,15 +188,18 @@ PutLayout data_layout_for_path(FsState& st, const std::string& path) {
 }
 
 PutLayout meta_layout_for_ino(FsState& st, uint64_t ino) {
+  if (!layout_rules_present(st)) return PutLayout{};
   return meta_layout_for_path(st, path_of_ino(st, ino));
 }
 
 PutLayout data_layout_for_ino(FsState& st, uint64_t ino) {
+  if (!layout_rules_present(st)) return PutLayout{};
   return data_layout_for_path(st, path_of_ino(st, ino));
 }
 
 bool layout_domains_differ(FsState& st, const std::string& path_a, const std::string& path_b) {
   auto rules = refresh_layout_rules(st);
+  if (rules->empty()) return false;
   const auto ra = match_posix_layout_rule(*rules, st.volume, path_a);
   const auto rb = match_posix_layout_rule(*rules, st.volume, path_b);
   return layout_domain_key(ra) != layout_domain_key(rb);

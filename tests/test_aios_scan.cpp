@@ -136,6 +136,7 @@ TEST(AiosScan, Basic) {
   EXPECT_TRUE(is_virtual_fstype("fuse"));
   EXPECT_TRUE(is_virtual_fstype("fuseblk"));
   EXPECT_TRUE(is_virtual_fstype("fuse.aios-fuse"));
+  EXPECT_TRUE(is_virtual_fstype("fuse.aios-fusell"));
   EXPECT_TRUE(is_virtual_fstype("aios"));
   EXPECT_TRUE(!is_virtual_fstype("xfs"));
   EXPECT_TRUE(!is_virtual_fstype("ext4"));

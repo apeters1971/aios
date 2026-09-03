@@ -952,3 +952,201 @@ TEST(Review2Posix, FrozenVolumeRejectsLinkAndRenameWithoutThrowing) {
     s.put_bytes(aios::posix::super_oid("pos10vol"), j.dump(), snap.attrs, std::nullopt);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Directory leases: namespace operations are queued under a server lock on the
+// directory's meta object and committed by a flusher; peers break the lease.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool meta_lock_free(const HttpFixture& http, const char* vol, uint64_t dir_ino) {
+  aios::Session s(http.session_cfg());
+  std::string token;
+  if (!s.lock_try_acquire(aios::posix::dir_meta_oid(vol, dir_ino), token, 1000)) return false;
+  s.lock_release(aios::posix::dir_meta_oid(vol, dir_ino), token);
+  return true;
+}
+
+// Directory table as committed on the server, read by a plain session (no lease).
+std::unordered_map<std::string, uint64_t> server_dir(const HttpFixture& http, const char* vol,
+                                                     uint64_t dir_ino) {
+  aios::Session s(http.session_cfg());
+  aios::posix::DirTable t(s, vol, dir_ino, nullptr);
+  t.load(false);
+  return t.entries();
+}
+
+}  // namespace
+
+TEST(Review2Posix, DirLeaseHeldWhileActiveAndReleasedOnUnmount) {
+  HttpFixture http("aios-r2p-lease1", 23440);
+  {
+    Mount a(http, "lease1", 4096);
+    EXPECT_TRUE(meta_lock_free(http, "lease1", 1)) << "no lease before the first change";
+    create_file(a.fs, 1, "f1");
+    EXPECT_FALSE(meta_lock_free(http, "lease1", 1)) << "root is leased after a create";
+
+    // A lookup is served from the lease's table; the record itself may still be
+    // in flight. fsyncdir waits for it.
+    aios_posix_stat st{};
+    EXPECT_EQ(aios_posix_lookup(a.fs, 1, "f1", &st), 0);
+    ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+    auto committed = server_dir(http, "lease1", 1);
+    EXPECT_EQ(committed.count("f1"), 1u);
+
+    // Parent mtime/nlink travel with the batch: mkdir bumps nlink in-core now and
+    // on the server after fsyncdir.
+    aios_posix_stat d{};
+    ASSERT_EQ(aios_posix_mkdir(a.fs, 1, "d", 0755, &d), 0);
+    aios_posix_stat root{};
+    ASSERT_EQ(aios_posix_getattr(a.fs, 1, &root), 0);
+    EXPECT_EQ(root.nlink, 3u);
+    ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+    {
+      aios::Session s(http.session_cfg());
+      auto snap = s.get_object(aios::posix::ino_oid("lease1", 1));
+      ASSERT_TRUE(snap.exists);
+      EXPECT_EQ(nlohmann::json::parse(snap.body).value("nlink", 0), 3);
+    }
+  }
+  EXPECT_TRUE(meta_lock_free(http, "lease1", 1)) << "unmount hands the lease back";
+  Mount c(http, "lease1", 4096);
+  aios_posix_stat st{};
+  EXPECT_EQ(aios_posix_lookup(c.fs, 1, "f1", &st), 0);
+  EXPECT_EQ(aios_posix_lookup(c.fs, 1, "d", &st), 0);
+}
+
+TEST(Review2Posix, DirLeaseBatchesManyCreates) {
+  HttpFixture http("aios-r2p-lease2", 23460);
+  constexpr int kFiles = 200;
+  {
+    Mount a(http, "lease2", 4096);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kFiles; ++i) {
+      create_file(a.fs, 1, ("f" + std::to_string(i)).c_str());
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+    // Nothing is lost between the in-core table and the committed one.
+    EXPECT_EQ(server_dir(http, "lease2", 1).size(), static_cast<size_t>(kFiles));
+    // Duplicate names are refused from the lease's table without a round trip.
+    aios_posix_stat st{};
+    EXPECT_EQ(aios_posix_create(a.fs, 1, "f7", 0644, &st), -EEXIST);
+    std::fprintf(stderr, "[lease] %d creates in %lld ms\n", kFiles,
+                 static_cast<long long>(
+                     std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()));
+  }
+  Mount c(http, "lease2", 4096);
+  uint64_t off = 0;
+  aios_posix_dirent ents[64];
+  int total = 0;
+  for (;;) {
+    const int n = aios_posix_readdir(c.fs, 1, &off, ents, 64);
+    ASSERT_GE(n, 0);
+    if (n == 0) break;
+    total += n;
+  }
+  EXPECT_EQ(total, kFiles + 2);  // . and ..
+}
+
+TEST(Review2Posix, DirLeaseUnlinkRmdirAndRenameUnderLease) {
+  HttpFixture http("aios-r2p-lease3", 23480);
+  Mount a(http, "lease3", 4096);
+  aios_posix_stat d{};
+  ASSERT_EQ(aios_posix_mkdir(a.fs, 1, "d", 0755, &d), 0);
+  const uint64_t x = create_file(a.fs, d.ino, "x");
+  const uint64_t y = create_file(a.fs, d.ino, "y");
+  EXPECT_FALSE(meta_lock_free(http, "lease3", d.ino));
+
+  // Same-directory rename is one queued record under the lease (the lease is
+  // kept); replacing an existing name drops the victim inode synchronously.
+  ASSERT_EQ(aios_posix_rename(a.fs, d.ino, "y", d.ino, "z"), 0);
+  EXPECT_FALSE(meta_lock_free(http, "lease3", d.ino)) << "rename keeps the lease";
+  aios_posix_stat st{};
+  EXPECT_EQ(aios_posix_lookup(a.fs, d.ino, "z", &st), 0);
+  EXPECT_EQ(st.ino, y);
+  EXPECT_EQ(aios_posix_lookup(a.fs, d.ino, "y", &st), -ENOENT);
+  const uint64_t w = create_file(a.fs, d.ino, "w");
+  ASSERT_EQ(aios_posix_rename(a.fs, d.ino, "w", d.ino, "z"), 0);
+  EXPECT_EQ(aios_posix_lookup(a.fs, d.ino, "z", &st), 0);
+  EXPECT_EQ(st.ino, w);
+  EXPECT_EQ(aios_posix_getattr(a.fs, y, &st), -ENOENT) << "replaced inode removed";
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, d.ino), 0);
+  {
+    auto committed = server_dir(http, "lease3", d.ino);
+    EXPECT_EQ(committed.size(), 2u);
+    EXPECT_EQ(committed.count("x"), 1u);
+    EXPECT_EQ(committed["z"], w);
+  }
+
+  EXPECT_EQ(aios_posix_unlink(a.fs, d.ino, "x"), 0);
+  EXPECT_EQ(aios_posix_lookup(a.fs, d.ino, "x", &st), -ENOENT);
+  EXPECT_EQ(aios_posix_getattr(a.fs, x, &st), -ENOENT) << "inode removed synchronously";
+  EXPECT_EQ(aios_posix_rmdir(a.fs, 1, "d"), -ENOTEMPTY);
+  EXPECT_EQ(aios_posix_unlink(a.fs, d.ino, "z"), 0);
+  EXPECT_EQ(aios_posix_rmdir(a.fs, 1, "d"), 0);
+  EXPECT_EQ(aios_posix_lookup(a.fs, 1, "d", &st), -ENOENT);
+  ASSERT_EQ(aios_posix_sync(a.fs), 0);
+  EXPECT_TRUE(server_dir(http, "lease3", 1).empty());
+  aios_posix_stat root{};
+  ASSERT_EQ(aios_posix_getattr(a.fs, 1, &root), 0);
+  EXPECT_EQ(root.nlink, 2u);
+}
+
+TEST(Review2Posix, PeerBreaksDirLeaseAndBothMountsConverge) {
+  HttpFixture http("aios-r2p-lease4", 23500);
+  Mount a(http, "lease4", 4096);
+  Mount b(http, "lease4", 4096);
+  create_file(a.fs, 1, "a1");
+  EXPECT_FALSE(meta_lock_free(http, "lease4", 1));
+
+  // b needs the directory: it asks for the lease back and waits; a flushes and
+  // releases at its next renew.
+  const auto t0 = std::chrono::steady_clock::now();
+  create_file(b.fs, 1, "b1");
+  const auto wait = std::chrono::steady_clock::now() - t0;
+  EXPECT_LT(wait, std::chrono::seconds(6)) << "break must be honoured within the grace period";
+
+  // Both records are committed and visible from either side (a's table is
+  // reloaded once its lease is gone and its dir cache expires).
+  aios_posix_stat st{};
+  ASSERT_EQ(aios_posix_fsyncdir(b.fs, 1), 0);
+  auto committed = server_dir(http, "lease4", 1);
+  EXPECT_EQ(committed.count("a1"), 1u);
+  EXPECT_EQ(committed.count("b1"), 1u);
+  bool seen = false;
+  for (int i = 0; i < 40 && !seen; ++i) {
+    seen = aios_posix_lookup(a.fs, 1, "b1", &st) == 0;
+    if (!seen) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_TRUE(seen);
+  EXPECT_EQ(aios_posix_lookup(b.fs, 1, "a1", &st), 0);
+
+  // Ping-pong back: a creates again (synchronously while b holds the lease, or
+  // after taking it back); everything converges.
+  create_file(a.fs, 1, "a2");
+  ASSERT_EQ(aios_posix_sync(a.fs), 0);
+  ASSERT_EQ(aios_posix_sync(b.fs), 0);
+  committed = server_dir(http, "lease4", 1);
+  EXPECT_EQ(committed.size(), 3u);
+}
+
+TEST(Review2Posix, NoLeaseFlagCommitsSynchronously) {
+  HttpFixture http("aios-r2p-lease5", 23520);
+  aios_posix_config cfg{};
+  const std::string ep = http.endpoint();
+  cfg.endpoint = ep.c_str();
+  cfg.cluster_key = http.fx.cfg.cluster_key.c_str();
+  cfg.volume = "lease5";
+  cfg.stripe_unit = 4096;
+  cfg.flags = AIOS_POSIX_F_NOLEASE;
+  int err = 0;
+  auto* fs = aios_posix_mount(&cfg, &err);
+  ASSERT_NE(fs, nullptr);
+  create_file(fs, 1, "sync");
+  EXPECT_TRUE(meta_lock_free(http, "lease5", 1));
+  EXPECT_EQ(server_dir(http, "lease5", 1).count("sync"), 1u) << "committed before return";
+  EXPECT_EQ(aios_posix_fsyncdir(fs, 1), 0);
+  aios_posix_unmount(fs);
+}

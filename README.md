@@ -14,7 +14,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 
 ```text
   POSIX (FUSE)          POSIX (kernel aiosfs)       VBD (kernel aiosvd)
-  aios-fuse             mount -t aios               /dev/aiosvdN
+  aios-fuse / aios-fusell   mount -t aios               /dev/aiosvdN
        │                        │                         │
        │                        │                    (optional NFS
        │                   ┌────┴────┐                of aiosfs)
@@ -34,7 +34,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 
 | Access | How | Notes |
 |--------|-----|--------|
-| **POSIX (FUSE)** | `aios-fuse` → `libaios_posix` | Userspace mount (Linux/macOS when libfuse3 is present) |
+| **POSIX (FUSE)** | `aios-fuse` / `aios-fusell` → `libaios_posix` | Userspace mount (Linux/macOS when libfuse3 is present; high-level or low-level) |
 | **POSIX (kernel)** | `aiosfs.ko` (`backend=http` or `upcall` + `aios-kbridge`) | AlmaLinux 9 VFS; can be re-exported via **nfsd** (below) |
 | **VBD (kernel)** | `aiosvd.ko` + `aios-vd` → `/dev/aiosvdN` | Object-striped block volumes |
 | **STL API (C++)** | `libaios_client` | Persistent `string` / containers / `mutex` over HTTP |
@@ -49,7 +49,8 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
-| `aios-fuse` | FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
+| `aios-fuse` | High-level FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
+| `aios-fusell` | Low-level FUSE3 mount of the same ABI (`fuse_lowlevel_ops`) |
 | `libXrdAios.so` | XRootD OSS plugin over `libaios_posix` (built when XRootD is found) |
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
@@ -190,7 +191,7 @@ Optional (auto-detected; each prints a `-- <dep>: enabled|not found` line at con
 |------------|---------|--------|
 | [ISA-L](https://github.com/intel/isa-l) | Reed–Solomon EC with `m > 1` (XOR `m = 1` always works) | `AIOS_WITH_ISAL` |
 | libzstd | `compression: zstd`, `bag_compression: zstd` | `AIOS_WITH_ZSTD` |
-| libfuse3 | `aios-fuse` | `AIOS_WITH_FUSE` |
+| libfuse3 | `aios-fuse`, `aios-fusell` | `AIOS_WITH_FUSE` |
 | XRootD ≥ 5 | `libXrdAios.so` OSS plugin | `AIOS_WITH_XROOTD`, `XRootD_ROOT` |
 | NVIDIA cuObjServer SDK | S3 GPUDirect / RDMA offload | `AIOS_WITH_CUOBJECT`, `CUOBJECT_ROOT` |
 | AlmaLinux 9 `kernel-devel` | `aios_http.ko` / `aiosfs.ko` / `aiosvd.ko` (separate `make -C kernel`) | — |
@@ -821,12 +822,20 @@ Wire format, append, and API notes: [`proto/stl_client.md`](proto/stl_client.md)
 
 Cross-directory `rename` uses a multi-object `/txn` compact rewrite of both directory tips; cross-directory `link` remains best-effort. Details: [`proto/posix_fuse.md`](proto/posix_fuse.md).
 
-When CMake finds **libfuse3**, it builds `aios-fuse`:
+**Directory leases.** A directory a mount is changing is *leased* (server lock on its meta object, renewed every second): `create`/`mkdir`/`unlink`/`symlink`/`link` then update an in-memory table and queue a changelog record that a flusher thread commits in batches, and `lookup`/`readdir` are served from that table — one round trip per create instead of about twelve. Other mounts (userspace or the kernel `aiosfs`) that need the directory ask for the lease back and get it within the grace period (5 s). Metadata becomes durable at `fsync(dir)` / `syncfs` / unmount (`aios_posix_fsyncdir`, `aios_posix_sync`), as POSIX specifies; `-o nolease` (or `AIOS_POSIX_F_NOLEASE`) restores per-operation commits.
+
+When CMake finds **libfuse3**, it builds `aios-fuse` (high-level) and `aios-fusell` (low-level):
 
 ```bash
 aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
+aios-fusell -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 # or: AIOS_ENDPOINT / AIOS_CLUSTER_KEY
+# -o nolease: commit every directory operation synchronously
 ```
+
+`aios-fuse` uses libfuse's path-based API (`fuse_main`). `aios-fusell` uses the inode API
+(`fuse_session_new`); that matches `libaios_posix` directly (root is inode 1) and skips
+libfuse's path walk. Mount options and POSIX behaviour are the same.
 
 ### Special / virtual attributes
 

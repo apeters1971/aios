@@ -1,6 +1,6 @@
 # POSIX filesystem client + FUSE3
 
-AIOS exposes a **C-portable POSIX ABI** (`aios_posix.h`) that maps a hierarchical filesystem onto objects. A FUSE3 helper (`aios-fuse`) mounts that ABI on Linux/macOS when `libfuse3` is available.
+AIOS exposes a **C-portable POSIX ABI** (`aios_posix.h`) that maps a hierarchical filesystem onto objects. FUSE3 helpers (`aios-fuse` high-level, `aios-fusell` low-level) mount that ABI on Linux/macOS when `libfuse3` is available.
 
 Root directory is always **inode 1**.
 
@@ -120,7 +120,7 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config*, int* err_out);
 void aios_posix_set_caller / clear_caller / get_caller;
 int aios_posix_access(fs, ino, amode);
 int aios_posix_lookup(fs, parent, name, &st);
-int aios_posix_link / setxattr / getxattr / listxattr / removexattr / flock;
+int aios_posix_link / link_ino / setxattr / getxattr / listxattr / removexattr / flock;
 int aios_posix_read/write/truncate/...
 ```
 
@@ -131,9 +131,25 @@ Errors are **negative errno**. The ABI avoids Boost/STL so a future kernel port 
 ```bash
 # Build with libfuse3 (pkg-config fuse3)
 aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
+aios-fusell -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 ```
 
-Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `stripe_width`, `app_label`. Process credentials from the kernel (`fuse_get_context`) drive permission checks.
+Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `stripe_width`, `app_label`, `nolease`. Process credentials from the kernel (`fuse_get_context` / `fuse_req_ctx`) drive permission checks.
+
+**`aios-fuse`** is high-level libfuse3 (`fuse_main`, multi-threaded unless `-s`), `kernel_cache` with 1 s attribute/entry timeouts, writeback cache when the kernel offers it, `use_ino`/`readdir_ino` (our inode numbers are exposed) and `nullpath_ok` (read/write/flush/fsync/release/readdir work on the file handle). `fsync(dirfd)` maps to `aios_posix_fsyncdir`.
+
+**`aios-fusell`** is the same filesystem over the low-level API (`fuse_session_new`, `fuse_lowlevel_ops`). The kernel already names inodes, so lookup/create/read skip libfuse's path resolution; root is `FUSE_ROOT_ID` (1), matching the POSIX ABI. Timeouts, writeback, `max_read`/`max_write`, `fsyncdir`, and `-o nolease` match `aios-fuse`. Hard links use `aios_posix_link_ino`.
+
+## Directory leases
+
+A directory is leased by the first mount that changes it: the server lock on `posix/{vol}/dir/{ino}/meta` (TTL 30 s, renewed every 1 s, released after 10 s idle). While a mount holds the lease:
+
+- `create` / `mkdir` / `symlink` / `link` / `unlink`, same-directory `rename` and the parent side of `rmdir` check the name against the lease's in-memory table, apply the change to it, update the parent inode in-core and queue a changelog record. The call returns after the child inode PUT (one round trip); a rename that replaces a name drops the victim inode synchronously.
+- `lookup` / `readdir` are served from the table.
+- A flusher thread appends queued records in batches (`POST …/append` with the lease token, then a CAS `PUT` of meta) and writes the parent's mtime/nlink once per batch. An append that lands past the committed `log_bytes` (a peer's refused append left garbage) or a log over 1 MiB triggers compaction under the log/snap locks through `/txn`.
+- Cross-directory `rename`, and `rmdir` of a leased directory, flush and release first and then run the transactional protocol.
+
+Peers (another `aios-fuse` / `aios-fusell`, the S3 gateway, a kernel `aiosfs` mount) that need the directory call `POST /o/{oid}/lock/break`; the holder sees `break_requested` at its next renew, flushes and releases, so the waiter proceeds within the grace period (5 s). A lost lease (expired, fenced) replays the queue with the synchronous protocol; a record that still cannot be committed is a sticky error returned by `aios_posix_fsyncdir` / `aios_posix_sync` (FUSE `fsyncdir`). Unmount flushes and releases everything. `AIOS_POSIX_F_NOLEASE` in `aios_posix_config.flags`, `AIOS_POSIX_NOLEASE=1`, or `-o nolease` disables leases.
 
 ## Kernel prototype (AlmaLinux 9)
 

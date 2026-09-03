@@ -305,6 +305,7 @@ add_library(aios_posix STATIC
   src/posix/posix_fs.cpp
   src/posix/posix_layout.cpp
   src/posix/posix_rstat.cpp
+  src/posix/posix_lease.cpp
   src/posix/quota_ledger.cpp
   src/posix/qos_controller.cpp
 )
@@ -340,8 +341,8 @@ target_include_directories(aios_s3 PUBLIC
 )
 target_link_libraries(aios_s3 PUBLIC aios_core aios_posix aios_cuobject OpenSSL::SSL)
 
-# Optional FUSE3 mount helper.
-option(AIOS_WITH_FUSE "Build aios-fuse when libfuse3 is available" ON)
+# Optional FUSE3 mount helpers (high-level aios-fuse and low-level aios-fusell).
+option(AIOS_WITH_FUSE "Build aios-fuse / aios-fusell when libfuse3 is available" ON)
 set(AIOS_HAVE_FUSE OFF)
 if(AIOS_WITH_FUSE)
   find_package(PkgConfig QUIET)
@@ -360,7 +361,7 @@ if(AIOS_WITH_FUSE)
       set(AIOS_HAVE_FUSE ON)
       message(STATUS "FUSE3: enabled (${FUSE3_LIBRARY})")
     else()
-      message(STATUS "FUSE3: not found (aios-fuse disabled)")
+      message(STATUS "FUSE3: not found (aios-fuse / aios-fusell disabled)")
     endif()
   endif()
 endif()
@@ -386,14 +387,20 @@ if(AIOS_HAVE_FUSE)
     tools/aios_fuse.cpp
     src/posix/fuse3_ops.cpp
   )
-  target_link_libraries(aios-fuse PRIVATE aios_posix)
-  if(TARGET PkgConfig::FUSE3)
-    target_link_libraries(aios-fuse PRIVATE PkgConfig::FUSE3)
-  else()
-    target_include_directories(aios-fuse PRIVATE ${FUSE3_INCLUDE_DIR})
-    target_link_libraries(aios-fuse PRIVATE ${FUSE3_LIBRARY})
-  endif()
-  install(TARGETS aios-fuse RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  add_executable(aios-fusell
+    tools/aios_fusell.cpp
+    src/posix/fuse3_ll_ops.cpp
+  )
+  foreach(_fuse_bin aios-fuse aios-fusell)
+    target_link_libraries(${_fuse_bin} PRIVATE aios_posix)
+    if(TARGET PkgConfig::FUSE3)
+      target_link_libraries(${_fuse_bin} PRIVATE PkgConfig::FUSE3)
+    else()
+      target_include_directories(${_fuse_bin} PRIVATE ${FUSE3_INCLUDE_DIR})
+      target_link_libraries(${_fuse_bin} PRIVATE ${FUSE3_LIBRARY})
+    endif()
+  endforeach()
+  install(TARGETS aios-fuse aios-fusell RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # Optional XRootD OSS plugin (libXrdAios) over libaios_posix.

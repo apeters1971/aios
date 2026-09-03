@@ -10,7 +10,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -42,6 +44,23 @@ inline constexpr auto kDirtyFlushTick = std::chrono::milliseconds(50);
 inline constexpr size_t kMaxSymlinkBytes = 4095;
 inline constexpr size_t kChunkLockStripes = 64;
 inline constexpr int kChunkWriteRetries = 16;
+// Inode numbers are reserved from the super object in batches (one CAS per batch).
+inline constexpr uint64_t kInoBatch = 64;
+
+// Changelog record ops (shared with libaios changelog / the kernel client).
+inline constexpr uint32_t kOpLink = 1;
+inline constexpr uint32_t kOpUnlink = 2;
+inline constexpr uint32_t kOpRename = 3;
+
+// Directory leases: see DirLeaseManager.
+inline constexpr int kLeaseTtlMs = 30000;
+inline constexpr auto kLeaseRenew = std::chrono::milliseconds(1000);
+inline constexpr int kLeaseBreakGraceMs = 5000;
+inline constexpr auto kLeaseIdle = std::chrono::seconds(10);
+inline constexpr auto kLeaseRetry = std::chrono::milliseconds(1000);
+inline constexpr size_t kLeaseMax = 64;
+inline constexpr size_t kLeaseMaxPending = 4096;
+inline constexpr size_t kLeaseBatchBytes = 64 * 1024;
 
 // Last-N stripe bodies so 128 KiB FUSE I/O does not re-GET the same 1 MiB chunk.
 // Bodies are shared immutable buffers so a lookup hands out a pointer instead of
@@ -243,13 +262,23 @@ class DirTable {
   // Mutable entry map for planning a transactional compact rewrite.
   std::unordered_map<std::string, uint64_t>& mutable_entries() { return entries_; }
   uint64_t meta_cas() const { return meta_cas_; }
+  uint64_t next_op() const { return next_op_; }
+  uint64_t log_bytes() const { return log_bytes_; }
+  uint64_t snapshot_op() const { return snapshot_op_; }
+  uint64_t ino() const { return ino_; }
   const std::string& meta_oid() const { return meta_oid_; }
   const std::string& log_oid() const { return log_oid_; }
   const std::string& snap_oid() const { return snap_oid_; }
+  const PutLayout& put_layout() const { return put_layout_; }
 
   // Bodies for a compacted directory tip (snapshot holds full map, empty log).
   void plan_compact_bodies(std::string& meta_out, std::string& snap_out,
                            std::string& log_out) const;
+
+  // Apply one record to the in-memory map (also used by the lease replay).
+  void apply_record(uint64_t op_id, uint32_t op, const std::vector<std::string>& args);
+  // Commit records with the synchronous per-operation protocol (no lease).
+  void append_ops(const std::vector<std::pair<uint32_t, std::vector<std::string>>>& ops);
 
  private:
   Session& session_;
@@ -267,9 +296,158 @@ class DirTable {
   PutLayout put_layout_{};
 
   void store_meta();
-  void apply_record(uint64_t op_id, uint32_t op, const std::vector<std::string>& args);
-  void append_ops(const std::vector<std::pair<uint32_t, std::vector<std::string>>>& ops);
   void publish_cache();
+  // Under our own lease: check + queue instead of committing. Returns true when
+  // handled (rc set), false when the caller must run the synchronous protocol.
+  bool lease_commit(uint32_t op, std::vector<std::string> args, bool must_be_absent,
+                    uint64_t expected_ino, int& rc);
+};
+
+uint64_t cas_from_attrs(const std::unordered_map<std::string, std::string>& attrs);
+
+// RAII set of server locks, acquired in sorted oid order (deadlock-free with peers).
+struct HeldLocks {
+  Session* session{nullptr};
+  std::vector<std::pair<std::string, std::string>> held;  // oid, token
+
+  ~HeldLocks();
+  // A lease holder that batches directory updates (the kernel client or another
+  // mount) keeps its lease across many operations, so a plain acquire would fail
+  // for seconds at a time. Ask it to hand the lease back and wait; the server
+  // bounds that wait by its break grace period, and a timeout still surfaces as
+  // lock_held so the callers' retry loops behave as before.
+  void acquire_sorted(std::vector<std::string> oids, int ttl_ms = 30000);
+  static constexpr int kLeaseWaitMs = 8000;
+  std::optional<std::string> token_for(const std::string& oid) const;
+};
+
+// Stage a compacted directory tip (snapshot, empty log, meta) into a /txn.
+void txn_put_dir(Session& session, const std::string& txn_id, DirTable& dir,
+                 const HeldLocks& locks);
+
+/*
+ * Directory lease (delegation).
+ *
+ * A directory this mount is modifying is leased: we hold the server lock on its
+ * meta object and keep renewing it. While the lease lasts nobody else can commit
+ * to the directory, so create/unlink/rename only update the lease's in-memory
+ * table and queue a changelog record; a flusher thread appends the queue in
+ * batches (one append + one CAS PUT of meta per batch) and writes the parent
+ * inode's mtime/nlink once per batch. Reads (lookup, readdir) are served from the
+ * lease's table without a round trip.
+ *
+ * A peer wanting the directory calls lock/break; we see break_requested at the
+ * next renew, flush and release. Losing the lease (expired, fenced) replays the
+ * queue with the synchronous protocol; what cannot be committed is a sticky
+ * error returned by fsync(dir) / aios_posix_sync. POSIX makes no durability
+ * promise for metadata before fsync.
+ */
+struct DirLeaseOp {
+  uint32_t op{0};
+  std::vector<std::string> args;
+};
+
+struct DirLease {
+  const uint64_t ino;
+  const std::string meta_oid, log_oid, snap_oid;
+  PutLayout put_layout;
+
+  std::mutex mu;               // everything below
+  std::condition_variable cv;  // state changes: flushed, released, lost
+  std::mutex acquire_mu;       // serialises acquire attempts for this directory
+  bool held{false};
+  bool break_requested{false};
+  bool release_wanted{false};
+  std::string token;
+  std::chrono::steady_clock::time_point expires{};
+  std::chrono::steady_clock::time_point last_use{};
+  std::chrono::steady_clock::time_point last_renew{};
+  std::chrono::steady_clock::time_point next_try{};
+  // Authoritative table while held: server tip + pending.
+  std::unordered_map<std::string, uint64_t> entries;
+  // Server-side meta as of our last commit (or the load at acquire).
+  uint64_t next_op{1};
+  uint64_t log_bytes{0};
+  uint64_t snapshot_op{0};
+  uint64_t meta_cas{0};
+  std::deque<DirLeaseOp> pending;  // oldest first
+  bool parent_dirty{false};
+  uint64_t parent_mtime_ns{0};
+  int nlink_delta{0};
+  int err{0};  // sticky -errno from an async commit; returned by fsync
+
+  DirLease(uint64_t i, std::string m, std::string l, std::string s)
+      : ino(i), meta_oid(std::move(m)), log_oid(std::move(l)), snap_oid(std::move(s)) {}
+
+  bool owns_locked(std::chrono::steady_clock::time_point now) const {
+    return held && now < expires;
+  }
+  bool active_locked(std::chrono::steady_clock::time_point now) const {
+    return owns_locked(now) && !break_requested && !release_wanted &&
+           now + kLeaseRenew < expires;
+  }
+  bool busy_locked() const { return held || !pending.empty() || parent_dirty; }
+  bool flushed_locked() const { return pending.empty() && !parent_dirty; }
+};
+
+class DirLeaseManager {
+ public:
+  explicit DirLeaseManager(FsState& st);
+  ~DirLeaseManager();
+
+  void start();
+  // Flush and release every lease, stop the flusher.
+  void stop();
+
+  // Lease usable for a new asynchronous op, acquiring it when we do not hold
+  // one. nullptr: use the synchronous protocol (leases disabled, a peer holds
+  // the lock — a break has been requested — or a recent failure).
+  std::shared_ptr<DirLease> get(uint64_t ino, const PutLayout& layout);
+  // Lease whose table is authoritative right now: held, or lost with records
+  // still queued for replay (the server tip alone would not show them).
+  std::shared_ptr<DirLease> authoritative(uint64_t ino);
+  // Flush what is queued and hand the server lock back; waits. Used before a
+  // synchronous path takes the directory's locks itself.
+  void drop(uint64_t ino);
+  // fsync(2) of a directory: wait for the queue, return + clear the sticky error.
+  int fsync(uint64_t ino);
+  // syncfs / unmount.
+  int sync_all(bool release);
+
+  // Check + apply + queue under l.mu. 0, -EEXIST, -ENOENT, or -EAGAIN when the
+  // lease is no longer usable (caller falls back to the synchronous protocol).
+  int queue(DirLease& l, uint32_t op, std::vector<std::string> args, bool must_be_absent,
+            uint64_t expected_ino);
+  // Same-directory rename under the lease: old_name must still map to moved and
+  // new_name to victim (0 = absent), as the caller observed them before its
+  // type checks. 0, -ENOENT, or -EAGAIN (state changed / lease unusable).
+  int rename(DirLease& l, const std::string& old_name, const std::string& new_name,
+             uint64_t moved, uint64_t victim);
+  // Name → ino from the lease's table (0 = absent); -EAGAIN when not usable.
+  int peek(DirLease& l, const std::string& name, uint64_t& ino_out);
+  // Deferred parent mtime/ctime/nlink update; the in-core inode is updated now.
+  void touch_parent(DirLease& l, uint64_t ts, int nlink_delta);
+
+ private:
+  FsState& st_;
+  std::mutex mu_;  // leases_
+  std::unordered_map<uint64_t, std::shared_ptr<DirLease>> leases_;
+  std::mutex wake_mu_;
+  std::condition_variable wake_cv_;
+  bool wake_{false};
+  std::atomic<bool> stop_{false};
+  std::thread th_;
+
+  void kick();
+  void run();
+  void service(DirLease& l);
+  // 0 = queue empty; -ESTALE = lease gone (queue intact); other -errno = transient.
+  int flush(DirLease& l);
+  int compact(DirLease& l, size_t n);
+  void replay(DirLease& l);
+  void touch_parent_now(DirLease& l, uint64_t ts, int delta);
+  void release_locked_token(DirLease& l, const std::string& token);
+  std::shared_ptr<DirLease> slot(uint64_t ino);
 };
 
 struct FsState {
@@ -300,6 +478,14 @@ struct FsState {
   ChunkCache chunk_cache;
   std::unordered_map<uint64_t, DirCacheEnt> dir_cache;
   std::unordered_map<uint64_t, DirtySize> dirty_sizes;
+  // Locally reserved inode numbers [ino_next, ino_end); under mu.
+  uint64_t ino_next{0};
+  uint64_t ino_end{0};
+  // Cached path of an inode for layout-rule matching (only used when rules exist).
+  std::unordered_map<uint64_t, std::pair<std::string, std::chrono::steady_clock::time_point>>
+      path_cache;
+  bool no_lease{false};
+  std::unique_ptr<DirLeaseManager> leases;
   // Serializes in-process read-modify-write of one (ino, chunk) so only cross-client
   // conflicts reach the server's CAS check.
   std::array<std::mutex, kChunkLockStripes> chunk_locks;
@@ -347,6 +533,11 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
                     const std::string& new_name);
 
 InodeMeta load_inode(FsState& st, uint64_t ino);
+// Warm the inode cache for many inodes with parallel GETs (readdir d_type).
+void prefetch_inodes(FsState& st, const std::vector<uint64_t>& inos);
+// Parent directory mtime/ctime/nlink after a namespace change (deferred under a lease).
+void touch_dir_inode(FsState& st, uint64_t dir_ino, InodeMeta& pmeta, uint64_t ts,
+                     int nlink_delta);
 
 // Restates this operation's own mutation against a record freshly loaded from the
 // server. Required for any store_inode that read-modify-writes an existing inode:

@@ -69,6 +69,8 @@ int lookup_path(aios_posix_fs* fs, const char* path, aios_posix_stat* st_out) {
   return 0;
 }
 
+uint64_t path_ino(aios_posix_fs* fs, const char* path, struct fuse_file_info* fi);
+
 void fill_times(uint64_t ns, time_t* sec, long* nsec) {
   *sec = static_cast<time_t>(ns / 1000000000ull);
   *nsec = static_cast<long>(ns % 1000000000ull);
@@ -152,17 +154,16 @@ int resolve_parent(aios_posix_fs* fs, const char* path, uint64_t* parent_out,
 
 #ifdef __APPLE__
 int posix_readdir(const char* path, void* buf, fuse_darwin_fill_dir_t filler, off_t /*offset*/,
-                  struct fuse_file_info* /*fi*/, enum fuse_readdir_flags /*flags*/) {
+                  struct fuse_file_info* fi, enum fuse_readdir_flags /*flags*/) {
   return guard([&] {
     auto* fs = fs_handle();
-    aios_posix_stat st{};
-    int rc = lookup_path(fs, path, &st);
-    if (rc) return rc;
+    const uint64_t dir_ino = path_ino(fs, path, fi);
+    if (!dir_ino) return -ENOENT;
     /* Offset 0: one-shot directory (libfuse mode 1). Non-zero cookies hang ls. */
     uint64_t off = 0;
     aios_posix_dirent ents[64];
     while (true) {
-      int n = aios_posix_readdir(fs, st.ino, &off, ents, 64);
+      int n = aios_posix_readdir(fs, dir_ino, &off, ents, 64);
       if (n < 0) return n;
       if (n == 0) break;
       for (int i = 0; i < n; ++i) {
@@ -177,16 +178,15 @@ int posix_readdir(const char* path, void* buf, fuse_darwin_fill_dir_t filler, of
 }
 #else
 int posix_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t /*offset*/,
-                  struct fuse_file_info* /*fi*/, enum fuse_readdir_flags /*flags*/) {
+                  struct fuse_file_info* fi, enum fuse_readdir_flags /*flags*/) {
   return guard([&] {
     auto* fs = fs_handle();
-    aios_posix_stat st{};
-    int rc = lookup_path(fs, path, &st);
-    if (rc) return rc;
+    const uint64_t dir_ino = path_ino(fs, path, fi);
+    if (!dir_ino) return -ENOENT;
     uint64_t off = 0;
     aios_posix_dirent ents[64];
     while (true) {
-      int n = aios_posix_readdir(fs, st.ino, &off, ents, 64);
+      int n = aios_posix_readdir(fs, dir_ino, &off, ents, 64);
       if (n < 0) return n;
       if (n == 0) break;
       for (int i = 0; i < n; ++i) {
@@ -378,6 +378,29 @@ int posix_fsync(const char* /*path*/, int /*datasync*/, struct fuse_file_info* f
 
 int posix_flush(const char* /*path*/, struct fuse_file_info* fi) {
   return posix_fsync(nullptr, 0, fi);
+}
+
+int posix_opendir(const char* path, struct fuse_file_info* fi) {
+  return guard([&] {
+    auto* fs = fs_handle();
+    aios_posix_stat st{};
+    int rc = lookup_path(fs, path, &st);
+    if (rc) return rc;
+    if (!S_ISDIR(st.mode)) return -ENOTDIR;
+    if (fi) fi->fh = st.ino;
+    return 0;
+  });
+}
+
+// Directory records queued under a lease are committed here (POSIX: metadata is
+// durable after fsync of the directory, not before).
+int posix_fsyncdir(const char* path, int /*datasync*/, struct fuse_file_info* fi) {
+  return guard([&] {
+    auto* fs = fs_handle();
+    const uint64_t ino = path_ino(fs, path, fi);
+    if (!ino) return -ENOENT;
+    return aios_posix_fsyncdir(fs, ino);
+  });
 }
 
 int posix_release(const char* /*path*/, struct fuse_file_info* fi) {
@@ -703,6 +726,13 @@ void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     cfg->kernel_cache = 1;
     cfg->attr_timeout = 1.0;
     cfg->entry_timeout = 1.0;
+    /* Our inode numbers are stable and unique: hand them to the kernel instead of
+     * libfuse's synthesized ones (hard links then share st_ino as they should). */
+    cfg->use_ino = 1;
+    cfg->readdir_ino = 1;
+    /* read/write/flush/fsync/release work on fi->fh; libfuse can skip the path
+     * lookup for them, which also keeps unlinked-but-open files usable. */
+    cfg->nullpath_ok = 1;
   }
   return fs;
 }
@@ -734,6 +764,8 @@ fuse_operations aios_fuse_operations() {
   ops.truncate = posix_truncate;
   ops.fsync = posix_fsync;
   ops.flush = posix_flush;
+  ops.opendir = posix_opendir;
+  ops.fsyncdir = posix_fsyncdir;
   ops.release = posix_release;
   ops.chmod = posix_chmod;
   ops.chown = posix_chown;

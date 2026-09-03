@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <errno.h>
 #include <memory>
@@ -28,12 +29,6 @@
 
 namespace aios {
 namespace posix {
-namespace {
-
-constexpr uint32_t kOpLink = 1;
-constexpr uint32_t kOpUnlink = 2;
-constexpr uint32_t kOpRename = 3;
-
 uint64_t cas_from_attrs(const std::unordered_map<std::string, std::string>& attrs) {
   auto it = attrs.find(kCasAttr);
   if (it == attrs.end()) return 0;
@@ -43,8 +38,6 @@ uint64_t cas_from_attrs(const std::unordered_map<std::string, std::string>& attr
     return 0;
   }
 }
-
-}  // namespace
 
 int validate_dentry_name(const char* name) {
   if (!name || !*name) return -EINVAL;
@@ -277,48 +270,34 @@ std::string super_to_json(const SuperMeta& m) {
       .dump();
 }
 
-namespace {
-
-struct HeldLocks {
-  Session* session{nullptr};
-  std::vector<std::pair<std::string, std::string>> held;  // oid, token
-
-  ~HeldLocks() {
-    if (!session) return;
-    for (auto it = held.rbegin(); it != held.rend(); ++it) {
-      try {
-        session->lock_release(it->first, it->second);
-      } catch (...) {
-      }
+HeldLocks::~HeldLocks() {
+  if (!session) return;
+  for (auto it = held.rbegin(); it != held.rend(); ++it) {
+    try {
+      session->lock_release(it->first, it->second);
+    } catch (...) {
     }
   }
+}
 
-  // A lease holder that batches directory updates (the kernel client) keeps its
-  // lease across many operations, so a plain acquire would fail for seconds at
-  // a time. Ask it to hand the lease back and wait; the server bounds that wait
-  // by its break grace period, and a timeout still surfaces as lock_held so the
-  // callers' retry loops behave as before.
-  void acquire_sorted(std::vector<std::string> oids, int ttl_ms = 30000) {
-    std::sort(oids.begin(), oids.end());
-    oids.erase(std::unique(oids.begin(), oids.end()), oids.end());
-    for (const auto& oid : oids) {
-      std::string token;
-      if (!session->lock_acquire_wait(oid, token, ttl_ms, kLeaseWaitMs)) {
-        throw client_error("lock_held", "lease not returned in time: " + oid);
-      }
-      held.emplace_back(oid, std::move(token));
+void HeldLocks::acquire_sorted(std::vector<std::string> oids, int ttl_ms) {
+  std::sort(oids.begin(), oids.end());
+  oids.erase(std::unique(oids.begin(), oids.end()), oids.end());
+  for (const auto& oid : oids) {
+    std::string token;
+    if (!session->lock_acquire_wait(oid, token, ttl_ms, kLeaseWaitMs)) {
+      throw client_error("lock_held", "lease not returned in time: " + oid);
     }
+    held.emplace_back(oid, std::move(token));
   }
+}
 
-  static constexpr int kLeaseWaitMs = 8000;
-
-  std::optional<std::string> token_for(const std::string& oid) const {
-    for (const auto& [o, t] : held) {
-      if (o == oid) return t;
-    }
-    return std::nullopt;
+std::optional<std::string> HeldLocks::token_for(const std::string& oid) const {
+  for (const auto& [o, t] : held) {
+    if (o == oid) return t;
   }
-};
+  return std::nullopt;
+}
 
 void txn_put_dir(Session& session, const std::string& txn_id, DirTable& dir,
                  const HeldLocks& locks) {
@@ -331,8 +310,6 @@ void txn_put_dir(Session& session, const std::string& txn_id, DirTable& dir,
   session.txn_prepare_put(txn_id, dir.meta_oid(), meta, dir.meta_cas(),
                           locks.token_for(dir.meta_oid()));
 }
-
-}  // namespace
 
 DirTable::DirTable(Session& session, std::string vol, uint64_t ino, FsState* cache)
     : session_(session),
@@ -372,7 +349,39 @@ void DirTable::publish_cache() {
   dir_cache_evict_locked(*cache_);
 }
 
+bool DirTable::lease_commit(uint32_t op, std::vector<std::string> args, bool must_be_absent,
+                            uint64_t expected_ino, int& rc) {
+  if (!cache_ || !cache_->leases) return false;
+  auto l = cache_->leases->get(ino_, put_layout_);
+  if (!l) {
+    // A lease we hold but cannot use (break requested, expiring) is handed back
+    // so the synchronous protocol below can take the lock itself.
+    cache_->leases->drop(ino_);
+    return false;
+  }
+  rc = cache_->leases->queue(*l, op, std::move(args), must_be_absent, expected_ino);
+  if (rc == -EAGAIN) {
+    cache_->leases->drop(ino_);
+    return false;
+  }
+  load(true);
+  return true;
+}
+
 void DirTable::load(bool allow_cache) {
+  if (cache_ && cache_->leases) {
+    // Under our lease (or while a lost lease still has records queued) the
+    // lease's table is the truth; the server tip alone would be behind it.
+    if (auto l = cache_->leases->authoritative(ino_)) {
+      std::lock_guard lock(l->mu);
+      entries_ = l->entries;
+      meta_cas_ = l->meta_cas;
+      next_op_ = l->next_op;
+      log_bytes_ = l->log_bytes;
+      snapshot_op_ = l->snapshot_op;
+      return;
+    }
+  }
   if (allow_cache && cache_) {
     std::lock_guard lock(cache_->mu);
     auto it = cache_->dir_cache.find(ino_);
@@ -436,6 +445,13 @@ void DirTable::store_meta() {
 
 void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std::string>>>& ops) {
   if (ops.empty()) return;
+  if (ops.size() == 1) {
+    int rc = 0;
+    if (lease_commit(ops[0].first, ops[0].second, false, 0, rc)) {
+      if (rc == -ENOENT || rc == 0) return;  // unlink/rename of a vanished name: no-op
+      throw client_error("conflict", "dir op refused under lease");
+    }
+  }
   // Reserve op ids via CAS on meta. Against a lease holder (a kernel client with
   // a directory delegation) the append is refused with lock_held; ask for the
   // lease back once and wait it out instead of burning the attempts.
@@ -489,6 +505,10 @@ void DirTable::link(const std::string& name, uint64_t child) {
 }
 
 bool DirTable::link_if_absent(const std::string& name, uint64_t child) {
+  {
+    int rc = 0;
+    if (lease_commit(kOpLink, {name, std::to_string(child)}, true, 0, rc)) return rc == 0;
+  }
   // Serialize create/link against peers and against directory compaction so two
   // racers cannot both observe a missing name and both return success.
   for (int attempt = 0; attempt < 16; ++attempt) {
@@ -562,6 +582,32 @@ void DirTable::unlink(const std::string& name) { append_ops({{kOpUnlink, {name}}
 int DirTable::unlink_if(const std::string& name, uint64_t expected_ino,
                         std::vector<std::string> extra_locks,
                         const std::function<int()>& guard) {
+  if (extra_locks.empty() && !guard) {
+    int rc = 0;
+    if (lease_commit(kOpUnlink, {name}, false, expected_ino, rc)) return rc;
+  } else if (cache_ && cache_->leases) {
+    // rmdir: the child's tip is locked below to re-check emptiness; only the
+    // parent's dentry removal can go through the lease.
+    if (auto l = cache_->leases->get(ino_, put_layout_)) {
+      HeldLocks locks;
+      locks.session = &session_;
+      try {
+        locks.acquire_sorted(extra_locks);
+      } catch (const client_error& e) {
+        if (e.code() != "lock_held") throw;
+        return -EBUSY;
+      }
+      if (guard) {
+        if (int g = guard()) return g;
+      }
+      int rc = cache_->leases->queue(*l, kOpUnlink, {name}, false, expected_ino);
+      if (rc != -EAGAIN) {
+        load(true);
+        return rc;
+      }
+    }
+    cache_->leases->drop(ino_);
+  }
   for (int attempt = 0; attempt < 16; ++attempt) {
     HeldLocks locks;
     locks.session = &session_;
@@ -641,6 +687,7 @@ void DirTable::rename_same(const std::string& old_name, const std::string& new_n
 
 void DirTable::compact_if_needed() {
   if (log_bytes_ < changelog::kAutoCompactBytes) return;
+  if (cache_ && cache_->leases && cache_->leases->authoritative(ino_)) return;
   // Snapshot, log truncation and meta must land together and must not race an
   // append from another client: hold the directory locks and commit through /txn.
   for (int attempt = 0; attempt < 4; ++attempt) {
@@ -716,6 +763,12 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
   if (int rc = validate_dentry_name(old_name.c_str())) return rc;
   if (int rc = validate_dentry_name(new_name.c_str())) return rc;
 
+  // The transaction below locks both directories itself; our own leases on them
+  // would refuse those locks. Flush and hand them back first.
+  if (st.leases) {
+    st.leases->drop(old_parent);
+    st.leases->drop(new_parent);
+  }
   for (int attempt = 0; attempt < 8; ++attempt) {
     DirTable old_dir = make_dir(st, old_parent);
     DirTable new_dir = make_dir(st, new_parent);
@@ -884,6 +937,12 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
       }
       old_dir.publish();
       new_dir.publish();
+      {
+        // Cached paths below the moved entry are stale (layout-rule matching).
+        std::lock_guard lock(st.mu);
+        if (S_ISDIR(moved.mode)) st.path_cache.clear();
+        else st.path_cache.erase(ino);
+      }
       mark_rstat_dirty(st, old_parent);
       mark_rstat_dirty(st, new_parent);
       return 0;
@@ -910,6 +969,40 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
   if (int rc = validate_dentry_name(new_name.c_str())) return rc;
   if (old_name == new_name) return 0;
 
+  if (st.leases) {
+    // Under our lease the rename is one queued record; the replaced inode (if
+    // any) is dropped synchronously like an unlink. create+rename (editors,
+    // rsync, compilers) thus never gives the lease up.
+    if (auto l = st.leases->get(parent, meta_layout_for_ino(st, parent))) {
+      uint64_t moved = 0;
+      uint64_t victim = 0;
+      const int prc = st.leases->peek(*l, old_name, moved);
+      if (prc == 0 && moved == 0) return -ENOENT;
+      if (prc == 0 && st.leases->peek(*l, new_name, victim) == 0) {
+        InodeMeta mm = load_inode(st, moved);
+        InodeMeta vm;
+        if (victim != 0 && victim != moved) {
+          vm = load_inode(st, victim);
+          if (vm.exists && S_ISDIR(vm.mode)) return -EISDIR;
+          if (mm.exists && S_ISDIR(mm.mode) && vm.exists && S_ISREG(vm.mode)) return -ENOTDIR;
+        }
+        const int rc = st.leases->rename(*l, old_name, new_name, moved, victim);
+        if (rc == 0) {
+          InodeMeta pmeta;
+          touch_dir_inode(st, parent, pmeta, now_ns(), 0);
+          if (victim != 0 && victim != moved && vm.exists) drop_nlink(st, victim);
+          {
+            std::lock_guard lock(st.mu);
+            st.path_cache.clear();
+          }
+          mark_rstat_dirty(st, parent);
+          return 0;
+        }
+        if (rc == -ENOENT) return -ENOENT;
+      }
+    }
+    st.leases->drop(parent);
+  }
   for (int attempt = 0; attempt < 8; ++attempt) {
     DirTable dir = make_dir(st, parent);
     dir.load(false);
@@ -1025,6 +1118,10 @@ int rename_same_dir(FsState& st, uint64_t parent, const std::string& old_name,
                            gc_gid);
       }
       dir.publish();
+      {
+        std::lock_guard lock(st.mu);
+        st.path_cache.clear();
+      }
       mark_rstat_dirty(st, parent);
       return 0;
     } catch (const client_error& e) {
@@ -1129,6 +1226,39 @@ InodeMeta load_inode(FsState& st, uint64_t ino) {
   std::lock_guard lock(st.mu);
   cache_inode_locked(st, m);
   return st.inode_cache[ino].meta;
+}
+
+void prefetch_inodes(FsState& st, const std::vector<uint64_t>& inos) {
+  std::vector<uint64_t> miss;
+  {
+    std::lock_guard lock(st.mu);
+    const auto now = std::chrono::steady_clock::now();
+    for (uint64_t ino : inos) {
+      auto it = st.inode_cache.find(ino);
+      if (it != st.inode_cache.end() && now - it->second.loaded < kInodeCacheTtl) continue;
+      miss.push_back(ino);
+    }
+  }
+  std::sort(miss.begin(), miss.end());
+  miss.erase(std::unique(miss.begin(), miss.end()), miss.end());
+  if (miss.size() < 2) return;  // the caller's own load is as good
+  const size_t nthreads = std::min<size_t>(8, miss.size());
+  std::atomic<size_t> next{0};
+  std::vector<std::thread> workers;
+  workers.reserve(nthreads);
+  for (size_t t = 0; t < nthreads; ++t) {
+    workers.emplace_back([&] {
+      for (;;) {
+        const size_t i = next.fetch_add(1);
+        if (i >= miss.size()) return;
+        try {
+          load_inode(st, miss[i]);
+        } catch (...) {
+        }
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
 }
 
 void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& path_for_layout,
@@ -1244,22 +1374,27 @@ void ensure_super(FsState& st) {
 }
 
 uint64_t alloc_ino(FsState& st) {
+  // Reserve a batch from the super object with one CAS; unused numbers of a
+  // batch are simply skipped (inode numbers need only be unique).
   for (int attempt = 0; attempt < 16; ++attempt) {
     ensure_super(st);
-    uint64_t id = 0;
     SuperMeta m;
     {
       std::lock_guard lock(st.mu);
+      if (st.ino_next < st.ino_end) return st.ino_next++;
       m = st.super;
-      id = m.next_ino++;
+      m.next_ino += kInoBatch;
     }
     try {
       m.cas = st.session.put_bytes(super_oid(st.volume), super_to_json(m), {}, m.cas);
       m.exists = true;
       std::lock_guard lock(st.mu);
+      const uint64_t first = m.next_ino - kInoBatch;
       st.super = m;
       st.super_loaded = std::chrono::steady_clock::now();
-      return id;
+      st.ino_next = first + 1;
+      st.ino_end = m.next_ino;
+      return first;
     } catch (const client_error& e) {
       if (e.code() != "conflict") throw;
       auto snap = st.session.get_object(super_oid(st.volume));
@@ -1328,6 +1463,37 @@ void drop_nlink(FsState& st, uint64_t ino) {
     } catch (...) {
     }
   }
+}
+
+// mtime/ctime/nlink of a directory after a namespace change. Under a lease the
+// server copy is written once per flush batch and only the in-core inode is
+// updated here; otherwise it is a CAS PUT with reapply.
+void touch_dir_inode(FsState& st, uint64_t dir_ino, InodeMeta& pmeta, uint64_t ts,
+                     int nlink_delta) {
+  if (st.leases) {
+    if (auto l = st.leases->authoritative(dir_ino)) {
+      st.leases->touch_parent(*l, ts, nlink_delta);
+      return;
+    }
+  }
+  if (!pmeta.exists) {
+    pmeta = load_inode(st, dir_ino);
+    if (!pmeta.exists) return;
+  }
+  pmeta.mtime_ns = pmeta.ctime_ns = ts;
+  if (nlink_delta > 0) {
+    pmeta.nlink += static_cast<uint32_t>(nlink_delta);
+  } else if (nlink_delta < 0 && pmeta.nlink > 2) {
+    pmeta.nlink -= 1;
+  }
+  store_inode(st, pmeta, std::nullopt, [ts, nlink_delta](InodeMeta& next) {
+    next.mtime_ns = next.ctime_ns = ts;
+    if (nlink_delta > 0) {
+      next.nlink += static_cast<uint32_t>(nlink_delta);
+    } else if (nlink_delta < 0 && next.nlink > 2) {
+      next.nlink -= 1;
+    }
+  });
 }
 
 void release_all_flocks(FsState& st) {
@@ -1610,6 +1776,42 @@ int ensure_not_frozen(aios_posix_fs* fs) {
   return 0;
 }
 
+int link_existing_ino(aios_posix_fs* fs, uint64_t ino, uint64_t new_parent, const char* new_name) {
+  const auto cred = effective_caller(fs);
+  auto m = aios::posix::load_inode(*fs->st, ino);
+  if (!m.exists) return -ENOENT;
+  if (S_ISDIR(m.mode)) return -EPERM;
+
+  auto new_dir = aios::posix::make_dir(*fs->st, new_parent);
+  new_dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, new_parent));
+  new_dir.load();
+  if (new_dir.entries().count(new_name)) return -EEXIST;
+  auto np = aios::posix::load_inode(*fs->st, new_parent);
+  if (!np.exists) return -ENOENT;
+  if (!S_ISDIR(np.mode)) return -ENOTDIR;
+  if (int ac = aios::posix::check_access(cred, np, kWantW | kWantX)) return ac;
+
+  // Bump nlink before creating the new dentry (safer on crash).
+  // Primary parent_ino is unchanged; only the destination dir is dirty for rstat.
+  const uint64_t ts = aios::posix::now_ns();
+  m.nlink += 1;
+  m.ctime_ns = ts;
+  aios::posix::store_inode(*fs->st, m, std::nullopt, [ts](aios::posix::InodeMeta& next) {
+    next.nlink += 1;
+    next.ctime_ns = ts;
+  });
+  if (!new_dir.link_if_absent(new_name, ino)) {
+    aios::posix::store_inode(*fs->st, m, std::nullopt, [ts](aios::posix::InodeMeta& next) {
+      if (next.nlink > 0) next.nlink -= 1;
+      next.ctime_ns = ts;
+    });
+    return -EEXIST;
+  }
+  aios::posix::touch_dir_inode(*fs->st, new_parent, np, ts, 0);
+  aios::posix::mark_rstat_dirty(*fs->st, new_parent);
+  return 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -1671,8 +1873,16 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
     fs->st->quota = std::make_unique<aios::posix::QuotaLedger>(fs->st->session, fs->st->volume);
     fs->st->qos = std::make_unique<aios::posix::QosController>(fs->st->session, fs->st->volume);
     fs->st->rstat_interval_ms = cfg->rstat_interval_ms;
+    fs->st->no_lease = (cfg->flags & AIOS_POSIX_F_NOLEASE) != 0;
+    if (const char* env = std::getenv("AIOS_POSIX_NOLEASE")) {
+      if (env[0] && env[0] != '0') fs->st->no_lease = true;
+    }
     aios::posix::ensure_super(*fs->st);
     aios::posix::ensure_root(*fs->st);
+    if (!fs->st->no_lease) {
+      fs->st->leases = std::make_unique<aios::posix::DirLeaseManager>(*fs->st);
+      fs->st->leases->start();
+    }
     aios::posix::start_rstat_thread(*fs->st);
     return fs;
   } catch (const aios::client_error& e) {
@@ -1688,12 +1898,38 @@ void aios_posix_unmount(aios_posix_fs* fs) {
   if (!fs) return;
   g_tls_callers.erase(fs);
   if (fs->st) {
+    // Queued directory records first: they must be on the server before the
+    // session goes away, and this hands every lease back.
+    if (fs->st->leases) fs->st->leases->stop();
     aios::posix::stop_rstat_thread(*fs->st);
     aios::posix::flush_all_dirty_inodes(*fs->st);
     if (fs->st->quota) fs->st->quota->flush();
     aios::posix::release_all_flocks(*fs->st);
   }
   delete fs;
+}
+
+int aios_posix_fsyncdir(aios_posix_fs* fs, uint64_t dir_ino) {
+  if (!fs || !fs->st) return -EINVAL;
+  if (!fs->st->leases) return 0;
+  try {
+    return fs->st->leases->fsync(dir_ino);
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+  AIOS_POSIX_CATCH_ALL
+}
+
+int aios_posix_sync(aios_posix_fs* fs) {
+  if (!fs || !fs->st) return -EINVAL;
+  try {
+    aios::posix::flush_all_dirty_inodes(*fs->st);
+    if (!fs->st->leases) return 0;
+    return fs->st->leases->sync_all(false);
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+  AIOS_POSIX_CATCH_ALL
 }
 
 uint64_t aios_posix_stripe_unit(const aios_posix_fs* fs) {
@@ -1762,6 +1998,14 @@ int aios_posix_readdir(aios_posix_fs* fs, uint64_t ino, uint64_t* offset,
     for (const auto& [n, i] : dir.entries()) items.emplace_back(n, i);
     std::sort(items.begin(), items.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
+    // d_type needs each child's mode; fetch the uncached ones of this batch in
+    // parallel instead of one GET after another.
+    {
+      std::vector<uint64_t> want;
+      const size_t end = std::min(items.size(), static_cast<size_t>(*offset) + max_entries);
+      for (size_t i = static_cast<size_t>(*offset); i < end; ++i) want.push_back(items[i].second);
+      aios::posix::prefetch_inodes(*fs->st, want);
+    }
     size_t nwrite = 0;
     while (*offset < items.size() && nwrite < max_entries) {
       const auto& [name, child] = items[static_cast<size_t>(*offset)];
@@ -1810,22 +2054,12 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    {
-      const std::string parent_path = aios::posix::path_of_ino(*fs->st, parent);
-      const std::string child_path =
-          parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
-      aios::posix::store_inode(*fs->st, m, child_path);
-    }
+    aios::posix::store_inode(*fs->st, m, aios::posix::child_path_for_layout(*fs->st, parent, name));
     if (!dir.link_if_absent(name, ino)) {
       aios::posix::delete_orphan_inode(*fs->st, ino);
       return -EEXIST;
     }
-    pmeta.mtime_ns = pmeta.ctime_ns = ts;
-    pmeta.nlink += 1;
-    aios::posix::store_inode(*fs->st, pmeta, std::nullopt, [ts](aios::posix::InodeMeta& next) {
-      next.mtime_ns = next.ctime_ns = ts;
-      next.nlink += 1;
-    });
+    aios::posix::touch_dir_inode(*fs->st, parent, pmeta, ts, 1);
     aios::posix::mark_rstat_dirty(*fs->st, parent);
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
@@ -1863,20 +2097,12 @@ int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    {
-      const std::string parent_path = aios::posix::path_of_ino(*fs->st, parent);
-      const std::string child_path =
-          parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
-      aios::posix::store_inode(*fs->st, m, child_path);
-    }
+    aios::posix::store_inode(*fs->st, m, aios::posix::child_path_for_layout(*fs->st, parent, name));
     if (!dir.link_if_absent(name, ino)) {
       aios::posix::delete_orphan_inode(*fs->st, ino);
       return -EEXIST;
     }
-    pmeta.mtime_ns = pmeta.ctime_ns = ts;
-    aios::posix::store_inode(*fs->st, pmeta, std::nullopt, [ts](aios::posix::InodeMeta& next) {
-      next.mtime_ns = next.ctime_ns = ts;
-    });
+    aios::posix::touch_dir_inode(*fs->st, parent, pmeta, ts, 0);
     aios::posix::mark_rstat_dirty(*fs->st, parent);
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
@@ -1918,20 +2144,12 @@ int aios_posix_symlink(aios_posix_fs* fs, uint64_t parent, const char* name, con
     m.atime_ns = m.mtime_ns = m.ctime_ns = ts;
     m.stripe_unit = fs->st->stripe_unit;
     m.stripe_width = fs->st->stripe_width;
-    {
-      const std::string parent_path = aios::posix::path_of_ino(*fs->st, parent);
-      const std::string child_path =
-          parent_path == "/" ? std::string("/") + name : parent_path + "/" + name;
-      aios::posix::store_inode(*fs->st, m, child_path);
-    }
+    aios::posix::store_inode(*fs->st, m, aios::posix::child_path_for_layout(*fs->st, parent, name));
     if (!dir.link_if_absent(name, ino)) {
       aios::posix::delete_orphan_inode(*fs->st, ino);
       return -EEXIST;
     }
-    pmeta.mtime_ns = pmeta.ctime_ns = ts;
-    aios::posix::store_inode(*fs->st, pmeta, std::nullopt, [ts](aios::posix::InodeMeta& next) {
-      next.mtime_ns = next.ctime_ns = ts;
-    });
+    aios::posix::touch_dir_inode(*fs->st, parent, pmeta, ts, 0);
     aios::posix::mark_rstat_dirty(*fs->st, parent);
     if (st_out) aios::posix::fill_stat(m, st_out);
     return 0;
@@ -2009,43 +2227,19 @@ int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name
     old_dir.load();
     auto it = old_dir.entries().find(old_name);
     if (it == old_dir.entries().end()) return -ENOENT;
-    const uint64_t ino = it->second;
-    auto m = aios::posix::load_inode(*fs->st, ino);
-    if (!m.exists) return -ENOENT;
-    if (S_ISDIR(m.mode)) return -EPERM;
+    return link_existing_ino(fs, it->second, new_parent, new_name);
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+  AIOS_POSIX_CATCH_ALL
+}
 
-    auto new_dir = aios::posix::make_dir(*fs->st, new_parent);
-    new_dir.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, new_parent));
-    new_dir.load();
-    if (new_dir.entries().count(new_name)) return -EEXIST;
-    auto np = aios::posix::load_inode(*fs->st, new_parent);
-    if (!np.exists) return -ENOENT;
-    if (!S_ISDIR(np.mode)) return -ENOTDIR;
-    if (int ac = aios::posix::check_access(cred, np, kWantW | kWantX)) return ac;
-
-    // Bump nlink before creating the new dentry (safer on crash).
-    // Primary parent_ino is unchanged; only the destination dir is dirty for rstat.
-    const uint64_t ts = aios::posix::now_ns();
-    m.nlink += 1;
-    m.ctime_ns = ts;
-    aios::posix::store_inode(*fs->st, m, std::nullopt, [ts](aios::posix::InodeMeta& next) {
-      next.nlink += 1;
-      next.ctime_ns = ts;
-    });
-    if (!new_dir.link_if_absent(new_name, ino)) {
-      // Roll back the nlink bump; the name lost the race.
-      aios::posix::store_inode(*fs->st, m, std::nullopt, [ts](aios::posix::InodeMeta& next) {
-        if (next.nlink > 0) next.nlink -= 1;
-        next.ctime_ns = ts;
-      });
-      return -EEXIST;
-    }
-    np.mtime_ns = np.ctime_ns = ts;
-    aios::posix::store_inode(*fs->st, np, std::nullopt, [ts](aios::posix::InodeMeta& next) {
-      next.mtime_ns = next.ctime_ns = ts;
-    });
-    aios::posix::mark_rstat_dirty(*fs->st, new_parent);
-    return 0;
+int aios_posix_link_ino(aios_posix_fs* fs, uint64_t ino, uint64_t new_parent, const char* new_name) {
+  if (!fs || !new_name) return -EINVAL;
+  if (int rc = aios::posix::validate_dentry_name(new_name)) return rc;
+  try {
+    if (int fr = ensure_not_frozen(fs)) return fr;
+    return link_existing_ino(fs, ino, new_parent, new_name);
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
   }
@@ -2075,6 +2269,8 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
     child.set_put_layout(aios::posix::meta_layout_for_ino(*fs->st, ino));
     child.load();
     if (!child.entries().empty()) return -ENOTEMPTY;
+    // Our own lease on the child would refuse the locks taken below.
+    if (fs->st->leases) fs->st->leases->drop(ino);
     // Re-check emptiness with the child's tip locked so a concurrent create in it
     // cannot slip between the check and the removal.
     int rc = dir.unlink_if(name, ino, {child.meta_oid(), child.log_oid(), child.snap_oid()},
@@ -2084,14 +2280,7 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name) {
                            });
     if (rc) return rc;
     fs->st->session.delete_object(aios::posix::ino_oid(fs->st->volume, ino));
-    pmeta = aios::posix::load_inode(*fs->st, parent);
-    if (pmeta.exists && pmeta.nlink > 2) {
-      const uint64_t ts = aios::posix::now_ns();
-      aios::posix::store_inode(*fs->st, pmeta, std::nullopt, [ts](aios::posix::InodeMeta& next) {
-        if (next.nlink > 2) next.nlink -= 1;
-        next.mtime_ns = next.ctime_ns = ts;
-      });
-    }
+    aios::posix::touch_dir_inode(*fs->st, parent, pmeta, aios::posix::now_ns(), -1);
     {
       std::lock_guard lock(fs->st->mu);
       fs->st->inode_cache.erase(ino);
@@ -2127,7 +2316,7 @@ int aios_posix_rename2(aios_posix_fs* fs, uint64_t old_parent, const char* old_n
     if (int ac = aios::posix::check_access(cred, np_meta, kWantW | kWantX)) return ac;
 
     // Cross layout-rule rename is not in-place; clients should copy (EXDEV).
-    {
+    if (aios::posix::layout_rules_present(*fs->st)) {
       auto join_path = [](const std::string& dir, const char* name) {
         if (dir == "/") return std::string("/") + name;
         return dir + "/" + name;
@@ -2530,6 +2719,9 @@ int aios_posix_snapshot_at(aios_posix_fs* fs, const char* path, char* snap_id_ou
       m.exists = true;
       st.super = m;
     }
+    // Directory records queued under leases must be on the server before the
+    // tips are read; new ones are refused while frozen.
+    if (st.leases) st.leases->sync_all(false);
     const auto sid = [&]() {
       static thread_local std::mt19937_64 rng{
           static_cast<std::uint64_t>(

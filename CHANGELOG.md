@@ -12,6 +12,13 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Added — `aios-fusell` (libfuse3 low-level)
+
+Inode-based FUSE mount of `libaios_posix`, next to high-level `aios-fuse`. Same `-o` keys
+(`endpoint`, `cluster_key`, `volume`, `nolease`, …) and the same directory-lease / writeback
+behaviour; the kernel talks inodes instead of paths (`fuse_session_new`, `fuse_lowlevel_ops`).
+`aios_posix_link_ino` is the hard-link primitive that path-based `aios_posix_link` now shares.
+
 ### Added — ticket authentication (cephx / Kerberos style)
 
 - **Principals** replace handing `cluster_key` to clients. `aios admin principal
@@ -56,6 +63,46 @@ current fix cycle — check the regression test of the same name before relying 
   nothing to cancel, but it waited for an io_context that had never run).
 - Tests: `tests/test_s3_tls.cpp` (context loading errors, startup refusal, SigV4 PUT/GET over TLS
   with a generated certificate, plaintext-on-TLS-port and TLS-on-plain-port both fail cleanly).
+
+### Added — directory leases in `libaios_posix` / `aios-fuse`; POSIX layer round-trip cuts
+
+The FUSE mount (and everything else on `libaios_posix`: the S3 gateway, XRootD OSS,
+`aios-kbridge`) now uses the same directory-lease protocol as the kernel client, so both kinds of
+mount interoperate on one volume and break each other's leases.
+
+- **Leases (`DirLeaseManager`, `src/posix/posix_lease.cpp`).** The first namespace change in a
+  directory takes the server lock on its meta object (TTL 30 s, renewed every 1 s, released after
+  10 s idle, at most 64 per mount). Under the lease `create`/`mkdir`/`symlink`/`link`/`unlink`
+  (and `rmdir`'s parent-side removal) check against and update the lease's in-memory table, update
+  the parent inode in-core and queue a changelog record; `lookup`/`readdir` on a leased directory
+  are served from that table without a round trip. A flusher thread (woken per op, so cross-mount
+  visibility lags by about one round trip) appends the queue in batches (one `append` + one CAS
+  `PUT` of meta per batch, compaction under log/snap locks when garbage from a peer's refused
+  append is detected or the log exceeds 1 MiB) and writes the parent's mtime/nlink once per batch.
+  A `create` is one synchronous round trip (child inode PUT) instead of about twelve (three lock
+  acquires, reload, append, meta PUT, parent PUT, three releases). `break_requested` seen at a
+  renew flushes and releases within the grace period; a lost lease replays the queue with the
+  synchronous protocol and keeps a sticky error. Same-directory `rename` is one queued record
+  too (the replaced inode is dropped synchronously, as for `unlink`), so create+rename never gives
+  the lease up; cross-directory `rename` and `rmdir` of a leased directory flush and release
+  first, then run the existing `/txn` protocol.
+- **ABI.** `aios_posix_fsyncdir(fs, dir_ino)` and `aios_posix_sync(fs)` wait for the queue and
+  return the sticky error; unmount flushes and releases every lease.
+  `aios_posix_config.flags` with `AIOS_POSIX_F_NOLEASE` (also `AIOS_POSIX_NOLEASE=1` in the
+  environment, `-o nolease` for `aios-fuse`) keeps the old per-operation commit.
+- **`aios-fuse`.** Implements `opendir`/`fsyncdir` (so `fsync(dirfd)` commits the queue), reports
+  our inode numbers to the kernel (`use_ino`, `readdir_ino`: hard links share `st_ino`) and sets
+  `nullpath_ok` so read/write/flush/fsync/release/readdir skip libfuse's path resolution.
+- **Fewer round trips elsewhere.** Inode numbers are reserved from the super object in batches of
+  64 (one CAS per batch instead of per create). Layout-rule matching no longer walks the parent
+  chain (one directory load per level, twice per create) when no rules are configured, and caches
+  the path per inode when they are. `readdir` fetches the uncached child inodes of a batch with
+  up to 8 parallel GETs instead of serially (d_type needs the mode; the S3 gateway relies on it).
+- `Session::lock_renew` reports `break_requested`.
+- Tests: `Review2Posix.DirLeaseHeldWhileActiveAndReleasedOnUnmount`,
+  `Review2Posix.DirLeaseBatchesManyCreates` (200 creates: ~1.7 s → ~0.6 s against a local daemon),
+  `Review2Posix.DirLeaseUnlinkRmdirAndRenameUnderLease`,
+  `Review2Posix.PeerBreaksDirLeaseAndBothMountsConverge`, `Review2Posix.NoLeaseFlagCommitsSynchronously`.
 
 ### Added — directory leases: asynchronous namespace operations in `aiosfs`
 

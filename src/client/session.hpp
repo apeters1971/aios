@@ -133,8 +133,11 @@ class Session {
 
   // Lock API on arbitrary oid.
   LockResult lock_acquire(const std::string& oid, int ttl_ms = 30000);
+  // break_requested_out: a peer asked for the lease back (lock_break); the
+  // server will not extend past its grace deadline and the holder should flush
+  // and release.
   void lock_renew(const std::string& oid, const std::string& token, int ttl_ms = 30000,
-                  std::int64_t* expires_ms_out = nullptr);
+                  std::int64_t* expires_ms_out = nullptr, bool* break_requested_out = nullptr);
   void lock_release(const std::string& oid, const std::string& token);
   bool lock_try_acquire(const std::string& oid, std::string& token_out, int ttl_ms = 30000,
                         std::int64_t* expires_ms_out = nullptr);

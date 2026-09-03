@@ -1,5 +1,7 @@
 #include "posix/aios_posix.h"
-#include "posix/fuse3_ops.hpp"
+#include "posix/fuse3_ll_ops.hpp"
+
+#include <fuse3/fuse_opt.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,8 +25,12 @@ struct Options {
 void usage(const char* argv0) {
   std::fprintf(stderr,
                "Usage: %s [FUSE options] -o endpoint=HOST:PORT,cluster_key=KEY[,volume=NAME] "
-               "MOUNTPOINT\n",
+               "MOUNTPOINT\n\n"
+               "AIOS options: endpoint, cluster_key, volume, app_label, stripe_unit, "
+               "stripe_width, nolease\n",
                argv0);
+  fuse_cmdline_help();
+  fuse_lowlevel_help();
 }
 
 bool is_aios_opt(const std::string& k) {
@@ -72,29 +78,64 @@ int main(int argc, char** argv) {
   if (const char* env = std::getenv("AIOS_CLUSTER_KEY")) opt.cluster_key = env;
   if (const char* env = std::getenv("AIOS_ENDPOINT")) opt.endpoint = env;
 
-  /* libfuse rejects unknown -o keys. Peel ours off; forward only FUSE leftovers. */
-  std::vector<std::string> fuse_args;
-  fuse_args.emplace_back(argv[0]);
+  std::vector<std::string> leftover;
+  leftover.emplace_back(argv[0]);
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
       const std::string rest = take_aios_opts(argv[++i], opt);
       if (!rest.empty()) {
-        fuse_args.emplace_back("-o");
-        fuse_args.push_back(rest);
+        leftover.emplace_back("-o");
+        leftover.push_back(rest);
       }
       continue;
     }
     if (std::strncmp(argv[i], "-o", 2) == 0 && argv[i][2] != '\0') {
       const std::string rest = take_aios_opts(argv[i] + 2, opt);
-      if (!rest.empty()) fuse_args.push_back(std::string("-o") + rest);
+      if (!rest.empty()) leftover.push_back(std::string("-o") + rest);
       continue;
     }
-    fuse_args.emplace_back(argv[i]);
+    leftover.emplace_back(argv[i]);
+  }
+
+  struct fuse_args args = FUSE_ARGS_INIT(0, nullptr);
+  for (const auto& s : leftover) {
+    if (fuse_opt_add_arg(&args, s.c_str()) != 0) {
+      std::fprintf(stderr, "fuse_opt_add_arg failed\n");
+      fuse_opt_free_args(&args);
+      return 1;
+    }
+  }
+
+  struct fuse_cmdline_opts opts {};
+  if (fuse_parse_cmdline(&args, &opts) != 0) {
+    usage(argv[0]);
+    fuse_opt_free_args(&args);
+    return 2;
+  }
+  if (opts.show_help) {
+    usage(argv[0]);
+    std::free(opts.mountpoint);
+    fuse_opt_free_args(&args);
+    return 0;
+  }
+  if (opts.show_version) {
+    fuse_lowlevel_version();
+    std::free(opts.mountpoint);
+    fuse_opt_free_args(&args);
+    return 0;
+  }
+  if (!opts.mountpoint) {
+    usage(argv[0]);
+    std::fprintf(stderr, "mountpoint required\n");
+    fuse_opt_free_args(&args);
+    return 2;
   }
 
   if (opt.cluster_key.empty()) {
     usage(argv[0]);
     std::fprintf(stderr, "cluster_key required (-o cluster_key=... or AIOS_CLUSTER_KEY)\n");
+    std::free(opts.mountpoint);
+    fuse_opt_free_args(&args);
     return 2;
   }
 
@@ -115,26 +156,42 @@ int main(int argc, char** argv) {
   aios_posix_fs* fs = aios_posix_mount(&cfg, &err);
   if (!fs) {
     std::fprintf(stderr, "aios_posix_mount failed errno=%d\n", err);
+    std::free(opts.mountpoint);
+    fuse_opt_free_args(&args);
     return 1;
   }
 
   /* libfuse 3.10: session_new and init() must request the same max_read. */
   bool have_max_read = false;
-  for (const auto& s : fuse_args) {
-    if (s.find("max_read=") != std::string::npos) have_max_read = true;
+  for (int i = 0; i < args.argc; ++i) {
+    if (args.argv[i] && std::strstr(args.argv[i], "max_read=")) have_max_read = true;
   }
   if (!have_max_read) {
-    fuse_args.emplace_back("-o");
-    fuse_args.push_back("max_read=" + std::to_string(aios_fuse_max_io(fs)));
+    const std::string max_read = "max_read=" + std::to_string(aios_fuse_ll_max_io(fs));
+    fuse_opt_add_arg(&args, "-o");
+    fuse_opt_add_arg(&args, max_read.c_str());
   }
 
-  std::vector<char*> fuse_argv;
-  fuse_argv.reserve(fuse_args.size() + 1);
-  for (auto& s : fuse_args) fuse_argv.push_back(s.data());
-  fuse_argv.push_back(nullptr);
-
-  auto ops = aios_fuse_operations();
-  const int rc = fuse_main(static_cast<int>(fuse_argv.size() - 1), fuse_argv.data(), &ops, fs);
+  int rc = 1;
+  auto ops = aios_fuse_ll_operations();
+  struct fuse_session* se = fuse_session_new(&args, &ops, sizeof(ops), fs);
+  if (!se) goto out_unmount;
+  if (fuse_set_signal_handlers(se) != 0) goto out_destroy;
+  if (fuse_session_mount(se, opts.mountpoint) != 0) goto out_signals;
+  fuse_daemonize(opts.foreground);
+  if (opts.singlethread) {
+    rc = fuse_session_loop(se);
+  } else {
+    rc = fuse_session_loop_mt(se, opts.clone_fd);
+  }
+  fuse_session_unmount(se);
+out_signals:
+  fuse_remove_signal_handlers(se);
+out_destroy:
+  fuse_session_destroy(se);
+out_unmount:
   aios_posix_unmount(fs);
-  return rc;
+  std::free(opts.mountpoint);
+  fuse_opt_free_args(&args);
+  return rc == 0 ? 0 : 1;
 }

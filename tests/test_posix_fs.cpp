@@ -178,6 +178,10 @@ TEST(PosixFs, Basic) {
   EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 2) << "nlink 2";
   EXPECT_TRUE(aios_posix_link(fs, dir_ino, "renamed.txt", dir2, "cross.txt") == 0) << "hardlink cross";
   EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 3) << "nlink 3";
+  EXPECT_TRUE(aios_posix_link_ino(fs, file_ino, dir2, "via_ino.txt") == 0) << "hardlink by ino";
+  EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 4) << "nlink 4";
+  EXPECT_TRUE(aios_posix_lookup(fs, dir2, "via_ino.txt", &looked) == 0 && looked.ino == file_ino)
+      << "via_ino lookup";
   char r2[8]{};
   size_t got2 = 0;
   EXPECT_TRUE(aios_posix_lookup(fs, dir2, "cross.txt", &looked) == 0 && looked.ino == file_ino) << "cross lookup";
@@ -194,16 +198,17 @@ TEST(PosixFs, Basic) {
   EXPECT_TRUE(aios_posix_rename(fs, dir_ino, "alias.txt", dir3, "moved.txt") == 0) << "cross rename";
   EXPECT_TRUE(aios_posix_lookup(fs, dir_ino, "alias.txt", &looked) == -ENOENT) << "src gone";
   EXPECT_TRUE(aios_posix_lookup(fs, dir3, "moved.txt", &looked) == 0 && looked.ino == file_ino) << "dst present";
-  EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 3) << "nlink unchanged by rename";
+  EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 4) << "nlink unchanged by rename";
   // Replace at destination via cross-dir rename.
   EXPECT_TRUE(aios_posix_create(fs, dir3, "victim.txt", 0644, &st) == 0) << "victim";
   const uint64_t victim = st.ino;
   EXPECT_TRUE(aios_posix_rename(fs, dir_ino, "renamed.txt", dir3, "victim.txt") == 0) << "cross rename replace";
   EXPECT_TRUE(aios_posix_getattr(fs, victim, &st) == -ENOENT) << "victim unlinked";
   EXPECT_TRUE(aios_posix_lookup(fs, dir3, "victim.txt", &looked) == 0 && looked.ino == file_ino) << "replaced name";
-  EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 3) << "nlink after replace move";
+  EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == 0 && st.nlink == 4) << "nlink after replace move";
 
   EXPECT_TRUE(aios_posix_unlink(fs, dir2, "cross.txt") == 0) << "unlink cross";
+  EXPECT_TRUE(aios_posix_unlink(fs, dir2, "via_ino.txt") == 0) << "unlink via_ino";
   EXPECT_TRUE(aios_posix_unlink(fs, dir3, "moved.txt") == 0) << "unlink moved";
   EXPECT_TRUE(aios_posix_unlink(fs, dir3, "victim.txt") == 0) << "unlink last";
   EXPECT_TRUE(aios_posix_getattr(fs, file_ino, &st) == -ENOENT) << "inode gone";

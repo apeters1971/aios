@@ -1095,7 +1095,7 @@ bool Session::lock_acquire_wait(const std::string& oid, std::string& token_out, 
 }
 
 void Session::lock_renew(const std::string& oid, const std::string& token, int ttl_ms,
-                         std::int64_t* expires_ms_out) {
+                         std::int64_t* expires_ms_out, bool* break_requested_out) {
   std::unordered_map<std::string, std::string> headers;
   headers["x-aios-lock-ttl-ms"] = std::to_string(ttl_ms);
   validate_header_value(token, "lock token");
@@ -1103,12 +1103,14 @@ void Session::lock_renew(const std::string& oid, const std::string& token, int t
   const auto path = "/o/" + url_encode_oid(oid) + "/lock/renew";
   auto resp = request("POST", path, headers);
   if (resp.status != 200) throw_http(resp, "lock_renew");
-  if (expires_ms_out) {
+  if (expires_ms_out) *expires_ms_out = 0;
+  if (break_requested_out) *break_requested_out = false;
+  if (expires_ms_out || break_requested_out) {
     try {
       auto j = nlohmann::json::parse(resp.body);
-      *expires_ms_out = j.value("expires_ms", static_cast<std::int64_t>(0));
+      if (expires_ms_out) *expires_ms_out = j.value("expires_ms", static_cast<std::int64_t>(0));
+      if (break_requested_out) *break_requested_out = j.value("break_requested", false);
     } catch (...) {
-      *expires_ms_out = 0;
     }
   }
 }

@@ -26,7 +26,12 @@ typedef struct aios_posix_config {
   int rstat_interval_ms;    /* recursive dir stats flush; 0 disables; typical 60000.
                                The deferred inode flusher (see aios_posix_write) runs
                                regardless of this value. */
+  unsigned flags;           /* AIOS_POSIX_F_* */
 } aios_posix_config;
+
+/* Commit every directory operation synchronously instead of leasing the
+ * directory and batching its changelog appends (see aios_posix_fsyncdir). */
+#define AIOS_POSIX_F_NOLEASE 0x1u
 
 /* Per-request caller identity (thread-local for this mount). */
 typedef struct aios_posix_cred {
@@ -59,6 +64,15 @@ typedef struct aios_posix_dirent {
 
 aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out);
 void aios_posix_unmount(aios_posix_fs* fs);
+
+/* Directory operations (create/mkdir/unlink/rename/symlink/link) on a directory
+ * this mount leases are acknowledged before the changelog record is on the
+ * server; a flusher commits them within milliseconds. fsyncdir waits for the
+ * directory's queue and returns (and clears) the error of a record that could
+ * not be committed; sync does so for every directory. Both are no-ops with
+ * AIOS_POSIX_F_NOLEASE. */
+int aios_posix_fsyncdir(aios_posix_fs* fs, uint64_t dir_ino);
+int aios_posix_sync(aios_posix_fs* fs);
 uint64_t aios_posix_stripe_unit(const aios_posix_fs* fs);
 
 /* Recompute dirty recursive directory stats (aios.r*). Also runs on the
@@ -97,6 +111,9 @@ int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name);
 /* Hard link. Directories are rejected (-EPERM). Cross-directory is best-effort. */
 int aios_posix_link(aios_posix_fs* fs, uint64_t old_parent, const char* old_name,
                     uint64_t new_parent, const char* new_name);
+/* Same, when the source is already known by inode (FUSE lowlevel). */
+int aios_posix_link_ino(aios_posix_fs* fs, uint64_t ino, uint64_t new_parent,
+                        const char* new_name);
 
 /* rename flags (linux renameat2). EXCHANGE/WHITEOUT are rejected (-EINVAL). */
 enum {
