@@ -121,7 +121,7 @@ void aios_posix_set_caller / clear_caller / get_caller;
 int aios_posix_access(fs, ino, amode);
 int aios_posix_lookup(fs, parent, name, &st);
 int aios_posix_link / link_ino / setxattr / getxattr / listxattr / removexattr / flock;
-int aios_posix_read/write/truncate/...
+int aios_posix_read/write/truncate/prefetchv/...
 ```
 
 Errors are **negative errno**. The ABI avoids Boost/STL so a future kernel port can keep the same surface in C.
@@ -139,6 +139,27 @@ Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `str
 **`aios-fuse`** is high-level libfuse3 (`fuse_main`, multi-threaded unless `-s`), `kernel_cache` with 1 s attribute/entry timeouts, writeback cache when the kernel offers it, `use_ino`/`readdir_ino` (our inode numbers are exposed) and `nullpath_ok` (read/write/flush/fsync/release/readdir work on the file handle). `fsync(dirfd)` maps to `aios_posix_fsyncdir`.
 
 **`aios-fusell`** is the same filesystem over the low-level API (`fuse_session_new`, `fuse_lowlevel_ops`). The kernel already names inodes, so lookup/create/read skip libfuse's path resolution; root is `FUSE_ROOT_ID` (1), matching the POSIX ABI. Timeouts, writeback, `max_read`/`max_write`, `fsyncdir`, and `-o nolease` match `aios-fuse`. Hard links use `aios_posix_link_ino`.
+
+## Sparse-range prefetch (`AIOS_IOC_PREFETCHV`)
+
+Applications can hand the filesystem a **complete vector of upcoming file ranges in one operation** so the mount fetches them as one logical backend batch before `read`/`pread`:
+
+```c
+#include <aios/aiosfs_uapi.h>
+
+struct aios_range ranges[] = {
+    {.offset = 64 * 1024, .length = 16 * 1024},
+    {.offset = 8ull * 1024 * 1024, .length = 32 * 1024},
+};
+int ret = aios_prefetchv(fd, ranges, 2);
+```
+
+The UAPI is a fixed inline struct (`nranges` + `flags` + up to 256 `aios_range` entries, no nested pointers) so the same `ioctl(fd, AIOS_IOC_PREFETCHV, &req)` works on:
+
+- **FUSE** (`aios-fuse` / `aios-fusell`) — restricted ioctl; the daemon receives the whole vector and `aios_posix_prefetchv` GETs the unique stripe chunks into the POSIX chunk cache the read path uses.
+- **Kernel aiosfs** — `.unlocked_ioctl`; HTTP backend maps ranges to unique chunks then populates the page cache; upcall backend sends `AIOS_OP_PREFETCHV` to `aios-kbridge` (same POSIX prefetch) then fills pages from that cache.
+
+Ranges are validated in full before any backend I/O (zero length, overflow, past EOF → `-EINVAL`; too many ranges or more than 256 MiB → `-E2BIG`; unknown `flags` → `-EOPNOTSUPP`). Overlapping/adjacent ranges are merged. Success means the data has been fetched into the mount's normal read cache, not that it is pinned there forever.
 
 ## Directory leases
 
@@ -164,4 +185,4 @@ See [`kernel/README.md`](../kernel/README.md).
 
 - `libaios_posix` — ABI implementation over `Session`
 - `libaios_client` — HTTP session (`put_bytes`, `delete_object`, `list_prefix`, …)
-- Header install: `include/aios/aios_posix.h` (+ `aios_kabi.h` when kbridge is enabled)
+- Header install: `include/aios/aios_posix.h`, `include/aios/aiosfs_uapi.h` (+ `aios_kabi.h` when kbridge is enabled)

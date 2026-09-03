@@ -568,6 +568,46 @@ void ll_fsync(fuse_req_t req, fuse_ino_t ino, int /*datasync*/, struct fuse_file
   });
 }
 
+void ll_ioctl(fuse_req_t req, fuse_ino_t ino,
+#if FUSE_USE_VERSION < 35
+              int cmd,
+#else
+              unsigned int cmd,
+#endif
+              void* /*arg*/, struct fuse_file_info* fi, unsigned flags, const void* in_buf,
+              size_t in_bufsz, size_t /*out_bufsz*/) {
+  guarded(req, [&] {
+#ifdef FUSE_IOCTL_DIR
+    if (flags & FUSE_IOCTL_DIR) {
+      fuse_reply_err(req, ENOTTY);
+      return;
+    }
+#endif
+    (void)flags;
+    if (static_cast<unsigned int>(cmd) != AIOS_IOC_PREFETCHV) {
+      fuse_reply_err(req, ENOTTY);
+      return;
+    }
+    if (!in_buf || in_bufsz < sizeof(struct aios_prefetchv)) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    auto* fs = fs_from(req);
+    if (!fs) {
+      fuse_reply_err(req, EIO);
+      return;
+    }
+    const uint64_t file = (fi && fi->fh) ? fi->fh : ino;
+    const auto* pref = static_cast<const struct aios_prefetchv*>(in_buf);
+    int rc = aios_posix_prefetchv(fs, file, pref);
+    if (rc < 0) {
+      fuse_reply_err(req, -rc);
+      return;
+    }
+    fuse_reply_ioctl(req, 0, nullptr, 0);
+  });
+}
+
 void ll_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
   guarded(req, [&] {
     auto* fs = fs_from(req);
@@ -872,6 +912,7 @@ fuse_lowlevel_ops aios_fuse_ll_operations() {
   ops.flush = ll_flush;
   ops.release = ll_release;
   ops.fsync = ll_fsync;
+  ops.ioctl = ll_ioctl;
   ops.opendir = ll_opendir;
   ops.readdir = ll_readdir;
   ops.releasedir = ll_releasedir;

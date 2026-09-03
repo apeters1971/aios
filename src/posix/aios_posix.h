@@ -5,6 +5,8 @@
  * call the same surface from C without Boost/STL in this header.
  */
 
+#include "aiosfs_uapi.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -137,6 +139,11 @@ int aios_posix_readlink(aios_posix_fs* fs, uint64_t ino, char* buf, size_t size)
 
 int aios_posix_read(aios_posix_fs* fs, uint64_t ino, uint64_t offset, void* buf,
                     size_t len, size_t* out_len);
+/* Fetch the given sparse ranges into the mount's read cache (chunk cache).
+ * Successful return means a later aios_posix_read of those ranges should not
+ * need another backend GET of the covering stripe objects. req is the same
+ * inline vector as ioctl(AIOS_IOC_PREFETCHV). */
+int aios_posix_prefetchv(aios_posix_fs* fs, uint64_t ino, const struct aios_prefetchv* req);
 /* Data is durable on the cluster when write returns. The inode's size/mtime
  * update is deferred and batched: it is visible to this mount immediately, and
  * to other clients (other mounts, S3, XRootD, the kernel client) within ~100 ms

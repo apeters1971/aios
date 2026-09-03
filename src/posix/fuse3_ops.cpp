@@ -376,6 +376,27 @@ int posix_fsync(const char* /*path*/, int /*datasync*/, struct fuse_file_info* f
   });
 }
 
+int posix_ioctl(const char* /*path*/,
+#if FUSE_USE_VERSION < 35
+                int cmd,
+#else
+                unsigned int cmd,
+#endif
+                void* /*arg*/, struct fuse_file_info* fi, unsigned int flags, void* data) {
+  return guard([&] {
+    auto* fs = fs_handle();
+    if (!fi) return -EIO;
+#ifdef FUSE_IOCTL_DIR
+    if (flags & FUSE_IOCTL_DIR) return -ENOTTY;
+#endif
+    (void)flags;
+    if (static_cast<unsigned int>(cmd) != AIOS_IOC_PREFETCHV) return -ENOTTY;
+    auto* req = static_cast<struct aios_prefetchv*>(data);
+    if (!req) return -EFAULT;
+    return aios_posix_prefetchv(fs, fi->fh, req);
+  });
+}
+
 int posix_flush(const char* /*path*/, struct fuse_file_info* fi) {
   return posix_fsync(nullptr, 0, fi);
 }
@@ -763,6 +784,7 @@ fuse_operations aios_fuse_operations() {
   ops.write = posix_write;
   ops.truncate = posix_truncate;
   ops.fsync = posix_fsync;
+  ops.ioctl = posix_ioctl;
   ops.flush = posix_flush;
   ops.opendir = posix_opendir;
   ops.fsyncdir = posix_fsyncdir;

@@ -495,6 +495,49 @@ void aios_evict_inode(struct inode *inode)
 	inode->i_private = NULL;
 }
 
+int aios_prefetch_copy_pages(struct inode *inode, loff_t pos, const void *buf, size_t len)
+{
+	struct address_space *mapping = inode->i_mapping;
+	loff_t i_size = i_size_read(inode);
+	size_t off = 0;
+
+	if (!buf || !len)
+		return 0;
+	if (pos >= i_size)
+		return 0;
+	if (pos + (loff_t)len > i_size)
+		len = (size_t)(i_size - pos);
+
+	while (off < len) {
+		pgoff_t index = (pos + off) >> PAGE_SHIFT;
+		size_t page_off = (pos + off) & (PAGE_SIZE - 1);
+		size_t n = min_t(size_t, PAGE_SIZE - page_off, len - off);
+		struct page *page;
+		void *kaddr;
+
+		page = find_or_create_page(mapping, index, mapping_gfp_mask(mapping));
+		if (!page)
+			return -ENOMEM;
+		if (PageDirty(page) || PageWriteback(page) || PageUptodate(page)) {
+			unlock_page(page);
+			put_page(page);
+			off += n;
+			continue;
+		}
+		kaddr = kmap(page);
+		if (page_off || n < PAGE_SIZE)
+			memset(kaddr, 0, PAGE_SIZE);
+		memcpy((char *)kaddr + page_off, (const char *)buf + off, n);
+		kunmap(page);
+		flush_dcache_page(page);
+		SetPageUptodate(page);
+		unlock_page(page);
+		put_page(page);
+		off += n;
+	}
+	return 0;
+}
+
 void aios_setup_file_inode(struct inode *inode)
 {
 	inode->i_mapping->a_ops = &aios_aops;

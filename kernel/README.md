@@ -152,7 +152,8 @@ Control device: `/dev/aiosvd_ctl` ([`aiosvd_uapi.h`](aiosvd_uapi.h) ioctls: map/
 
 | Path | Role |
 |------|------|
-| [`aios_kabi.h`](aios_kabi.h) | Upcall request/reply ABI (incl. xattr ops 18–21) |
+| [`aios_kabi.h`](aios_kabi.h) | Upcall request/reply ABI (incl. xattr ops 18–21, PREFETCHV 24) |
+| [`aiosfs_uapi.h`](aiosfs_uapi.h) | aiosfs file ioctl ABI (`AIOS_IOC_PREFETCHV`) |
 | [`aiosvd_uapi.h`](aiosvd_uapi.h) | aiosvd map/unmap/info/list/resize/clone/rename ioctl ABI |
 | [`aios_http/`](aios_http/) | Shared HTTP client (keep-alive, timeouts, `put_range`, pool) |
 | [`aiosfs/`](aiosfs/) | VFS module |
@@ -165,7 +166,7 @@ Control device: `/dev/aiosvd_ctl` ([`aiosvd_uapi.h`](aiosvd_uapi.h) ioctls: map/
 ## Status / limits (prototype)
 
 - **aios_http**: keep-alive TCP, ~30s send/recv timeouts, reconnect-on-error; `Content-Range` PUT; shared `aios_http_pool` used by aiosfs + aiosvd.
-- **aiosfs page cache**: buffered I/O + `writepage`/`writepages`; HTTP writeback groups dirty pages by stripe chunk and flushes in parallel via the pool; `O_DIRECT` via `IOCB_DIRECT`; `fsync` waits for writeback.
+- **aiosfs page cache**: buffered I/O + `writepage`/`writepages`; HTTP writeback groups dirty pages by stripe chunk and flushes in parallel via the pool; `O_DIRECT` via `IOCB_DIRECT`; `fsync` waits for writeback; `AIOS_IOC_PREFETCHV` fills pages covering a sparse range vector.
 - **aiosfs xattrs**: `user.*` / `trusted.*` via 5.14 `s_xattr` handlers; HTTP stores base64 values in inode meta JSON (`xattrs`); upcall uses `AIOS_OP_*XATTR` → `aios_posix_*xattr`.
 - **aiosfs locks**: advisory POSIX/`flock` via kernel `locks_lock_file_wait` — **node-local only**, not cluster-wide.
 - **aiosfs densening**: HTTP hardlinks (`link(2)`); `fallocate` punch-hole + `KEEP_SIZE` best-effort on HTTP (else `-EOPNOTSUPP`); prealloc not implemented.

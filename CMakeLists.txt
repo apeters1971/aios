@@ -311,6 +311,7 @@ add_library(aios_posix STATIC
 )
 target_include_directories(aios_posix PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernel
 )
 target_link_libraries(aios_posix PUBLIC aios_client)
 
@@ -600,7 +601,10 @@ add_executable(aios_tests
   tests/test_ticket_auth.cpp
   tests/test_s3_tls.cpp
 )
-target_include_directories(aios_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_include_directories(aios_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  ${CMAKE_CURRENT_SOURCE_DIR}/kernel
+)
 target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)
 # The process-level smoke test spawns the real daemon and CLI binaries.
 target_compile_definitions(aios_tests PRIVATE
@@ -620,6 +624,7 @@ install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION ${CMA
 #   (+ zstd / isal when enabled) — see README "STL-like C++ client → Build / link".
 install(TARGETS aios_core aios_client aios_posix ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES src/posix/aios_posix.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
+install(FILES kernel/aiosfs_uapi.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
 # Public client headers keep their "client/…" include spelling: add -I<prefix>/include/aios.
 install(DIRECTORY src/client/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios/client
   FILES_MATCHING PATTERN "*.hpp"

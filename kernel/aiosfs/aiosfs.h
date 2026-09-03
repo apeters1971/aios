@@ -248,6 +248,9 @@ int aios_file_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 ssize_t aios_file_read_iter(struct kiocb *iocb, struct iov_iter *to);
 ssize_t aios_file_write_iter(struct kiocb *iocb, struct iov_iter *from);
 long aios_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
+long aios_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+/* Copy @len bytes at file @pos into the page cache; skip dirty / uptodate pages. */
+int aios_prefetch_copy_pages(struct inode *inode, loff_t pos, const void *buf, size_t len);
 
 extern const struct inode_operations aios_dir_inode_ops;
 extern const struct inode_operations aios_file_inode_ops;

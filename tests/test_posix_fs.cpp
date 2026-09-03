@@ -371,3 +371,70 @@ TEST(PosixFs, DirCacheDeferredSizeRenameSymlink) {
 
   aios_posix_unmount(fs);
 }
+
+TEST(PosixFs, PrefetchvSparseRanges) {
+  HttpFixture http("aios-posix-prefetchv");
+
+  aios_posix_config cfg{};
+  const std::string ep = http.endpoint();
+  cfg.endpoint = ep.c_str();
+  cfg.cluster_key = http.fx.cfg.cluster_key.c_str();
+  cfg.volume = "vprefetch";
+  cfg.stripe_unit = 4096;
+  cfg.stripe_width = 2;
+  cfg.uid = 1000;
+  cfg.gid = 1000;
+
+  int err = 0;
+  aios_posix_fs* fs = aios_posix_mount(&cfg, &err);
+  ASSERT_NE(fs, nullptr);
+
+  aios_posix_stat st{};
+  ASSERT_EQ(aios_posix_create(fs, 1, "sparse.bin", 0644, &st), 0);
+  const uint64_t ino = st.ino;
+  const std::string a(4096, 'A');
+  const std::string b(4096, 'B');
+  const std::string c(4096, 'C');
+  size_t wrote = 0;
+  ASSERT_EQ(aios_posix_write(fs, ino, 0, a.data(), a.size(), &wrote), 0);
+  ASSERT_EQ(aios_posix_write(fs, ino, 8192, b.data(), b.size(), &wrote), 0);
+  ASSERT_EQ(aios_posix_write(fs, ino, 16384, c.data(), c.size(), &wrote), 0);
+  ASSERT_EQ(aios_posix_fsync(fs, ino), 0);
+
+  struct aios_prefetchv req {};
+  EXPECT_EQ(aios_posix_prefetchv(fs, ino, nullptr), -EINVAL);
+  req.nranges = 0;
+  EXPECT_EQ(aios_posix_prefetchv(fs, ino, &req), -EINVAL);
+  req.nranges = AIOS_PREFETCH_MAX_RANGES + 1;
+  EXPECT_EQ(aios_posix_prefetchv(fs, ino, &req), -E2BIG);
+  req.nranges = 1;
+  req.flags = 1;
+  req.ranges[0] = {.offset = 0, .length = 4096};
+  EXPECT_EQ(aios_posix_prefetchv(fs, ino, &req), -EOPNOTSUPP);
+  req.flags = 0;
+  req.ranges[0] = {.offset = 0, .length = 0};
+  EXPECT_EQ(aios_posix_prefetchv(fs, ino, &req), -EINVAL);
+  req.ranges[0] = {.offset = 1ull << 60, .length = 1ull << 60};
+  EXPECT_EQ(aios_posix_prefetchv(fs, ino, &req), -EINVAL);
+  req.ranges[0] = {.offset = 20000, .length = 4096};
+  EXPECT_EQ(aios_posix_prefetchv(fs, ino, &req), -EINVAL);
+
+  req.nranges = 4;
+  req.ranges[0] = {.offset = 8192, .length = 4096};
+  req.ranges[1] = {.offset = 0, .length = 4096};
+  req.ranges[2] = {.offset = 1000, .length = 100};
+  req.ranges[3] = {.offset = 16384, .length = 4096};
+  ASSERT_EQ(aios_posix_prefetchv(fs, ino, &req), 0);
+
+  char buf[4096];
+  size_t got = 0;
+  ASSERT_EQ(aios_posix_read(fs, ino, 0, buf, sizeof(buf), &got), 0);
+  EXPECT_EQ(got, 4096u);
+  EXPECT_EQ(std::string(buf, 4096), a);
+  ASSERT_EQ(aios_posix_read(fs, ino, 8192, buf, sizeof(buf), &got), 0);
+  EXPECT_EQ(std::string(buf, 4096), b);
+  ASSERT_EQ(aios_posix_read(fs, ino, 16384, buf, sizeof(buf), &got), 0);
+  EXPECT_EQ(std::string(buf, 4096), c);
+
+  aios_posix_unmount(fs);
+}

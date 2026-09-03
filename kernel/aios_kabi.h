@@ -13,6 +13,8 @@
 #include <stdint.h>
 #endif
 
+#include "aiosfs_uapi.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,6 +50,7 @@ enum aios_kabi_opcode {
   AIOS_OP_REMOVEXATTR = 21,
   AIOS_OP_SYMLINK = 22,
   AIOS_OP_READLINK = 23,
+  AIOS_OP_PREFETCHV = 24,
 };
 
 /* Wire-format inode attributes (packed, LE on the wire as host for Alma9 x86_64). */
@@ -195,6 +198,12 @@ struct aios_kabi_rw_out {
   uint32_t size;
   uint32_t _pad;
   /* READ: followed by size bytes */
+};
+
+/* AIOS_OP_PREFETCHV: inode plus the same inline vector as AIOS_IOC_PREFETCHV. */
+struct aios_kabi_prefetchv_in {
+  uint64_t ino;
+  struct aios_prefetchv req;
 };
 
 struct aios_kabi_truncate_in {

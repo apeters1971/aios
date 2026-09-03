@@ -4,7 +4,7 @@
 #   make
 
 obj-m += aiosfs.o
-aiosfs-y := main.o upcall.o super.o inode.o http_backend.o io.o pagecache.o xattr.o
+aiosfs-y := main.o upcall.o super.o inode.o http_backend.o io.o pagecache.o xattr.o ioctl.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

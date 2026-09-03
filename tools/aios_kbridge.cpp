@@ -373,6 +373,12 @@ bool serve_one(int fd, const aios_kabi_req_hdr& hdr, const std::vector<uint8_t>&
       int rc = aios_posix_removexattr(fs, in->ino, in->name);
       return write_reply(fd, hdr.unique, rc, nullptr, 0);
     }
+    case AIOS_OP_PREFETCHV: {
+      if (payload.size() < sizeof(aios_kabi_prefetchv_in))
+        return write_reply(fd, hdr.unique, -EINVAL, nullptr, 0);
+      auto* in = reinterpret_cast<const aios_kabi_prefetchv_in*>(payload.data());
+      return write_reply(fd, hdr.unique, aios_posix_prefetchv(fs, in->ino, &in->req), nullptr, 0);
+    }
     default:
       return write_reply(fd, hdr.unique, -ENOSYS, nullptr, 0);
   }

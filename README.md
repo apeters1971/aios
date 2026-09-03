@@ -816,6 +816,7 @@ Wire format, append, and API notes: [`proto/stl_client.md`](proto/stl_client.md)
 - Directories use an append-only **dentry changelog** (no dedicated MDS — meta is ordinary objects)
 - File data is **chunk-striped** (`posix/{vol}/data/{ino}/c/{chunk}`, default 1 MiB chunks, parallel PUTs bounded by `stripe_width`)
 - Stored **xattrs** in inode meta, **hard links** (files only), **flock** via AIOS locks on the inode object
+- **Sparse-range prefetch** (`ioctl(AIOS_IOC_PREFETCHV)` / `aios_posix_prefetchv`): up to 256 inline file ranges fetched as one backend batch; same UAPI on FUSE and kernel aiosfs ([`kernel/aiosfs_uapi.h`](kernel/aiosfs_uapi.h))
 - **Parent pointers** (`parent_ino`) and lazy **recursive directory stats** (see below)
 - **Subtree layout rules** place meta vs data independently by path prefix; cross-domain `rename` returns `EXDEV` (copy)
 - Volume / subtree **snapshots** for backup (`aios_posix_snapshot` / `snapshot_at`)
@@ -835,7 +836,10 @@ aios-fusell -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 
 `aios-fuse` uses libfuse's path-based API (`fuse_main`). `aios-fusell` uses the inode API
 (`fuse_session_new`); that matches `libaios_posix` directly (root is inode 1) and skips
-libfuse's path walk. Mount options and POSIX behaviour are the same.
+libfuse's path walk. Mount options and POSIX behaviour are the same. Sparse-range prefetch
+uses `ioctl(fd, AIOS_IOC_PREFETCHV, &req)` with the inline vector in
+[`kernel/aiosfs_uapi.h`](kernel/aiosfs_uapi.h); the helper `aios_prefetchv(fd, ranges, n)`
+is identical on FUSE and kernel aiosfs.
 
 ### Special / virtual attributes
 

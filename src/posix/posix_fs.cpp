@@ -1570,6 +1570,117 @@ int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len,
   return 0;
 }
 
+void normalize_ranges(aios_range* ranges, uint32_t* nranges) {
+  if (!ranges || !nranges || *nranges < 2) return;
+  const uint32_t n = *nranges;
+  std::sort(ranges, ranges + n, [](const aios_range& a, const aios_range& b) {
+    if (a.offset != b.offset) return a.offset < b.offset;
+    return a.length < b.length;
+  });
+  uint32_t out = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    if (out == 0) {
+      ranges[out++] = ranges[i];
+      continue;
+    }
+    aios_range& prev = ranges[out - 1];
+    const uint64_t prev_end = prev.offset + prev.length;
+    if (ranges[i].offset <= prev_end) {
+      const uint64_t cur_end = ranges[i].offset + ranges[i].length;
+      if (cur_end > prev_end) prev.length = cur_end - prev.offset;
+    } else {
+      ranges[out++] = ranges[i];
+    }
+  }
+  *nranges = out;
+}
+
+int prefetch_file(FsState& st, uint64_t ino, aios_range* ranges, uint32_t nranges, uint32_t flags) {
+  if (!ranges) return -EINVAL;
+  if (nranges == 0) return -EINVAL;
+  if (nranges > AIOS_PREFETCH_MAX_RANGES) return -E2BIG;
+  if (flags & ~AIOS_PREFETCH_SUPPORTED_FLAGS) return -EOPNOTSUPP;
+
+  auto meta = load_inode(st, ino);
+  if (!meta.exists) return -ENOENT;
+  if (!S_ISREG(meta.mode)) return -EISDIR;
+
+  uint64_t total = 0;
+  for (uint32_t i = 0; i < nranges; ++i) {
+    const uint64_t offset = ranges[i].offset;
+    const uint64_t length = ranges[i].length;
+    if (length == 0) return -EINVAL;
+    if (offset > UINT64_MAX - length) return -EINVAL;
+    const uint64_t end = offset + length;
+    if (offset >= meta.size || end > meta.size) return -EINVAL;
+    if (UINT64_MAX - total < length) return -EOVERFLOW;
+    total += length;
+    if (total > AIOS_PREFETCH_MAX_BYTES) return -E2BIG;
+  }
+
+  normalize_ranges(ranges, &nranges);
+  if (nranges == 0) return -EINVAL;
+
+  if (st.qos && !st.qos->admit(meta.project_id, meta.uid, meta.gid, total)) return -EAGAIN;
+  aios::note_frontend_io(st.frontend_label, false, total);
+
+  const uint64_t unit = meta.stripe_unit ? meta.stripe_unit : st.stripe_unit;
+  std::vector<uint64_t> chunks;
+  chunks.reserve(nranges);
+  for (uint32_t i = 0; i < nranges; ++i) {
+    const uint64_t first = ranges[i].offset / unit;
+    const uint64_t last = (ranges[i].offset + ranges[i].length - 1) / unit;
+    for (uint64_t c = first; c <= last; ++c) chunks.push_back(c);
+  }
+  std::sort(chunks.begin(), chunks.end());
+  chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
+  if (chunks.empty()) return 0;
+
+  std::vector<uint64_t> miss;
+  miss.reserve(chunks.size());
+  for (uint64_t chunk : chunks) {
+    uint64_t cas = 0;
+    if (!st.chunk_cache.lookup(ino, chunk, cas)) miss.push_back(chunk);
+  }
+  if (miss.empty()) return 0;
+
+  std::atomic<int> err{0};
+  size_t nthreads = st.stripe_width ? st.stripe_width : 1;
+  if (nthreads > miss.size()) nthreads = miss.size();
+  if (nthreads > 8) nthreads = 8;
+  std::atomic<size_t> next{0};
+  auto worker = [&] {
+    for (;;) {
+      if (err.load() != 0) return;
+      const size_t i = next.fetch_add(1);
+      if (i >= miss.size()) return;
+      const uint64_t chunk = miss[i];
+      try {
+        auto snap = st.session.get_object(chunk_oid(st.volume, ino, chunk));
+        if (snap.exists) {
+          st.chunk_cache.store(ino, chunk, std::move(snap.body), cas_from_attrs(snap.attrs));
+        }
+      } catch (const client_error& e) {
+        int mapped = map_error(e);
+        int expected = 0;
+        err.compare_exchange_strong(expected, mapped ? mapped : -EIO);
+      } catch (...) {
+        int expected = 0;
+        err.compare_exchange_strong(expected, -EIO);
+      }
+    }
+  };
+  if (nthreads <= 1) {
+    worker();
+  } else {
+    std::vector<std::thread> workers;
+    workers.reserve(nthreads);
+    for (size_t t = 0; t < nthreads; ++t) workers.emplace_back(worker);
+    for (auto& w : workers) w.join();
+  }
+  return err.load();
+}
+
 int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size_t len,
                size_t* out_len) {
   if (out_len) *out_len = 0;
@@ -2396,6 +2507,20 @@ int aios_posix_read(aios_posix_fs* fs, uint64_t ino, uint64_t offset, void* buf,
     if (!m.exists) return -ENOENT;
     if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
     return aios::posix::read_file(*fs->st, ino, offset, buf, len, out_len);
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+  AIOS_POSIX_CATCH_ALL
+}
+
+int aios_posix_prefetchv(aios_posix_fs* fs, uint64_t ino, const struct aios_prefetchv* req) {
+  if (!fs || !req) return -EINVAL;
+  try {
+    auto m = aios::posix::load_inode(*fs->st, ino);
+    if (!m.exists) return -ENOENT;
+    if (int ac = aios::posix::check_access(effective_caller(fs), m, kWantR)) return ac;
+    struct aios_prefetchv copy = *req;
+    return aios::posix::prefetch_file(*fs->st, ino, copy.ranges, copy.nranges, copy.flags);
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
   }

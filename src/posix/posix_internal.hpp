@@ -31,7 +31,10 @@ inline constexpr uint64_t kRootIno = 1;
 inline constexpr uint64_t kDefaultStripeUnit = 1024ull * 1024ull;
 inline constexpr uint32_t kDefaultStripeWidth = 4;
 inline constexpr const char* kCasAttr = "aios.posix.cas";
-inline constexpr size_t kChunkCacheSlots = 8;
+/* Last-N stripe bodies so 128 KiB FUSE I/O does not re-GET the same 1 MiB
+ * chunk, and so a PREFETCHV of up to AIOS_PREFETCH_MAX_RANGES distinct stripes
+ * can stay in the daemon cache the read path uses. */
+inline constexpr size_t kChunkCacheSlots = 256;
 inline constexpr auto kDirCacheTtl = std::chrono::milliseconds(250);
 inline constexpr size_t kDirCacheMaxEntries = 4096;
 // Cached inode records are revalidated (GET + merge) once this old; a pending
@@ -556,6 +559,9 @@ void drop_nlink(FsState& st, uint64_t ino);
 void release_all_flocks(FsState& st);
 
 int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len, size_t* out_len);
+/* Sort/merge overlapping and adjacent ranges in place. */
+void normalize_ranges(aios_range* ranges, uint32_t* nranges);
+int prefetch_file(FsState& st, uint64_t ino, aios_range* ranges, uint32_t nranges, uint32_t flags);
 int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size_t len,
                size_t* out_len);
 int truncate_file(FsState& st, uint64_t ino, uint64_t size);

@@ -27,7 +27,7 @@ static_assert(AIOS_KABI_NAME_MAX == 255);
 static_assert(AIOS_KABI_SYMLINK_MAX == 4095);
 static_assert(AIOS_KABI_MAX_PAYLOAD == 1024u * 1024u);
 static_assert(AIOS_KABI_XATTR_VALUE_MAX == 64u * 1024u);
-static_assert(AIOS_OP_MOUNT == 1 && AIOS_OP_READLINK == 23);
+static_assert(AIOS_OP_MOUNT == 1 && AIOS_OP_READLINK == 23 && AIOS_OP_PREFETCHV == 24);
 
 static_assert(sizeof(aios_kabi_stat) == 56);
 static_assert(offsetof(aios_kabi_stat, ino) == 0);
@@ -129,6 +129,19 @@ static_assert(offsetof(aios_kabi_rw_in, _pad) == 20);
 static_assert(sizeof(aios_kabi_rw_out) == 8);
 static_assert(offsetof(aios_kabi_rw_out, size) == 0);
 static_assert(offsetof(aios_kabi_rw_out, _pad) == 4);
+static_assert(sizeof(struct aios_range) == 16);
+static_assert(offsetof(struct aios_range, offset) == 0);
+static_assert(offsetof(struct aios_range, length) == 8);
+static_assert(sizeof(struct aios_prefetchv) == 4104);
+static_assert(offsetof(struct aios_prefetchv, nranges) == 0);
+static_assert(offsetof(struct aios_prefetchv, flags) == 4);
+static_assert(offsetof(struct aios_prefetchv, ranges) == 8);
+#ifdef _IOC_SIZE
+static_assert(_IOC_SIZE(AIOS_IOC_PREFETCHV) == sizeof(struct aios_prefetchv));
+#endif
+static_assert(sizeof(aios_kabi_prefetchv_in) == 4112);
+static_assert(offsetof(aios_kabi_prefetchv_in, ino) == 0);
+static_assert(offsetof(aios_kabi_prefetchv_in, req) == 8);
 static_assert(sizeof(aios_kabi_truncate_in) == 16);
 static_assert(offsetof(aios_kabi_truncate_in, ino) == 0);
 static_assert(offsetof(aios_kabi_truncate_in, size) == 8);

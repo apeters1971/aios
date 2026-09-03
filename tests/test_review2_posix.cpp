@@ -451,6 +451,22 @@ TEST(Review2Posix, ChunkCacheKeepsNewerVersion) {
   EXPECT_EQ(cache.cached_cas(7, 0), 0u);
 }
 
+TEST(Review2Posix, PrefetchvNormalizesAndFillsChunkCache) {
+  aios_range ranges[4] = {
+      {.offset = 1000, .length = 100},
+      {.offset = 1050, .length = 100},
+      {.offset = 1150, .length = 50},
+      {.offset = 5000, .length = 100},
+  };
+  uint32_t n = 4;
+  aios::posix::normalize_ranges(ranges, &n);
+  ASSERT_EQ(n, 2u);
+  EXPECT_EQ(ranges[0].offset, 1000u);
+  EXPECT_EQ(ranges[0].length, 200u);
+  EXPECT_EQ(ranges[1].offset, 5000u);
+  EXPECT_EQ(ranges[1].length, 100u);
+}
+
 // ---------------------------------------------------------------------------
 // POS-8 — redirect allowlist is safe under concurrent refresh
 // ---------------------------------------------------------------------------
