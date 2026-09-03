@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -306,27 +307,45 @@ void force_close_socket(tcp::socket& s) {
   s.close(ignored);
 }
 
+void wake_socket_fd(tcp::socket& s) {
+  const int fd = static_cast<int>(s.native_handle());
+  if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+}
+
+// Asio sockets are not thread-safe: close the acceptor on the io_context thread
+// when that thread is still running. dispatch() runs inline if we are already on it.
+void close_acceptor_on_ioc(boost::asio::io_context& ioc, tcp::acceptor& acceptor) {
+  if (ioc.stopped()) {
+    boost::system::error_code ec;
+    acceptor.close(ec);
+    return;
+  }
+  std::promise<void> done;
+  auto fut = done.get_future();
+  boost::asio::dispatch(ioc, [&acceptor, &done] {
+    boost::system::error_code ec;
+    acceptor.close(ec);
+    done.set_value();
+  });
+  fut.wait();
+}
+
 }  // namespace
 
 void TcpServer::start() { do_accept(); }
 
 void TcpServer::kick_sessions() {
-  std::unordered_set<std::shared_ptr<tcp::socket>> socks;
-  {
-    std::lock_guard lock(sessions_mu_);
-    socks = sessions_;
-  }
-  for (const auto& s : socks) {
-    if (!s || !s->is_open()) continue;
-    const int fd = static_cast<int>(s->native_handle());
-    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+  // Hold the lock for the native shutdown so we never call is_open()/native_handle()
+  // concurrently with force_close_socket() on a worker.
+  std::lock_guard lock(sessions_mu_);
+  for (const auto& s : sessions_) {
+    if (s) wake_socket_fd(*s);
   }
 }
 
 void TcpServer::close() {
   closing_.store(true, std::memory_order_release);
-  boost::system::error_code ec;
-  acceptor_.close(ec);
+  close_acceptor_on_ioc(ioc_, acceptor_);
 
   // ioc_ may still be running, so a late accept can insert a keep-alive session
   // after a one-shot snapshot. Keep waking sockets until workers drain.
@@ -366,11 +385,7 @@ void TcpServer::do_accept() {
           drop = true;
         } else {
           sessions_.insert(sock);
-          boost::asio::post(workers_, [this, sock] {
-            handle_session(sock);
-            std::lock_guard lock(sessions_mu_);
-            sessions_.erase(sock);
-          });
+          boost::asio::post(workers_, [this, sock] { handle_session(sock); });
         }
       }
       if (drop) {
@@ -406,7 +421,9 @@ void TcpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
   } catch (...) {
     AIOS_LOG_WARN("inbound session aborted: unknown exception");
   }
+  std::lock_guard lock(sessions_mu_);
   force_close_socket(*sock);
+  sessions_.erase(sock);
 }
 
 void TcpServer::run_session(tcp::socket& sock) {

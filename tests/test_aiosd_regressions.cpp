@@ -376,6 +376,9 @@ struct HttpTestServer {
 
   ~HttpTestServer() {
     http->close_sessions();
+    // Destroy HttpServer (and its sockets) while ioc is still running. Stopping
+    // the context first races reactor teardown against session-thread socket dtors.
+    http.reset();
     work.reset();
     ioc.stop();
     if (th.joinable()) th.join();
@@ -639,8 +642,9 @@ TEST(HttpServerRegression, ShutdownDrainsLongPollHandlers) {
 
   // The watch would otherwise hold its thread for the full 120 s timeout.
   std::atomic<bool> replied{false};
-  std::thread watcher([&, body = req.str()] {
-    raw_request(srv->port, body, 30000);
+  const std::string port = srv->port;
+  std::thread watcher([&, body = req.str(), port] {
+    raw_request(port, body, 30000);
     replied.store(true);
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(300));

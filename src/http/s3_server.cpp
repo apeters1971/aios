@@ -537,9 +537,14 @@ void S3Server::stop() {
 
   if (fs_) {
     aios_posix_unmount(fs_);
-    fs_ = nullptr;
   }
-  stop_cv_.notify_all();
+  {
+    // Notify under the mutex so waiters (and ~condition_variable) cannot race
+    // with pthread_cond_broadcast from a session thread that just hit 0.
+    std::lock_guard lock(stop_mu_);
+    fs_ = nullptr;
+    stop_cv_.notify_all();
+  }
 }
 
 void S3Server::start() {
@@ -627,8 +632,11 @@ void S3Server::do_accept() {
         }
         boost::system::error_code cec;
         sock->close(cec);
-        sessions_.fetch_sub(1);
-        stop_cv_.notify_all();
+        {
+          std::lock_guard lock(stop_mu_);
+          sessions_.fetch_sub(1);
+          stop_cv_.notify_all();
+        }
       }).detach();
     }
     if (!stopping_.load() && acceptor_.is_open()) do_accept();

@@ -44,6 +44,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -1548,25 +1549,39 @@ void force_close_http_socket(tcp::socket& s) {
   s.close(ignored);
 }
 
+void wake_http_socket_fd(tcp::socket& s) {
+  const int fd = static_cast<int>(s.native_handle());
+  if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+}
+
+void close_http_acceptor_on_ioc(boost::asio::io_context& ioc, tcp::acceptor& acceptor) {
+  if (ioc.stopped()) {
+    boost::system::error_code ec;
+    acceptor.close(ec);
+    return;
+  }
+  std::promise<void> done;
+  auto fut = done.get_future();
+  boost::asio::dispatch(ioc, [&acceptor, &done] {
+    boost::system::error_code ec;
+    acceptor.close(ec);
+    done.set_value();
+  });
+  fut.wait();
+}
+
 }  // namespace
 
 void HttpServer::kick_sessions() {
-  std::unordered_set<std::shared_ptr<tcp::socket>> socks;
-  {
-    std::lock_guard lock(sessions_mu_);
-    socks = sessions_;
-  }
-  for (const auto& s : socks) {
-    if (!s || !s->is_open()) continue;
-    const int fd = static_cast<int>(s->native_handle());
-    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+  std::lock_guard lock(sessions_mu_);
+  for (const auto& s : sessions_) {
+    if (s) wake_http_socket_fd(*s);
   }
 }
 
 void HttpServer::close_sessions() {
   closing_.store(true, std::memory_order_release);
-  boost::system::error_code ec;
-  acceptor_.close(ec);
+  close_http_acceptor_on_ioc(ioc_, acceptor_);
   kick_sessions();
   // Detached long polls are no longer in sessions_, so closing sockets does not
   // reach them: release their waiters explicitly, then wait. They hold a raw
@@ -3334,7 +3349,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         write_long_poll_busy(*sock, keep_alive);
         continue;
       }
-      std::thread([this, sock_ptr, svc, prefix, timeout_ms, target_copy, label_copy]() {
+      std::thread([this, sock_ptr, svc, prefix, timeout_ms, target_copy, label_copy]() mutable {
         DetachedGuard guard{this};
         detached_body(*sock_ptr, [&] {
           AppLabelScope scope(label_copy);
@@ -3355,6 +3370,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           }
           write_json(*sock_ptr, 200, "OK", {{"events", arr}}, false);
         });
+        // Destroy the socket before DetachedGuard: close_sessions() waits on
+        // detached_end() and the io_context may be torn down immediately after.
+        sock_ptr.reset();
       }).detach();
       return;
     }
@@ -3510,7 +3528,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           continue;
         }
         std::thread([this, sock_ptr, svc, topic, after_id, after_set, timeout_ms, target_copy,
-                     label_copy]() {
+                     label_copy]() mutable {
           DetachedGuard guard{this};
           detached_body(*sock_ptr, [&] {
             AppLabelScope scope(label_copy);
@@ -3533,6 +3551,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
             }
             write_json(*sock_ptr, 200, "OK", {{"topic", topic}, {"messages", arr}}, false);
           });
+          sock_ptr.reset();
         }).detach();
         return;
       }
@@ -3954,7 +3973,8 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           write_long_poll_busy(*sock, keep_alive);
           continue;
         }
-        std::thread([this, sock_ptr, svc, oid, after_seq, timeout_ms, target_copy, label_copy]() {
+        std::thread([this, sock_ptr, svc, oid, after_seq, timeout_ms, target_copy,
+                     label_copy]() mutable {
           DetachedGuard guard{this};
           detached_body(*sock_ptr, [&] {
             AppLabelScope scope(label_copy);
@@ -3973,6 +3993,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
                        {{"oid", e.oid}, {"seq", e.seq}, {"op", e.op}, {"ts_ms", e.ts_ms}},
                        false);
           });
+          sock_ptr.reset();
         }).detach();
         return;
       }
