@@ -1,7 +1,9 @@
 #include "client/session.hpp"
 
+#include "ec/codec_factory.hpp"
 #include "http/http_auth.hpp"
 #include "util/auth.hpp"
+#include "util/crc32c.hpp"
 #include "util/log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -12,9 +14,11 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <span>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -691,6 +695,13 @@ void Session::ensure_ticket(bool force) {
 HttpResponse Session::request(const std::string& method, const std::string& target,
                               std::unordered_map<std::string, std::string> headers,
                               const std::string& body, int max_redirects) {
+  return request_peer({}, method, target, std::move(headers), body, max_redirects);
+}
+
+HttpResponse Session::request_peer(const std::string& http_addr, const std::string& method,
+                                   const std::string& target,
+                                   std::unordered_map<std::string, std::string> headers,
+                                   const std::string& body, int max_redirects) {
   if (body.size() > kMaxBodyBytes) {
     throw client_error("payload_too_large", "request body exceeds 16 MiB");
   }
@@ -702,6 +713,15 @@ HttpResponse Session::request(const std::string& method, const std::string& targ
 
   std::string host = host_;
   std::string port = port_;
+  if (!http_addr.empty()) {
+    allow_redirect_peer(http_addr);
+    auto colon = http_addr.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= http_addr.size()) {
+      throw client_error("bad_request", "peer address must be HOST:PORT");
+    }
+    host = http_addr.substr(0, colon);
+    port = http_addr.substr(colon + 1);
+  }
   std::string path = target;
   HttpResponse resp;
   bool ticket_renewed = false;
@@ -889,10 +909,162 @@ std::uint64_t Session::put_bytes(const std::string& oid, const std::string& body
     validate_header_value(*lock_token, "lock token");
     headers["x-aios-lock-token"] = *lock_token;
   }
+  if (use_client_io()) {
+    return put_bytes_client(oid, body, headers, new_cas);
+  }
   const auto path = "/o/" + url_encode_oid(oid);
   auto resp = request("PUT", path, headers, body);
   if (resp.status != 204 && resp.status != 200 && resp.status != 201) {
     throw_http(resp, "put_bytes");
+  }
+  return new_cas;
+}
+
+bool Session::use_client_io() {
+  if (cfg_.io_path == "server") return false;
+  if (cfg_.io_path == "client") return true;
+  {
+    std::lock_guard lock(io_mu_);
+    if (!cluster_io_path_.empty()) return cluster_io_path_ == "client";
+  }
+  std::string discovered = "server";
+  try {
+    auto resp = request("GET", "/map");
+    if (resp.status == 200 && !resp.body.empty()) {
+      discovered = nlohmann::json::parse(resp.body).value("io_path", "server");
+    }
+  } catch (...) {
+    discovered = "server";
+  }
+  if (discovered != "client") discovered = "server";
+  std::lock_guard lock(io_mu_);
+  if (cluster_io_path_.empty()) cluster_io_path_ = discovered;
+  return cluster_io_path_ == "client";
+}
+
+std::uint64_t Session::put_bytes_client(const std::string& oid, const std::string& body,
+                                        std::unordered_map<std::string, std::string> headers,
+                                        std::uint64_t new_cas) {
+  const auto enc = url_encode_oid(oid);
+  const std::uint32_t full_crc =
+      crc32c(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+  headers["x-aios-size"] = std::to_string(body.size());
+  headers["x-aios-crc32c"] = std::to_string(full_crc);
+
+  auto prep_resp = request("POST", "/o/" + enc + "/prepare", headers, {});
+  if (prep_resp.status == 501) {
+    throw client_error("not_supported", "cluster io_path is server");
+  }
+  if (prep_resp.status != 200) throw_http(prep_resp, "client prepare");
+
+  nlohmann::json pj;
+  try {
+    pj = nlohmann::json::parse(prep_resp.body);
+  } catch (...) {
+    throw client_error("http", "malformed prepare reply");
+  }
+  const std::string grant = pj.value("grant", "");
+  const std::string layout_kind = pj.value("layout", "replica");
+  auto acting = pj.value("acting_set", nlohmann::json::array());
+  if (grant.empty() || !acting.is_array() || acting.empty()) {
+    throw client_error("http", "prepare reply missing grant/acting_set");
+  }
+
+  auto abort_grant = [&] {
+    try {
+      std::unordered_map<std::string, std::string> ah;
+      ah["x-aios-write-grant"] = grant;
+      request("POST", "/o/" + enc + "/abort-prepared", ah, {});
+    } catch (...) {
+    }
+  };
+
+  struct Piece {
+    int shard{0};
+    std::string http_addr;
+    std::string payload;
+  };
+  std::vector<Piece> pieces;
+  if (layout_kind == "ec") {
+    const int k = pj.value("ec_k", 0);
+    const int m = pj.value("ec_m", 0);
+    const std::string codec = pj.value("ec_codec", "");
+    std::string err;
+    auto ec = make_erasure_codec(k, m, codec, err);
+    if (!ec) {
+      abort_grant();
+      throw client_error("bad_request", err);
+    }
+    std::vector<std::vector<std::uint8_t>> shards;
+    if (!ec->encode(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(body.data()),
+                                                  body.size()),
+                    shards, err)) {
+      abort_grant();
+      throw client_error("store_error", err);
+    }
+    if (static_cast<int>(shards.size()) != static_cast<int>(acting.size())) {
+      abort_grant();
+      throw client_error("http", "ec shard count mismatch");
+    }
+    for (int i = 0; i < static_cast<int>(shards.size()); ++i) {
+      Piece p;
+      p.shard = i;
+      p.http_addr = acting[static_cast<std::size_t>(i)].value("http_addr", "");
+      p.payload.assign(reinterpret_cast<const char*>(shards[static_cast<std::size_t>(i)].data()),
+                       shards[static_cast<std::size_t>(i)].size());
+      pieces.push_back(std::move(p));
+    }
+  } else {
+    for (int i = 0; i < static_cast<int>(acting.size()); ++i) {
+      Piece p;
+      p.shard = i;
+      p.http_addr = acting[static_cast<std::size_t>(i)].value("http_addr", "");
+      p.payload = body;
+      pieces.push_back(std::move(p));
+    }
+  }
+
+  std::atomic<int> fails{0};
+  std::string first_err;
+  std::mutex err_mu;
+  std::vector<std::thread> workers;
+  workers.reserve(pieces.size());
+  for (const auto& piece : pieces) {
+    workers.emplace_back([&, piece] {
+      try {
+        std::unordered_map<std::string, std::string> ih;
+        ih["content-type"] = "application/octet-stream";
+        ih["x-aios-write-grant"] = grant;
+        ih["x-aios-shard"] = std::to_string(piece.shard);
+        const auto crc = crc32c(reinterpret_cast<const std::uint8_t*>(piece.payload.data()),
+                                piece.payload.size());
+        ih["x-aios-crc32c"] = std::to_string(crc);
+        auto resp = request_peer(piece.http_addr, "PUT", "/o/" + enc + "/install", ih,
+                                 piece.payload);
+        if (resp.status != 204 && resp.status != 200) {
+          fails.fetch_add(1);
+          std::lock_guard elock(err_mu);
+          if (first_err.empty()) first_err = "install shard " + std::to_string(piece.shard);
+        }
+      } catch (const std::exception& e) {
+        fails.fetch_add(1);
+        std::lock_guard elock(err_mu);
+        if (first_err.empty()) first_err = e.what();
+      }
+    });
+  }
+  for (auto& t : workers) t.join();
+  if (fails.load() > 0) {
+    abort_grant();
+    throw client_error("quorum_failed", first_err.empty() ? "client install failed" : first_err);
+  }
+
+  std::unordered_map<std::string, std::string> ph;
+  ph["x-aios-write-grant"] = grant;
+  auto pub = request("POST", "/o/" + enc + "/publish", ph, {});
+  if (pub.status != 200 && pub.status != 204) {
+    abort_grant();
+    throw_http(pub, "client publish");
   }
   return new_cas;
 }

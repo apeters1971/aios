@@ -564,6 +564,7 @@ void GossipEngine::write_status() {
        object_service_ ? object_service_->ops().total().http_requests.load() : 0},
       {"replica_count", cfg_.replica_count},
       {"write_quorum", cfg_.write_quorum > 0 ? cfg_.write_quorum : cfg_.replica_count},
+      {"io_path", cfg_.io_path},
       {"membership", membership_.to_json()},
       {"fs_table", fs_table_.to_json()},
       {"cluster_map", map.to_json()},

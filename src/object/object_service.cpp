@@ -1595,6 +1595,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
                                 std::optional<std::uint32_t> expected_crc32c,
                                 const LayoutRequest& layout_req,
                                 const std::optional<std::string>& lock_token) {
+  gc_client_writes();
   MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
   ServiceLock lock(mu_);
   ObjectLayout layout;
@@ -1799,11 +1800,12 @@ ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
     return fail("not_supported", "pipeline put not supported with compression");
   }
 
+  gc_client_writes();
   {
     // Checked before taking the oid guard: an open pipeline holds it, so a second
     // begin would otherwise block until that pipeline finishes instead of failing.
     ServiceLock lock(mu_);
-    if (pipelines_.count(oid)) {
+    if (pipelines_.count(oid) || client_writes_.count(oid)) {
       return fail("conflict", "pipelined put already in progress for oid");
     }
   }
@@ -1814,7 +1816,7 @@ ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
   pl->oid_guard = std::make_shared<MutatingOid>(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
   {
     ServiceLock lock(mu_);
-    if (pipelines_.count(oid)) {
+    if (pipelines_.count(oid) || client_writes_.count(oid)) {
       return fail("conflict", "pipelined put already in progress for oid");
     }
     auto placement = place(oid, map_, layout.n, layout.storage_class);
@@ -2366,6 +2368,7 @@ ApiResult ObjectService::api_put_range(
   // Range/append writes materialize the full new version on the primary and
   // replicate the whole body (not a delta), so memory and network cost scale
   // with object size rather than write size. Delta replication is out of scope.
+  gc_client_writes();
   MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
   ServiceLock lock(mu_);
   ObjectLayout layout;
@@ -2431,6 +2434,7 @@ ApiResult ObjectService::api_append(
   // Range/append writes materialize the full new version on the primary and
   // replicate the whole body (not a delta), so memory and network cost scale
   // with object size rather than write size. Delta replication is out of scope.
+  gc_client_writes();
   MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
   ServiceLock lock(mu_);
   ObjectLayout layout;
@@ -4359,6 +4363,369 @@ ApiResult ObjectService::api_pubsub_subscribe(const std::string& topic, std::uin
   r.placement = placement;
   r.pub_messages = std::move(messages);
   r.json_body = {{"topic", topic}};
+  return r;
+}
+
+void ObjectService::gc_client_writes() {
+  const auto now = now_ms();
+  std::vector<std::shared_ptr<ClientWrite>> stale;
+  {
+    ServiceLock lock(mu_);
+    for (auto it = client_writes_.begin(); it != client_writes_.end();) {
+      if (now > it->second->expires_ms) {
+        stale.push_back(it->second);
+        it = client_writes_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto& w : stale) {
+    AIOS_LOG_WARN("expiring client write grant oid=", w->oid, " seq=", w->seq);
+    std::string err;
+    auto* store = primary_store(w->placement, err);
+    if (store) store->abort_version(w->oid, w->seq, err);
+    replicate_abort(w->placement, w->oid, w->seq);
+  }
+}
+
+nlohmann::json ObjectService::client_prepare_json(const ClientWrite& w) const {
+  nlohmann::json acting = nlohmann::json::array();
+  for (std::size_t i = 0; i < w.placement.acting_set.size(); ++i) {
+    const auto& t = w.placement.acting_set[i];
+    acting.push_back({{"index", i},
+                      {"node_id", t.node_id},
+                      {"addr", t.addr},
+                      {"http_addr", t.http_addr},
+                      {"aios_path", t.aios_path}});
+  }
+  return {{"seq", w.seq},
+          {"epoch", w.placement.epoch},
+          {"grant", w.grant},
+          {"expires_ms", w.expires_ms},
+          {"layout", w.layout.is_ec() ? "ec" : "replica"},
+          {"n", w.layout.n},
+          {"ec_k", w.layout.ec_k},
+          {"ec_m", w.layout.ec_m},
+          {"ec_codec", w.layout.ec_codec},
+          {"storage_class", w.layout.storage_class},
+          {"full_size", w.full_size},
+          {"full_crc", w.full_crc},
+          {"acting_set", std::move(acting)}};
+}
+
+ApiResult ObjectService::verify_client_grant(const std::string& oid, const std::string& grant_blob,
+                                             WriteGrant& g) {
+  if (cfg_.io_path != "client") {
+    return fail("not_supported", "client I/O path is disabled (io_path=server)");
+  }
+  std::string err;
+  auto opened = open_write_grant(grant_blob, cfg_.cluster_key, now_ms(), err);
+  if (!opened) return fail("bad_request", err);
+  if (opened->oid != oid) return fail("bad_request", "grant oid mismatch");
+  g = std::move(*opened);
+  ApiResult ok;
+  ok.ok = true;
+  ok.epoch = cur_epoch();
+  return ok;
+}
+
+int ObjectService::count_client_installs(const WriteGrant& g) {
+  int ok = 0;
+  for (const auto& t : g.acting_set) {
+    if (t.node_id == cfg_.node_id) {
+      auto* s = stores_.get(t.aios_path);
+      std::string err;
+      if (s && s->stat(g.oid, g.seq, err)) ++ok;
+      continue;
+    }
+    UnlockForRpc unlock(mu_);
+    auto st = object_stat_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                 cfg_.auth_skew_ms, g.epoch, t.aios_path, g.oid, false, g.seq);
+    if (st.ok) ++ok;
+  }
+  return ok;
+}
+
+ApiResult ObjectService::api_client_prepare(
+    const std::string& oid, std::uint64_t full_size, std::uint32_t full_crc,
+    const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
+    const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
+    const std::optional<std::string>& lock_token) {
+  if (cfg_.io_path != "client") {
+    return fail("not_supported", "client I/O path is disabled (io_path=server)");
+  }
+  gc_client_writes();
+  ObjectLayout layout;
+  std::string err;
+  if (!resolve_object_layout(cfg_, oid, layout_req, layout, err)) {
+    return fail("bad_request", err);
+  }
+
+  {
+    ServiceLock lock(mu_);
+    if (pipelines_.count(oid) || client_writes_.count(oid)) {
+      return fail("conflict", "write already in progress for oid");
+    }
+  }
+
+  auto w = std::make_shared<ClientWrite>();
+  w->oid_guard =
+      std::make_shared<MutatingOid>(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
+  {
+    ServiceLock lock(mu_);
+    if (pipelines_.count(oid) || client_writes_.count(oid)) {
+      return fail("conflict", "write already in progress for oid");
+    }
+    auto placement = place(oid, map_, layout.n, layout.storage_class);
+    if (placement.acting_set.empty()) return fail("no_targets", "no storage targets");
+    if (placement.acting_set[0].node_id != cfg_.node_id) {
+      auto r = fail("not_primary", "this node is not primary for oid");
+      r.placement = placement;
+      return r;
+    }
+    if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
+    auto* store = primary_store(placement, err);
+    if (!store) return fail("store_error", err);
+    {
+      auto tip_attrs = store->list_attrs(oid, err);
+      if (attrs_are_frozen(tip_attrs)) {
+        return fail("frozen", "object is archived/frozen; recall before mutate");
+      }
+    }
+    auto pr = check_preds_on(store, oid, preds, err);
+    if (pr == PrecondResult::NotFound) return fail("not_found", err);
+    if (pr == PrecondResult::Conflict) return fail("precondition_failed", err);
+
+    std::uint64_t seq = 0;
+    std::uint64_t tip = 0;
+    if (!store->peek_next_seq(oid, seq, tip, err)) return fail("store_error", err);
+
+    auto put_attrs = attrs;
+    apply_layout_attrs(put_attrs, layout);
+
+    WriteGrant grant;
+    grant.oid = oid;
+    grant.seq = seq;
+    grant.epoch = placement.epoch;
+    grant.layout = layout.is_ec() ? "ec" : "replica";
+    grant.n = layout.n;
+    grant.ec_k = layout.ec_k;
+    grant.ec_m = layout.ec_m;
+    grant.ec_codec = layout.ec_codec;
+    grant.storage_class = layout.storage_class;
+    grant.full_size = full_size;
+    grant.full_crc = full_crc;
+    grant.expires_ms = now_ms() + cfg_.io_path_grant_ttl_ms;
+    grant.acting_set = placement.acting_set;
+    w->grant = seal_write_grant(grant, cfg_.cluster_key, err);
+    if (w->grant.empty()) return fail("store_error", err);
+
+    w->oid = oid;
+    w->seq = seq;
+    w->placement = std::move(placement);
+    w->layout = std::move(layout);
+    w->attrs = std::move(put_attrs);
+    w->full_size = full_size;
+    w->full_crc = full_crc;
+    w->expires_ms = grant.expires_ms;
+    (void)replace_attrs;
+    client_writes_[oid] = w;
+  }
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = w->placement.epoch;
+  r.placement = w->placement;
+  r.json_body = client_prepare_json(*w);
+  r.info = ObjectInfo{};
+  r.info->oid = oid;
+  r.info->seq = w->seq;
+  r.info->size = full_size;
+  r.info->crc32c = full_crc;
+  r.info->crc32c_known = true;
+  return r;
+}
+
+ApiResult ObjectService::api_client_install(
+    const std::string& oid, int shard, const std::string& grant_blob, const std::uint8_t* data,
+    std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
+    std::optional<std::uint32_t> expected_crc32c, const std::string& abs_body_path) {
+  WriteGrant g;
+  if (auto v = verify_client_grant(oid, grant_blob, g); !v.ok) return v;
+  if (shard < 0 || shard >= static_cast<int>(g.acting_set.size())) {
+    return fail("bad_request", "shard index out of acting set");
+  }
+  const auto& t = g.acting_set[static_cast<std::size_t>(shard)];
+  if (t.node_id != cfg_.node_id) {
+    Placement p;
+    p.epoch = g.epoch;
+    p.storage_class = g.storage_class;
+    p.acting_set = g.acting_set;
+    if (shard != 0) std::swap(p.acting_set[0], p.acting_set[static_cast<std::size_t>(shard)]);
+    auto r = fail("not_primary", "this node does not store this shard");
+    r.placement = std::move(p);
+    return r;
+  }
+
+  const bool use_file = !abs_body_path.empty();
+  std::uint32_t body_crc = 0;
+  if (use_file) {
+    if (!expected_crc32c) return fail("bad_request", "crc32c required for staged install");
+    body_crc = *expected_crc32c;
+  } else {
+    body_crc = crc32c(data, len);
+    if (expected_crc32c && *expected_crc32c != body_crc) {
+      return fail("crc_mismatch", "crc32c mismatch");
+    }
+  }
+
+  std::size_t expect_len = static_cast<std::size_t>(g.full_size);
+  if (g.is_ec()) {
+    const auto k = static_cast<std::size_t>(std::max(1, g.ec_k));
+    expect_len = g.full_size == 0 ? 0 : (static_cast<std::size_t>(g.full_size) + k - 1) / k;
+  } else if (body_crc != g.full_crc) {
+    return fail("crc_mismatch", "replica crc32c does not match grant");
+  }
+  if (len != expect_len) {
+    return fail("bad_request", "install size does not match grant");
+  }
+
+  auto merged = attrs;
+  ObjectLayout layout;
+  layout.kind = g.is_ec() ? ObjectLayout::Kind::Ec : ObjectLayout::Kind::Replica;
+  layout.n = g.n;
+  layout.ec_k = g.ec_k;
+  layout.ec_m = g.ec_m;
+  layout.ec_codec = g.ec_codec;
+  layout.storage_class = g.storage_class;
+  apply_layout_attrs(merged, layout);
+  if (g.is_ec()) {
+    set_ec_attrs(merged, g.ec_k, g.ec_m, shard, g.ec_codec, g.full_size, g.full_crc);
+  }
+
+  PreparedVersion pv;
+  pv.oid = oid;
+  pv.seq = g.seq;
+  pv.size = len;
+  pv.crc32c = body_crc;
+  pv.crc_verified = true;
+  pv.inline_body = !use_file && len <= 64 * 1024;
+
+  std::string err;
+  bool done = false;
+  if (use_file) {
+    done = local_install_file(t.aios_path, pv, abs_body_path, merged, err);
+  } else {
+    done = local_install(t.aios_path, pv, data, len, merged, err);
+  }
+  if (!done) {
+    if (err == "version already exists") return fail("conflict", err);
+    return fail("store_error", err);
+  }
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = g.epoch;
+  r.replicas = 1;
+  r.info = ObjectInfo{};
+  r.info->oid = oid;
+  r.info->seq = g.seq;
+  r.info->size = g.is_ec() ? g.full_size : len;
+  r.info->crc32c = g.full_crc;
+  r.info->crc32c_known = true;
+  r.json_body = {{"seq", g.seq}, {"shard", shard}, {"epoch", g.epoch}};
+  return r;
+}
+
+ApiResult ObjectService::api_client_publish(const std::string& oid, const std::string& grant_blob) {
+  WriteGrant g;
+  if (auto v = verify_client_grant(oid, grant_blob, g); !v.ok) return v;
+
+  Placement placement;
+  placement.epoch = g.epoch;
+  placement.storage_class = g.storage_class;
+  placement.acting_set = g.acting_set;
+  if (placement.acting_set.empty() || placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+
+  const int installed = count_client_installs(g);
+  const int need = g.is_ec() ? std::max(g.ec_k, quorum_need(placement)) : quorum_need(placement);
+  if (installed < need) {
+    return fail("quorum_failed", "client install quorum failed: installed " +
+                                     std::to_string(installed) + " of " +
+                                     std::to_string(g.n) + ", need " + std::to_string(need));
+  }
+
+  std::string err;
+  auto* store = primary_store(placement, err);
+  if (!store) return fail("store_error", err);
+  if (!store->stat(oid, g.seq, err)) {
+    return fail("not_found", "primary shard not installed");
+  }
+  if (!store->publish_tip(oid, g.seq, err)) {
+    return fail("store_error", err);
+  }
+  replicate_publish(placement, oid, g.seq);
+  signal_watch(oid, g.seq, "put");
+  ops_.note_put(g.full_size);
+
+  {
+    ServiceLock lock(mu_);
+    client_writes_.erase(oid);
+  }
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = cur_epoch();
+  r.replicas = installed;
+  r.placement = placement;
+  r.info = ObjectInfo{};
+  r.info->oid = oid;
+  r.info->seq = g.seq;
+  r.info->size = g.full_size;
+  r.info->crc32c = g.full_crc;
+  r.info->crc32c_known = true;
+  r.json_body = {{"seq", g.seq}, {"replicas", installed}, {"epoch", r.epoch}};
+  return r;
+}
+
+ApiResult ObjectService::api_client_abort(const std::string& oid, const std::string& grant_blob) {
+  if (cfg_.io_path != "client") {
+    return fail("not_supported", "client I/O path is disabled (io_path=server)");
+  }
+  std::string err;
+  auto opened = open_write_grant(grant_blob, cfg_.cluster_key, now_ms(), err, /*allow_expired=*/true);
+  if (!opened || opened->oid != oid) {
+    return fail("bad_request", err.empty() ? "grant oid mismatch" : err);
+  }
+  WriteGrant g = std::move(*opened);
+
+  Placement placement;
+  placement.epoch = g.epoch;
+  placement.storage_class = g.storage_class;
+  placement.acting_set = g.acting_set;
+  if (!placement.acting_set.empty() && placement.acting_set[0].node_id != cfg_.node_id) {
+    auto r = fail("not_primary", "this node is not primary for oid");
+    r.placement = placement;
+    return r;
+  }
+
+  auto* store = primary_store(placement, err);
+  if (store) store->abort_version(oid, g.seq, err);
+  replicate_abort(placement, oid, g.seq);
+  {
+    ServiceLock lock(mu_);
+    client_writes_.erase(oid);
+  }
+  ApiResult r;
+  r.ok = true;
+  r.epoch = cur_epoch();
+  r.placement = placement;
+  r.json_body = {{"seq", g.seq}, {"epoch", r.epoch}};
   return r;
 }
 

@@ -102,6 +102,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 - Hybrid local store: SQLite metadata + inline or filesystem bodies, sharded by oid hash
 - Versioned objects (`max_versions`), attrs, ranged PUT/GET, delete markers, atomic append
 - Server-side **replica** or **erasure-coded** durability, with background repair
+- Optional **client I/O path** (`io_path: client`): clients write copies/shards; primary coordinates
 - **Class transitions** (`transition_rules`): background tip migration between classes (e.g. `nvme` → `hdd`)
 - **Cold archive**: pack many tips into large bag objects, freeze stubs, optional ZSTD + AES-256-GCM, drain bags to tape/S3/XRootD
 - **Backup**: crash-consistent POSIX/VBD snapshots (whole volume or subtree), then pack + drain via the same bag path; YAML rules and live GFS policies
@@ -298,6 +299,7 @@ suspect_after_ms: 5000
 dead_after_ms: 15000
 scan_interval_ms: 5000
 replica_count: 3
+# io_path: server          # server = primary fans out; client = smart-client stripe/replicate
 default_storage_class: nvme
 placement:
   vnodes_per_target: 128
@@ -426,6 +428,8 @@ The tip stores `aios.storage_class`. Reads and repair use that attr (attrs win o
 | **`durability: ec`** | Primary stripes into `ec_k + ec_m` shards (one per acting-set target). GET reconstructs from any `k` shards; repair rebuilds missing shards |
 
 EC codec is auto-selected (`xor` when `ec_m=1`, else `isal` / Reed–Solomon). Build with ISA-L available for `m>1`. Ranged PUT is rejected under EC; staged PUT is capped (see HTTP docs).
+
+**I/O path.** By default (`io_path: server`) the primary is the data plane: it receives the body and fans out copies or EC shards. `io_path: client` keeps the primary as coordinator (seq, lock, preconditions, tip publish) but lets smart clients (`libaios_client` `Session`, `io_path: auto|client`) stripe or replicate directly to the acting set with a short-lived HMAC write grant. Ordinary `PUT /o/{oid}`, S3, and the kernel HTTP client still use server fan-out. Range/append stay on the primary. See [`proto/http.md`](proto/http.md#client-io-path).
 
 **Per-object layout** (no pools): each PUT may override via `x-aios-layout` / `x-aios-ec-*`. Cluster `durability` / `ec_*` are defaults. `layout_rules` can set both layout and `storage_class` by oid prefix (longest match; request headers still win).
 

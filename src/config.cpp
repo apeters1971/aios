@@ -353,6 +353,9 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["status_file"]) cfg.status_file = root["status_file"].as<std::string>();
     if (root["cluster_key"]) cfg.cluster_key = root["cluster_key"].as<std::string>();
     if (root["auth_skew_ms"]) cfg.auth_skew_ms = root["auth_skew_ms"].as<int>();
+    if (root["io_path"]) cfg.io_path = root["io_path"].as<std::string>();
+    if (root["io_path_grant_ttl_ms"])
+      cfg.io_path_grant_ttl_ms = root["io_path_grant_ttl_ms"].as<int>();
     if (root["replica_count"]) cfg.replica_count = root["replica_count"].as<int>();
     if (root["write_quorum"]) cfg.write_quorum = root["write_quorum"].as<int>();
     if (root["durability"]) cfg.durability = root["durability"].as<std::string>();
@@ -695,6 +698,12 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       cfg.cluster_key = v;
       continue;
     }
+    if (arg == "--io-path") {
+      const char* v = need("--io-path");
+      if (!v) return false;
+      cfg.io_path = v;
+      continue;
+    }
     if (arg == "--replica-count") {
       if (!need_int("--replica-count", cfg.replica_count)) return false;
       continue;
@@ -847,6 +856,20 @@ bool normalize_config(Config& cfg, std::string& err) {
   }
   if (cfg.suspect_after_ms >= cfg.dead_after_ms) {
     err = "suspect_after_ms must be less than dead_after_ms";
+    return false;
+  }
+  cfg.io_path = lower_copy(cfg.io_path);
+  if (cfg.io_path.empty()) cfg.io_path = "server";
+  if (cfg.io_path != "server" && cfg.io_path != "client") {
+    err = "io_path must be 'server' or 'client'";
+    return false;
+  }
+  if (cfg.io_path_grant_ttl_ms < 1000) {
+    err = "io_path_grant_ttl_ms must be >= 1000";
+    return false;
+  }
+  if (cfg.io_path_grant_ttl_ms > 3600000) {
+    err = "io_path_grant_ttl_ms must be <= 3600000";
     return false;
   }
   if (cfg.replica_count < 1) {

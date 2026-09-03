@@ -128,6 +128,10 @@ remote clients must be principals while the daemon's own S3 gateway keeps workin
 | `POST` | `/auth/ticket` | Principal → ticket + session key (no `Authorization`; see above) |
 | `PUT` | `/o/{oid}` | Full replace, or partial with `Content-Range: bytes start-end/*` (new version) |
 | `POST` | `/o/{oid}/append` | Atomic byte-append at tip size (primary-serialized) → `200` `{offset,size,seq,epoch}` |
+| `POST` | `/o/{oid}/prepare` | **Client I/O path:** reserve seq + HMAC grant (`io_path: client`) |
+| `PUT` | `/o/{oid}/install` | **Client I/O path:** install replica copy or EC shard (`x-aios-write-grant`, `x-aios-shard`) |
+| `POST` | `/o/{oid}/publish` | **Client I/O path:** publish after install quorum |
+| `POST` | `/o/{oid}/abort-prepared` | **Client I/O path:** abort unpublished seq |
 | `GET` | `/o/{oid}` | Tip, or `?version={seq}` / `x-aios-version`; `Range` → 206 |
 | `HEAD` | `/o/{oid}` | Stat + attr headers (+ version selection as GET) |
 | `DELETE` | `/o/{oid}` | Delete-marker version at tip |
@@ -145,7 +149,7 @@ remote clients must be principals while the daemon's own S3 gateway keeps workin
 | `POST` | `/pubsub/{topic}/publish` | Publish raw body (≤1 MiB) → `201` `{topic,id,delivery,ts_ms}` |
 | `GET` | `/pubsub/{topic}/subscribe` | Long-poll (`timeout_ms`, `after_id`) → messages or `204` |
 | `GET` | `/o?prefix=&limit=&cursor=&attr_eq=k:v&attrs=1&scope=` | LIST tip objects (default **cluster** scatter-gather; `scope=local` for this node) |
-| `GET` | `/map` | Cluster map JSON (targets include `http_addr`) |
+| `GET` | `/map` | Cluster map JSON (targets include `http_addr`) plus `io_path` |
 | `GET` | `/admin/status` | **Admin nodes only:** local status + OPS counters + membership |
 | `GET` | `/admin/ops` | **Admin:** `{node_id,ops}` |
 | `GET` | `/admin/config` | **Admin:** effective config (`cluster_key` redacted) |
@@ -178,6 +182,18 @@ When the daemon runs with `durability: ec`, ordinary `PUT /o/{oid}` stripes the 
 | `x-aios-ec-codec: xor \| isal` | Omit → auto (`xor` if `m==1`, else `isal`) |
 
 Layout and class are stored on the version (`x-aios-attr-aios.layout`, `x-aios-attr-aios.storage_class`, etc.). Optional YAML `layout_rules` / `transition_rules` set admin defaults by oid prefix. See [`layout.md`](layout.md).
+
+### Client I/O path
+
+`io_path: server` (default): clients `PUT /o/{oid}` to the primary; aiosd fans out replica copies or EC shards.
+
+`io_path: client`: the primary still allocates `seq`, checks locks/preconditions, and publishes the tip, but the **body** is written by the client to each acting-set target.
+
+1. `POST /o/{oid}/prepare` on the primary (layout / lock / precondition headers, `x-aios-size`, `x-aios-crc32c`). Reply JSON includes `seq`, `acting_set`, `layout`, `ec_*`, and an opaque HMAC `grant` (TTL `io_path_grant_ttl_ms`, default 5 min).
+2. `PUT /o/{oid}/install` in parallel to each target with `x-aios-write-grant` and `x-aios-shard` (0-based acting-set index). Replica: full body on every shard. EC: client encodes and sends shard `i` to `acting_set[i]`. Wrong node → **307** to that shard’s `http_addr`. Does not publish the tip.
+3. `POST /o/{oid}/publish` on the primary with the grant. Counts installed unpublished versions, requires `write_quorum` (and `k` for EC), then publishes. `POST /o/{oid}/abort-prepared` discards the seq.
+
+`libaios_client` `SessionConfig::io_path` is `auto` (use `GET /map` `io_path`), `server`, or `client`. Ordinary `PUT /o/{oid}` still fans out on the server so S3 / curl / kernel keep working. Range PUT and append stay on the primary.
 
 ### Large objects
 

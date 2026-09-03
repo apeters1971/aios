@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -417,13 +418,15 @@ ObjectRpcResult object_stat_remote(const std::string& peer_addr,
                                    const std::string& local_listen,
                                    const std::string& cluster_key, int auth_skew_ms,
                                    std::uint64_t epoch, const std::string& aios_path,
-                                   const std::string& oid, bool include_deleted) {
+                                   const std::string& oid, bool include_deleted,
+                                   std::optional<std::uint64_t> seq) {
   nlohmann::json body = {
       {"epoch", epoch},
       {"aios_path", aios_path},
       {"oid", oid},
   };
   if (include_deleted) body["include_deleted"] = true;
+  if (seq) body["seq"] = *seq;
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
                     MsgType::ObjectStat, std::move(body));
 }

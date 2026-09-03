@@ -106,6 +106,13 @@ struct Config {
   // Extra directories to scan for a top-level .aios (in addition to mount roots).
   std::vector<std::string> scan_roots;
   std::string status_file;
+  // Where replica copies / EC shards are written for smart clients:
+  //   server — primary receives the body and fans out (default)
+  //   client — clients write the acting set; primary coordinates prepare/publish
+  // Ordinary PUT / S3 / kernel still use server fan-out either way.
+  std::string io_path{"server"};
+  // Lifetime of HMAC write grants minted by POST /o/{oid}/prepare.
+  int io_path_grant_ttl_ms{300000};
   // Server-side replication: primary fans out to replica_count targets.
   int replica_count{3};
   // Successful copies required for Put/Del ACK (including primary). 0 => replica_count.

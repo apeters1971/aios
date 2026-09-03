@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
         << "usage: aiosd --cluster-key UUID [--config PATH] [--listen HOST:PORT]\n"
         << "             [--peer HOST:PORT] [--node-id ID] [--status-file PATH]\n"
         << "             [--scan-root PATH] [--scan-prefix PATH]\n"
-        << "             [--replica-count N] [--write-quorum N]\n"
+        << "             [--replica-count N] [--write-quorum N] [--io-path server|client]\n"
         << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
         << "             [--s3-listen HOST:PORT] [--s3-volume NAME] [--s3-access-key ID]\n"
         << "             [--s3-tls-cert PEM --s3-tls-key PEM [--s3-tls-chain PEM]]\n"

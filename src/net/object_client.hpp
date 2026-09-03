@@ -219,6 +219,7 @@ ObjectRpcResult object_stat_remote(const std::string& peer_addr,
                                    const std::string& local_listen,
                                    const std::string& cluster_key, int auth_skew_ms,
                                    std::uint64_t epoch, const std::string& aios_path,
-                                   const std::string& oid, bool include_deleted = false);
+                                   const std::string& oid, bool include_deleted = false,
+                                   std::optional<std::uint64_t> seq = std::nullopt);
 
 }  // namespace aios

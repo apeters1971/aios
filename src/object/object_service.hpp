@@ -11,6 +11,7 @@
 #include "object/pubsub.hpp"
 #include "store/local_stores.hpp"
 #include "store/object_store.hpp"
+#include "util/write_grant.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -177,6 +178,22 @@ class ObjectService {
                                const std::optional<std::string>& lock_token = std::nullopt);
   ApiResult api_publish_version(const std::string& oid, std::uint64_t seq);
   ApiResult api_abort_prepared(const std::string& oid, std::uint64_t seq);
+
+  // Client I/O path (io_path: client): primary coordinates seq/lock/publish;
+  // the client writes replica copies / EC shards with a signed grant.
+  ApiResult api_client_prepare(const std::string& oid, std::uint64_t full_size,
+                               std::uint32_t full_crc,
+                               const std::unordered_map<std::string, std::string>& attrs,
+                               bool replace_attrs, const std::vector<AttrPrecondition>& preds,
+                               const LayoutRequest& layout = {},
+                               const std::optional<std::string>& lock_token = std::nullopt);
+  ApiResult api_client_install(const std::string& oid, int shard, const std::string& grant_blob,
+                               const std::uint8_t* data, std::size_t len,
+                               const std::unordered_map<std::string, std::string>& attrs,
+                               std::optional<std::uint32_t> expected_crc32c = std::nullopt,
+                               const std::string& abs_body_path = {});
+  ApiResult api_client_publish(const std::string& oid, const std::string& grant_blob);
+  ApiResult api_client_abort(const std::string& oid, const std::string& grant_blob);
 
   // Cross-object transactions (coordinator = primary for txn/<id>).
   ApiResult api_txn_begin();
@@ -359,6 +376,25 @@ class ObjectService {
   };
   void destroy_pipeline(const std::shared_ptr<PutPipeline>& pl, bool abort_peers);
 
+  struct ClientWrite {
+    std::mutex mu;
+    std::shared_ptr<void> oid_guard;
+    std::string oid;
+    std::uint64_t seq{0};
+    Placement placement;
+    ObjectLayout layout;
+    std::unordered_map<std::string, std::string> attrs;
+    std::uint64_t full_size{0};
+    std::uint32_t full_crc{0};
+    std::string grant;
+    std::int64_t expires_ms{0};
+  };
+  void gc_client_writes();
+  ApiResult verify_client_grant(const std::string& oid, const std::string& grant_blob,
+                                WriteGrant& g);
+  int count_client_installs(const WriteGrant& g);
+  nlohmann::json client_prepare_json(const ClientWrite& w) const;
+
   // Lock-free mirror of map_.epoch for reply/error paths that run without mu_
   // (a plain map_.epoch read there races update_cluster_map). Refreshed whenever
   // the map is published or epoch_ok takes the slow path under the lock.
@@ -383,6 +419,8 @@ class ObjectService {
   std::unordered_map<std::string, std::shared_ptr<StageSession>> stages_;
   // At most one in-flight pipelined PUT per oid (serializes seq reservation).
   std::unordered_map<std::string, std::shared_ptr<PutPipeline>> pipelines_;
+  // At most one in-flight client-path write per oid (seq reservation + grant).
+  std::unordered_map<std::string, std::shared_ptr<ClientWrite>> client_writes_;
 };
 
 }  // namespace aios

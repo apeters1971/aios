@@ -346,6 +346,7 @@ int status_for(const ApiResult& r) {
   if (r.code == "lock_expired") return 409;
   if (r.code == "mode_mismatch") return 409;
   if (r.code == "payload_too_large") return 413;
+  if (r.code == "not_supported") return 501;
   return 500;
 }
 
@@ -1108,6 +1109,8 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"status_file", c.status_file},
       {"replica_count", c.replica_count},
       {"write_quorum", c.write_quorum > 0 ? c.write_quorum : c.replica_count},
+      {"io_path", c.io_path},
+      {"io_path_grant_ttl_ms", c.io_path_grant_ttl_ms},
       {"durability", c.durability},
       {"default_storage_class", c.default_storage_class},
       {"placement",
@@ -3320,7 +3323,9 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     }
 
     if (method == "GET" && path == "/map") {
-      write_json(*sock, 200, "OK", objects_.map().to_json(), keep_alive);
+      auto j = objects_.map().to_json();
+      j["io_path"] = cfg_.io_path;
+      write_json(*sock, 200, "OK", j, keep_alive);
       continue;
     }
 
@@ -3846,6 +3851,146 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         }
         write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
                    keep_alive);
+        continue;
+      }
+
+      if (sub == "prepare" && method == "POST") {
+        std::uint64_t full_size = content_length;
+        const auto size_hdr = header_get(headers, "x-aios-size");
+        if (!size_hdr.empty()) {
+          try {
+            full_size = static_cast<std::uint64_t>(std::stoull(size_hdr));
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-size"}}, keep_alive);
+            continue;
+          }
+        }
+        std::uint32_t full_crc = 0;
+        const auto crc_hdr = header_get(headers, "x-aios-crc32c");
+        if (!crc_hdr.empty()) {
+          try {
+            full_crc = static_cast<std::uint32_t>(std::stoul(crc_hdr));
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-crc32c"}}, keep_alive);
+            continue;
+          }
+        } else {
+          full_crc = crc32c(body.data(), body.size());
+        }
+        const LayoutRequest layout_req = layout_request_from_headers(headers);
+        const auto lock_token = lock_token_hdr();
+        auto r = objects_.api_client_prepare(oid, full_size, full_crc, attrs, true, preds,
+                                             layout_req, lock_token);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+
+      if (sub == "install" && method == "PUT") {
+        const auto grant = header_get(headers, "x-aios-write-grant");
+        if (grant.empty()) {
+          write_json(*sock, 400, "Bad Request", {{"error", "x-aios-write-grant required"}},
+                     keep_alive);
+          continue;
+        }
+        int shard = 0;
+        const auto shard_hdr = header_get(headers, "x-aios-shard");
+        if (!shard_hdr.empty()) {
+          try {
+            shard = std::stoi(shard_hdr);
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-shard"}}, keep_alive);
+            continue;
+          }
+        }
+        std::optional<std::uint32_t> expected_crc;
+        const auto crc_hdr = header_get(headers, "x-aios-crc32c");
+        if (!crc_hdr.empty()) {
+          try {
+            expected_crc = static_cast<std::uint32_t>(std::stoul(crc_hdr));
+          } catch (...) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-crc32c"}}, keep_alive);
+            continue;
+          }
+        }
+        ApiResult r;
+        if (!upload_path.empty()) {
+          r = objects_.api_client_install(oid, shard, grant, nullptr,
+                                          static_cast<std::size_t>(content_length), attrs,
+                                          expected_crc, upload_path);
+          std::error_code rec;
+          fs::remove(upload_path, rec);
+          upload_path.clear();
+        } else {
+          if (!expected_crc) expected_crc = crc32c(body.data(), body.size());
+          r = objects_.api_client_install(oid, shard, grant, body.data(), body.size(), attrs,
+                                          expected_crc);
+        }
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        std::unordered_map<std::string, std::string> rh = {
+            {"x-aios-epoch", std::to_string(r.epoch)},
+            {"x-aios-replicas", std::to_string(r.replicas)},
+        };
+        if (r.info) {
+          rh["x-aios-version"] = std::to_string(r.info->seq);
+          if (r.info->crc32c_known) rh["x-aios-crc32c"] = std::to_string(r.info->crc32c);
+        }
+        write_response(*sock, 204, "No Content", rh, nullptr, 0, keep_alive);
+        continue;
+      }
+
+      if (sub == "publish" && method == "POST") {
+        auto grant = header_get(headers, "x-aios-write-grant");
+        if (grant.empty() && !body.empty()) {
+          try {
+            auto j = nlohmann::json::parse(body.begin(), body.end());
+            grant = j.value("grant", "");
+          } catch (...) {
+          }
+        }
+        if (grant.empty()) {
+          write_json(*sock, 400, "Bad Request", {{"error", "x-aios-write-grant required"}},
+                     keep_alive);
+          continue;
+        }
+        auto r = objects_.api_client_publish(oid, grant);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+
+      if (sub == "abort-prepared" && method == "POST") {
+        auto grant = header_get(headers, "x-aios-write-grant");
+        if (grant.empty() && !body.empty()) {
+          try {
+            auto j = nlohmann::json::parse(body.begin(), body.end());
+            grant = j.value("grant", "");
+          } catch (...) {
+          }
+        }
+        if (grant.empty()) {
+          write_json(*sock, 400, "Bad Request", {{"error", "x-aios-write-grant required"}},
+                     keep_alive);
+          continue;
+        }
+        auto r = objects_.api_client_abort(oid, grant);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_response(*sock, 204, "No Content",
+                       {{"x-aios-epoch", std::to_string(r.epoch)}}, nullptr, 0, keep_alive);
         continue;
       }
 

@@ -5,6 +5,7 @@ AIOS has no pools or placement groups. Durability, storage class, and data layou
 ## Goals
 
 - Client (or admin default / prefix rule) picks `replica` or `ec`, and a **storage class** (e.g. `nvme`, `hdd`), **per PUT**
+- Optional **client I/O path** (`io_path: client`): the client writes copies/shards; the primary still coordinates seq and publish
 - Placement uses **consistent hashing with virtual nodes** on a **class-scoped** ring
 - Layout and storage class are stored on the version and are authoritative for GET / HEAD / repair
 - Tips can **transition** between storage classes under `transition_rules` (background) or via a new PUT with a different class

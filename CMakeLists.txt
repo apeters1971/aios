@@ -206,6 +206,7 @@ add_library(aios_core STATIC
   src/util/compression.cpp
   src/util/aes_gcm.cpp
   src/util/ticket.cpp
+  src/util/write_grant.cpp
   src/store/object_store.cpp
   src/store/fs_clone.cpp
   src/store/local_stores.cpp
@@ -598,6 +599,7 @@ add_executable(aios_tests
   tests/test_review2_posix.cpp
   tests/test_review2_kabi.cpp
   tests/test_process_smoke.cpp
+  tests/test_client_io.cpp
   tests/test_ticket_auth.cpp
   tests/test_s3_tls.cpp
 )

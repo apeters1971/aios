@@ -36,6 +36,9 @@ struct SessionConfig {
   // current hop host. When an absolute redirect is not yet allowlisted, Session
   // once refreshes peers from GET /admin/cluster on the bootstrap endpoint.
   std::vector<std::string> redirect_peers{};
+  // Durability data path: "auto" (cluster GET /map io_path), "server" (PUT to
+  // primary; aiosd fans out), or "client" (prepare + parallel install + publish).
+  std::string io_path{"auto"};
 };
 
 struct LockResult {
@@ -93,6 +96,12 @@ class Session {
   HttpResponse request(const std::string& method, const std::string& target,
                        std::unordered_map<std::string, std::string> headers = {},
                        const std::string& body = {}, int max_redirects = 5);
+  // Like request(), but the first hop is `http_addr` (host:port). Empty uses
+  // the session endpoint. Used by the client I/O path to fan out installs.
+  HttpResponse request_peer(const std::string& http_addr, const std::string& method,
+                            const std::string& target,
+                            std::unordered_map<std::string, std::string> headers = {},
+                            const std::string& body = {}, int max_redirects = 5);
 
   ObjectSnapshot get_object(const std::string& oid);
   ObjectSnapshot head_object(const std::string& oid);
@@ -196,6 +205,11 @@ class Session {
   // One-shot GET to the bootstrap endpoint; does not follow redirects.
   HttpResponse bootstrap_get(const std::string& path);
 
+  bool use_client_io();
+  std::uint64_t put_bytes_client(const std::string& oid, const std::string& body,
+                                 std::unordered_map<std::string, std::string> headers,
+                                 std::uint64_t new_cas);
+
   SessionConfig cfg_;
   std::string host_;
   std::string port_;
@@ -205,6 +219,9 @@ class Session {
   std::unordered_set<std::string> redirect_allow_;
   std::atomic<bool> redirect_refreshed_{false};
   std::atomic<bool> refreshing_allowlist_{false};
+  // Cluster io_path from GET /map ("server" | "client"); empty until fetched.
+  mutable std::mutex io_mu_;
+  std::string cluster_io_path_;
   // Current ticket (principal mode). Renewal happens under ticket_mu_ so a burst
   // of expired-ticket 401s from many threads costs one grant, not one each.
   mutable std::mutex ticket_mu_;
