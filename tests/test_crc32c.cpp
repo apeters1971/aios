@@ -37,6 +37,7 @@ TEST(Crc32c, Basic) {
   ObjectStoreOptions opts;
   opts.shard_count = 4;
   opts.inline_max_bytes = 16;
+  opts.clone_required = false;  // allow copy fallback in CI (no FICLONE on overlayfs)
   std::string err;
   EXPECT_TRUE(store.open(root.string(), opts, err)) << "open";
 

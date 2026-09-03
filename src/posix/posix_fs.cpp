@@ -884,6 +884,29 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
         }
       }
 
+      // Parent and project_id must commit with the dentry rewrite. A follow-up
+      // PUT was racy with the dirty-size flusher and was swallowed, so reconcile
+      // still charged the source project after a rename out.
+      const auto old_proj = moved.project_id;
+      const bool reproject = moved.project_id != new_p.project_id;
+      const bool move_inode = moved.parent_ino != new_parent || reproject;
+      if (move_inode) {
+        {
+          std::lock_guard lock(st.mu);
+          auto dit = st.dirty_sizes.find(moved.ino);
+          if (dit != st.dirty_sizes.end()) {
+            moved.size = std::max(moved.size, dit->second.size);
+            moved.mtime_ns = std::max(moved.mtime_ns, dit->second.mtime_ns);
+            moved.ctime_ns = std::max(moved.ctime_ns, dit->second.ctime_ns);
+          }
+        }
+        moved.parent_ino = new_parent;
+        if (reproject) moved.project_id = new_p.project_id;
+        moved.ctime_ns = ts;
+        st.session.txn_prepare_put(txn_id, ino_oid(st.volume, ino), inode_to_json(moved),
+                                   moved.cas);
+      }
+
       st.session.txn_commit(txn_id);
       txn_id.clear();
 
@@ -894,10 +917,20 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
       if (victim_ino && victim_ino != ino && victim.exists && !delete_victim) {
         victim.cas += 1;
       }
+      if (move_inode) {
+        moved.cas += 1;
+        moved.exists = true;
+      }
       {
         std::lock_guard lock(st.mu);
         cache_inode_locked(st, old_p);
         cache_inode_locked(st, new_p);
+        if (move_inode) {
+          auto dit = st.dirty_sizes.find(ino);
+          if (dit != st.dirty_sizes.end() && dit->second.size <= moved.size)
+            st.dirty_sizes.erase(dit);
+          cache_inode_locked(st, moved);
+        }
         if (victim_ino && victim_ino != ino) {
           if (delete_victim) {
             cache_erase_locked(st, victim_ino);
@@ -912,28 +945,8 @@ int rename_cross_dir(FsState& st, uint64_t old_parent, const std::string& old_na
                              gc_gid);
         }
       }
-      // Primary parent follows the destination directory; reproject if needed.
-      const auto old_proj = moved.project_id;
-      const bool reproject = moved.project_id != new_p.project_id;
-      if (moved.parent_ino != new_parent || reproject) {
-        moved.parent_ino = new_parent;
-        if (reproject) moved.project_id = new_p.project_id;
-        moved.ctime_ns = ts;
-        try {
-          const uint64_t reproject_ts = ts;
-          const uint64_t new_parent_ino = new_parent;
-          const uint32_t new_project_id = new_p.project_id;
-          store_inode(st, moved, std::nullopt, [reproject_ts, new_parent_ino, reproject,
-                                                new_project_id](InodeMeta& next) {
-            next.parent_ino = new_parent_ino;
-            if (reproject) next.project_id = new_project_id;
-            next.ctime_ns = reproject_ts;
-          });
-          if (reproject && st.quota) {
-            st.quota->note_reproject(old_proj, moved.project_id, moved.uid, moved.gid, moved.size);
-          }
-        } catch (...) {
-        }
+      if (reproject && st.quota) {
+        st.quota->note_reproject(old_proj, moved.project_id, moved.uid, moved.gid, moved.size);
       }
       old_dir.publish();
       new_dir.publish();
