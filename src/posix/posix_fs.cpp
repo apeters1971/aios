@@ -3150,6 +3150,9 @@ int aios_posix_flock(aios_posix_fs* fs, uint64_t ino, int op) {
     if (cmd != LOCK_UN) {
       const int want = (cmd == LOCK_EX) ? kWantW : kWantR;
       if (int ac = aios::posix::check_access(effective_caller(fs), m, want)) return ac;
+      // The cluster lock is on the inode oid and blocks PUTs without the token.
+      // Publish first so the lease flusher (and a peer GET) are not fenced out.
+      aios::posix::publish_inodes(*fs->st, {ino});
     }
     const std::string oid = aios::posix::ino_oid(fs->st->volume, ino);
 

@@ -331,6 +331,7 @@ TEST(Review2Posix, DeferredSizeVisibleToSecondMountWithoutFsync) {
   HttpFixture http("aios-r2p-pos1", 23020);
   Mount a(http, "pos1vol", 4096);
   const uint64_t ino = create_file(a.fs, 1, "nofsync");
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
   const std::string data(3000, 'x');
   size_t wrote = 0;
   ASSERT_EQ(aios_posix_write(a.fs, ino, 0, data.data(), data.size(), &wrote), 0);
@@ -352,6 +353,7 @@ TEST(Review2Posix, InodeCacheRevalidatesAfterTtl) {
   HttpFixture http("aios-r2p-pos3", 23040);
   Mount a(http, "pos3vol", 4096);
   const uint64_t ino = create_file(a.fs, 1, "modes");
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
   aios_posix_stat st{};
   ASSERT_EQ(aios_posix_getattr(a.fs, ino, &st), 0);  // cached on A
   EXPECT_EQ(st.mode & 0777u, 0644u);
@@ -394,6 +396,7 @@ TEST(Review2Posix, ConflictReapplyPreservesDeferredSize) {
   HttpFixture http("aios-r2p-pos6", 23060);
   Mount a(http, "pos6vol", 4096);
   const uint64_t ino = create_file(a.fs, 1, "reapply");
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
 
   Mount b(http, "pos6vol", 4096);
   aios_posix_stat warm{};
@@ -726,6 +729,7 @@ TEST(Review2Posix, StaleUnlinkDoesNotRemoveRecreatedFile) {
   {
     Mount a(http, "pos9vol", 4096);
     const uint64_t old_ino = create_file(a.fs, 1, "f");
+    ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
     const std::string sz_old(700, 'o');
     size_t wrote = 0;
     ASSERT_EQ(aios_posix_write(a.fs, old_ino, 0, sz_old.data(), sz_old.size(), &wrote), 0);
@@ -787,6 +791,7 @@ TEST(Review2Posix, RmdirRechecksEmptinessUnderLock) {
   Mount a(http, "pos9bvol", 4096);
   aios_posix_stat d{};
   ASSERT_EQ(aios_posix_mkdir(a.fs, 1, "d", 0755, &d), 0);
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
   uint64_t off = 0;
   aios_posix_dirent ents[4];
   ASSERT_EQ(aios_posix_readdir(a.fs, d.ino, &off, ents, 4), 2);  // "." and ".." only, cached
