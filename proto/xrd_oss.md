@@ -50,4 +50,4 @@ Parms after the library path also work: `ofs.osslib libXrdAios.so endpoint=… c
 
 ## Scope (v1)
 
-Create/open/read/write/stat/mkdir/rmdir/unlink/rename/truncate/chmod/readdir. No TPC, AIO, or proxy FSctl.
+Create/open/read/write/stat/mkdir/rmdir/unlink/rename/truncate/chmod/readdir. `ReadV` prefetches covering stripe chunks (`aios_posix_prefetchv`, same 256-range / 256 MiB cap as `AIOS_IOC_PREFETCHV`, ranges clipped to the file) then fills each iovec with `Read`. No TPC, AIO, or proxy FSctl.

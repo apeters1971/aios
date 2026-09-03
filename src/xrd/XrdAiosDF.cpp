@@ -100,6 +100,54 @@ ssize_t XrdAiosFile::Read(void* buffer, off_t offset, size_t size) {
   return static_cast<ssize_t>(got);
 }
 
+void XrdAiosFile::prefetch_readv(const XrdOucIOVec* readV, int n) {
+  aios_posix_stat st{};
+  if (aios_posix_getattr(oss_->fs(), ino_, &st) != 0) return;
+  const uint64_t file_size = st.size;
+
+  struct aios_prefetchv req {};
+  uint64_t total = 0;
+  for (int i = 0; i < n && req.nranges < AIOS_PREFETCH_MAX_RANGES; ++i) {
+    if (readV[i].size <= 0 || readV[i].offset < 0) continue;
+    const auto off = static_cast<uint64_t>(readV[i].offset);
+    if (off >= file_size) continue;
+    uint64_t len = static_cast<uint64_t>(readV[i].size);
+    if (len > file_size - off) len = file_size - off;
+    if (len == 0) continue;
+    if (total >= AIOS_PREFETCH_MAX_BYTES) break;
+    if (len > AIOS_PREFETCH_MAX_BYTES - total) len = AIOS_PREFETCH_MAX_BYTES - total;
+    req.ranges[req.nranges].offset = off;
+    req.ranges[req.nranges].length = len;
+    ++req.nranges;
+    total += len;
+  }
+  if (req.nranges == 0) return;
+  (void)aios_posix_prefetchv(oss_->fs(), ino_, &req);
+}
+
+ssize_t XrdAiosFile::ReadV(XrdOucIOVec* readV, int n) {
+  if (int rc = restore_caller()) return rc;
+  if (!open_ || !oss_ || !oss_->fs()) return -EBADF;
+  if (n <= 0) return 0;
+  if (!readV) return -EINVAL;
+
+  // Best-effort: pull covering stripe chunks in one batch, then fill. A failed
+  // prefetch still leaves sequential Read() correct (and -ESPIPE on a short).
+  prefetch_readv(readV, n);
+
+  ssize_t nbytes = 0;
+  for (int i = 0; i < n; ++i) {
+    const ssize_t got =
+        Read(readV[i].data, static_cast<off_t>(readV[i].offset), static_cast<size_t>(readV[i].size));
+    if (got != readV[i].size) {
+      if (got < 0) return got;
+      return -ESPIPE;
+    }
+    nbytes += got;
+  }
+  return nbytes;
+}
+
 ssize_t XrdAiosFile::Write(const void* buffer, off_t offset, size_t size) {
   if (int rc = restore_caller()) return rc;
   if (!open_ || !oss_ || !oss_->fs()) return -EBADF;

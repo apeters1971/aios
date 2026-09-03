@@ -20,6 +20,7 @@ public:
   int Open(const char* path, int Oflag, mode_t Mode, XrdOucEnv& env) override;
   int Close(long long* retsz = 0) override;
   ssize_t Read(void* buffer, off_t offset, size_t size) override;
+  ssize_t ReadV(XrdOucIOVec* readV, int rdvcnt) override;
   ssize_t Write(const void* buffer, off_t offset, size_t size) override;
   int Fstat(struct stat* buf) override;
   int Fsync() override;
@@ -28,6 +29,7 @@ public:
 
 private:
   int restore_caller() const;
+  void prefetch_readv(const XrdOucIOVec* readV, int n);
 
   XrdAiosOss* oss_{nullptr};
   uint64_t ino_{0};

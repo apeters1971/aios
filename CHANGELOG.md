@@ -14,7 +14,7 @@ current fix cycle — check the regression test of the same name before relying 
 
 ### Added — sparse-range prefetch ioctl (`AIOS_IOC_PREFETCHV`)
 
-One UAPI ([`kernel/aiosfs_uapi.h`](kernel/aiosfs_uapi.h)) lets an application pass up to 256 inline file ranges in a single `ioctl` so FUSE and kernel aiosfs see the complete vector before any backend fetch. `aios-fuse` / `aios-fusell` handle it as a restricted ioctl and `aios_posix_prefetchv` GETs the unique stripe chunks into the POSIX chunk cache; aiosfs `.unlocked_ioctl` maps the same struct onto unique chunks and populates the page cache (`AIOS_OP_PREFETCHV` on the upcall path). Ranges past EOF, empty lengths, unknown flags, and a total over 256 MiB are rejected before I/O.
+One UAPI ([`kernel/aiosfs_uapi.h`](kernel/aiosfs_uapi.h)) lets an application pass up to 256 inline file ranges in a single `ioctl` so FUSE and kernel aiosfs see the complete vector before any backend fetch. `aios-fuse` / `aios-fusell` handle it as a restricted ioctl and `aios_posix_prefetchv` GETs the unique stripe chunks into the POSIX chunk cache; aiosfs `.unlocked_ioctl` maps the same struct onto unique chunks and populates the page cache (`AIOS_OP_PREFETCHV` on the upcall path). `libXrdAios` `ReadV` uses the same prefetch (ranges clipped to the file, then each iovec filled with `Read`) so sparse XRootD vector I/O is one backend batch instead of one GET per range. Ranges past EOF, empty lengths, unknown flags, and a total over 256 MiB are rejected before I/O.
 
 ### Added — `aios-fusell` (libfuse3 low-level)
 
