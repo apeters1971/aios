@@ -63,7 +63,7 @@ TEST(Crc32c, Basic) {
 
   // Grow with hole
   EXPECT_TRUE(store.put_range("x", 20, reinterpret_cast<const std::uint8_t*>("QQ"), 2, {}, false,
-                         err)) << "grow range";
+                         err)) << "grow range: " << err;
   got = store.get("x", err);
   st = store.stat("x", err);
   EXPECT_TRUE(got && got->size() == 22) << "grown size";

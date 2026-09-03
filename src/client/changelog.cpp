@@ -473,11 +473,12 @@ bool Log::compact(sync_mode mode,
   auto snap_head = session_->head_object(snap_oid_);
   session_->put_object(snap_oid_, snapshot_json, type_, snap_head.cas, lock_token, 1);
 
-  // next_op must stay contiguous with snapshot_op. Bumping past an unused
-  // "fence" id (without writing a Compact record) left a hole that made pull
-  // stop applying later ops after a rebuild-under-lock.
+  // next_op must stay contiguous with snapshot_op. Do not claim reserved-but
+  // unlogged ids as snapshotted: a writer that CAS'd next_op before we took the
+  // lock still appends that id after we drop it, and pull would skip the record
+  // if snapshot_op had already consumed it.
   const std::uint64_t fence_id = m.next_op;
-  const std::uint64_t snap_op = applied_op > 0 ? applied_op : (fence_id > 0 ? fence_id - 1 : 0);
+  const std::uint64_t snap_op = applied_op;
   const std::uint64_t new_next = std::max(fence_id, snap_op + 1);
 
   Meta reserved = m;

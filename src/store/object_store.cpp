@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <chrono>
 #include <filesystem>
+#include <sys/stat.h>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -808,16 +809,33 @@ bool ObjectStore::crc_file_range(Shard& shard, const std::string& relpath,
   while (done < len) {
     const std::size_t chunk =
         static_cast<std::size_t>(std::min<std::uint64_t>(sizeof(buf), len - done));
-    const ssize_t n = ::pread(fd, buf, chunk, static_cast<off_t>(offset + done));
+    ssize_t n = ::pread(fd, buf, chunk, static_cast<off_t>(offset + done));
     if (n < 0) {
       err = std::string("pread crc: ") + std::strerror(errno);
       ::close(fd);
       return false;
     }
     if (n == 0) {
-      err = "short read: file truncated";
-      ::close(fd);
-      return false;
+      // Sparse holes inside st_size should read as zeros. Some clone+ftruncate
+      // paths (reflink on overlay/tmp) report EOF instead; treat that as zeros
+      // when the file is still as long as the requested range. A truly truncated
+      // backing file (st_size behind the range) still fails.
+      struct stat st {};
+      if (::fstat(fd, &st) != 0) {
+        err = std::string("fstat crc: ") + std::strerror(errno);
+        ::close(fd);
+        return false;
+      }
+      const auto pos = offset + done;
+      if (static_cast<std::uint64_t>(st.st_size) <= pos) {
+        err = "short read: file truncated";
+        ::close(fd);
+        return false;
+      }
+      const std::size_t hole = static_cast<std::size_t>(
+          std::min<std::uint64_t>(chunk, static_cast<std::uint64_t>(st.st_size) - pos));
+      std::memset(buf, 0, hole);
+      n = static_cast<ssize_t>(hole);
     }
     crc = crc32c_update(crc, buf, static_cast<std::size_t>(n));
     done += static_cast<std::uint64_t>(n);
@@ -832,19 +850,25 @@ bool ObjectStore::crc_after_range_update(Shard& shard, const std::string& relpat
                                         const std::uint8_t* data, std::size_t len,
                                         std::uint64_t new_size, std::uint32_t& out_crc,
                                         std::string& err) {
-  (void)old_size;
   std::uint32_t combined = 0;
+  const std::uint64_t range_end = offset + static_cast<std::uint64_t>(len);
   if (offset > 0) {
-    std::uint32_t pref = 0;
-    if (!crc_file_range(shard, relpath, 0, offset, pref, err)) return false;
-    combined = pref;
+    const std::uint64_t solid = std::min(old_size, offset);
+    if (solid > 0) {
+      std::uint32_t pref = 0;
+      if (!crc_file_range(shard, relpath, 0, solid, pref, err)) return false;
+      combined = pref;
+    }
+    if (offset > old_size) {
+      combined = crc32c_update_zeros(combined, static_cast<std::size_t>(offset - old_size));
+    }
   }
   if (len > 0) {
     combined = crc32c_combine(combined, crc32c(data, len), len);
   }
-  if (offset + static_cast<std::uint64_t>(len) < new_size) {
+  if (range_end < new_size) {
     std::uint32_t suf = 0;
-    const std::uint64_t suf_off = offset + len;
+    const std::uint64_t suf_off = range_end;
     const std::uint64_t suf_len = new_size - suf_off;
     if (!crc_file_range(shard, relpath, suf_off, suf_len, suf, err)) return false;
     combined = crc32c_combine(combined, suf, static_cast<std::size_t>(suf_len));

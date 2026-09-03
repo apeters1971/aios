@@ -127,6 +127,8 @@ struct StubServer {
   std::atomic<int> request_count{0};
   std::mutex req_mu;
   std::vector<std::string> requests;
+  std::mutex live_mu;
+  std::vector<std::shared_ptr<tcp::socket>> live;
   Handler handler;
 
   explicit StubServer(Handler h) : acc(ioc, tcp::endpoint(tcp::v4(), 0)), handler(std::move(h)) {
@@ -138,6 +140,10 @@ struct StubServer {
         acc.accept(*sock, ec);
         if (ec || stop.load()) return;
         const int idx = accept_count.fetch_add(1);
+        {
+          std::lock_guard lock(live_mu);
+          live.push_back(sock);
+        }
         std::lock_guard lock(workers_mu);
         workers.emplace_back([this, sock, idx] { serve(sock, idx); });
       }
@@ -146,7 +152,25 @@ struct StubServer {
 
   ~StubServer() {
     stop.store(true);
+    // Closing worker sockets unblocks keep-alive read_some. Closing the
+    // acceptor from this thread is not required to interrupt a blocking
+    // accept() (POSIX); a dummy connect to the listen port is.
+    {
+      std::lock_guard lock(live_mu);
+      for (auto& s : live) {
+        boost::system::error_code ec;
+        s->shutdown(tcp::socket::shutdown_both, ec);
+        s->close(ec);
+      }
+    }
     boost::system::error_code ec;
+    const auto listen_port = static_cast<unsigned short>(std::stoul(port));
+    try {
+      boost::asio::io_context poke_ioc;
+      tcp::socket poke(poke_ioc);
+      poke.connect(tcp::endpoint(boost::asio::ip::address_v4::loopback(), listen_port), ec);
+    } catch (...) {
+    }
     acc.close(ec);
     if (th.joinable()) th.join();
     std::lock_guard lock(workers_mu);
@@ -712,7 +736,8 @@ TEST(Review2Posix, StaleUnlinkDoesNotRemoveRecreatedFile) {
     if (rc == 0) {
       new_removed = true;
       EXPECT_EQ(aios_posix_lookup(b.fs, 1, "f", &st), -ENOENT);
-      EXPECT_EQ(aios_posix_getattr(b.fs, new_ino, &st), -ENOENT);
+      // B's inode cache (1s TTL) may still hold new_ino; a fresh mount is the
+      // source of truth for whether the inode object was actually removed.
     } else {
       EXPECT_EQ(rc, -ENOENT) << "stale dentry must not half-remove the peer's new file";
       ASSERT_EQ(aios_posix_getattr(b.fs, new_ino, &st), 0);
@@ -733,6 +758,7 @@ TEST(Review2Posix, StaleUnlinkDoesNotRemoveRecreatedFile) {
   aios_posix_stat st{};
   if (new_removed) {
     EXPECT_EQ(aios_posix_lookup(c.fs, 1, "f", &st), -ENOENT);
+    EXPECT_EQ(aios_posix_getattr(c.fs, new_ino, &st), -ENOENT);
   } else {
     ASSERT_EQ(aios_posix_lookup(c.fs, 1, "f", &st), 0);
     EXPECT_EQ(st.ino, new_ino);
