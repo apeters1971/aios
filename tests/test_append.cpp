@@ -204,4 +204,38 @@ using namespace aios;
   }
 }
 
+TEST(Append, SessionLockAcquireWaitBreaksAndFencesLease) {
+  using namespace aios;
+  HttpFixture hf("aios-lease-break");
+  Session holder(hf.cfg());
+  Session waiter(hf.cfg());
+  const std::string oid = "lease/dir";
+
+  // Holder takes a long lease and commits under it.
+  auto lease = holder.lock_acquire(oid, 60000);
+  ASSERT_FALSE(lease.token.empty());
+  auto a1 = holder.append(oid, "one", lease.token);
+  EXPECT_EQ(a1.size, 3u);
+
+  // Waiter cannot append, asks for the lease back with a short grace and waits.
+  EXPECT_THROW(waiter.append(oid, "two"), client_error);
+  std::string wtok;
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool got = waiter.lock_acquire_wait(oid, wtok, 30000, 10000);
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  EXPECT_TRUE(got);
+  EXPECT_LT(waited, std::chrono::seconds(8)) << "default break grace is 5 s";
+
+  // The former holder is fenced even though it never noticed.
+  try {
+    holder.append(oid, "late", lease.token);
+    ADD_FAILURE() << "stale token accepted";
+  } catch (const client_error& e) {
+    EXPECT_TRUE(e.code() == "lock_held" || e.code() == "lock_expired") << e.code();
+  }
+  auto a2 = waiter.append(oid, "two", wtok);
+  EXPECT_EQ(a2.size, 6u);
+  waiter.lock_release(oid, wtok);
+}
+
 

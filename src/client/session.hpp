@@ -138,6 +138,13 @@ class Session {
   void lock_release(const std::string& oid, const std::string& token);
   bool lock_try_acquire(const std::string& oid, std::string& token_out, int ttl_ms = 30000,
                         std::int64_t* expires_ms_out = nullptr);
+  // Ask the current holder to give the lease back within grace_ms. Returns the
+  // deadline (server clock, ms) by which it will be gone, or 0 if nobody holds it.
+  std::int64_t lock_break(const std::string& oid, int grace_ms = 5000);
+  // Acquire, and when the lease is held by someone else, request a break and
+  // wait (up to max_wait_ms) for it to be released. Returns false on timeout.
+  bool lock_acquire_wait(const std::string& oid, std::string& token_out, int ttl_ms = 30000,
+                         int max_wait_ms = 15000, std::int64_t* expires_ms_out = nullptr);
 
   // Cross-object transactions (HTTP /txn). Prepare uses aios.posix.cas like put_bytes
   // when expected_cas is set. Pass lock_token when the oid is locked by this client.

@@ -131,6 +131,8 @@ class ObjectService {
                            int ttl_ms = LockTable::kDefaultTtlMs);
   ApiResult api_lock_release(const std::string& oid, const std::string& token);
   ApiResult api_lock_stat(const std::string& oid);
+  // Ask the current holder to give the lease back within grace_ms (see LockTable).
+  ApiResult api_lock_break(const std::string& oid, int grace_ms = LockTable::kDefaultBreakGraceMs);
 
   // Long-poll watches (blocking; call from a worker thread, not the io_context).
   // after_seq: return immediately if tip.seq > after_seq; else wait for next change.

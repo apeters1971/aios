@@ -3901,17 +3901,38 @@ ApiResult ObjectService::api_lock_renew(const std::string& oid, const std::strin
   Placement placement;
   auto pr = require_primary(oid, placement);
   if (!pr.ok) return pr;
-  std::int64_t expires = 0;
+  LockTable::Status st;
   std::string err;
-  if (!locks_.renew(oid, token, ttl_ms, expires, err)) {
+  if (!locks_.renew(oid, token, ttl_ms, st, err)) {
     if (err.find("mismatch") != std::string::npos) return fail("lock_held", err);
+    if (err.find("expired") != std::string::npos) return fail("lock_expired", err);
     return fail("not_found", err);
   }
   ApiResult r;
   r.ok = true;
   r.epoch = cur_epoch();
   r.placement = placement;
-  r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
+  r.json_body = {{"oid", oid},
+                 {"token", token},
+                 {"expires_ms", st.expires_ms},
+                 {"break_requested", st.break_requested}};
+  return r;
+}
+
+ApiResult ObjectService::api_lock_break(const std::string& oid, int grace_ms) {
+  ServiceLock lock(mu_);
+  Placement placement;
+  auto pr = require_primary(oid, placement);
+  if (!pr.ok) return pr;
+  LockTable::Status st;
+  std::string err;
+  if (!locks_.request_break(oid, grace_ms, st, err)) return fail("not_found", err);
+  ApiResult r;
+  r.ok = true;
+  r.epoch = cur_epoch();
+  r.placement = placement;
+  r.json_body = {{"oid", oid}, {"held", true}, {"expires_ms", st.expires_ms},
+                 {"break_requested", true}};
   return r;
 }
 
@@ -3937,13 +3958,16 @@ ApiResult ObjectService::api_lock_stat(const std::string& oid) {
   Placement placement;
   auto pr = require_primary(oid, placement);
   if (!pr.ok) return pr;
-  std::int64_t expires = 0;
-  if (!locks_.stat(oid, expires)) return fail("not_found", "lock not held");
+  LockTable::Status st;
+  if (!locks_.stat(oid, st)) return fail("not_found", "lock not held");
   ApiResult r;
   r.ok = true;
   r.epoch = cur_epoch();
   r.placement = placement;
-  r.json_body = {{"oid", oid}, {"held", true}, {"expires_ms", expires}};
+  r.json_body = {{"oid", oid},
+                 {"held", true},
+                 {"expires_ms", st.expires_ms},
+                 {"break_requested", st.break_requested}};
   return r;
 }
 

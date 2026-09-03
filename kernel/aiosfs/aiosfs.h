@@ -162,6 +162,11 @@ struct aios_sb_info {
 	u64 ino_next;
 	u64 ino_end;
 	unsigned int attr_ttl_ms;
+	/* Directory leases (http backend); list is stable under http_mu.
+	 * nolease= disables them (every directory op commits synchronously). */
+	struct list_head leases;
+	unsigned int nleases;
+	bool no_lease;
 	int mount_id;
 	char endpoint[256];
 	/* Shared cluster key, or the principal key when principal[0] is set. */

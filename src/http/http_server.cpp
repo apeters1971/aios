@@ -342,6 +342,7 @@ int status_for(const ApiResult& r) {
   if (r.code == "bad_request") return 400;
   if (r.code == "conflict") return 409;
   if (r.code == "lock_held") return 409;
+  if (r.code == "lock_expired") return 409;
   if (r.code == "mode_mismatch") return 409;
   if (r.code == "payload_too_large") return 413;
   return 500;
@@ -3859,6 +3860,30 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
           continue;
         }
         auto r = objects_.api_lock_renew(oid, *tok, ttl);
+        if (!r.ok) {
+          write_api_error(*sock, r, target, keep_alive);
+          continue;
+        }
+        write_json(*sock, 200, "OK", r.json_body.value_or(nlohmann::json::object()),
+                   keep_alive);
+        continue;
+      }
+      if (sub == "lock/break" && method == "POST") {
+        int grace = LockTable::kDefaultBreakGraceMs;
+        const auto g = header_get(headers, "x-aios-lock-grace-ms");
+        if (!g.empty()) {
+          try {
+            grace = std::stoi(g);
+          } catch (...) {
+            grace = -1;
+          }
+          if (grace <= 0) {
+            write_json(*sock, 400, "Bad Request", {{"error", "bad x-aios-lock-grace-ms"}},
+                       keep_alive);
+            continue;
+          }
+        }
+        auto r = objects_.api_lock_break(oid, grace);
         if (!r.ok) {
           write_api_error(*sock, r, target, keep_alive);
           continue;

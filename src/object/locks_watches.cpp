@@ -40,11 +40,39 @@ bool LockTable::active_locked(const Entry& e, std::int64_t now) const {
   return e.expires_ms > now;
 }
 
+// Turn an entry into a fence: the token stays refused until forget_ms.
+void LockTable::fence_locked(Entry& e, std::int64_t now) {
+  if (active_locked(e, now)) e.expires_ms = now;
+  e.break_requested = false;
+  if (e.forget_ms == 0) e.forget_ms = now + kFenceRetainMs;
+}
+
 void LockTable::purge_expired_locked(std::int64_t now) {
   for (auto it = locks_.begin(); it != locks_.end();) {
-    if (!active_locked(it->second, now)) it = locks_.erase(it);
+    Entry& e = it->second;
+    if (active_locked(e, now)) {
+      ++it;
+      continue;
+    }
+    if (e.forget_ms == 0) fence_locked(e, now);
+    if (e.forget_ms <= now) it = locks_.erase(it);
     else
       ++it;
+  }
+  // Bound the fence memory under a flood of short leases on distinct oids:
+  // drop the oldest fences first.
+  if (locks_.size() > kFenceMaxEntries) {
+    std::vector<std::pair<std::int64_t, std::string>> fences;
+    for (const auto& [oid, e] : locks_) {
+      if (!active_locked(e, now)) fences.emplace_back(e.forget_ms, oid);
+    }
+    std::sort(fences.begin(), fences.end());
+    std::size_t excess = locks_.size() - kFenceMaxEntries;
+    for (const auto& [_, oid] : fences) {
+      if (excess == 0) break;
+      locks_.erase(oid);
+      --excess;
+    }
   }
 }
 
@@ -53,8 +81,16 @@ std::optional<std::string> LockTable::check_mutate(
   std::lock_guard lock(mu_);
   const auto now = now_ms();
   auto it = locks_.find(oid);
-  if (it == locks_.end() || !active_locked(it->second, now)) return std::nullopt;
-  if (token && *token == it->second.token) return std::nullopt;
+  if (it == locks_.end()) return std::nullopt;
+  const Entry& e = it->second;
+  if (!active_locked(e, now)) {
+    // Expired or released: anyone may write, except the fenced former holder.
+    if (token && *token == e.token && (e.forget_ms == 0 || e.forget_ms > now)) {
+      return std::string("lock_expired");
+    }
+    return std::nullopt;
+  }
+  if (token && *token == e.token) return std::nullopt;
   return std::string("lock_held");
 }
 
@@ -68,6 +104,8 @@ bool LockTable::acquire(const std::string& oid, int ttl_ms, std::string& token_o
     err = "lock held";
     return false;
   }
+  // Overwriting a fence is fine: the old token then mismatches the new one
+  // and is refused as lock_held instead of lock_expired.
   Entry e;
   e.token = random_token_hex();
   e.expires_ms = now + clamp_ttl(ttl_ms);
@@ -78,20 +116,28 @@ bool LockTable::acquire(const std::string& oid, int ttl_ms, std::string& token_o
 }
 
 bool LockTable::renew(const std::string& oid, const std::string& token, int ttl_ms,
-                      std::int64_t& expires_ms_out, std::string& err) {
+                      Status& out, std::string& err) {
   std::lock_guard lock(mu_);
   const auto now = now_ms();
   auto it = locks_.find(oid);
   if (it == locks_.end() || !active_locked(it->second, now)) {
-    err = "lock not held";
+    if (it != locks_.end() && it->second.token == token) {
+      fence_locked(it->second, now);
+      err = "lock expired";
+    } else {
+      err = "lock not held";
+    }
     return false;
   }
-  if (it->second.token != token) {
+  Entry& e = it->second;
+  if (e.token != token) {
     err = "lock token mismatch";
     return false;
   }
-  it->second.expires_ms = now + clamp_ttl(ttl_ms);
-  expires_ms_out = it->second.expires_ms;
+  // A requested break is a hard deadline: renewals may not push it out.
+  if (!e.break_requested) e.expires_ms = now + clamp_ttl(ttl_ms);
+  out.expires_ms = e.expires_ms;
+  out.break_requested = e.break_requested;
   return true;
 }
 
@@ -107,16 +153,36 @@ bool LockTable::release(const std::string& oid, const std::string& token, std::s
     err = "lock token mismatch";
     return false;
   }
-  locks_.erase(it);
+  fence_locked(it->second, now);
   return true;
 }
 
-bool LockTable::stat(const std::string& oid, std::int64_t& expires_ms_out) const {
+bool LockTable::stat(const std::string& oid, Status& out) const {
   std::lock_guard lock(mu_);
   const auto now = now_ms();
   auto it = locks_.find(oid);
   if (it == locks_.end() || !active_locked(it->second, now)) return false;
-  expires_ms_out = it->second.expires_ms;
+  out.expires_ms = it->second.expires_ms;
+  out.break_requested = it->second.break_requested;
+  return true;
+}
+
+bool LockTable::request_break(const std::string& oid, int grace_ms, Status& out,
+                              std::string& err) {
+  std::lock_guard lock(mu_);
+  const auto now = now_ms();
+  auto it = locks_.find(oid);
+  if (it == locks_.end() || !active_locked(it->second, now)) {
+    err = "lock not held";
+    return false;
+  }
+  Entry& e = it->second;
+  if (grace_ms <= 0) grace_ms = kDefaultBreakGraceMs;
+  grace_ms = std::min(grace_ms, kMaxTtlMs);
+  e.break_requested = true;
+  e.expires_ms = std::min(e.expires_ms, now + grace_ms);
+  out.expires_ms = e.expires_ms;
+  out.break_requested = true;
   return true;
 }
 

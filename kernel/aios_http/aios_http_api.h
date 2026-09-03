@@ -78,6 +78,14 @@ int aios_http_get_range(struct aios_http_client *c, const char *oid, u64 start, 
 int aios_http_lock_acquire(struct aios_http_client *c, const char *oid, int ttl_ms,
 			   char *token_out, size_t token_len);
 int aios_http_lock_release(struct aios_http_client *c, const char *oid, const char *token);
+/* POST /o/{oid}/lock/renew. -ESTALE when the lease is gone (expired, fenced or
+ * taken over); *break_requested is set when a waiter asked for the lease back,
+ * in which case the deadline can no longer be extended. */
+int aios_http_lock_renew(struct aios_http_client *c, const char *oid, const char *token,
+			 int ttl_ms, bool *break_requested);
+/* POST /o/{oid}/lock/break: ask the holder to release within grace_ms.
+ * -ENOENT when nothing is held. */
+int aios_http_lock_break(struct aios_http_client *c, const char *oid, int grace_ms);
 
 /* Cross-object transactions (/txn). cas_inout NULL = unconditional prepare. */
 int aios_http_txn_begin(struct aios_http_client *c, char *txn_id_out, size_t txn_id_len);

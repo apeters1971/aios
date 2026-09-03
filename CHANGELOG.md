@@ -57,13 +57,46 @@ current fix cycle — check the regression test of the same name before relying 
 - Tests: `tests/test_s3_tls.cpp` (context loading errors, startup refusal, SigV4 PUT/GET over TLS
   with a generated certificate, plaintext-on-TLS-port and TLS-on-plain-port both fail cleanly).
 
+### Added — directory leases: asynchronous namespace operations in `aiosfs`
+
+The per-object lock API is now a lease with fencing and a break protocol, and the kernel client
+uses it to delegate whole directories to itself.
+
+- **Server (`LockTable`, `/o/{oid}/lock*`).** An expired or released token is *fenced*: a
+  mutation carrying it fails with `409 lock_expired` (retained `kFenceRetainMs`) instead of being
+  accepted as unlocked. New `POST /o/{oid}/lock/break` (`x-aios-lock-grace-ms`, default 5000,
+  capped at the 300 s max TTL) shortens the holder's lease to the grace period and sets `break_requested`, which
+  `lock/renew` and `GET lock` now report; a renew after a break cannot extend past the deadline.
+  Lease state stays primary-local (not replicated), as before.
+- **`libaios` / `libaios_posix`.** `Session::lock_break` and `Session::lock_acquire_wait`
+  (break + wait with backoff). `DirTable::append_ops` and `HeldLocks::acquire_sorted` use them,
+  so a userspace client blocked by a kernel mount's lease gets the directory back within the
+  grace period instead of failing with `EBUSY`.
+- **`aios_http`.** `aios_http_lock_renew` (returns `break_requested`) and `aios_http_lock_break`;
+  `409`/`404` on renew map to `-ESTALE`.
+- **`aiosfs` (http backend).** A directory this mount modifies is leased (server lock on its
+  meta object, TTL 30 s, renewed every 3 s, released after 10 s idle, at most 32 per mount).
+  Under the lease `create`/`mkdir`/`symlink`/`link`/`unlink`/`rename` (same directory) update
+  the cached table and the in-core parent inode and queue an `AOPk` record; a `wb_wq` worker
+  appends the queue in batches (one `POST …/append` + one CAS `PUT` of meta, compaction when
+  the log grows or garbage is detected) and writes the parent's mtime/nlink once per batch. A
+  `create` thus costs one synchronous round trip (the child inode PUT) instead of four. Cache
+  misses under a lease overlay the queue on the server tip. `fsync(dir)`, `syncfs` and `umount`
+  wait for the queue; `fsync`/`syncfs` return the sticky error of a record that could not be
+  committed. A lost lease (expiry, `-ESTALE` on renew, break past the grace) replays the queue
+  with the synchronous protocol; `break_requested` is honoured at the next renew by flushing and
+  releasing. Cross-directory rename and `rmdir` of a leased directory flush and release first
+  and then run the locking protocol. `nolease` mount option disables all of this.
+- Tests: `LocksWatches.ReleasedOrExpiredTokenIsFenced`, `LocksWatches.BreakShortensLeaseAndIsVisibleToHolder`,
+  `Append.SessionLockAcquireWaitBreaksAndFencesLease`.
+
 ### Changed — `aiosfs` in-kernel HTTP backend: caching, concurrency, fewer round trips
 
 Findings `K-1`…`K-19` of the 2026-09-02 kernel client review. Wire format and server API are
 unchanged; a mount made with the previous module reads the same objects.
 
 - **Data path off the global lock.** Read, readahead, writeback, O_DIRECT, punch and metadata
-  revalidation take a connection from the `aios_http` pool (`pool=N` mount option, default 4)
+  revalidation take a connection from the `aios_http` pool (`pool=N` mount option, default 8)
   instead of serializing on the single namespace connection; `http_mu` now only covers
   create/unlink/rename/mkdir. Per-inode metadata updates (size, mtime, xattrs) serialize on a new
   `meta_mu` in the inode aux instead.
@@ -79,7 +112,7 @@ unchanged; a mount made with the previous module reads the same objects.
 - **Parallel O_DIRECT.** Chunk-aligned segments of a DIO request are dispatched to the pool in
   parallel and reassembled in order.
 - **Metadata caching.** `stat`, `getxattr`, `listxattr` and `readdir` `d_type` are served from
-  the in-core inode while it is within `actimeo=` (default 1 s, was hard-wired); revalidation is a
+  the in-core inode while it is within `actimeo=` (milliseconds, default 250 ms, was hard-wired); revalidation is a
   `HEAD` with the cached CAS tag and re-`GET`s only on change. `HEAD` responses no longer stall
   the client on `Content-Length` (`aios_http/client.c`).
 - **Directory updates append to the changelog** (`POST /o/{oid}/append` under the meta lock,

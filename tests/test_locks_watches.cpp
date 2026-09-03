@@ -155,6 +155,89 @@ using namespace aios;
   }
 }
 
+TEST(LocksWatches, ReleasedOrExpiredTokenIsFenced) {
+  using namespace aios;
+  DualStoreFixture fx("aios-lock-fence");
+  const auto* body = reinterpret_cast<const std::uint8_t*>("payload");
+
+  // Released: the object is free for everyone except the old token.
+  auto acq = fx.svc->api_lock_acquire("fence/a", 5000);
+  ASSERT_TRUE(acq.ok);
+  const std::string tok = (*acq.json_body)["token"].get<std::string>();
+  ASSERT_TRUE(fx.svc->api_lock_release("fence/a", tok).ok);
+  EXPECT_TRUE(fx.svc->api_put("fence/a", body, 7, {}, true, {}).ok) << "tokenless put ok";
+  auto stale = fx.svc->api_put("fence/a", body, 7, {}, true, {}, std::nullopt, {}, tok);
+  EXPECT_FALSE(stale.ok);
+  EXPECT_EQ(stale.code, "lock_expired");
+  auto stale_renew = fx.svc->api_lock_renew("fence/a", tok, 5000);
+  EXPECT_FALSE(stale_renew.ok);
+
+  // Expired (tiny TTL): same, and renew reports lock_expired, not not_found.
+  auto acq2 = fx.svc->api_lock_acquire("fence/b", 1);
+  ASSERT_TRUE(acq2.ok);
+  const std::string tok2 = (*acq2.json_body)["token"].get<std::string>();
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  auto r = fx.svc->api_lock_renew("fence/b", tok2, 5000);
+  EXPECT_FALSE(r.ok);
+  EXPECT_EQ(r.code, "lock_expired");
+  auto late = fx.svc->api_put("fence/b", body, 7, {}, true, {}, std::nullopt, {}, tok2);
+  EXPECT_FALSE(late.ok);
+  EXPECT_EQ(late.code, "lock_expired");
+  EXPECT_TRUE(fx.svc->api_put("fence/b", body, 7, {}, true, {}).ok) << "tokenless put ok";
+
+  // A successor's lease makes the stale token a plain lock_held.
+  auto acq3 = fx.svc->api_lock_acquire("fence/b", 5000);
+  ASSERT_TRUE(acq3.ok);
+  auto held = fx.svc->api_put("fence/b", body, 7, {}, true, {}, std::nullopt, {}, tok2);
+  EXPECT_EQ(held.code, "lock_held");
+}
+
+TEST(LocksWatches, BreakShortensLeaseAndIsVisibleToHolder) {
+  using namespace aios;
+  DualStoreFixture fx("aios-lock-break");
+  const auto* body = reinterpret_cast<const std::uint8_t*>("payload");
+
+  EXPECT_FALSE(fx.svc->api_lock_break("brk/a", 100).ok) << "nothing to break";
+
+  auto acq = fx.svc->api_lock_acquire("brk/a", 60000);
+  ASSERT_TRUE(acq.ok);
+  const std::string tok = (*acq.json_body)["token"].get<std::string>();
+  const auto orig_exp = (*acq.json_body)["expires_ms"].get<std::int64_t>();
+
+  auto brk = fx.svc->api_lock_break("brk/a", 200);
+  ASSERT_TRUE(brk.ok);
+  const auto new_exp = (*brk.json_body)["expires_ms"].get<std::int64_t>();
+  EXPECT_LT(new_exp, orig_exp);
+  EXPECT_LE(new_exp, now_ms() + 200);
+
+  // The holder sees the break on renew and cannot push the deadline out.
+  auto ren = fx.svc->api_lock_renew("brk/a", tok, 60000);
+  ASSERT_TRUE(ren.ok);
+  EXPECT_TRUE((*ren.json_body)["break_requested"].get<bool>());
+  EXPECT_EQ((*ren.json_body)["expires_ms"].get<std::int64_t>(), new_exp);
+  auto st = fx.svc->api_lock_stat("brk/a");
+  ASSERT_TRUE(st.ok);
+  EXPECT_TRUE((*st.json_body)["break_requested"].get<bool>());
+
+  // Until the deadline the holder still owns it and others are refused.
+  EXPECT_TRUE(fx.svc->api_put("brk/a", body, 7, {}, true, {}, std::nullopt, {}, tok).ok);
+  EXPECT_EQ(fx.svc->api_put("brk/a", body, 7, {}, true, {}).code, "lock_held");
+
+  // A cooperative holder releases early and the waiter gets in.
+  ASSERT_TRUE(fx.svc->api_lock_release("brk/a", tok).ok);
+  auto acq2 = fx.svc->api_lock_acquire("brk/a", 60000);
+  EXPECT_TRUE(acq2.ok);
+  EXPECT_FALSE((*fx.svc->api_lock_stat("brk/a").json_body)["break_requested"].get<bool>());
+
+  // A dead holder simply loses the lease at the grace deadline.
+  const std::string tok2 = (*acq2.json_body)["token"].get<std::string>();
+  ASSERT_TRUE(fx.svc->api_lock_break("brk/a", 50).ok);
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  EXPECT_TRUE(fx.svc->api_lock_acquire("brk/a", 60000).ok);
+  EXPECT_EQ(fx.svc->api_put("brk/a", body, 7, {}, true, {}, std::nullopt, {}, tok2).code,
+            "lock_held");
+}
+
 TEST(LocksWatches, ServiceWatchWakesOnPut) {
 using namespace aios;
   // Service: watch wakes on put
@@ -211,6 +294,21 @@ using namespace aios;
     auto put_ok = http_request(host, port, "PUT", "/o/http-lock",
                                {{"x-aios-lock-token", token}}, "yes", key);
     EXPECT_TRUE(put_ok.status == 204) << "HTTP put with token 204";
+
+    auto brk = http_request(host, port, "POST", "/o/http-lock/lock/break",
+                            {{"x-aios-lock-grace-ms", "3000"}}, "", key);
+    EXPECT_EQ(brk.status, 200) << brk.body;
+    auto ren = http_request(host, port, "POST", "/o/http-lock/lock/renew",
+                            {{"x-aios-lock-token", token}}, "", key);
+    EXPECT_EQ(ren.status, 200);
+    try {
+      EXPECT_TRUE(nlohmann::json::parse(ren.body).value("break_requested", false));
+    } catch (...) {
+      ADD_FAILURE() << "bad renew body: " << ren.body;
+    }
+    auto bad_grace = http_request(host, port, "POST", "/o/http-lock/lock/break",
+                                  {{"x-aios-lock-grace-ms", "zero"}}, "", key);
+    EXPECT_EQ(bad_grace.status, 400);
 
     auto watch = http_request(host, port, "GET", "/o/http-lock/watch?timeout_ms=200", {},
                               "", key);

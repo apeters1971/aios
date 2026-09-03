@@ -293,13 +293,24 @@ struct HeldLocks {
     }
   }
 
+  // A lease holder that batches directory updates (the kernel client) keeps its
+  // lease across many operations, so a plain acquire would fail for seconds at
+  // a time. Ask it to hand the lease back and wait; the server bounds that wait
+  // by its break grace period, and a timeout still surfaces as lock_held so the
+  // callers' retry loops behave as before.
   void acquire_sorted(std::vector<std::string> oids, int ttl_ms = 30000) {
     std::sort(oids.begin(), oids.end());
     oids.erase(std::unique(oids.begin(), oids.end()), oids.end());
     for (const auto& oid : oids) {
-      held.emplace_back(oid, session->lock_acquire(oid, ttl_ms).token);
+      std::string token;
+      if (!session->lock_acquire_wait(oid, token, ttl_ms, kLeaseWaitMs)) {
+        throw client_error("lock_held", "lease not returned in time: " + oid);
+      }
+      held.emplace_back(oid, std::move(token));
     }
   }
+
+  static constexpr int kLeaseWaitMs = 8000;
 
   std::optional<std::string> token_for(const std::string& oid) const {
     for (const auto& [o, t] : held) {
@@ -425,8 +436,12 @@ void DirTable::store_meta() {
 
 void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std::string>>>& ops) {
   if (ops.empty()) return;
-  // Reserve op ids via CAS on meta.
-  for (int attempt = 0; attempt < 8; ++attempt) {
+  // Reserve op ids via CAS on meta. Against a lease holder (a kernel client with
+  // a directory delegation) the append is refused with lock_held; ask for the
+  // lease back once and wait it out instead of burning the attempts.
+  bool broke = false;
+  int lease_sleep_ms = 5;
+  for (int attempt = 0; attempt < 24; ++attempt) {
     load(false);
     const uint64_t start = next_op_;
     std::string batch;
@@ -448,7 +463,21 @@ void DirTable::append_ops(const std::vector<std::pair<uint32_t, std::vector<std:
       publish_cache();
       return;
     } catch (const client_error& e) {
-      if (e.code() == "conflict" || e.code() == "lock_held") continue;
+      if (e.code() == "conflict") continue;
+      if (e.code() == "lock_held") {
+        if (!broke) {
+          for (const auto& oid : {meta_oid_, log_oid_}) {
+            try {
+              session_.lock_break(oid);
+            } catch (const client_error&) {
+            }
+          }
+          broke = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(lease_sleep_ms));
+        lease_sleep_ms = std::min(lease_sleep_ms * 2, 500);
+        continue;
+      }
       throw;
     }
   }

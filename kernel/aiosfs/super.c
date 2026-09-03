@@ -22,6 +22,7 @@ enum {
 	Opt_key,
 	Opt_pool,
 	Opt_actimeo,
+	Opt_nolease,
 	Opt_err,
 };
 
@@ -41,6 +42,8 @@ static const match_table_t aios_tokens = {
 	/* http backend: connections per mount, attribute/dentry cache TTL (ms). */
 	{ Opt_pool, "pool=%u" },
 	{ Opt_actimeo, "actimeo=%u" },
+	/* http backend: commit every directory op synchronously (no leases). */
+	{ Opt_nolease, "nolease" },
 	{ Opt_err, NULL },
 };
 
@@ -130,6 +133,9 @@ static int aios_parse_options(char *options, struct aios_sb_info *info)
 			info->attr_ttl_ms = v;
 			break;
 		}
+		case Opt_nolease:
+			info->no_lease = true;
+			break;
 		case Opt_backend: {
 			char buf[16];
 
@@ -228,6 +234,8 @@ int aios_show_options(struct seq_file *m, struct dentry *root)
 	if (info->backend == AIOS_BACKEND_HTTP) {
 		seq_printf(m, ",pool=%u", info->pool_size);
 		seq_printf(m, ",actimeo=%u", aios_attr_ttl_ms(root->d_sb));
+		if (info->no_lease)
+			seq_puts(m, ",nolease");
 	}
 	return 0;
 }

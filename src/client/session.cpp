@@ -8,12 +8,15 @@
 
 #include <boost/asio.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #ifndef _WIN32
@@ -1054,6 +1057,40 @@ bool Session::lock_try_acquire(const std::string& oid, std::string& token_out, i
   } catch (const client_error& e) {
     if (e.code() == "lock_held") return false;
     throw;
+  }
+}
+
+std::int64_t Session::lock_break(const std::string& oid, int grace_ms) {
+  std::unordered_map<std::string, std::string> headers;
+  headers["x-aios-lock-grace-ms"] = std::to_string(grace_ms);
+  const auto path = "/o/" + url_encode_oid(oid) + "/lock/break";
+  auto resp = request("POST", path, headers);
+  if (resp.status == 404) return 0;
+  if (resp.status != 200) throw_http(resp, "lock_break");
+  try {
+    auto j = nlohmann::json::parse(resp.body);
+    return j.value("expires_ms", static_cast<std::int64_t>(0));
+  } catch (...) {
+    throw client_error("http", "bad lock_break response");
+  }
+}
+
+bool Session::lock_acquire_wait(const std::string& oid, std::string& token_out, int ttl_ms,
+                                int max_wait_ms, std::int64_t* expires_ms_out) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(max_wait_ms);
+  bool broke = false;
+  int sleep_ms = 2;
+  for (;;) {
+    if (lock_try_acquire(oid, token_out, ttl_ms, expires_ms_out)) return true;
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    // A holder that batches work under the lease releases early once it sees
+    // the break; a dead one loses the lease at the grace deadline.
+    if (!broke) {
+      lock_break(oid);
+      broke = true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    sleep_ms = std::min(sleep_ms * 2, 200);
   }
 }
 

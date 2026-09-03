@@ -83,6 +83,90 @@ out:
 }
 EXPORT_SYMBOL_GPL(aios_http_lock_release);
 
+int aios_http_lock_renew(struct aios_http_client *c, const char *oid, const char *token,
+			 int ttl_ms, bool *break_requested)
+{
+	struct {
+		char enc[1024];
+		char path[AIOS_HTTP_PATH_MAX];
+		char extra[256];
+	} *b;
+	struct aios_http_buf body = { 0 };
+	int status = 0;
+	int err;
+
+	if (!c || !token || !*token)
+		return -EINVAL;
+	if (break_requested)
+		*break_requested = false;
+	b = kmalloc(sizeof(*b), c->gfp);
+	if (!b)
+		return -ENOMEM;
+	err = aios_http_encode_oid(oid, b->enc, sizeof(b->enc));
+	if (err)
+		goto out;
+	if (snprintf(b->path, sizeof(b->path), "/o/%s/lock/renew", b->enc) >=
+	    (int)sizeof(b->path)) {
+		err = -ENAMETOOLONG;
+		goto out;
+	}
+	snprintf(b->extra, sizeof(b->extra), "x-aios-lock-ttl-ms: %d\r\nx-aios-lock-token: %s\r\n",
+		 ttl_ms > 0 ? ttl_ms : 30000, token);
+	err = aios_http_request(c, "POST", b->path, b->extra, NULL, 0, &status, &body);
+	if (err)
+		goto out;
+	if (status == 200) {
+		if (break_requested && body.data &&
+		    strnstr(body.data, "\"break_requested\":true", body.len))
+			*break_requested = true;
+		err = 0;
+	} else if (status == 404 || status == 409) {
+		/* Expired, fenced or taken over: the lease is gone either way. */
+		err = -ESTALE;
+	} else {
+		err = aios_http_map_status(status);
+	}
+	aios_http_buf_free(&body);
+out:
+	kfree(b);
+	return err;
+}
+EXPORT_SYMBOL_GPL(aios_http_lock_renew);
+
+int aios_http_lock_break(struct aios_http_client *c, const char *oid, int grace_ms)
+{
+	struct {
+		char enc[1024];
+		char path[AIOS_HTTP_PATH_MAX];
+		char extra[64];
+	} *b;
+	int status = 0;
+	int err;
+
+	if (!c)
+		return -EINVAL;
+	b = kmalloc(sizeof(*b), c->gfp);
+	if (!b)
+		return -ENOMEM;
+	err = aios_http_encode_oid(oid, b->enc, sizeof(b->enc));
+	if (err)
+		goto out;
+	if (snprintf(b->path, sizeof(b->path), "/o/%s/lock/break", b->enc) >=
+	    (int)sizeof(b->path)) {
+		err = -ENAMETOOLONG;
+		goto out;
+	}
+	snprintf(b->extra, sizeof(b->extra), "x-aios-lock-grace-ms: %d\r\n",
+		 grace_ms > 0 ? grace_ms : 5000);
+	err = aios_http_request(c, "POST", b->path, b->extra, NULL, 0, &status, NULL);
+	if (!err)
+		err = aios_http_map_status(status);
+out:
+	kfree(b);
+	return err;
+}
+EXPORT_SYMBOL_GPL(aios_http_lock_break);
+
 int aios_http_txn_begin(struct aios_http_client *c, char *txn_id_out, size_t txn_id_len)
 {
 	struct aios_http_buf body = { 0 };

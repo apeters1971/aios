@@ -48,7 +48,9 @@
 #endif
 
 /* Contended directory ops back off exponentially up to this many attempts
- * (~3 s worst case) and then fail with -EBUSY, never -EAGAIN. */
+ * (~5 s typical, ~7 s worst case: longer than a lease break grace period, so
+ * a peer's lease is broken and reacquired within the budget) and then fail
+ * with -EBUSY, never -EAGAIN. */
 #define AIOS_HTTP_DIR_RETRIES 20
 #define AIOS_HTTP_TXN_ID_LEN 128
 #define AIOS_HTTP_META_RETRIES 8
@@ -69,10 +71,10 @@ static void http_client_put(struct aios_sb_info *info, struct aios_http_client *
 /* Sleep before retry @attempt of a contended directory / CAS operation. */
 static void http_retry_backoff(int attempt)
 {
-	unsigned int ms = 2u << min(attempt, 6); /* 2, 4, ... 128 */
+	unsigned int ms = 2u << min(attempt, 7); /* 2, 4, ... 256 */
 
 	ms += get_random_u32() % (ms + 1);
-	msleep(min(ms, 250u));
+	msleep(min(ms, 500u));
 }
 
 /* -EAGAIN is what the HTTP layer returns for CAS / lock conflicts; it is not
@@ -134,6 +136,81 @@ struct aios_inode_meta {
 	char *xattrs_obj;
 	char *symlink;
 };
+
+/*
+ * Directory lease (delegation).
+ *
+ * A directory that this mount is actively modifying is leased: we hold the
+ * server lock on its meta object and keep renewing it. While the lease lasts
+ * nobody else can commit to the directory, so namespace operations only
+ * update the dcache / directory cache and queue a changelog record here; a
+ * worker appends the queued records in batches, advances meta once per batch
+ * and updates the parent inode's mtime/nlink once per batch. create/unlink/
+ * rename thus cost no synchronous directory round trip.
+ *
+ * Losing the lease (renew fails: expired, fenced or broken past the grace
+ * period) drops back to the synchronous per-operation protocol; queued
+ * records are re-committed one by one under fresh locks, and anything that
+ * still fails is reported by the next fsync/syncfs of the directory (POSIX
+ * makes no durability promise for metadata before fsync). A peer asking for
+ * the lease (break) is honoured by flushing and releasing at the next renew.
+ *
+ * Locking: the list and every lease's ino are stable under http_mu (leases
+ * are created / recycled by namespace operations). lease->mu covers the
+ * queue and state; flush_mu serialises a flush against a cache-miss reload
+ * so a load never sees a record both on the server and still in the queue.
+ */
+struct aios_lease_op {
+	struct list_head node;
+	u32 op;
+	char a0[AIOS_KABI_NAME_MAX + 1];
+	char a1[AIOS_KABI_NAME_MAX + 1];
+};
+
+struct aios_dir_lease {
+	struct list_head node;
+	struct aios_sb_info *info;
+	struct mutex mu;
+	struct mutex flush_mu;
+	u64 ino;
+	bool held;             /* server lease believed valid */
+	bool break_requested;  /* a peer wants it: flush, release, stop */
+	bool release_wanted;   /* a local sync path wants it dropped */
+	char token[128];
+	char meta_oid[160];
+	char log_oid[160];
+	char snap_oid[160];
+	unsigned long expires;    /* jiffies; conservative local copy */
+	unsigned long last_use;   /* jiffies of the last queued op */
+	unsigned long last_renew; /* jiffies */
+	unsigned long next_try;   /* jiffies; do not re-acquire before */
+	/* Directory meta as of the last commit we made (or the load at acquire). */
+	u64 next_op;
+	u64 log_bytes;
+	u64 snapshot_op;
+	u64 meta_cas;
+	struct list_head pending; /* aios_lease_op, oldest first */
+	unsigned int npending;
+	/* Deferred parent inode update. */
+	bool parent_dirty;
+	u64 parent_mtime_ns;
+	int nlink_delta;
+	int err; /* sticky error from an async commit, returned by fsync */
+	struct delayed_work work;
+	wait_queue_head_t wq;
+};
+
+/* Lease tuning. Renew well inside the TTL; the break grace must exceed the
+ * renew interval so a holder always sees the break before the deadline. */
+#define AIOS_LEASE_TTL_MS 30000
+#define AIOS_LEASE_RENEW_MS 3000
+#define AIOS_LEASE_BREAK_GRACE_MS 5000
+#define AIOS_LEASE_FLUSH_MS 20
+#define AIOS_LEASE_IDLE_MS 10000
+#define AIOS_LEASE_RETRY_MS 1000
+#define AIOS_LEASE_MAX 32
+#define AIOS_LEASE_MAX_PENDING 1024
+#define AIOS_LEASE_BATCH_BYTES (64u * 1024u)
 
 static u64 now_ns(void)
 {
@@ -627,7 +704,8 @@ static void dir_cache_invalidate(struct aios_sb_info *info, u64 ino)
 	kfree(old);
 }
 
-static bool dir_cache_lookup(struct aios_sb_info *info, struct aios_dir_table *dt)
+static bool dir_cache_lookup(struct aios_sb_info *info, struct aios_dir_table *dt,
+			     bool ignore_ttl)
 {
 	unsigned int i;
 	bool hit = false;
@@ -640,9 +718,11 @@ static bool dir_cache_lookup(struct aios_sb_info *info, struct aios_dir_table *d
 
 		if (!slot->ino || slot->ino != dt->ino)
 			continue;
-		if (!time_before(jiffies, slot->loaded +
-					      msecs_to_jiffies(info->attr_ttl_ms)))
+		if (!ignore_ttl &&
+		    !time_before(jiffies, slot->loaded + msecs_to_jiffies(info->attr_ttl_ms)))
 			continue;
+		if (ignore_ttl)
+			slot->loaded = jiffies; /* keep the leased table out of LRU's way */
 		if (slot->count > AIOS_HTTP_MAX_DIR_ENTS)
 			break;
 		if (slot->count)
@@ -659,13 +739,13 @@ static bool dir_cache_lookup(struct aios_sb_info *info, struct aios_dir_table *d
 	return hit;
 }
 
-static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt, bool allow_cache)
+/* Load the directory tip exactly as the server has it: meta, snapshot and
+ * the committed part of the log. No cache, no lease. */
+static int dir_load_raw(struct aios_sb_info *info, struct aios_http_client *c,
+			struct aios_dir_table *dt)
 {
 	struct aios_http_buf body = { 0 };
 	int err;
-
-	if (allow_cache && dir_cache_lookup(info, dt))
-		return 0;
 
 	dt->count = 0;
 	dt->next_op = 1;
@@ -673,12 +753,9 @@ static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt, bool a
 	dt->snapshot_op = 0;
 	dt->meta_cas = 0;
 
-	err = aios_http_get(info->http, dt->meta_oid, &body, &dt->meta_cas);
-	if (err == -ENOENT) {
-		if (allow_cache)
-			dir_cache_publish(info, dt);
+	err = aios_http_get(c, dt->meta_oid, &body, &dt->meta_cas);
+	if (err == -ENOENT)
 		return 0;
-	}
 	if (err)
 		return err;
 	{
@@ -698,7 +775,7 @@ static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt, bool a
 	aios_http_buf_free(&body);
 
 	if (dt->snapshot_op > 0) {
-		err = aios_http_get(info->http, dt->snap_oid, &body, NULL);
+		err = aios_http_get(c, dt->snap_oid, &body, NULL);
 		if (!err && body.len) {
 			char *js = kmalloc(body.len + 1, GFP_KERNEL);
 
@@ -720,21 +797,45 @@ static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt, bool a
 		}
 	}
 
-	if (dt->log_bytes == 0) {
-		if (allow_cache)
-			dir_cache_publish(info, dt);
+	if (dt->log_bytes == 0)
 		return 0;
-	}
-	err = aios_http_get_range(info->http, dt->log_oid, 0, dt->log_bytes - 1, &body);
-	if (err == -ENOENT) {
-		if (allow_cache)
-			dir_cache_publish(info, dt);
+	err = aios_http_get_range(c, dt->log_oid, 0, dt->log_bytes - 1, &body);
+	if (err == -ENOENT)
 		return 0;
-	}
 	if (err)
 		return err;
 	err = decode_and_apply_log(dt, body.data, body.len, dt->snapshot_op);
 	aios_http_buf_free(&body);
+	return err;
+}
+
+static struct aios_dir_lease *dir_lease_find(struct aios_sb_info *info, u64 ino);
+static bool dir_lease_owns(struct aios_dir_lease *l);
+static int dir_lease_overlay(struct aios_sb_info *info, struct aios_http_client *c,
+			     struct aios_dir_table *dt);
+
+/*
+ * Load a directory table for a namespace operation (caller holds http_mu).
+ *
+ * Without a lease this is the cached table when @allow_cache and it is within
+ * actimeo, else the server tip. Under a lease the cached table is authoritative
+ * for as long as the lease lasts (nobody else can write), so it is used
+ * regardless of @allow_cache or age; on a cache miss the server tip is loaded
+ * and the operations still queued in the lease are replayed on top.
+ */
+static int dir_load(struct aios_sb_info *info, struct aios_dir_table *dt, bool allow_cache)
+{
+	struct aios_dir_lease *l = dir_lease_find(info, dt->ino);
+	/* Also while a lost lease still has records queued for replay: the
+	 * server tip alone would not show them. */
+	bool leased = l && (dir_lease_owns(l) || READ_ONCE(l->npending));
+	int err;
+
+	if ((allow_cache || leased) && dir_cache_lookup(info, dt, leased))
+		return 0;
+	if (leased)
+		return dir_lease_overlay(info, info->http, dt);
+	err = dir_load_raw(info, info->http, dt);
 	if (!err && allow_cache)
 		dir_cache_publish(info, dt);
 	return err;
@@ -808,17 +909,17 @@ static int held_lock_cmp(const void *a, const void *b)
 		      ((const struct aios_held_lock *)b)->oid);
 }
 
-static void release_held_locks(struct aios_sb_info *info, struct aios_held_lock *locks,
+static void release_held_locks(struct aios_http_client *c, struct aios_held_lock *locks,
 			       unsigned int n)
 {
 	while (n--) {
 		if (locks[n].token[0])
-			aios_http_lock_release(info->http, locks[n].oid, locks[n].token);
+			aios_http_lock_release(c, locks[n].oid, locks[n].token);
 		locks[n].token[0] = '\0';
 	}
 }
 
-static int acquire_sorted_locks(struct aios_sb_info *info, struct aios_held_lock *locks,
+static int acquire_sorted_locks(struct aios_http_client *c, struct aios_held_lock *locks,
 				unsigned int *n_inout)
 {
 	unsigned int n = *n_inout;
@@ -837,10 +938,15 @@ static int acquire_sorted_locks(struct aios_sb_info *info, struct aios_held_lock
 	}
 	*n_inout = n;
 	for (i = 0; i < n; i++) {
-		err = aios_http_lock_acquire(info->http, locks[i].oid, 30000, locks[i].token,
+		err = aios_http_lock_acquire(c, locks[i].oid, 30000, locks[i].token,
 					     sizeof(locks[i].token));
 		if (err) {
-			release_held_locks(info, locks, i);
+			/* A lease holder (kernel peer with a directory delegation)
+			 * gives the lock back once asked; the caller's backoff
+			 * loop covers the grace period. */
+			if (err == -EAGAIN)
+				aios_http_lock_break(c, locks[i].oid, AIOS_LEASE_BREAK_GRACE_MS);
+			release_held_locks(c, locks, i);
 			return err;
 		}
 	}
@@ -858,7 +964,7 @@ static const char *token_for(struct aios_held_lock *locks, unsigned int n, const
 	return NULL;
 }
 
-static int txn_put_dir(struct aios_sb_info *info, const char *txn_id, struct aios_dir_table *dt,
+static int txn_put_dir(struct aios_http_client *c, const char *txn_id, struct aios_dir_table *dt,
 		       struct aios_held_lock *locks, unsigned int nlocks)
 {
 	char *snap = NULL;
@@ -869,16 +975,16 @@ static int txn_put_dir(struct aios_sb_info *info, const char *txn_id, struct aio
 	err = dir_plan_compact(dt, &snap, &meta);
 	if (err)
 		return err;
-	err = aios_http_txn_prepare_put(info->http, txn_id, dt->snap_oid, snap, strlen(snap),
+	err = aios_http_txn_prepare_put(c, txn_id, dt->snap_oid, snap, strlen(snap),
 					token_for(locks, nlocks, dt->snap_oid), NULL);
 	if (err)
 		goto out;
-	err = aios_http_txn_prepare_put(info->http, txn_id, dt->log_oid, "", 0,
+	err = aios_http_txn_prepare_put(c, txn_id, dt->log_oid, "", 0,
 					token_for(locks, nlocks, dt->log_oid), NULL);
 	if (err)
 		goto out;
 	meta_cas = dt->meta_cas;
-	err = aios_http_txn_prepare_put(info->http, txn_id, dt->meta_oid, meta, strlen(meta),
+	err = aios_http_txn_prepare_put(c, txn_id, dt->meta_oid, meta, strlen(meta),
 					token_for(locks, nlocks, dt->meta_oid), &meta_cas);
 	if (!err)
 		dt->meta_cas = meta_cas;
@@ -958,7 +1064,7 @@ static size_t dir_encode_record(u64 op_id, u32 op, const char *a0, const char *a
  * lock the caller holds; log and snap are acquired here and released before
  * returning. Returns -EAGAIN when a lock or the meta CAS is contended.
  */
-static int dir_compact_locked(struct aios_sb_info *info, struct aios_dir_table *dt,
+static int dir_compact_locked(struct aios_http_client *c, struct aios_dir_table *dt,
 			      struct aios_held_lock *locks, char *txn_id)
 {
 	unsigned int nlocks = 3;
@@ -967,27 +1073,27 @@ static int dir_compact_locked(struct aios_sb_info *info, struct aios_dir_table *
 	strscpy(locks[1].oid, dt->log_oid, sizeof(locks[1].oid));
 	strscpy(locks[2].oid, dt->snap_oid, sizeof(locks[2].oid));
 	locks[1].token[0] = locks[2].token[0] = '\0';
-	err = aios_http_lock_acquire(info->http, locks[1].oid, 30000, locks[1].token,
+	err = aios_http_lock_acquire(c, locks[1].oid, 30000, locks[1].token,
 				     sizeof(locks[1].token));
 	if (err)
 		return err;
-	err = aios_http_lock_acquire(info->http, locks[2].oid, 30000, locks[2].token,
+	err = aios_http_lock_acquire(c, locks[2].oid, 30000, locks[2].token,
 				     sizeof(locks[2].token));
 	if (err) {
-		release_held_locks(info, &locks[1], 1);
+		release_held_locks(c, &locks[1], 1);
 		return err;
 	}
 
 	txn_id[0] = '\0';
-	err = aios_http_txn_begin(info->http, txn_id, AIOS_HTTP_TXN_ID_LEN);
+	err = aios_http_txn_begin(c, txn_id, AIOS_HTTP_TXN_ID_LEN);
 	if (!err)
-		err = txn_put_dir(info, txn_id, dt, locks, nlocks);
+		err = txn_put_dir(c, txn_id, dt, locks, nlocks);
 	if (!err)
-		err = aios_http_txn_commit(info->http, txn_id);
+		err = aios_http_txn_commit(c, txn_id);
 	if (err && txn_id[0])
-		aios_http_txn_abort(info->http, txn_id);
+		aios_http_txn_abort(c, txn_id);
 	txn_id[0] = '\0';
-	release_held_locks(info, &locks[1], 2);
+	release_held_locks(c, &locks[1], 2);
 	return err;
 }
 
@@ -1009,8 +1115,9 @@ static int dir_compact_locked(struct aios_sb_info *info, struct aios_dir_table *
  * must_be_absent: LINK fails with -EEXIST if a0 already exists.
  * UNLINK / RENAME fail with -ENOENT if a0 vanished under the lock.
  */
-static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u32 op,
-			 const char *a0, const char *a1, bool must_be_absent)
+static int dir_commit_sync(struct aios_sb_info *info, struct aios_http_client *c,
+			   struct aios_dir_table *dt, u32 op, const char *a0, const char *a1,
+			   bool must_be_absent)
 {
 	struct {
 		struct aios_held_lock locks[3];
@@ -1034,16 +1141,19 @@ static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u
 
 		strscpy(b->locks[0].oid, dt->meta_oid, sizeof(b->locks[0].oid));
 		b->locks[0].token[0] = '\0';
-		err = aios_http_lock_acquire(info->http, b->locks[0].oid, 30000,
+		err = aios_http_lock_acquire(c, b->locks[0].oid, 30000,
 					     b->locks[0].token, sizeof(b->locks[0].token));
 		if (err == -EAGAIN) {
+			/* Possibly a peer's lease: ask for it back (idempotent),
+			 * then wait. */
+			aios_http_lock_break(c, b->locks[0].oid, AIOS_LEASE_BREAK_GRACE_MS);
 			http_retry_backoff(attempt);
 			continue;
 		}
 		if (err)
 			break;
 
-		err = dir_load(info, dt, false);
+		err = dir_load_raw(info, c, dt);
 		if (err)
 			goto unlock;
 		if (op == AIOS_HTTP_OP_LINK && must_be_absent && !dir_find(dt, a0, NULL)) {
@@ -1063,7 +1173,7 @@ static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u
 			err = -ENAMETOOLONG;
 			goto unlock;
 		}
-		err = aios_http_append(info->http, dt->log_oid, b->rec, rec_len, NULL, &new_size);
+		err = aios_http_append(c, dt->log_oid, b->rec, rec_len, NULL, &new_size);
 		if (err)
 			goto retry_or_fail;
 
@@ -1074,7 +1184,7 @@ static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u
 
 		if (new_size - rec_len != dt->log_bytes ||
 		    new_size >= AIOS_HTTP_LOG_COMPACT_BYTES) {
-			err = dir_compact_locked(info, dt, b->locks, b->txn_id);
+			err = dir_compact_locked(c, dt, b->locks, b->txn_id);
 			if (err)
 				goto retry_or_fail;
 			/* txn_put_dir advanced dt (next_op, log_bytes = 0, snapshot_op, meta_cas). */
@@ -1090,19 +1200,19 @@ static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u
 		snprintf(b->extra, sizeof(b->extra), "x-aios-lock-token: %s\r\n",
 			 b->locks[0].token);
 		cas = dt->meta_cas;
-		err = aios_http_put(info->http, dt->meta_oid, b->meta, mlen, b->extra, &cas);
+		err = aios_http_put(c, dt->meta_oid, b->meta, mlen, b->extra, &cas);
 		if (err)
 			goto retry_or_fail;
 		dt->meta_cas = cas;
 
 committed:
 		dir_cache_publish(info, dt);
-		release_held_locks(info, b->locks, 1);
+		release_held_locks(c, b->locks, 1);
 		err = 0;
 		break;
 
 retry_or_fail:
-		release_held_locks(info, b->locks, 1);
+		release_held_locks(c, b->locks, 1);
 		if (err == -EAGAIN) {
 			http_retry_backoff(attempt);
 			continue;
@@ -1110,7 +1220,7 @@ retry_or_fail:
 		break;
 
 unlock:
-		release_held_locks(info, b->locks, 1);
+		release_held_locks(c, b->locks, 1);
 		break;
 	}
 	/* The cached table is stale if we gave up after appending anything. */
@@ -1118,6 +1228,821 @@ unlock:
 		dir_cache_invalidate(info, dt->ino);
 	kfree(b);
 	return http_no_eagain(err);
+}
+
+/* ------------------------------------------------------------------------
+ * Directory leases (see struct aios_dir_lease).
+ * ------------------------------------------------------------------------ */
+
+static int load_inode_c(struct aios_sb_info *info, struct aios_http_client *c, u64 ino,
+			struct aios_inode_meta *m);
+static int store_inode_c(struct aios_sb_info *info, struct aios_http_client *c,
+			 struct aios_inode_meta *m);
+static void inode_meta_reset(struct aios_inode_meta *m);
+static void dir_lease_work(struct work_struct *w);
+
+/* Caller holds http_mu (the list only changes under it). */
+static struct aios_dir_lease *dir_lease_find(struct aios_sb_info *info, u64 ino)
+{
+	struct aios_dir_lease *l;
+
+	list_for_each_entry(l, &info->leases, node) {
+		if (l->ino == ino)
+			return l;
+	}
+	return NULL;
+}
+
+static bool dir_lease_owns_locked(const struct aios_dir_lease *l)
+{
+	return l->held && time_before(jiffies, l->expires);
+}
+
+/* The server lock is ours: the cached table is authoritative. */
+static bool dir_lease_owns(struct aios_dir_lease *l)
+{
+	bool ok;
+
+	mutex_lock(&l->mu);
+	ok = dir_lease_owns_locked(l);
+	mutex_unlock(&l->mu);
+	return ok;
+}
+
+/* ... and it may take new asynchronous operations. */
+static bool dir_lease_active(struct aios_dir_lease *l)
+{
+	bool ok;
+
+	mutex_lock(&l->mu);
+	ok = dir_lease_owns_locked(l) && !l->break_requested && !l->release_wanted &&
+	     time_before(jiffies, l->expires - msecs_to_jiffies(AIOS_LEASE_RENEW_MS));
+	mutex_unlock(&l->mu);
+	return ok;
+}
+
+/* Lockless: these are wait_event() conditions (no sleeping there). */
+static bool dir_lease_busy(struct aios_dir_lease *l)
+{
+	return READ_ONCE(l->held) || READ_ONCE(l->npending) || READ_ONCE(l->parent_dirty);
+}
+
+static bool dir_lease_flushed(struct aios_dir_lease *l)
+{
+	return !READ_ONCE(l->npending) && !READ_ONCE(l->parent_dirty);
+}
+
+/* Cache miss under a lease: server tip plus everything still queued here. */
+static int dir_lease_overlay(struct aios_sb_info *info, struct aios_http_client *c,
+			     struct aios_dir_table *dt)
+{
+	struct aios_dir_lease *l = dir_lease_find(info, dt->ino);
+	struct aios_lease_op *op;
+	int err;
+
+	if (!l)
+		return dir_load_raw(info, c, dt);
+	mutex_lock(&l->flush_mu);
+	err = dir_load_raw(info, c, dt);
+	if (!err) {
+		mutex_lock(&l->mu);
+		list_for_each_entry(op, &l->pending, node)
+			apply_dir_op(dt, op->op, op->a0, op->a1);
+		mutex_unlock(&l->mu);
+	}
+	mutex_unlock(&l->flush_mu);
+	if (!err)
+		dir_cache_publish(info, dt);
+	return err;
+}
+
+static void dir_lease_set_ino(struct aios_dir_lease *l, struct aios_sb_info *info, u64 ino)
+{
+	l->ino = ino;
+	oid_dir_meta(info->volume, ino, l->meta_oid, sizeof(l->meta_oid));
+	oid_dir_log(info->volume, ino, l->log_oid, sizeof(l->log_oid));
+	oid_dir_snap(info->volume, ino, l->snap_oid, sizeof(l->snap_oid));
+	l->err = 0;
+	l->next_try = 0;
+}
+
+/* New or recycled lease slot for @ino. Caller holds http_mu. */
+static struct aios_dir_lease *dir_lease_alloc(struct aios_sb_info *info, u64 ino)
+{
+	struct aios_dir_lease *l;
+
+	if (info->nleases >= AIOS_LEASE_MAX) {
+		struct aios_dir_lease *victim = NULL;
+
+		list_for_each_entry(l, &info->leases, node) {
+			/* A slot with an unreported error keeps it for fsync. */
+			if (dir_lease_busy(l) || READ_ONCE(l->err))
+				continue;
+			if (!victim || time_before(l->last_use, victim->last_use))
+				victim = l;
+		}
+		if (!victim)
+			return NULL;
+		cancel_delayed_work_sync(&victim->work);
+		mutex_lock(&victim->mu);
+		dir_lease_set_ino(victim, info, ino);
+		mutex_unlock(&victim->mu);
+		return victim;
+	}
+	l = kzalloc(sizeof(*l), GFP_KERNEL);
+	if (!l)
+		return NULL;
+	l->info = info;
+	mutex_init(&l->mu);
+	mutex_init(&l->flush_mu);
+	INIT_LIST_HEAD(&l->pending);
+	INIT_DELAYED_WORK(&l->work, dir_lease_work);
+	init_waitqueue_head(&l->wq);
+	dir_lease_set_ino(l, info, ino);
+	list_add(&l->node, &info->leases);
+	info->nleases++;
+	return l;
+}
+
+/*
+ * Flush what is queued and give the server lock back, then wait for it.
+ * Used before a synchronous path takes the directory's locks itself
+ * (cross-directory rename, rmdir of the directory) and by umount.
+ * Caller holds http_mu.
+ */
+static void dir_lease_drop(struct aios_sb_info *info, u64 ino)
+{
+	struct aios_dir_lease *l = dir_lease_find(info, ino);
+
+	if (!l || !info->wb_wq)
+		return;
+	mutex_lock(&l->mu);
+	l->release_wanted = true;
+	l->next_try = jiffies + msecs_to_jiffies(AIOS_LEASE_RETRY_MS);
+	mutex_unlock(&l->mu);
+	mod_delayed_work(info->wb_wq, &l->work, 0);
+	wait_event(l->wq, !dir_lease_busy(l));
+	mutex_lock(&l->mu);
+	l->release_wanted = false;
+	mutex_unlock(&l->mu);
+}
+
+/*
+ * Lease for @ino usable for a new asynchronous op, acquiring it when we do
+ * not hold one. NULL means: use the synchronous protocol (leases disabled,
+ * lock held by a peer — a break has been requested —, or a recent failure).
+ * Caller holds http_mu.
+ */
+static struct aios_dir_lease *dir_lease_get(struct aios_sb_info *info, u64 ino)
+{
+	struct aios_dir_lease *l;
+	struct aios_dir_table dt;
+	char token[128];
+	int err;
+
+	if (info->no_lease || !info->wb_wq)
+		return NULL;
+	l = dir_lease_find(info, ino);
+	if (l) {
+		if (dir_lease_active(l))
+			return l;
+		if (dir_lease_owns(l)) {
+			/* Break requested / release wanted / about to expire:
+			 * hand it back so the sync path can take the lock. */
+			dir_lease_drop(info, ino);
+			return NULL;
+		}
+		/* Lost with records still queued: they must reach the server
+		 * before anything else is committed to this directory. */
+		if (!dir_lease_flushed(l)) {
+			mod_delayed_work(info->wb_wq, &l->work, 0);
+			wait_event(l->wq, dir_lease_flushed(l));
+		}
+		mutex_lock(&l->mu);
+		if (l->next_try && time_before(jiffies, l->next_try)) {
+			mutex_unlock(&l->mu);
+			return NULL;
+		}
+		mutex_unlock(&l->mu);
+	} else {
+		l = dir_lease_alloc(info, ino);
+		if (!l)
+			return NULL;
+	}
+
+	err = aios_http_lock_acquire(info->http, l->meta_oid, AIOS_LEASE_TTL_MS, token,
+				     sizeof(token));
+	if (err) {
+		if (err == -EAGAIN)
+			aios_http_lock_break(info->http, l->meta_oid, AIOS_LEASE_BREAK_GRACE_MS);
+		mutex_lock(&l->mu);
+		l->next_try = jiffies + msecs_to_jiffies(AIOS_LEASE_RETRY_MS);
+		mutex_unlock(&l->mu);
+		return NULL;
+	}
+	/* We own the directory now: load the tip once, it stays authoritative. */
+	err = dir_table_init(&dt, info->volume, ino);
+	if (!err) {
+		err = dir_load_raw(info, info->http, &dt);
+		if (err)
+			dir_table_free(&dt);
+	}
+	if (err) {
+		aios_http_lock_release(info->http, l->meta_oid, token);
+		mutex_lock(&l->mu);
+		l->next_try = jiffies + msecs_to_jiffies(AIOS_LEASE_RETRY_MS);
+		mutex_unlock(&l->mu);
+		return NULL;
+	}
+	mutex_lock(&l->mu);
+	strscpy(l->token, token, sizeof(l->token));
+	l->held = true;
+	l->break_requested = false;
+	l->release_wanted = false;
+	l->expires = jiffies + msecs_to_jiffies(AIOS_LEASE_TTL_MS);
+	l->last_renew = l->last_use = jiffies;
+	l->next_op = dt.next_op;
+	l->log_bytes = dt.log_bytes;
+	l->snapshot_op = dt.snapshot_op;
+	l->meta_cas = dt.meta_cas;
+	mutex_unlock(&l->mu);
+	dir_cache_publish(info, &dt);
+	dir_table_free(&dt);
+	mod_delayed_work(info->wb_wq, &l->work, msecs_to_jiffies(AIOS_LEASE_RENEW_MS));
+	return l;
+}
+
+/*
+ * Commit one directory operation. Under a lease the record is queued and the
+ * cached table updated; otherwise the synchronous protocol runs. Caller holds
+ * http_mu and has loaded @dt through dir_load.
+ */
+static int dir_commit_op(struct aios_sb_info *info, struct aios_dir_table *dt, u32 op,
+			 const char *a0, const char *a1, bool must_be_absent)
+{
+	struct aios_dir_lease *l = dir_lease_get(info, dt->ino);
+	struct aios_lease_op *lop;
+	int err;
+
+	if (!l)
+		return dir_commit_sync(info, info->http, dt, op, a0, a1, must_be_absent);
+
+	/* The lease may have been acquired just now, after the caller loaded
+	 * dt; the cached table is the authoritative one. */
+	err = dir_load(info, dt, true);
+	if (err)
+		return err;
+	if (op == AIOS_HTTP_OP_LINK && must_be_absent && !dir_find(dt, a0, NULL))
+		return -EEXIST;
+	if ((op == AIOS_HTTP_OP_UNLINK || op == AIOS_HTTP_OP_RENAME) && dir_find(dt, a0, NULL))
+		return -ENOENT;
+	if (strlen(a0) > AIOS_KABI_NAME_MAX || (a1 && strlen(a1) > AIOS_KABI_NAME_MAX))
+		return -ENAMETOOLONG;
+
+	lop = kmalloc(sizeof(*lop), GFP_KERNEL);
+	if (!lop)
+		return -ENOMEM;
+	lop->op = op;
+	strscpy(lop->a0, a0, sizeof(lop->a0));
+	if (a1 && op != AIOS_HTTP_OP_UNLINK)
+		strscpy(lop->a1, a1, sizeof(lop->a1));
+	else
+		lop->a1[0] = '\0';
+
+	err = apply_dir_op(dt, op, a0, lop->a1);
+	if (err) {
+		kfree(lop);
+		return err;
+	}
+	dt->next_op += 1;
+
+	/* Bound the queue: a flood of creates waits for the flusher. */
+	mutex_lock(&l->mu);
+	while (l->npending >= AIOS_LEASE_MAX_PENDING) {
+		mutex_unlock(&l->mu);
+		mod_delayed_work(info->wb_wq, &l->work, 0);
+		wait_event(l->wq, l->npending < AIOS_LEASE_MAX_PENDING);
+		mutex_lock(&l->mu);
+	}
+	list_add_tail(&lop->node, &l->pending);
+	l->npending++;
+	l->last_use = jiffies;
+	mutex_unlock(&l->mu);
+	dir_cache_publish(info, dt);
+	mod_delayed_work(info->wb_wq, &l->work,
+			 l->npending >= 64 ? 0 : msecs_to_jiffies(AIOS_LEASE_FLUSH_MS));
+	return 0;
+}
+
+/*
+ * mtime/ctime/nlink of a directory after a namespace change. Under a lease
+ * the in-core inode is updated and the server copy is written once per
+ * flush; otherwise the CAS PUT happens here.
+ */
+static int touch_parent(struct aios_sb_info *info, struct aios_inode_meta *pm, u64 ts,
+			int nlink_delta);
+static int load_inode(struct aios_sb_info *info, u64 ino, struct aios_inode_meta *m);
+static void meta_to_stat(const struct aios_inode_meta *m, struct aios_kabi_stat *st);
+
+static int touch_dir_inode(struct aios_sb_info *info, struct inode *dir,
+			   struct aios_inode_meta *pm, u64 ts, int nlink_delta)
+{
+	struct aios_dir_lease *l = dir_lease_find(info, dir->i_ino);
+	int err;
+
+	if (l && dir_lease_owns(l)) {
+		mutex_lock(&l->mu);
+		l->parent_dirty = true;
+		if (ts > l->parent_mtime_ns)
+			l->parent_mtime_ns = ts;
+		l->nlink_delta += nlink_delta;
+		l->last_use = jiffies;
+		mutex_unlock(&l->mu);
+		dir->i_mtime = dir->i_ctime = ns_to_timespec64(ts);
+		if (nlink_delta > 0)
+			inc_nlink(dir);
+		else if (nlink_delta < 0 && dir->i_nlink > 2)
+			drop_nlink(dir);
+		mod_delayed_work(info->wb_wq, &l->work, msecs_to_jiffies(AIOS_LEASE_FLUSH_MS));
+		return 0;
+	}
+	if (!pm->exists) {
+		err = load_inode(info, dir->i_ino, pm);
+		if (err)
+			return err;
+	}
+	err = touch_parent(info, pm, ts, nlink_delta);
+	if (!err) {
+		struct aios_kabi_stat st;
+
+		meta_to_stat(pm, &st);
+		aios_stat_to_inode(dir, &st);
+	}
+	return err;
+}
+
+/* Deferred parent update from the flusher: load-modify-CAS with retries. */
+static int dir_lease_touch_parent(struct aios_sb_info *info, struct aios_http_client *c,
+				  u64 ino, u64 ts, int delta)
+{
+	struct aios_inode_meta pm = { 0 };
+	int attempt;
+	int err = -EAGAIN;
+
+	for (attempt = 0; attempt < AIOS_HTTP_META_RETRIES && err == -EAGAIN; attempt++) {
+		if (attempt)
+			http_retry_backoff(attempt);
+		err = load_inode_c(info, c, ino, &pm);
+		if (err == -ENOENT) {
+			err = 0; /* directory removed meanwhile */
+			break;
+		}
+		if (err)
+			break;
+		if (delta < 0)
+			pm.nlink = (u32)max_t(int, 2, (int)pm.nlink + delta);
+		else
+			pm.nlink += delta;
+		if (ts > pm.mtime_ns)
+			pm.mtime_ns = ts;
+		if (ts > pm.ctime_ns)
+			pm.ctime_ns = ts;
+		err = store_inode_c(info, c, &pm);
+	}
+	inode_meta_reset(&pm);
+	return http_no_eagain(err);
+}
+
+/* Compact under the lease: table = server tip + the @n records just appended. */
+static int dir_lease_compact(struct aios_sb_info *info, struct aios_http_client *c,
+			     struct aios_dir_lease *l, unsigned int n)
+{
+	struct {
+		struct aios_held_lock locks[3];
+		char txn_id[AIOS_HTTP_TXN_ID_LEN];
+		struct aios_dir_table dt;
+	} *b;
+	struct aios_lease_op *op;
+	unsigned int i = 0;
+	int attempt;
+	int err;
+
+	b = kzalloc(sizeof(*b), GFP_KERNEL);
+	if (!b)
+		return -ENOMEM;
+	err = dir_table_init(&b->dt, info->volume, l->ino);
+	if (err)
+		goto out;
+	err = dir_load_raw(info, c, &b->dt);
+	if (err)
+		goto out_dt;
+	mutex_lock(&l->mu);
+	list_for_each_entry(op, &l->pending, node) {
+		if (i++ == n)
+			break;
+		apply_dir_op(&b->dt, op->op, op->a0, op->a1);
+	}
+	b->dt.next_op = l->next_op + n;
+	strscpy(b->locks[0].oid, l->meta_oid, sizeof(b->locks[0].oid));
+	strscpy(b->locks[0].token, l->token, sizeof(b->locks[0].token));
+	mutex_unlock(&l->mu);
+
+	err = -EAGAIN;
+	for (attempt = 0; attempt < 4 && err == -EAGAIN; attempt++) {
+		if (attempt)
+			http_retry_backoff(attempt);
+		err = dir_compact_locked(c, &b->dt, b->locks, b->txn_id);
+	}
+	if (!err) {
+		mutex_lock(&l->mu);
+		l->next_op = b->dt.next_op;
+		l->log_bytes = 0;
+		l->snapshot_op = b->dt.snapshot_op;
+		l->meta_cas = b->dt.meta_cas;
+		mutex_unlock(&l->mu);
+	}
+out_dt:
+	dir_table_free(&b->dt);
+out:
+	kfree(b);
+	return err;
+}
+
+/*
+ * Append the queued records in batches and advance meta once per batch; then
+ * the deferred parent inode update. Returns -ESTALE when the lease is gone
+ * (the queue is left intact for the replay), another -errno on a transient
+ * failure (queue intact, retried by the next run).
+ */
+static int dir_lease_flush(struct aios_sb_info *info, struct aios_http_client *c,
+			   struct aios_dir_lease *l)
+{
+	u8 *buf;
+	char *meta;
+	char extra[192];
+	int conflicts = 0;
+	int err = 0;
+
+	buf = kvmalloc(AIOS_LEASE_BATCH_BYTES, GFP_KERNEL);
+	meta = kmalloc(512, GFP_KERNEL);
+	if (!buf || !meta) {
+		kvfree(buf);
+		kfree(meta);
+		return -ENOMEM;
+	}
+	snprintf(extra, sizeof(extra), "x-aios-lock-token: %s\r\n", l->token);
+
+	for (;;) {
+		struct aios_lease_op *op, *tmp;
+		size_t len = 0;
+		unsigned int n = 0;
+		u64 new_size = 0;
+		bool pd;
+		u64 pts;
+		int pdelta;
+
+		mutex_lock(&l->flush_mu);
+		mutex_lock(&l->mu);
+		list_for_each_entry(op, &l->pending, node) {
+			size_t rl = dir_encode_record(l->next_op + n, op->op, op->a0,
+						      op->op == AIOS_HTTP_OP_UNLINK ? NULL : op->a1,
+						      buf + len, AIOS_LEASE_BATCH_BYTES - len);
+
+			if (!rl)
+				break;
+			len += rl;
+			n++;
+		}
+		pd = l->parent_dirty;
+		pts = l->parent_mtime_ns;
+		pdelta = l->nlink_delta;
+		l->parent_dirty = false;
+		l->nlink_delta = 0;
+		mutex_unlock(&l->mu);
+
+		if (!n && !pd) {
+			mutex_unlock(&l->flush_mu);
+			break;
+		}
+		if (n) {
+			err = aios_http_append(c, l->log_oid, buf, len, l->token, &new_size);
+			if (err)
+				goto fail;
+			if (new_size - len != l->log_bytes ||
+			    new_size >= AIOS_HTTP_LOG_COMPACT_BYTES) {
+				err = dir_lease_compact(info, c, l, n);
+				if (err)
+					goto fail;
+			} else {
+				struct aios_dir_table hdr = { 0 };
+				u64 cas = l->meta_cas;
+				int mlen;
+
+				hdr.next_op = l->next_op + n;
+				hdr.log_bytes = new_size;
+				hdr.snapshot_op = l->snapshot_op;
+				strscpy(hdr.snap_oid, l->snap_oid, sizeof(hdr.snap_oid));
+				mlen = dir_meta_json(&hdr, meta, 512);
+				if (mlen < 0) {
+					err = mlen;
+					goto fail;
+				}
+				err = aios_http_put(c, l->meta_oid, meta, mlen, extra, &cas);
+				if (err)
+					goto fail;
+				mutex_lock(&l->mu);
+				l->meta_cas = cas;
+				l->log_bytes = new_size;
+				l->next_op += n;
+				mutex_unlock(&l->mu);
+			}
+			mutex_lock(&l->mu);
+			list_for_each_entry_safe(op, tmp, &l->pending, node) {
+				if (!n)
+					break;
+				list_del(&op->node);
+				kfree(op);
+				l->npending--;
+				n--;
+			}
+			mutex_unlock(&l->mu);
+		}
+		if (pd) {
+			err = dir_lease_touch_parent(info, c, l->ino, pts, pdelta);
+			if (err) {
+				mutex_lock(&l->mu);
+				if (!l->err)
+					l->err = err;
+				mutex_unlock(&l->mu);
+				err = 0;
+			}
+		}
+		mutex_unlock(&l->flush_mu);
+		wake_up_all(&l->wq);
+		continue;
+
+fail:
+		mutex_lock(&l->mu);
+		if (pd) {
+			l->parent_dirty = true;
+			l->nlink_delta += pdelta;
+			if (pts > l->parent_mtime_ns)
+				l->parent_mtime_ns = pts;
+		}
+		mutex_unlock(&l->mu);
+		mutex_unlock(&l->flush_mu);
+		/* -EAGAIN is also what a peer transiently holding the log/snap
+		 * lock (cross-directory rename) produces, and what our own PUT
+		 * that timed out but was applied produces; give those a few
+		 * tries. A duplicate append is harmless: it shows up as garbage
+		 * past log_bytes and forces a compaction. */
+		if (err == -EAGAIN && ++conflicts < 3) {
+			http_retry_backoff(conflicts);
+			continue;
+		}
+		/* lock_held / lock_expired / CAS mismatch: someone else owns the
+		 * directory now. Anything else is a transport error. */
+		if (err == -EAGAIN || err == -ESTALE)
+			err = -ESTALE;
+		break;
+	}
+	kvfree(buf);
+	kfree(meta);
+	return err;
+}
+
+/*
+ * The lease is gone with records still queued: commit them one by one with
+ * the synchronous protocol. What cannot be committed is reported through
+ * fsync of the directory.
+ */
+static void dir_lease_replay(struct aios_sb_info *info, struct aios_http_client *c,
+			     struct aios_dir_lease *l)
+{
+	struct aios_dir_table dt;
+	bool pd;
+	u64 pts;
+	int pdelta;
+	int err;
+
+	if (dir_table_init(&dt, info->volume, l->ino))
+		return;
+	mutex_lock(&l->flush_mu);
+	for (;;) {
+		struct aios_lease_op *op;
+
+		mutex_lock(&l->mu);
+		op = list_first_entry_or_null(&l->pending, struct aios_lease_op, node);
+		if (op) {
+			list_del(&op->node);
+			l->npending--;
+		}
+		mutex_unlock(&l->mu);
+		if (!op)
+			break;
+		err = dir_commit_sync(info, c, &dt, op->op, op->a0,
+				      op->op == AIOS_HTTP_OP_UNLINK ? NULL : op->a1, false);
+		if (err) {
+			pr_warn("aiosfs: dir %llu: lost lease, op %u on \"%s\" not committed: %d\n",
+				(unsigned long long)l->ino, op->op, op->a0, err);
+			mutex_lock(&l->mu);
+			if (!l->err)
+				l->err = err;
+			mutex_unlock(&l->mu);
+		}
+		kfree(op);
+		wake_up_all(&l->wq);
+	}
+	mutex_lock(&l->mu);
+	pd = l->parent_dirty;
+	pts = l->parent_mtime_ns;
+	pdelta = l->nlink_delta;
+	l->parent_dirty = false;
+	l->nlink_delta = 0;
+	mutex_unlock(&l->mu);
+	if (pd) {
+		err = dir_lease_touch_parent(info, c, l->ino, pts, pdelta);
+		if (err) {
+			mutex_lock(&l->mu);
+			if (!l->err)
+				l->err = err;
+			mutex_unlock(&l->mu);
+		}
+	}
+	mutex_unlock(&l->flush_mu);
+	dir_table_free(&dt);
+	dir_cache_invalidate(info, l->ino);
+	wake_up_all(&l->wq);
+}
+
+static void dir_lease_work(struct work_struct *w)
+{
+	struct aios_dir_lease *l = container_of(to_delayed_work(w), struct aios_dir_lease, work);
+	struct aios_sb_info *info = l->info;
+	struct aios_http_client *c = http_client_get(info);
+	char token[128];
+	bool held, lost = false;
+	int err;
+
+	mutex_lock(&l->mu);
+	held = dir_lease_owns_locked(l);
+	strscpy(token, l->token, sizeof(token));
+	if (l->held && !held) {
+		/* Expired without a successful renew: treat as lost. */
+		l->held = false;
+		lost = true;
+	}
+	mutex_unlock(&l->mu);
+
+	if (held) {
+		err = dir_lease_flush(info, c, l);
+		if (err == -ESTALE) {
+			/* Give the lock back in case we still have it (the conflict
+			 * may have been on the log object), so the replay's own
+			 * acquire does not have to break our lease. Only touch the
+			 * lease if nobody re-acquired it meanwhile. */
+			mutex_lock(&l->mu);
+			if (l->held && !strcmp(token, l->token)) {
+				l->held = false;
+				l->break_requested = false;
+				mutex_unlock(&l->mu);
+				aios_http_lock_release(c, l->meta_oid, token);
+				lost = true;
+			} else {
+				mutex_unlock(&l->mu);
+			}
+		}
+	}
+	if (lost) {
+		dir_cache_invalidate(info, l->ino);
+		dir_lease_replay(info, c, l);
+	} else if (!held && (l->npending || l->parent_dirty)) {
+		/* Queued after the lease went away (or never acquired). */
+		dir_lease_replay(info, c, l);
+	}
+
+	mutex_lock(&l->mu);
+	if (dir_lease_owns_locked(l)) {
+		bool idle = !l->npending && !l->parent_dirty &&
+			    time_after(jiffies, l->last_use + msecs_to_jiffies(AIOS_LEASE_IDLE_MS));
+
+		if (l->release_wanted || l->break_requested || idle) {
+			char token[128];
+
+			/* Anything still queued (a flush just failed) is
+			 * re-committed synchronously by the next run. */
+			strscpy(token, l->token, sizeof(token));
+			l->held = false;
+			l->break_requested = false;
+			mutex_unlock(&l->mu);
+			aios_http_lock_release(c, l->meta_oid, token);
+			mutex_lock(&l->mu);
+		} else if (time_after_eq(jiffies, l->last_renew +
+						  msecs_to_jiffies(AIOS_LEASE_RENEW_MS))) {
+			char token[128];
+			bool brk = false;
+
+			strscpy(token, l->token, sizeof(token));
+			mutex_unlock(&l->mu);
+			err = aios_http_lock_renew(c, l->meta_oid, token, AIOS_LEASE_TTL_MS, &brk);
+			mutex_lock(&l->mu);
+			/* A re-acquire may have raced us; only touch our own lease. */
+			if (!l->held || strcmp(token, l->token)) {
+				/* nothing */
+			} else if (err == -ESTALE) {
+				l->held = false;
+			} else if (!err) {
+				l->last_renew = jiffies;
+				if (brk) {
+					/* The server shortened us to the grace period. */
+					l->break_requested = true;
+					l->expires = min(l->expires, jiffies +
+						msecs_to_jiffies(AIOS_LEASE_BREAK_GRACE_MS));
+				} else {
+					l->expires = jiffies + msecs_to_jiffies(AIOS_LEASE_TTL_MS);
+				}
+			}
+			/* Other errors: keep going on the current expiry. */
+		}
+	}
+	if (l->held && (l->break_requested || l->release_wanted))
+		mod_delayed_work(info->wb_wq, &l->work, 0);
+	else if (l->npending || l->parent_dirty)
+		mod_delayed_work(info->wb_wq, &l->work, msecs_to_jiffies(AIOS_LEASE_FLUSH_MS));
+	else if (l->held)
+		mod_delayed_work(info->wb_wq, &l->work, msecs_to_jiffies(AIOS_LEASE_RENEW_MS));
+	mutex_unlock(&l->mu);
+	wake_up_all(&l->wq);
+	http_client_put(info, c);
+}
+
+/*
+ * fsync(2) on a directory: everything queued for it must be on the server.
+ * Returns and clears the sticky error of an earlier failed async commit.
+ */
+static int dir_lease_fsync(struct aios_sb_info *info, u64 ino)
+{
+	struct aios_dir_lease *l;
+	int err;
+
+	mutex_lock(&info->http_mu);
+	l = dir_lease_find(info, ino);
+	mutex_unlock(&info->http_mu);
+	if (!l || !info->wb_wq)
+		return 0;
+	mod_delayed_work(info->wb_wq, &l->work, 0);
+	wait_event(l->wq, dir_lease_flushed(l));
+	mutex_lock(&l->mu);
+	err = l->err;
+	l->err = 0;
+	mutex_unlock(&l->mu);
+	return err;
+}
+
+/* syncfs / umount: flush every lease; @release also hands the locks back. */
+static int dir_lease_sync_all(struct aios_sb_info *info, bool release)
+{
+	struct aios_dir_lease *l;
+	int err = 0;
+
+	if (!info->wb_wq)
+		return 0;
+	mutex_lock(&info->http_mu);
+	list_for_each_entry(l, &info->leases, node) {
+		int e;
+
+		if (release) {
+			dir_lease_drop(info, l->ino);
+		} else {
+			mod_delayed_work(info->wb_wq, &l->work, 0);
+			wait_event(l->wq, dir_lease_flushed(l));
+		}
+		mutex_lock(&l->mu);
+		e = l->err;
+		l->err = 0;
+		mutex_unlock(&l->mu);
+		if (e && !err)
+			err = e;
+	}
+	mutex_unlock(&info->http_mu);
+	return err;
+}
+
+static void dir_lease_destroy_all(struct aios_sb_info *info)
+{
+	struct aios_dir_lease *l, *tmp;
+
+	dir_lease_sync_all(info, true);
+	list_for_each_entry_safe(l, tmp, &info->leases, node) {
+		struct aios_lease_op *op, *otmp;
+
+		cancel_delayed_work_sync(&l->work);
+		list_del(&l->node);
+		list_for_each_entry_safe(op, otmp, &l->pending, node)
+			kfree(op);
+		kfree(l);
+	}
+	info->nleases = 0;
 }
 
 static int dir_find(struct aios_dir_table *dt, const char *name, u64 *ino_out)
@@ -2252,6 +3177,7 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 	char name[AIOS_KABI_NAME_MAX + 1];
 	char inos[32];
 	u64 ino, ts;
+	bool leased;
 	int err;
 
 	if (dentry->d_name.len > AIOS_KABI_NAME_MAX)
@@ -2262,12 +3188,18 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 		return -EINVAL;
 
 	mutex_lock(&info->http_mu);
-	err = load_inode(info, dir->i_ino, &pmeta);
-	if (err)
-		goto out;
-	if (!S_ISDIR(pmeta.mode)) {
-		err = -ENOTDIR;
-		goto out;
+	/* Under a lease the directory is ours: the in-core inode and the cached
+	 * table are authoritative and the parent update is deferred, so a
+	 * create costs the child inode PUT and nothing else synchronous. */
+	leased = !!dir_lease_get(info, dir->i_ino);
+	if (!leased) {
+		err = load_inode(info, dir->i_ino, &pmeta);
+		if (err)
+			goto out;
+		if (!S_ISDIR(pmeta.mode)) {
+			err = -ENOTDIR;
+			goto out;
+		}
 	}
 	err = dir_table_init(&dt, info->volume, dir->i_ino);
 	if (err)
@@ -2307,7 +3239,7 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 		aios_http_delete(info->http, oid);
 		goto out_dt;
 	}
-	err = touch_parent(info, &pmeta, ts, is_dir ? 1 : 0);
+	err = touch_dir_inode(info, dir, &pmeta, ts, is_dir ? 1 : 0);
 	if (err)
 		goto out_dt;
 	inode = aios_http_iget(dir->i_sb, &m);
@@ -2317,14 +3249,6 @@ static int http_create_common(struct inode *dir, struct dentry *dentry, umode_t 
 	}
 	d_instantiate(dentry, inode);
 	aios_d_mark_fresh(dentry);
-	if (is_dir)
-		inc_nlink(dir);
-	{
-		struct aios_kabi_stat st;
-
-		meta_to_stat(&pmeta, &st);
-		aios_stat_to_inode(dir, &st);
-	}
 out_dt:
 	dir_table_free(&dt);
 out:
@@ -2431,15 +3355,15 @@ static int http_rmdir(struct inode *dir, struct dentry *dentry)
 	}
 	dir_table_free(&child_dt);
 
+	/* The removed directory may itself be leased by us; its lock would
+	 * refuse the object deletes below. */
+	dir_lease_drop(info, child);
 	err = dir_commit_op(info, &dt, AIOS_HTTP_OP_UNLINK, name, NULL, false);
 	if (err)
 		goto out_dt;
-	err = load_inode(info, dir->i_ino, &pmeta);
-	if (!err)
-		touch_parent(info, &pmeta, now_ns(), -1);
+	touch_dir_inode(info, dir, &pmeta, now_ns(), -1);
 	delete_dir_objects(info, child);
 	clear_nlink(d_inode(dentry));
-	drop_nlink(dir);
 	d_drop(dentry);
 	err = 0;
 out_dt:
@@ -2490,6 +3414,7 @@ static int http_rename_same_dir(struct aios_sb_info *info, u64 parent, const cha
 				goto out;
 			}
 			dir_table_free(&child_dt);
+			dir_lease_drop(info, victim_ino);
 		}
 	}
 	err = dir_commit_op(info, &dt, AIOS_HTTP_OP_RENAME, old_name, new_name, false);
@@ -2612,7 +3537,7 @@ static int http_rename_cross_dir_once(struct aios_sb_info *info, struct aios_ren
 	for (i = 0; i < nlocks; i++)
 		rc->locks[i].token[0] = '\0';
 
-	err = acquire_sorted_locks(info, rc->locks, &nlocks);
+	err = acquire_sorted_locks(info->http, rc->locks, &nlocks);
 	if (err)
 		goto out;
 
@@ -2686,10 +3611,10 @@ static int http_rename_cross_dir_once(struct aios_sb_info *info, struct aios_ren
 	if (err)
 		goto unlock;
 
-	err = txn_put_dir(info, rc->txn_id, &rc->old_dir, rc->locks, nlocks);
+	err = txn_put_dir(info->http, rc->txn_id, &rc->old_dir, rc->locks, nlocks);
 	if (err)
 		goto abort;
-	err = txn_put_dir(info, rc->txn_id, &rc->new_dir, rc->locks, nlocks);
+	err = txn_put_dir(info->http, rc->txn_id, &rc->new_dir, rc->locks, nlocks);
 	if (err)
 		goto abort;
 
@@ -2749,7 +3674,7 @@ static int http_rename_cross_dir_once(struct aios_sb_info *info, struct aios_ren
 	rc->txn_id[0] = '\0';
 	dir_cache_publish(info, &rc->old_dir);
 	dir_cache_publish(info, &rc->new_dir);
-	release_held_locks(info, rc->locks, nlocks);
+	release_held_locks(info->http, rc->locks, nlocks);
 	rename_ctx_reset(rc);
 	return 0;
 
@@ -2757,7 +3682,7 @@ abort:
 	if (rc->txn_id[0])
 		aios_http_txn_abort(info->http, rc->txn_id);
 unlock:
-	release_held_locks(info, rc->locks, nlocks);
+	release_held_locks(info->http, rc->locks, nlocks);
 out:
 	rename_ctx_reset(rc);
 	return err;
@@ -2773,6 +3698,10 @@ static int http_rename_cross_dir(struct aios_sb_info *info, u64 old_parent, cons
 	rc = kzalloc(sizeof(*rc), GFP_KERNEL);
 	if (!rc)
 		return -ENOMEM;
+	/* The transaction below locks both directories itself; our own leases
+	 * on them would refuse those locks. Flush and hand them back first. */
+	dir_lease_drop(info, old_parent);
+	dir_lease_drop(info, new_parent);
 	for (attempt = 0; attempt < AIOS_HTTP_DIR_RETRIES; attempt++) {
 		err = http_rename_cross_dir_once(info, rc, old_parent, old_name, new_parent,
 						 new_name, noreplace);
@@ -2812,12 +3741,14 @@ static int http_link(struct dentry *old_dentry, struct inode *dir, struct dentry
 		err = -EPERM;
 		goto out;
 	}
-	err = load_inode(info, dir->i_ino, &np);
-	if (err)
-		goto out;
-	if (!S_ISDIR(np.mode)) {
-		err = -ENOTDIR;
-		goto out;
+	if (!dir_lease_get(info, dir->i_ino)) {
+		err = load_inode(info, dir->i_ino, &np);
+		if (err)
+			goto out;
+		if (!S_ISDIR(np.mode)) {
+			err = -ENOTDIR;
+			goto out;
+		}
 	}
 	err = dir_table_init(&new_dt, info->volume, dir->i_ino);
 	if (err)
@@ -2843,8 +3774,7 @@ static int http_link(struct dentry *old_dentry, struct inode *dir, struct dentry
 		store_inode(info, &m);
 		goto out_dt;
 	}
-	np.mtime_ns = np.ctime_ns = ts;
-	err = store_inode(info, &np);
+	err = touch_dir_inode(info, dir, &np, ts, 0);
 	if (err)
 		goto out_dt;
 	{
@@ -3187,12 +4117,14 @@ static int http_symlink(AIOS_IDMAP *mnt_userns, struct inode *dir, struct dentry
 		return -EINVAL;
 
 	mutex_lock(&info->http_mu);
-	err = load_inode(info, dir->i_ino, &pmeta);
-	if (err)
-		goto out;
-	if (!S_ISDIR(pmeta.mode)) {
-		err = -ENOTDIR;
-		goto out;
+	if (!dir_lease_get(info, dir->i_ino)) {
+		err = load_inode(info, dir->i_ino, &pmeta);
+		if (err)
+			goto out;
+		if (!S_ISDIR(pmeta.mode)) {
+			err = -ENOTDIR;
+			goto out;
+		}
 	}
 	err = dir_table_init(&dt, info->volume, dir->i_ino);
 	if (err)
@@ -3236,7 +4168,7 @@ static int http_symlink(AIOS_IDMAP *mnt_userns, struct inode *dir, struct dentry
 		aios_http_delete(info->http, oid);
 		goto out_dt;
 	}
-	err = touch_parent(info, &pmeta, ts, 0);
+	err = touch_dir_inode(info, dir, &pmeta, ts, 0);
 	if (err)
 		goto out_dt;
 	inode = aios_http_iget(dir->i_sb, &m);
@@ -3246,12 +4178,6 @@ static int http_symlink(AIOS_IDMAP *mnt_userns, struct inode *dir, struct dentry
 	}
 	d_instantiate(dentry, inode);
 	aios_d_mark_fresh(dentry);
-	{
-		struct aios_kabi_stat st;
-
-		meta_to_stat(&pmeta, &st);
-		aios_stat_to_inode(dir, &st);
-	}
 out_dt:
 	dir_table_free(&dt);
 out:
@@ -3380,10 +4306,22 @@ out:
 	return err;
 }
 
+/* fsync(2) of a directory: commit the operations queued under its lease. */
+static int http_dir_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct inode *inode = file_inode(file);
+
+	(void)start;
+	(void)end;
+	(void)datasync;
+	return dir_lease_fsync(AIOS_SB(inode->i_sb), inode->i_ino);
+}
+
 const struct file_operations aios_http_dir_ops = {
 	.owner = THIS_MODULE,
 	.iterate_shared = http_readdir,
 	.llseek = generic_file_llseek,
+	.fsync = http_dir_fsync,
 };
 
 /*
@@ -4820,6 +5758,9 @@ static void http_put_super(struct super_block *sb)
 
 	if (!info)
 		return;
+	/* Queued directory operations must be on the server before the
+	 * connections go away; this also hands every lease back. */
+	dir_lease_destroy_all(info);
 	if (info->wb_wq) {
 		/* Chunk work dereferences info->http_pool and info->volume, so it has
 		 * to be drained before either goes away. */
@@ -4843,10 +5784,19 @@ static void http_put_super(struct super_block *sb)
 	sb->s_fs_info = NULL;
 }
 
+/* syncfs(2): every directory's queued operations must be on the server. */
+static int http_sync_fs(struct super_block *sb, int wait)
+{
+	if (!wait)
+		return 0;
+	return dir_lease_sync_all(AIOS_SB(sb), false);
+}
+
 static const struct super_operations aios_http_super_ops = {
 	.statfs = http_statfs,
 	.evict_inode = aios_evict_inode,
 	.write_inode = aios_write_inode,
+	.sync_fs = http_sync_fs,
 	.put_super = http_put_super,
 	.show_options = aios_show_options,
 };
@@ -4878,6 +5828,8 @@ int aios_fill_super_http(struct super_block *sb, struct aios_sb_info *info)
 	mutex_init(&info->http_mu);
 	mutex_init(&info->dir_cache_mu);
 	mutex_init(&info->ino_mu);
+	INIT_LIST_HEAD(&info->leases);
+	info->nleases = 0;
 	info->dir_cache = kzalloc(sizeof(*info->dir_cache), GFP_KERNEL);
 	if (!info->dir_cache)
 		return -ENOMEM;

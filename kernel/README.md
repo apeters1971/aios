@@ -59,11 +59,22 @@ Prefer a numeric IPv4 `endpoint=` (hostname resolution needs `CONFIG_DNS_RESOLVE
 HTTP-backend tuning:
 
 - `pool=N` — number of pooled HTTP connections used by the data path (read/readahead,
-  writeback, O_DIRECT, background chunk deletion) and by metadata revalidation. Default 4, max 32.
-  Namespace operations (create/unlink/rename/mkdir) are serialized on their own connection.
-- `actimeo=SECONDS` — attribute / directory / xattr cache lifetime (default 1 s). Within the window
-  `stat`, `readdir`, `getxattr` and `listxattr` are answered from the in-core inode; after it a
-  `HEAD` with the cached CAS tag revalidates the inode (a full `GET` only if it changed).
+  writeback, O_DIRECT, background chunk deletion, directory lease flushing) and by metadata
+  revalidation. Default 8, max 63. Namespace operations (create/unlink/rename/mkdir) are
+  serialized on their own connection.
+- `actimeo=MILLISECONDS` — attribute / directory / xattr cache lifetime (default 250 ms). Within
+  the window `stat`, `readdir`, `getxattr` and `listxattr` are answered from the in-core inode;
+  after it a `HEAD` with the cached CAS tag revalidates the inode (a full `GET` only if it changed).
+- `nolease` — disable directory leases. By default a directory this mount modifies is leased
+  (the server lock on its meta object, renewed every 3 s, TTL 30 s): while the lease is held
+  `create`/`mkdir`/`unlink`/`rename`/`symlink`/`link` update only the in-core directory and queue
+  a changelog record; a worker appends the queue in batches (one `POST /o/.../append` + one CAS
+  `PUT` of meta per batch) and writes the parent's mtime/nlink once per batch. `fsync(dir)` and
+  `syncfs` wait for the queue and return the sticky error of anything that could not be
+  committed; `umount` flushes and releases. A peer that needs the directory calls
+  `lock/break`; the holder sees `break_requested` at its next renew, flushes and releases within
+  the 5 s grace. If the lease is lost, queued records are re-committed one by one with the
+  per-operation locking protocol. `nolease` commits every operation synchronously as before.
 
 ## Filesystem — upcall + aios-kbridge
 
@@ -75,7 +86,7 @@ sudo mount -t aios none /mnt/aios \
   -o backend=upcall,endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default
 ```
 
-Mount options: `endpoint`, `cluster_key`, `backend=upcall|http`, `volume`, `app_label`, `stripe_unit`, `stripe_width`, `uid`, `gid`, `principal`/`key`, `pool` (http), `actimeo` (http).
+Mount options: `endpoint`, `cluster_key`, `backend=upcall|http`, `volume`, `app_label`, `stripe_unit`, `stripe_width`, `uid`, `gid`, `principal`/`key`, `pool` (http), `actimeo` (http), `nolease` (http).
 
 ## Block device — aiosvd
 
