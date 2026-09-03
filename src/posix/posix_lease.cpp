@@ -446,9 +446,9 @@ void DirLeaseManager::service(DirLease& l) {
     const auto now2 = clock_t_::now();
     if (l.owns_locked(now2)) {
       const bool idle = l.flushed_locked() && now2 - l.last_use > kLeaseIdle;
-      if (l.release_wanted || l.break_requested || idle) {
-        // Anything still queued (a flush just failed) is re-committed
-        // synchronously by the next run.
+      if ((l.release_wanted || l.break_requested || idle) && l.flushed_locked()) {
+        // Keep the lease while the queue is still local so a peer cannot rmdir
+        // an empty server tip. service() retries flush on the next cycle.
         const std::string tok = l.token;
         l.held = false;
         l.break_requested = false;

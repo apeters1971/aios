@@ -272,7 +272,7 @@ std::string super_to_json(const SuperMeta& m) {
       .dump();
 }
 
-HeldLocks::~HeldLocks() {
+void HeldLocks::release_all() {
   if (!session) return;
   for (auto it = held.rbegin(); it != held.rend(); ++it) {
     try {
@@ -280,17 +280,47 @@ HeldLocks::~HeldLocks() {
     } catch (...) {
     }
   }
+  held.clear();
 }
+
+HeldLocks::~HeldLocks() { release_all(); }
 
 void HeldLocks::acquire_sorted(std::vector<std::string> oids, int ttl_ms) {
   std::sort(oids.begin(), oids.end());
   oids.erase(std::unique(oids.begin(), oids.end()), oids.end());
-  for (const auto& oid : oids) {
-    std::string token;
-    if (!session->lock_acquire_wait(oid, token, ttl_ms, kLeaseWaitMs)) {
-      throw client_error("lock_held", "lease not returned in time: " + oid);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(kLeaseWaitMs);
+  bool broke = false;
+  int sleep_ms = 2;
+  for (;;) {
+    release_all();
+    bool ok = true;
+    std::string blocked;
+    for (const auto& oid : oids) {
+      std::string token;
+      if (!session->lock_try_acquire(oid, token, ttl_ms)) {
+        ok = false;
+        blocked = oid;
+        break;
+      }
+      held.emplace_back(oid, std::move(token));
     }
-    held.emplace_back(oid, std::move(token));
+    if (ok) return;
+    release_all();
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw client_error("lock_held", "lease not returned in time: " + blocked);
+    }
+    // A holder that batches work under the lease releases early once it sees
+    // the break; a dead one loses the lease at the grace deadline.
+    if (!broke) {
+      try {
+        session->lock_break(blocked);
+      } catch (const client_error&) {
+      }
+      broke = true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+    sleep_ms = std::min(sleep_ms * 2, 200);
   }
 }
 

@@ -319,11 +319,16 @@ struct HeldLocks {
   std::vector<std::pair<std::string, std::string>> held;  // oid, token
 
   ~HeldLocks();
+  void release_all();
   // A lease holder that batches directory updates (the kernel client or another
   // mount) keeps its lease across many operations, so a plain acquire would fail
   // for seconds at a time. Ask it to hand the lease back and wait; the server
   // bounds that wait by its break grace period, and a timeout still surfaces as
   // lock_held so the callers' retry loops behave as before.
+  //
+  // Never wait for one oid while holding another: directory leases are the meta
+  // lock only, and log sorts before meta, so waiting on meta with the log held
+  // stops the holder flushing and a subsequent rmdir can see an empty tip.
   void acquire_sorted(std::vector<std::string> oids, int ttl_ms = 30000);
   static constexpr int kLeaseWaitMs = 8000;
   std::optional<std::string> token_for(const std::string& oid) const;
