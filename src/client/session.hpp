@@ -19,12 +19,12 @@ struct SessionConfig {
   std::string endpoint{"127.0.0.1:7480"};
   // Shared cluster key (legacy: full access, HMAC keyed by the key itself).
   // Leave empty when authenticating as a principal instead.
-  std::string cluster_key;
+  std::string cluster_key{};
   // Ticket auth (util/ticket.hpp): principal name + its 64-hex key. The session
   // obtains a ticket on first use, renews it at half-life, and signs requests
   // with the derived session key; the principal key never leaves the process.
-  std::string principal;
-  std::string principal_key;
+  std::string principal{};
+  std::string principal_key{};
   // Optional workload label sent as x-aios-app-label on every request.
   std::string app_label{};
   // Per-socket read/write deadline. Applied as SO_RCVTIMEO / SO_SNDTIMEO on a
