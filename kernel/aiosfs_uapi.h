@@ -16,15 +16,18 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#ifdef __linux__
+/* glibc sys/stat.h later pulls linux/types.h; take __u32/__u64 from there
+ * instead of typedef-ing them ourselves (redefinition is a -Werror error). */
+#include <linux/types.h>
+#else
+typedef uint32_t __u32;
+typedef uint64_t __u64;
+#endif
 #endif
 
 #ifdef __cplusplus
 extern "C" {
-#endif
-
-#ifndef __KERNEL__
-typedef uint32_t __u32;
-typedef uint64_t __u64;
 #endif
 
 #define AIOSFS_IOCTL_MAGIC 0xA2
