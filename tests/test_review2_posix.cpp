@@ -19,6 +19,7 @@
 
 #include <boost/asio.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -32,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -152,15 +154,16 @@ struct StubServer {
 
   ~StubServer() {
     stop.store(true);
-    // Closing worker sockets unblocks keep-alive read_some. Closing the
-    // acceptor from this thread is not required to interrupt a blocking
-    // accept() (POSIX); a dummy connect to the listen port is.
+    // Unblock keep-alive read_some without touching Asio's socket state: a
+    // concurrent asio::close from this thread races the worker's own close
+    // (TSAN). POSIX shutdown on the fd is enough to wake the reader.
     {
       std::lock_guard lock(live_mu);
       for (auto& s : live) {
-        boost::system::error_code ec;
-        s->shutdown(tcp::socket::shutdown_both, ec);
-        s->close(ec);
+        const auto fd = s->native_handle();
+        if (fd != tcp::socket::native_handle_type{} && fd != -1) {
+          ::shutdown(fd, SHUT_RDWR);
+        }
       }
     }
     boost::system::error_code ec;
@@ -173,10 +176,19 @@ struct StubServer {
     }
     acc.close(ec);
     if (th.joinable()) th.join();
-    std::lock_guard lock(workers_mu);
-    for (auto& w : workers) {
-      if (w.joinable()) w.join();
+    {
+      std::lock_guard lock(workers_mu);
+      for (auto& w : workers) {
+        if (w.joinable()) w.join();
+      }
     }
+    // Workers have left serve(); close from this thread only.
+    std::lock_guard lock(live_mu);
+    for (auto& s : live) {
+      boost::system::error_code ignored;
+      s->close(ignored);
+    }
+    live.clear();
   }
 
   static bool read_request(tcp::socket& sock, std::string& out) {
@@ -228,9 +240,14 @@ struct StubServer {
       boost::asio::write(*sock, boost::asio::buffer(reply.body), ec);
       if (ec || reply.close) break;
     }
-    boost::system::error_code ec;
-    sock->shutdown(tcp::socket::shutdown_both, ec);
-    sock->close(ec);
+    // Close under live_mu so ~StubServer never asio-closes the same socket
+    // concurrently (TSAN). Drop from `live` first so the destructor's
+    // wake-up shutdown skips already-closed fds.
+    std::lock_guard lock(live_mu);
+    live.erase(std::remove(live.begin(), live.end(), sock), live.end());
+    boost::system::error_code ignored;
+    sock->shutdown(tcp::socket::shutdown_both, ignored);
+    sock->close(ignored);
   }
 
   int count_requests_with(const std::string& needle) {

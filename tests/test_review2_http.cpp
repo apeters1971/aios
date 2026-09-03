@@ -488,9 +488,12 @@ TEST(Review2Http, ReplayedSignedDeleteIsRejected) {
   EXPECT_EQ(again.status, 401) << "identical signed request replayed: " << again.body;
   EXPECT_NE(again.body.find("replayed"), std::string::npos) << again.body;
 
-  // Two distinct signed requests (different dates) both pass.
-  const auto d1 = std::to_string(aios::now_ms() - 5);
-  const auto d2 = std::to_string(aios::now_ms() + 5);
+  // Two distinct signed requests (different dates) both pass. Offset from the
+  // first DELETE's date, not now±5: a 5 ms window can collide with that date
+  // and look like a replay (401) instead of a delete of a missing object (404).
+  const auto orig = std::stoll(del.at("x-aios-date"));
+  const auto d1 = std::to_string(orig - 10000);
+  const auto d2 = std::to_string(orig + 10000);
   std::unordered_map<std::string, std::string> a, b;
   add_hmac(a, "DELETE", "/o/replay", key, empty_sha, "", d1);
   add_hmac(b, "DELETE", "/o/replay", key, empty_sha, "", d2);
