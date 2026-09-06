@@ -12,6 +12,17 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Added — FUSE mounts exercised in CI
+
+`tests/fuse_smoke.sh` (shared setup in `tests/fuse_env.sh`) brings up a single-node `aiosd`, mounts
+`aios-fuse` and `aios-fusell` through the runner's `/dev/fuse`, and checks the POSIX behaviour the
+in-process suite cannot reach through the VFS (page cache and partial rewrites, truncate, rename,
+hard links, symlinks, unlink-while-open, xattrs, `chmod`/`utimens`, lease batching of many creates,
+`fsyncdir`, and a second mount taking the directory lease back). The `linux` workflow job runs it
+after `ctest`; `tests/fuse_pjdfstest.sh` runs pjdfstest groups against the same mount as an advisory
+step with the TAP archive uploaded. Known gap surfaced by the script: `aios-fusell` does not keep the
+data of an unlinked-while-open file (no libfuse `.fuse_hidden` rename on the low-level path).
+
 ### Changed — leases are scoped to the granting primary
 
 An object lease (`POST /o/{oid}/lock`) used to be silently forgotten when the cluster map moved

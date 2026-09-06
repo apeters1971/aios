@@ -1128,6 +1128,16 @@ first, otherwise ASan/TSan may abort at startup.
 and `kernel` (the three modules against AlmaLinux 9 `kernel-devel` with `KCFLAGS=-Werror`). FetchContent
 sources are cached between runs.
 
+**FUSE through the kernel.** The `linux` job also mounts for real: [`tests/fuse_smoke.sh`](tests/fuse_smoke.sh)
+starts a single-node `aiosd`, mounts `aios-fuse` (and, in a second pass, `aios-fusell`) on the
+runner's `/dev/fuse`, and drives it with coreutils: page-cache writes and a mid-file rewrite, truncate
+both ways, rename within and across directories, hard links and `nlink`, symlinks, unlink-while-open,
+xattrs, `chmod`/`utimens`, 300 creates in one directory, `rmdir` refusals, `fsync` on a directory, and a
+second mount that sees the first's committed state and takes its directory lease back with a create.
+`tests/fuse_pjdfstest.sh` runs [pjdfstest](https://github.com/pjd/pjdfstest) groups against the same
+setup (advisory, results uploaded as an artifact until the expected-failure baseline is pinned). Both
+scripts run locally too: `tests/fuse_smoke.sh build` on any Linux box with `fuse3`.
+
 **Process-level smoke test.** `ProcessSmoke.*` is the one part of the suite that is not in-process: it
 spawns the built `aiosd` and `aios` binaries (paths baked in at configure time), brings a single-node
 daemon up on free loopback ports with a scratch `.aios` target, and checks `--version`, CLI usage errors,

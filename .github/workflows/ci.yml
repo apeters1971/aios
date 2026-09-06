@@ -50,6 +50,35 @@ jobs:
       - name: Install (smoke)
         run: cmake --install build-ci --prefix "$RUNNER_TEMP/aios-prefix" && ls -R "$RUNNER_TEMP/aios-prefix" | head -50
 
+      - name: FUSE smoke (aios-fuse through the kernel)
+        # A real mount: aiosd + aios-fuse on the runner's /dev/fuse, two mounts,
+        # page cache, rename/link/symlink/xattr/truncate, cross-mount lease break.
+        run: |
+          sudo apt-get install -y --no-install-recommends fuse3 attr
+          echo user_allow_other | sudo tee -a /etc/fuse.conf > /dev/null
+          tests/fuse_smoke.sh build-ci
+
+      - name: FUSE smoke (aios-fusell, low-level)
+        run: FUSELL=1 tests/fuse_smoke.sh build-ci
+
+      - name: pjdfstest (advisory)
+        # POSIX conformance suite. Advisory until the baseline of expected
+        # failures on a network filesystem is pinned; results are uploaded.
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y --no-install-recommends autoconf automake libtool perl
+          git clone --depth 1 https://github.com/pjd/pjdfstest "$RUNNER_TEMP/pjdfstest"
+          (cd "$RUNNER_TEMP/pjdfstest" && autoreconf -ifs && ./configure && make pjdfstest)
+          PJD_OUT="$RUNNER_TEMP/pjd-results" tests/fuse_pjdfstest.sh build-ci "$RUNNER_TEMP/pjdfstest"
+
+      - name: Upload pjdfstest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjdfstest-results
+          path: ${{ runner.temp }}/pjd-results
+          if-no-files-found: ignore
+
   macos:
     name: macos (AppleClang, -Werror)
     runs-on: macos-latest
