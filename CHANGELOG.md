@@ -12,6 +12,16 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Added — `aios-posix-fsck`
+
+Offline consistency check and repair of a `libaios_posix` volume from its objects
+(`aios::posix::fsck_volume`, `src/posix/posix_fsck.{hpp,cpp}`). Finds dangling dentries, orphan
+inodes, orphan and stray chunks, stale directory objects, `nlink` and `parent_ino` mismatches, a
+superblock allocator behind the highest inode, doubly linked directories and directory-log garbage;
+`--repair` fixes the first eight with CAS-guarded writes and skips anything younger than `--min-age`
+(a lease-deferred create or an in-flight write looks like damage for a moment). Exit codes follow
+`fsck(8)`. See [`proto/posix_fuse.md`](proto/posix_fuse.md#fsck-aios-posix-fsck).
+
 ### Added — FUSE mounts exercised in CI
 
 `tests/fuse_smoke.sh` (shared setup in `tests/fuse_env.sh`) brings up a single-node `aiosd`, mounts

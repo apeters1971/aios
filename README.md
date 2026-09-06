@@ -51,6 +51,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
 | `aios-fuse` | High-level FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
 | `aios-fusell` | Low-level FUSE3 mount of the same ABI (`fuse_lowlevel_ops`) |
+| `aios-posix-fsck` | Check / repair a `libaios_posix` volume from its objects (no mount needed) |
 | `libXrdAios.so` | XRootD OSS plugin over `libaios_posix` (built when XRootD is found) |
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |

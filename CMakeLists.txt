@@ -308,6 +308,7 @@ add_library(aios_posix STATIC
   src/posix/posix_layout.cpp
   src/posix/posix_rstat.cpp
   src/posix/posix_lease.cpp
+  src/posix/posix_fsck.cpp
   src/posix/quota_ledger.cpp
   src/posix/qos_controller.cpp
 )
@@ -380,6 +381,11 @@ target_link_libraries(aios-store-bench PRIVATE aios_core)
 
 add_executable(aios tools/aios.cpp)
 target_link_libraries(aios PRIVATE aios_client)
+
+# Offline consistency check / repair of a libaios_posix volume (no mount needed).
+add_executable(aios-posix-fsck tools/aios_posix_fsck.cpp)
+target_link_libraries(aios-posix-fsck PRIVATE aios_posix)
+install(TARGETS aios-posix-fsck RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_executable(aios-cuobj-s3 tools/aios_cuobj_s3.cpp)
 target_link_libraries(aios-cuobj-s3 PRIVATE aios_core aios_cuobject)
@@ -602,6 +608,7 @@ add_executable(aios_tests
   tests/test_review2_kabi.cpp
   tests/test_process_smoke.cpp
   tests/test_process_consensus.cpp
+  tests/test_posix_fsck.cpp
   tests/test_client_io.cpp
   tests/test_ticket_auth.cpp
   tests/test_s3_tls.cpp

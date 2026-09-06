@@ -85,6 +85,36 @@ Same-directory rename remains a single changelog `Rename` op. Commit still has t
 
 `aios_posix_snapshot(fs, id_out, id_len)` freezes the volume (`super.frozen`), copies live oids to `posix/{vol}/.snap/{id}/` (excluding other snaps), then unfreezes. `aios_posix_snapshot_at(fs, path, …)` limits the copy to a volume-relative subtree (`"/"` = whole volume). Mutating ops return `-EBUSY` while frozen. Used by cluster backup ([`backup.md`](backup.md)).
 
+## fsck (`aios-posix-fsck`)
+
+```
+aios-posix-fsck --volume NAME [--endpoint HOST:PORT] [--repair] [--min-age SECONDS] [--quiet]
+```
+
+Walks the volume from inode 1 over the object API (no mount; a concurrent mount is tolerated) and
+reports, per finding kind:
+
+| Finding | Meaning | `--repair` |
+|---------|---------|------------|
+| `dangling-dentry` | a name maps to an inode object that does not exist | remove the name (locked `unlink_if`) |
+| `orphan-inode` | inode object not reachable from `/` | delete it, its chunks, its dir objects |
+| `orphan-chunk` | `data/{ino}/c/*` for an inode that does not exist | delete |
+| `stray-chunk` | chunk index past the file's size / stripe unit | delete |
+| `stale-dir-objects` | `dir/{ino}/*` for a missing or non-directory inode | delete |
+| `nlink-mismatch` | file `nlink` ≠ number of names; directory `nlink` ≠ 2 + subdirs | CAS-rewrite the inode |
+| `parent-mismatch` | a subdirectory's `parent_ino` is not the directory naming it | CAS-rewrite the inode |
+| `next-ino-behind` | superblock `next_ino` ≤ an existing inode number | bump past it (+ one allocation batch) |
+| `dir-linked-twice` | a directory reachable under two names / a cycle | report only |
+| `log-garbage` | directory log longer than the committed `log_bytes` | report only (the next writer compacts) |
+| `no-superblock`, `no-root` | volume unusable | report only, exit 8 |
+
+Nothing younger than `--min-age` (default 600 s) is repaired: a create under a directory lease
+publishes the inode before the name, a write publishes chunks before the size, and a hard link
+updates dentry and `nlink` in two steps, so each of those looks briefly like damage. Repairs are
+CAS-guarded and fail closed if the object changed underneath. Exit status as `fsck(8)`: 0 clean,
+1 everything repaired, 4 findings remain, 8 error. `aios::posix::fsck_volume()`
+([`posix_fsck.hpp`](../src/posix/posix_fsck.hpp)) is the library entry point.
+
 ## Consistency notes (intentional POSIX relaxations)
 
 - **Cross-directory `link`** is still best-effort (not multi-object atomic).
