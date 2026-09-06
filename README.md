@@ -777,11 +777,27 @@ Follows `307` redirects. Put/get stream file bytes (no full-object client buffer
 
 ### `aios-store-bench` — local store microbench
 
+The object store engine alone: no daemon, no HTTP, no replication. What one primary gets from
+one store on one disk. `--mode` picks the body path (`inline` = SQLite BLOB, `fs` = file per
+version), `--op` the workload, `--threads` the concurrency (each worker on its own objects;
+shards are locked independently). Every op is timed: ops/s, MiB/s, p50 and p99 per phase.
+
 ```bash
+# full-object put / get / del (default), both body paths
 ./build/aios-store-bench --root /tmp/aios-bench --mode both --shards 16 --count 1000
+# concurrent 4 KiB random writes + reads inside 1 MiB objects, then appends; engine cost only
+./build/aios-store-bench --root /tmp/aios-bench --mode fs --op all --threads 8 --count 4000 \
+    --large-size 1048576 --io-size 4096 --no-fsync
+# durable small-object inline path, single writer
 ./build/aios-store-bench --root /tmp/aios-bench --mode inline --small-size 256 --count 5000
-./build/aios-store-bench --root /tmp/aios-bench --mode fs --large-size 262144 --count 200 --keep
 ```
+
+`--op range` writes then reads `--io-size` bytes at random offsets of a per-thread object of the
+mode's size; `--op append` appends `--io-size` bytes to a per-thread log (a `put_range` at the
+current end, which is how the HTTP append lands). `--no-fsync` skips body/dir fsync and sets
+SQLite `synchronous=OFF` to separate engine cost from the durability write. Compare with
+`aios-bench` against a `--replica-count 1` node to see the HTTP + object-service overhead, and
+against `--replica-count 2/3` to see replication.
 
 ---
 

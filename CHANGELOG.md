@@ -12,6 +12,14 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — `aios-store-bench` measures the engine the way the daemon uses it
+
+`--threads N` (workers on disjoint objects; shards lock independently), `--no-fsync`
+(`data_fsync=false`, SQLite `synchronous=OFF`) to separate engine cost from the durability write,
+and `--op put|range|append|all`: random `--io-size` range writes and reads inside per-thread
+objects, and appends to per-thread logs via `put_range` at the tail — the paths FUSE and STL
+traffic actually take. Per-op timing with p50/p99 instead of phase totals.
+
 ### Changed — every client signs the body digest
 
 The kernel module `aios_http`, the `aios` CLI and `aios-bench` used to sign `UNSIGNED-PAYLOAD`, so
