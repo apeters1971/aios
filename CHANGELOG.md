@@ -23,7 +23,12 @@ of the empty body for bodiless requests). CLI: one extra read pass over the file
 Bench: signed by default so the numbers include the client-side hash; `--unsigned-payload` /
 `"unsigned_payload": true` measures the wire alone. The process smoke test runs its daemon with
 `http_require_signed_payload: true`, so a client that regresses to `UNSIGNED-PAYLOAD` fails CI.
-Remaining gap: node-to-node RPC trailers are bound to the signed envelope by CRC32C only.
+
+Node-to-node RPC: requests already bound their raw trailer to the signed envelope (`sha256`,
+required by `ObjectService::handle`); GET replies did not — a replica's ranged/full read (used
+for client reads, recovery and EC repair) returned the bytes with a CRC32C only. The reply
+envelope now carries the trailer's `sha256` too, and `parse_object_reply` (`verify_reply_trailer`)
+rejects a signed reply that omits it or whose bytes do not hash to it (`code: auth`).
 
 ### Added — TLS on the HTTP API
 

@@ -17,6 +17,12 @@
 
 namespace aios {
 
+// A reply's raw trailer (ranged / full GET bytes) is bound to its signed JSON
+// envelope by body["sha256"]. False (with err) when a signed reply omits it or
+// the bytes do not hash to it; the caller must discard the trailer.
+bool verify_reply_trailer(const nlohmann::json& body, const std::uint8_t* raw, std::size_t raw_len,
+                          std::string& err);
+
 struct ObjectRpcResult {
   bool ok{false};
   std::string error;

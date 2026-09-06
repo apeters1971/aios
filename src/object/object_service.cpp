@@ -1116,6 +1116,13 @@ Frame ObjectService::handle_get(const nlohmann::json& body) {
     f.body["offset"] = offset;
     f.body["length"] = data.size();
     f.body["size"] = st->size;
+    // The reply HMAC covers only the JSON envelope; bind the trailer to it so
+    // the requesting node can tell a swapped body from ours (crc32c alone is
+    // not collision-resistant).
+    if (!data.empty()) {
+      f.body["sha256"] =
+          sha256_hex(std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+    }
     f.flags |= kFlagRawBody;
     f.raw = std::move(data);
   };

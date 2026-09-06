@@ -8,8 +8,10 @@
 #include "membership.hpp"
 #include "net/framing.hpp"
 #include "object/object_service.hpp"
+#include "net/object_client.hpp"
 #include "object/repair.hpp"
 #include "store/local_stores.hpp"
+#include "util/auth.hpp"
 #include "util/base64.hpp"
 #include "util/crc32c.hpp"
 
@@ -110,6 +112,29 @@ TEST(ObjectRpc, Basic) {
   auto data = aios::test::rpc_payload(get_reply);
   EXPECT_TRUE((get_reply.flags & aios::kFlagRawBody) != 0) << "get uses raw body";
   EXPECT_TRUE(std::string(data.begin(), data.end()) == "payload-data") << "get data";
+
+  // The reply's raw trailer is bound to the signed envelope: body.sha256 is the
+  // digest of the bytes, and the requesting side refuses a trailer that does
+  // not hash to it (or a signed reply that omits it).
+  {
+    ASSERT_TRUE(get_reply.body.contains("sha256")) << get_reply.body.dump();
+    EXPECT_EQ(get_reply.body["sha256"].get<std::string>(),
+              sha256_hex(std::string(data.begin(), data.end())));
+    std::string terr;
+    EXPECT_TRUE(verify_reply_trailer(get_reply.body, data.data(), data.size(), terr)) << terr;
+    auto tampered = data;
+    tampered[0] ^= 0x01;
+    EXPECT_FALSE(verify_reply_trailer(get_reply.body, tampered.data(), tampered.size(), terr));
+    EXPECT_NE(terr.find("mismatch"), std::string::npos) << terr;
+    nlohmann::json no_hash = get_reply.body;
+    no_hash.erase("sha256");
+    EXPECT_TRUE(verify_reply_trailer(no_hash, data.data(), data.size(), terr))
+        << "unsigned in-process reply may omit it";
+    no_hash["sig"] = "deadbeef";
+    EXPECT_FALSE(verify_reply_trailer(no_hash, data.data(), data.size(), terr))
+        << "signed reply must carry it";
+    EXPECT_TRUE(verify_reply_trailer(no_hash, nullptr, 0, terr)) << "no trailer, nothing to bind";
+  }
 
   Frame raw_put;
   raw_put.type = MsgType::ObjectPut;

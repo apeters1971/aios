@@ -45,12 +45,47 @@ void sign_raw_trailer(nlohmann::json& body, const std::uint8_t* data, std::size_
   body["sha256"] = sha256_hex(std::string(reinterpret_cast<const char*>(data), len));
 }
 
+}  // namespace
+
+bool verify_reply_trailer(const nlohmann::json& body, const std::uint8_t* raw, std::size_t raw_len,
+                          std::string& err) {
+  if (!raw || raw_len == 0) return true;
+  const auto it = body.find("sha256");
+  if (it == body.end() || !it->is_string()) {
+    // Only signed replies must carry it; unsigned frames come from in-process
+    // callers (tests) that never crossed a wire.
+    if (body.contains("sig")) {
+      err = "reply raw body without sha256";
+      return false;
+    }
+    return true;
+  }
+  const auto got = sha256_hex(std::string(reinterpret_cast<const char*>(raw), raw_len));
+  if (it->get<std::string>() != got) {
+    err = "reply raw body sha256 mismatch";
+    return false;
+  }
+  return true;
+}
+
+namespace {
+
 ObjectRpcResult parse_object_reply(Frame& reply) {
   ObjectRpcResult result;
   result.body = reply.body;
   reply.compact_raw();
   result.raw = std::move(reply.raw);
   reply.raw_off = 0;
+  {
+    std::string terr;
+    if (!verify_reply_trailer(reply.body, result.raw.data(), result.raw.size(), terr)) {
+      result.ok = false;
+      result.error = terr;
+      result.code = "auth";
+      result.raw.clear();
+      return result;
+    }
+  }
   result.ok = reply.body.value("ok", false);
   result.error = reply.body.value("error", "");
   result.code = reply.body.value("code", result.ok ? "" : "error");
