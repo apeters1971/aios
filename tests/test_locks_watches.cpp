@@ -192,6 +192,86 @@ TEST(LocksWatches, ReleasedOrExpiredTokenIsFenced) {
   EXPECT_EQ(held.code, "lock_held");
 }
 
+TEST(LocksWatches, UnknownTokenIsRefusedLikeAnExpiredLease) {
+  using namespace aios;
+  DualStoreFixture fx("aios-lock-unknown");
+  const auto* body = reinterpret_cast<const std::uint8_t*>("payload");
+
+  // A token this primary never issued: another primary's lease (the object
+  // moved) or one from before a restart. It must not be waved through.
+  const std::string foreign = "0123456789abcdef0123456789abcdef";
+  auto put = fx.svc->api_put("unk/a", body, 7, {}, true, {}, std::nullopt, {}, foreign);
+  EXPECT_FALSE(put.ok);
+  EXPECT_EQ(put.code, "lock_expired");
+  auto ren = fx.svc->api_lock_renew("unk/a", foreign, 5000);
+  EXPECT_FALSE(ren.ok);
+  EXPECT_EQ(ren.code, "lock_expired");
+  // Tokenless writes and fresh leases are unaffected.
+  EXPECT_TRUE(fx.svc->api_put("unk/a", body, 7, {}, true, {}).ok);
+  auto acq = fx.svc->api_lock_acquire("unk/a", 5000);
+  ASSERT_TRUE(acq.ok);
+  const std::string tok = (*acq.json_body)["token"].get<std::string>();
+  EXPECT_EQ(tok.size(), LockTable::kTokenHex);
+  EXPECT_EQ((*acq.json_body)["epoch"].get<std::uint64_t>(), fx.svc->map().epoch);
+  EXPECT_EQ((*acq.json_body)["primary"].get<std::string>(), "node-a");
+
+  // A token of this primary's own presented on a *different*, unleased object
+  // is still accepted: directory clients carry the meta lease token on the
+  // sibling log / inode writes.
+  EXPECT_TRUE(fx.svc->api_put("unk/a-log", body, 7, {}, true, {}, std::nullopt, {}, tok).ok);
+  // ... but a foreign token on an unleased object is not, and neither is one on
+  // an object whose lease has lapsed.
+  EXPECT_EQ(fx.svc->api_put("unk/a-log", body, 7, {}, true, {}, std::nullopt, {}, foreign).code,
+            "lock_expired");
+  ASSERT_TRUE(fx.svc->api_lock_release("unk/a", tok).ok);
+  EXPECT_EQ(fx.svc->api_put("unk/a", body, 7, {}, true, {}, std::nullopt, {}, foreign).code,
+            "lock_expired");
+}
+
+TEST(LocksWatches, LeaseIsFencedWhenTheMapMovesItsObjectToAnotherPrimary) {
+  using namespace aios;
+  DualStoreFixture fx("aios-lock-moved");
+  const auto* body = reinterpret_cast<const std::uint8_t*>("payload");
+
+  auto acq = fx.svc->api_lock_acquire("mv/a", 60000);
+  ASSERT_TRUE(acq.ok);
+  const std::string tok = (*acq.json_body)["token"].get<std::string>();
+  ASSERT_TRUE(fx.svc->api_put("mv/a", body, 7, {}, true, {}, std::nullopt, {}, tok).ok);
+
+  // New epoch, every target now belongs to someone else: this node is no
+  // longer primary for mv/a.
+  ClusterMap moved = fx.svc->map();
+  moved.epoch += 1;
+  for (auto& t : moved.targets) t.node_id = "node-b";
+  fx.svc->update_cluster_map(moved);
+  auto here = fx.svc->api_put("mv/a", body, 7, {}, true, {}, std::nullopt, {}, tok);
+  EXPECT_EQ(here.code, "not_primary");
+
+  // The map comes back to us (operator undo, flapping node): the lease did not
+  // survive the excursion. The holder's token is fenced, anyone may lease anew.
+  ClusterMap back = fx.svc->map();
+  back.epoch += 1;
+  for (auto& t : back.targets) t.node_id = "node-a";
+  fx.svc->update_cluster_map(back);
+  auto late = fx.svc->api_put("mv/a", body, 7, {}, true, {}, std::nullopt, {}, tok);
+  EXPECT_FALSE(late.ok);
+  EXPECT_EQ(late.code, "lock_expired");
+  auto ren = fx.svc->api_lock_renew("mv/a", tok, 5000);
+  EXPECT_EQ(ren.code, "lock_expired");
+  EXPECT_FALSE(fx.svc->api_lock_stat("mv/a").ok);
+  EXPECT_TRUE(fx.svc->api_lock_acquire("mv/a", 5000).ok);
+
+  // An epoch change that keeps the object here leaves the lease alone.
+  auto acq2 = fx.svc->api_lock_acquire("mv/b", 60000);
+  ASSERT_TRUE(acq2.ok);
+  const std::string tok2 = (*acq2.json_body)["token"].get<std::string>();
+  ClusterMap same = fx.svc->map();
+  same.epoch += 1;
+  fx.svc->update_cluster_map(same);
+  EXPECT_TRUE(fx.svc->api_put("mv/b", body, 7, {}, true, {}, std::nullopt, {}, tok2).ok);
+  EXPECT_TRUE(fx.svc->api_lock_renew("mv/b", tok2, 5000).ok);
+}
+
 TEST(LocksWatches, BreakShortensLeaseAndIsVisibleToHolder) {
   using namespace aios;
   DualStoreFixture fx("aios-lock-break");

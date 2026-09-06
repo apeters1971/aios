@@ -1055,6 +1055,53 @@ TEST(Review2Posix, DirLeaseHeldWhileActiveAndReleasedOnUnmount) {
   EXPECT_EQ(aios_posix_lookup(c.fs, 1, "d", &st), 0);
 }
 
+TEST(Review2Posix, DirLeaseLostToMapChangeIsReplayedUnderAFreshLease) {
+  HttpFixture http("aios-r2p-lease-moved", 23470);
+  Mount a(http, "leasemv", 4096);
+  create_file(a.fs, 1, "before");
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+  EXPECT_FALSE(meta_lock_free(http, "leasemv", 1));
+
+  // Queue work under the lease, then move the root directory's objects to
+  // another primary and back (a map excursion). The server fences the lease;
+  // whatever the client still has queued must not be lost, and must not be
+  // written under the dead token either.
+  create_file(a.fs, 1, "queued1");
+  create_file(a.fs, 1, "queued2");
+  {
+    aios::ClusterMap moved = http.fx.svc->map();
+    moved.epoch += 1;
+    for (auto& t : moved.targets) t.node_id = "elsewhere";
+    http.fx.svc->update_cluster_map(moved);
+    aios::ClusterMap back = http.fx.svc->map();
+    back.epoch += 1;
+    for (auto& t : back.targets) t.node_id = http.fx.cfg.node_id;
+    http.fx.svc->update_cluster_map(back);
+  }
+  EXPECT_TRUE(meta_lock_free(http, "leasemv", 1)) << "lease fenced by the map change";
+
+  // More work after the loss, then a sync: the flusher sees lock_expired,
+  // re-syncs the directory and replays everything under a new lease.
+  create_file(a.fs, 1, "after");
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+  auto committed = server_dir(http, "leasemv", 1);
+  EXPECT_EQ(committed.count("before"), 1u);
+  EXPECT_EQ(committed.count("queued1"), 1u);
+  EXPECT_EQ(committed.count("queued2"), 1u);
+  EXPECT_EQ(committed.count("after"), 1u);
+  aios_posix_stat st{};
+  EXPECT_EQ(aios_posix_lookup(a.fs, 1, "queued1", &st), 0);
+  EXPECT_EQ(aios_posix_lookup(a.fs, 1, "after", &st), 0);
+  // The replay itself goes through the synchronous protocol and the directory
+  // backs off from leasing for kLeaseRetry; after that a change takes a fresh
+  // lease again as usual.
+  std::this_thread::sleep_for(aios::posix::kLeaseRetry + std::chrono::milliseconds(200));
+  create_file(a.fs, 1, "later");
+  EXPECT_FALSE(meta_lock_free(http, "leasemv", 1)) << "fresh lease after the loss";
+  ASSERT_EQ(aios_posix_fsyncdir(a.fs, 1), 0);
+  EXPECT_EQ(server_dir(http, "leasemv", 1).count("later"), 1u);
+}
+
 TEST(Review2Posix, DirLeaseBatchesManyCreates) {
   HttpFixture http("aios-r2p-lease2", 23460);
   constexpr int kFiles = 200;

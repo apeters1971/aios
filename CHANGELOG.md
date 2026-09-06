@@ -12,6 +12,34 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — leases are scoped to the granting primary
+
+An object lease (`POST /o/{oid}/lock`) used to be silently forgotten when the cluster map moved
+the object to another primary or the primary restarted: the new primary did not know the token and
+waved writes under it through, so a holder that had batched directory changes could land them on
+top of a successor's. Tokens now carry the issuing `LockTable` instance id; a mutation or renew
+under a token from another primary, from a previous incarnation, or on an object whose lease this
+primary fenced because the map moved it (`LockTable::fence_if` on `update_cluster_map`) is refused
+with **409** `lock_expired`. Acquire / renew return `epoch` and `primary`. `libaios_posix` and the
+kernel client already treat `lock_expired` as a lost lease (re-sync, replay under a fresh lease);
+`Review2Posix.DirLeaseLostToMapChangeIsReplayedUnderAFreshLease` covers the round trip.
+
+### Added — consensus-backed cluster map (`monitors`)
+
+The map epoch was a content hash of each node's own gossip view; two partitions could disagree
+about who is primary and both serve writes. With `monitors` (3–5 TCP++ addresses) set, those
+nodes run a small Raft-style register (`cluster/map_monitor`): elected leader, Pre-Vote so a
+partitioned or restarted voter cannot unseat a healthy leader, monotonic epochs committed by a
+majority and persisted (`map_state_file`), leader-granted primary leases (`map_lease_ms`, bounded
+by the leader's own remaining lease), and an epoch that becomes *active* only once every node in
+the map acknowledged it (or a lease period passed). Storage nodes gossip only to monitors and pull
+the committed map. `ObjectService` gates every primary path on that lease (`503 no_map_lease` /
+`map_transition`, retried by `Session` for `map_transition_wait_ms`), replicas reject RPCs older
+than the highest committed epoch they have seen, and stale write grants are fenced.
+`GET /map` reports `consensus`, `lease_valid`, `active_epoch`; the status file carries
+`map_consensus`. Without `monitors` the gossip-derived map is kept, with a startup warning when
+peers are configured.
+
 ### Added — client I/O path (`io_path: client`)
 
 Replication and erasure coding can run as a **client data plane** while the object primary still coordinates seq, locks, preconditions, and tip publish. Cluster `io_path: server` (default) keeps today’s primary fan-out. `io_path: client` enables `POST /o/{oid}/prepare`, `PUT /o/{oid}/install`, `POST /o/{oid}/publish` (and abort) authenticated with an HMAC write grant; `libaios_client` `Session` follows `GET /map` (`io_path: auto`) or `SessionConfig::io_path`. Ordinary PUT / S3 / kernel HTTP still fan out on the primary. Range and append stay server-side.

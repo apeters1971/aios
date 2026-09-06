@@ -36,6 +36,11 @@ int clamp_ttl(int ttl_ms) {
 
 }  // namespace
 
+LockTable::LockTable() : instance_(random_token_hex(kInstanceHex / 2)) {
+  // The time-based fallback of random_token_hex may be shorter than asked for.
+  instance_.resize(kInstanceHex, '0');
+}
+
 bool LockTable::active_locked(const Entry& e, std::int64_t now) const {
   return e.expires_ms > now;
 }
@@ -81,17 +86,47 @@ std::optional<std::string> LockTable::check_mutate(
   std::lock_guard lock(mu_);
   const auto now = now_ms();
   auto it = locks_.find(oid);
-  if (it == locks_.end()) return std::nullopt;
+  if (it == locks_.end()) {
+    // No lease on this object. A token issued by another primary (the object
+    // moved with the cluster map) or by an earlier incarnation of this one (we
+    // restarted) means the caller's view is not authoritative any more: refuse
+    // like an expired lease, the client re-syncs and replays under a fresh one
+    // (NFSv4 BAD_STATEID after a server reboot recovers the same way). A token
+    // of our own for some *other* object is fine: clients carry their directory
+    // lease token on the sibling log/inode writes.
+    if (token && !token->empty() && !issued_here(*token)) return std::string("lock_expired");
+    return std::nullopt;
+  }
   const Entry& e = it->second;
   if (!active_locked(e, now)) {
-    // Expired or released: anyone may write, except the fenced former holder.
-    if (token && *token == e.token && (e.forget_ms == 0 || e.forget_ms > now)) {
+    // Expired or released: anyone may write without a token, except the fenced
+    // former holder and anyone with a token from elsewhere.
+    if (token && !token->empty() &&
+        ((*token == e.token && (e.forget_ms == 0 || e.forget_ms > now)) ||
+         !issued_here(*token))) {
       return std::string("lock_expired");
     }
     return std::nullopt;
   }
   if (token && *token == e.token) return std::nullopt;
   return std::string("lock_held");
+}
+
+bool LockTable::issued_here(const std::string& token) const {
+  return token.size() == kTokenHex && token.compare(0, kInstanceHex, instance_) == 0;
+}
+
+std::size_t LockTable::fence_if(const std::function<bool(const std::string&)>& moved) {
+  std::lock_guard lock(mu_);
+  const auto now = now_ms();
+  std::size_t n = 0;
+  for (auto& [oid, e] : locks_) {
+    if (!active_locked(e, now)) continue;
+    if (!moved(oid)) continue;
+    fence_locked(e, now);
+    ++n;
+  }
+  return n;
 }
 
 bool LockTable::acquire(const std::string& oid, int ttl_ms, std::string& token_out,
@@ -107,7 +142,7 @@ bool LockTable::acquire(const std::string& oid, int ttl_ms, std::string& token_o
   // Overwriting a fence is fine: the old token then mismatches the new one
   // and is refused as lock_held instead of lock_expired.
   Entry e;
-  e.token = random_token_hex();
+  e.token = instance_ + random_token_hex((kTokenHex - kInstanceHex) / 2);
   e.expires_ms = now + clamp_ttl(ttl_ms);
   locks_[oid] = e;
   token_out = e.token;
@@ -121,12 +156,10 @@ bool LockTable::renew(const std::string& oid, const std::string& token, int ttl_
   const auto now = now_ms();
   auto it = locks_.find(oid);
   if (it == locks_.end() || !active_locked(it->second, now)) {
-    if (it != locks_.end() && it->second.token == token) {
-      fence_locked(it->second, now);
-      err = "lock expired";
-    } else {
-      err = "lock not held";
-    }
+    if (it != locks_.end() && it->second.token == token) fence_locked(it->second, now);
+    // Unknown token (lease moved with the cluster map, or this primary was
+    // restarted) reads the same to the holder as an expired one: it is gone.
+    err = "lock expired";
     return false;
   }
   Entry& e = it->second;

@@ -254,6 +254,20 @@ std::uint64_t ObjectService::update_cluster_map(ClusterMap m) {
   map_ = std::move(m);
   epoch_.store(map_.epoch, std::memory_order_release);
   if (gate_.consensus) fence_epoch_ = std::max(fence_epoch_, map_.epoch);
+  if (prev != map_.epoch) {
+    // Leases are scoped to the primary that granted them: fence the ones whose
+    // object this node no longer owns, so a holder that keeps talking to us
+    // (before it sees the redirect) cannot land a write the new primary never
+    // saw. The new primary refuses the unknown token on its own.
+    const auto fenced = locks_.fence_if([this](const std::string& oid) {
+      const auto p = place(oid, map_, cfg_.default_storage_class);
+      return p.acting_set.empty() || p.acting_set[0].node_id != cfg_.node_id;
+    });
+    if (fenced > 0) {
+      AIOS_LOG_INFO("cluster map epoch ", map_.epoch, ": fenced ", fenced,
+                    " lease(s) on objects that moved to another primary");
+    }
+  }
   return prev;
 }
 
@@ -3964,7 +3978,11 @@ ApiResult ObjectService::api_lock_acquire(const std::string& oid, int ttl_ms) {
   r.ok = true;
   r.epoch = cur_epoch();
   r.placement = placement;
-  r.json_body = {{"oid", oid}, {"token", token}, {"expires_ms", expires}};
+  r.json_body = {{"oid", oid},
+                 {"token", token},
+                 {"expires_ms", expires},
+                 {"epoch", map_.epoch},
+                 {"primary", cfg_.node_id}};
   ops_.note_lock_acquire();
   return r;
 }
@@ -3989,7 +4007,9 @@ ApiResult ObjectService::api_lock_renew(const std::string& oid, const std::strin
   r.json_body = {{"oid", oid},
                  {"token", token},
                  {"expires_ms", st.expires_ms},
-                 {"break_requested", st.break_requested}};
+                 {"break_requested", st.break_requested},
+                 {"epoch", map_.epoch},
+                 {"primary", cfg_.node_id}};
   return r;
 }
 

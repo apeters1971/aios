@@ -236,15 +236,30 @@ Whole-object Castagnoli CRC-32C is stored with each object and updated on full a
 
 ### Locks (enforced leases)
 
-Primary-local, in-memory leases (lost on restart / primary change). While held:
+Primary-local, in-memory leases. While held:
 
 - Mutating ops (`PUT` / ranged PUT / redirect PUT / `DELETE` / txn prepare) without matching `x-aios-lock-token` → **409** `lock_held`
 - With the token → allowed
+
+Acquire and renew answer `{oid,token,expires_ms,epoch,primary}` (renew also `break_requested`) so a
+holder can tell which cluster-map epoch and node vouch for its lease.
+
+**Scope and fencing.** A lease exists only on the primary instance that granted it; the token
+carries that instance's id. It ends when it expires, is released, is broken (`POST
+/o/{oid}/lock/break`, `x-aios-lock-grace-ms`), **when the cluster map moves the object to another
+primary**, or when the primary restarts. In every one of those cases a mutation or renew under the
+old token is refused with **409** `lock_expired`, on the old primary (which fences the lease as
+soon as it sees the new map) and on the new one (which does not know the token) alike: a holder
+can never land a late write on top of what a successor did. Clients treat `lock_expired` like
+expiry — re-read the object, re-acquire, replay. A tokenless write to an unleased object, and a
+token of the current primary presented on a *different* unleased object (directory clients carry
+their `meta` lease token on the sibling `log` / inode writes), stay allowed.
 
 | Header | Role |
 |--------|------|
 | `x-aios-lock-ttl-ms` | Acquire/renew TTL (default 30000, max 300000) |
 | `x-aios-lock-token` | Present lock token for renew/release/mutate |
+| `x-aios-lock-grace-ms` | Break: time the holder gets to flush and release (default 5000) |
 
 Wrong coordinator → **307** like other mutating APIs.
 
