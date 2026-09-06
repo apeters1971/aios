@@ -27,6 +27,13 @@ struct SessionConfig {
   std::string principal_key{};
   // Optional workload label sent as x-aios-app-label on every request.
   std::string app_label{};
+  // HTTPS to the cluster (the listener is either plain or TLS, cluster-wide).
+  // An "https://" scheme on `endpoint` sets tls as well. tls_ca: PEM bundle to
+  // trust (empty => system store); tls_insecure skips verification (labs with
+  // self-signed certificates, loopback consumers).
+  bool tls{false};
+  std::string tls_ca{};
+  bool tls_insecure{false};
   // Per-socket read/write deadline. Applied as SO_RCVTIMEO / SO_SNDTIMEO on a
   // blocking native fd; I/O uses recv/send so Asio cannot swallow the timeout.
   // Also bounds name resolution + TCP connect for a new pooled connection.

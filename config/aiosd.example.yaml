@@ -129,6 +129,12 @@ placement:
 # repair_interval_ms: 30000
 # repair_batch_oids: 256
 http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
+# HTTPS for the object/admin API (cluster-wide: every node, same scheme; clients
+# then use https://host:port endpoints). Both cert and key, PEM; chain optional.
+# http_tls_cert: /etc/aios/http.crt
+# http_tls_key: /etc/aios/http.key
+# http_tls_chain: /etc/aios/http-chain.pem
+# http_tls_ca: /etc/aios/ca.pem        # what this node trusts when talking to peers
 # S3-compatible API (FS-backed via libaios_posix on s3_volume; requires http_listen):
 # s3_listen: "0.0.0.0:7481"
 # s3_volume: s3                 # POSIX volume; buckets = top-level directories

@@ -421,6 +421,14 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
         return false;
       }
     }
+    if (root["http_tls_cert"]) cfg.http_tls_cert = root["http_tls_cert"].as<std::string>();
+    if (root["http_tls_key"]) cfg.http_tls_key = root["http_tls_key"].as<std::string>();
+    if (root["http_tls_chain"]) cfg.http_tls_chain = root["http_tls_chain"].as<std::string>();
+    if (root["http_tls_ca"]) cfg.http_tls_ca = root["http_tls_ca"].as<std::string>();
+    if (cfg.http_tls_cert.empty() != cfg.http_tls_key.empty()) {
+      err = "http_tls_cert and http_tls_key must be set together";
+      return false;
+    }
     if (root["s3_listen"]) cfg.s3_listen = root["s3_listen"].as<std::string>();
     if (root["s3_tls_cert"]) cfg.s3_tls_cert = root["s3_tls_cert"].as<std::string>();
     if (root["s3_tls_key"]) cfg.s3_tls_key = root["s3_tls_key"].as<std::string>();
@@ -776,6 +784,30 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       const char* v = need("--s3-access-key");
       if (!v) return false;
       cfg.s3_access_key = v;
+      continue;
+    }
+    if (arg == "--http-tls-cert") {
+      const char* v = need("--http-tls-cert");
+      if (!v) return false;
+      cfg.http_tls_cert = v;
+      continue;
+    }
+    if (arg == "--http-tls-key") {
+      const char* v = need("--http-tls-key");
+      if (!v) return false;
+      cfg.http_tls_key = v;
+      continue;
+    }
+    if (arg == "--http-tls-chain") {
+      const char* v = need("--http-tls-chain");
+      if (!v) return false;
+      cfg.http_tls_chain = v;
+      continue;
+    }
+    if (arg == "--http-tls-ca") {
+      const char* v = need("--http-tls-ca");
+      if (!v) return false;
+      cfg.http_tls_ca = v;
       continue;
     }
     if (arg == "--s3-tls-cert") {

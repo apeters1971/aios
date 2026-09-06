@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
         << "             [--scan-root PATH] [--scan-prefix PATH]\n"
         << "             [--replica-count N] [--write-quorum N] [--io-path server|client]\n"
         << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
+        << "             [--http-tls-cert PEM --http-tls-key PEM [--http-tls-chain PEM] [--http-tls-ca PEM]]\n"
         << "             [--s3-listen HOST:PORT] [--s3-volume NAME] [--s3-access-key ID]\n"
         << "             [--s3-tls-cert PEM --s3-tls-key PEM [--s3-tls-chain PEM]]\n"
         << "             [--no-fsync] [--version]\n"
@@ -115,7 +116,7 @@ int main(int argc, char** argv) {
       // without racing acceptor teardown against the io_context thread.
       engine.start();
 
-      auto bench_ep = s3_loopback_http_endpoint(cfg.http_listen);
+      auto bench_ep = s3_loopback_http_endpoint(cfg);
       if (bench_ep.empty()) bench_ep = "127.0.0.1:7480";
       auto bench = std::make_shared<HttpBenchJob>(bench_ep, cfg.cluster_key);
       if (auto* http = engine.http()) {
@@ -131,7 +132,7 @@ int main(int argc, char** argv) {
 
       std::unique_ptr<S3Server> s3;
       if (!cfg.s3_listen.empty()) {
-        auto endpoint = s3_loopback_http_endpoint(cfg.http_listen);
+        auto endpoint = s3_loopback_http_endpoint(cfg);
         if (endpoint.empty()) {
           throw std::runtime_error("cannot derive loopback HTTP endpoint for S3 posix mount");
         }

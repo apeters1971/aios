@@ -1,6 +1,7 @@
 #include "bench/http_bench.hpp"
 #include "client/stl.hpp"
 #include "http/http_auth.hpp"
+#include "http/tls_stream.hpp"
 #include "util/log.hpp"
 
 #include <nlohmann/json.hpp>
@@ -96,7 +97,21 @@ std::string format_size(std::size_t n) {
   return os.str();
 }
 
-void parse_endpoint(const std::string& ep, std::string& host, std::string& port) {
+// Null when the config is plain HTTP; throws on a bad CA file.
+std::shared_ptr<aios::TlsClientContext> tls_context(const BenchArgs& a) {
+  if (!a.tls) return nullptr;
+  std::string err;
+  auto ctx = aios::TlsClientContext::create(a.tls_ca, a.tls_insecure, err);
+  if (!ctx) throw std::runtime_error("tls: " + err);
+  return ctx;
+}
+
+void parse_endpoint(const std::string& ep_in, std::string& host, std::string& port) {
+  bool scheme_tls = false;
+  std::string ep;
+  if (!aios::split_endpoint_scheme(ep_in, scheme_tls, ep)) {
+    throw std::runtime_error("endpoint must be [http[s]://]HOST:PORT");
+  }
   auto colon = ep.rfind(':');
   if (colon == std::string::npos || colon == 0 || colon + 1 >= ep.size()) {
     throw std::runtime_error("endpoint must be HOST:PORT");
@@ -122,15 +137,17 @@ enum class BodyMode { Store, Discard };
 
 bool parse_http_location(const std::string& loc, std::string& host, std::string& port,
                          std::string& path) {
-  if (loc.rfind("http://", 0) == 0) {
-    auto rest = loc.substr(7);
+  bool abs_tls = false;
+  std::string hostpath;
+  if (aios::split_endpoint_scheme(loc, abs_tls, hostpath) && hostpath != loc) {
+    auto rest = hostpath;
     auto slash = rest.find('/');
     auto hp = slash == std::string::npos ? rest : rest.substr(0, slash);
     path = slash == std::string::npos ? std::string("/") : rest.substr(slash);
     auto colon = hp.rfind(':');
     if (colon == std::string::npos) {
       host = hp;
-      port = "80";
+      port = abs_tls ? "443" : "80";
     } else {
       host = hp.substr(0, colon);
       port = hp.substr(colon + 1);
@@ -146,12 +163,14 @@ bool parse_http_location(const std::string& loc, std::string& host, std::string&
 
 class HttpSession {
  public:
-  HttpSession(std::string host, std::string port, std::string cluster_key)
+  HttpSession(std::string host, std::string port, std::string cluster_key,
+              std::shared_ptr<aios::TlsClientContext> tls = nullptr)
       : host_(std::move(host)),
         port_(std::move(port)),
         bootstrap_host_(host_),
         bootstrap_port_(port_),
         cluster_key_(std::move(cluster_key)),
+        tls_(std::move(tls)),
         resolver_(ioc_),
         sock_(ioc_) {
     allow_peer(host_ + ":" + port_);
@@ -181,11 +200,19 @@ class HttpSession {
     tv.tv_usec = 0;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    stream_ = std::make_unique<aios::TlsStream>(fd, tls_, host_);
+    std::string terr;
+    if (!stream_->connect(terr)) {
+      err = "tls: " + terr;
+      close();
+      return false;
+    }
     return true;
   }
 
   void close() {
     boost::system::error_code ec;
+    stream_.reset();
     sock_.shutdown(tcp::socket::shutdown_both, ec);
     sock_.close(ec);
   }
@@ -219,7 +246,7 @@ class HttpSession {
         resp.error = "bad redirect Location";
         return resp;
       }
-      if (resp.location.rfind("http://", 0) == 0) {
+      if (resp.location.rfind("http://", 0) == 0 || resp.location.rfind("https://", 0) == 0) {
         if (!redirect_allowed(new_host, new_port)) {
           refresh_redirect_allowlist();
           if (!redirect_allowed(new_host, new_port)) {
@@ -307,10 +334,45 @@ class HttpSession {
   // final error/redirect) before sending the payload.
   static constexpr std::size_t kExpectContinueBytes = 256u * 1024u;
 
+  // Stream I/O (plain or TLS) with asio-style error codes.
+  std::size_t stream_read(void* out, std::size_t n, boost::system::error_code& ec) {
+    int err = 0;
+    const long r = stream_->read_some(out, n, err);
+    if (r > 0) {
+      ec = {};
+      return static_cast<std::size_t>(r);
+    }
+    ec = r == 0 ? boost::system::error_code(asio::error::eof)
+                : boost::system::error_code(err ? err : EIO, boost::system::system_category());
+    return 0;
+  }
+  void stream_write(const void* in, std::size_t n, boost::system::error_code& ec) {
+    int err = 0;
+    ec = stream_->write_all(in, n, err)
+             ? boost::system::error_code{}
+             : boost::system::error_code(err ? err : EPIPE, boost::system::system_category());
+  }
+  void read_until_headers(asio::streambuf& buf, boost::system::error_code& ec) {
+    ec = {};
+    for (;;) {
+      const auto data = buf.data();
+      const std::string view(asio::buffers_begin(data), asio::buffers_end(data));
+      if (view.find("\r\n\r\n") != std::string::npos) return;
+      if (view.size() > 64u * 1024u) {
+        ec = asio::error::message_size;
+        return;
+      }
+      auto mb = buf.prepare(4096);
+      const std::size_t n = stream_read(mb.data(), mb.size(), ec);
+      if (ec) return;
+      buf.commit(n);
+    }
+  }
+
   HttpResp read_http_message(asio::streambuf& buf, BodyMode body_mode = BodyMode::Store) {
     HttpResp resp;
     boost::system::error_code ec;
-    asio::read_until(sock_, buf, "\r\n\r\n", ec);
+    read_until_headers(buf, ec);
     if (ec && ec != asio::error::eof) {
       resp.status = -1;
       resp.error = "read headers: " + ec.message();
@@ -373,8 +435,7 @@ class HttpSession {
       std::size_t need = content_length - have;
       while (need > 0) {
         const auto chunk = std::min(need, sizeof(scratch));
-        const auto n = asio::read(sock_, asio::buffer(scratch, chunk), asio::transfer_at_least(1),
-                                  ec);
+        const auto n = stream_read(scratch, chunk, ec);
         if (ec) {
           resp.status = -1;
           resp.error = "read body: " + ec.message();
@@ -390,9 +451,7 @@ class HttpSession {
       }
       std::size_t need = content_length - have;
       while (need > 0) {
-        const auto n =
-            asio::read(sock_, asio::buffer(resp.body.data() + (content_length - need), need),
-                       asio::transfer_at_least(1), ec);
+        const auto n = stream_read(resp.body.data() + (content_length - need), need, ec);
         if (ec) {
           resp.status = -1;
           resp.error = "read body: " + ec.message();
@@ -431,7 +490,7 @@ class HttpSession {
     const auto head = req.str();
 
     boost::system::error_code ec;
-    asio::write(sock_, asio::buffer(head), ec);
+    stream_write(head.data(), head.size(), ec);
     if (ec) {
       resp.status = -1;
       resp.error = "write: " + ec.message();
@@ -450,7 +509,7 @@ class HttpSession {
     }
 
     if (body_len > 0) {
-      asio::write(sock_, asio::buffer(body, body_len), ec);
+      stream_write(body, body_len, ec);
       if (ec) {
         resp.status = -1;
         resp.error = "write body: " + ec.message();
@@ -468,9 +527,11 @@ class HttpSession {
   std::string bootstrap_host_;
   std::string bootstrap_port_;
   std::string cluster_key_;
+  std::shared_ptr<aios::TlsClientContext> tls_;
   asio::io_context ioc_;
   tcp::resolver resolver_;
   tcp::socket sock_;
+  std::unique_ptr<aios::TlsStream> stream_;
   std::unordered_set<std::string> redirect_allow_;
   bool redirect_refreshed_{false};
 };
@@ -544,7 +605,7 @@ PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::str
 
   for (std::size_t t = 0; t < nthreads; ++t) {
     workers.emplace_back([&, t]() {
-      HttpSession sess(host, port, a.cluster_key);
+      HttpSession sess(host, port, a.cluster_key, tls_context(a));
       auto& buf = thread_bufs[t];
 
       for (;;) {
@@ -812,6 +873,9 @@ PhaseStats run_stl_phase(const BenchArgs& a, const std::string& type, aios::sync
   aios::SessionConfig cfg;
   cfg.endpoint = a.endpoint;
   cfg.cluster_key = a.cluster_key;
+  cfg.tls = a.tls;
+  cfg.tls_ca = a.tls_ca;
+  cfg.tls_insecure = a.tls_insecure;
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<std::thread> workers;
   workers.reserve(nthreads);
@@ -1011,7 +1075,7 @@ bool probe_endpoint(const BenchArgs& args, const std::string& host, const std::s
   std::condition_variable cv;
   bool done = false;
   std::thread th([&] {
-    HttpSession probe(host, port, args.cluster_key);
+    HttpSession probe(host, port, args.cluster_key, tls_context(args));
     auto local =
         probe.request("GET", "/o/" + url_encode_oid(args.prefix + "/probe"), nullptr, 0, {});
     probe.close();
@@ -1046,6 +1110,13 @@ void normalize_config(BenchArgs& a) {
     a.stl_types = {"string", "map", "unordered_map", "set", "list", "deque"};
   }
   if (a.threads == 0) a.threads = std::max(1u, std::thread::hardware_concurrency());
+  // "https://host:port" selects TLS; the scheme is stripped for the raw client.
+  bool scheme_tls = false;
+  std::string hostport;
+  if (aios::split_endpoint_scheme(a.endpoint, scheme_tls, hostport)) {
+    if (scheme_tls) a.tls = true;
+    a.endpoint = hostport;
+  }
 }
 
 }  // namespace
@@ -1121,6 +1192,9 @@ HttpBenchConfig http_bench_from_json(const nlohmann::json& j) {
   if (!j.is_object()) return c;
   c.endpoint = j.value("endpoint", c.endpoint);
   c.cluster_key = j.value("cluster_key", c.cluster_key);
+  c.tls = j.value("tls", c.tls);
+  c.tls_ca = j.value("tls_ca", c.tls_ca);
+  c.tls_insecure = j.value("tls_insecure", c.tls_insecure);
   if (j.contains("threads") && j["threads"].is_number_unsigned()) {
     c.threads = j["threads"].get<unsigned>();
   }
@@ -1189,6 +1263,7 @@ nlohmann::json http_bench_config_json(const HttpBenchConfig& c) {
     size_labels.push_back(format_size(s));
   }
   return {{"endpoint", c.endpoint},
+          {"tls", c.tls},
           {"threads", c.threads},
           {"ops", c.ops},
           {"warmup", c.warmup},
@@ -1281,6 +1356,8 @@ nlohmann::json HttpBenchJob::start(const nlohmann::json& req) {
   // local HTTP listener.
   c.endpoint = default_endpoint_;
   c.cluster_key = cluster_key_;
+  c.tls_ca.clear();
+  c.tls_insecure = default_endpoint_.rfind("https://", 0) == 0;  // loopback listener
   if (!body.contains("ops")) c.ops = 50;
   if (!body.contains("warmup")) c.warmup = 5;
   if (!body.contains("threads")) c.threads = 0;

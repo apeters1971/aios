@@ -36,6 +36,30 @@ class TlsServerContext {
   SSL_CTX* ctx_{nullptr};
 };
 
+// Client-side TLS configuration: which CAs to trust. Shared by every connection
+// of a Session / tool.
+class TlsClientContext {
+ public:
+  ~TlsClientContext();
+  TlsClientContext(const TlsClientContext&) = delete;
+  TlsClientContext& operator=(const TlsClientContext&) = delete;
+
+  // ca_pem: PEM bundle to trust (empty => the system default store). insecure
+  // skips certificate and hostname verification altogether (self-signed labs,
+  // the daemon's own loopback consumers); every production client should carry
+  // the cluster CA instead. Enforces TLS 1.2+.
+  static std::shared_ptr<TlsClientContext> create(const std::string& ca_pem, bool insecure,
+                                                  std::string& err);
+
+  SSL_CTX* native() const { return ctx_; }
+  bool insecure() const { return insecure_; }
+
+ private:
+  TlsClientContext(SSL_CTX* ctx, bool insecure) : ctx_(ctx), insecure_(insecure) {}
+  SSL_CTX* ctx_{nullptr};
+  bool insecure_{false};
+};
+
 class TlsStream {
  public:
   // Plain stream over fd.
@@ -43,6 +67,10 @@ class TlsStream {
   // TLS stream over fd when ctx is set (call accept() before any I/O); plain
   // when ctx is null, so listeners can pass their optional context through.
   TlsStream(int fd, std::shared_ptr<TlsServerContext> ctx);
+  // Client TLS stream over a connected fd (call connect() before any I/O);
+  // plain when ctx is null. host is sent as SNI and checked against the
+  // certificate unless the context is insecure.
+  TlsStream(int fd, std::shared_ptr<TlsClientContext> ctx, const std::string& host);
   ~TlsStream();
   TlsStream(const TlsStream&) = delete;
   TlsStream& operator=(const TlsStream&) = delete;
@@ -53,6 +81,9 @@ class TlsStream {
   // Server handshake. No-op (true) for plain streams. On failure err_out
   // describes the reason (a plaintext client on the TLS port is the common one).
   bool accept(std::string& err_out);
+  // Client handshake. No-op (true) for plain streams. A plain-HTTP server on the
+  // other end shows up as a protocol error here.
+  bool connect(std::string& err_out);
 
   // Same contract as fd_read_some / fd_write_all in sock_io.hpp: read_some
   // returns bytes read, 0 on clean EOF, -1 on error (err_out = errno or a
@@ -63,8 +94,13 @@ class TlsStream {
  private:
   int fd_{-1};
   std::shared_ptr<TlsServerContext> ctx_;
+  std::shared_ptr<TlsClientContext> cctx_;
   SSL* ssl_{nullptr};
   bool handshaken_{false};
 };
+
+// "https://host:port" / "http://host:port" / "host:port" -> (tls?, "host:port").
+// Lets every tool accept a scheme in its endpoint option.
+bool split_endpoint_scheme(const std::string& endpoint, bool& tls_out, std::string& hostport_out);
 
 }  // namespace aios

@@ -26,6 +26,7 @@ void usage(const char* argv0) {
                "  --min-age SECONDS    never repair objects modified more recently (default 600)\n"
                "  --quiet              summary only\n"
                "  --cluster-key KEY    or AIOS_CLUSTER_KEY; --principal / --principal-key for ticket auth\n"
+               "  --tls-ca PEM / --tls-insecure   for an https:// endpoint\n"
                "\n"
                "Exit status: 0 clean, 1 all findings repaired, 4 findings remain, 8 error.\n",
                argv0);
@@ -54,6 +55,8 @@ int main(int argc, char** argv) {
     else if (a == "--cluster-key") cfg.cluster_key = need("--cluster-key");
     else if (a == "--principal") cfg.principal = need("--principal");
     else if (a == "--principal-key") cfg.principal_key = need("--principal-key");
+    else if (a == "--tls-ca") cfg.tls_ca = need("--tls-ca"), cfg.tls = true;
+    else if (a == "--tls-insecure") cfg.tls_insecure = cfg.tls = true;
     else if (a == "--repair") opt.repair = true;
     else if (a == "--min-age") opt.min_age = std::chrono::seconds(std::atol(need("--min-age")));
     else if (a == "--quiet") quiet = true;

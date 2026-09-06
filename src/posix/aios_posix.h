@@ -29,11 +29,15 @@ typedef struct aios_posix_config {
                                The deferred inode flusher (see aios_posix_write) runs
                                regardless of this value. */
   unsigned flags;           /* AIOS_POSIX_F_* */
+  const char* tls_ca;       /* optional PEM bundle for an https:// endpoint
+                               (NULL => system trust store) */
 } aios_posix_config;
 
 /* Commit every directory operation synchronously instead of leasing the
  * directory and batching its changelog appends (see aios_posix_fsyncdir). */
 #define AIOS_POSIX_F_NOLEASE 0x1u
+/* https:// endpoint: skip certificate verification (labs, loopback). */
+#define AIOS_POSIX_F_TLS_INSECURE 0x2u
 
 /* Per-request caller identity (thread-local for this mount). */
 typedef struct aios_posix_cred {

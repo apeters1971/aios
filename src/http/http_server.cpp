@@ -364,15 +364,30 @@ std::size_t http_worker_count(const Config& cfg) {
 // Bounds how long a session may sit in a blocking read or write. Without it an
 // idle keep-alive client (one that connects and never sends, or that stops reading
 // a large response) owns its worker forever, and a handful of them starve the pool.
-void set_session_timeouts(tcp::socket& sock, int idle_ms) {
-  set_fd_timeouts(static_cast<int>(sock.native_handle()), idle_ms);
-}
+void set_session_timeouts(HttpConn& sock, int idle_ms) { set_fd_timeouts(sock.fd(), idle_ms); }
 
-// See sock_io.hpp: SO_RCVTIMEO is only observable from the raw syscall.
-bool sock_read_exact(tcp::socket& sock, void* out, std::size_t n,
+// See sock_io.hpp: SO_RCVTIMEO is only observable from the raw syscall. With TLS
+// the stream sits on the same blocking fd, so the deadline still applies.
+bool sock_read_exact(HttpConn& sock, void* out, std::size_t n,
                      boost::system::error_code& ec) {
   int err = 0;
-  if (fd_read_exact(static_cast<int>(sock.native_handle()), out, n, err)) {
+  bool ok;
+  if (sock.stream) {
+    auto* p = static_cast<char*>(out);
+    std::size_t done = 0;
+    ok = true;
+    while (done < n) {
+      const long r = sock.stream->read_some(p + done, n - done, err);
+      if (r <= 0) {
+        ok = false;
+        break;
+      }
+      done += static_cast<std::size_t>(r);
+    }
+  } else {
+    ok = fd_read_exact(sock.fd(), out, n, err);
+  }
+  if (ok) {
     ec = {};
     return true;
   }
@@ -381,10 +396,11 @@ bool sock_read_exact(tcp::socket& sock, void* out, std::size_t n,
   return false;
 }
 
-bool sock_write_all(tcp::socket& sock, const void* in, std::size_t n,
+bool sock_write_all(HttpConn& sock, const void* in, std::size_t n,
                     boost::system::error_code& ec) {
   int err = 0;
-  if (fd_write_all(static_cast<int>(sock.native_handle()), in, n, err)) {
+  const bool ok = sock.stream ? sock.stream->write_all(in, n, err) : fd_write_all(sock.fd(), in, n, err);
+  if (ok) {
     ec = {};
     return true;
   }
@@ -392,7 +408,7 @@ bool sock_write_all(tcp::socket& sock, const void* in, std::size_t n,
   return false;
 }
 
-bool write_response(tcp::socket& sock, int status, const std::string& reason,
+bool write_response(HttpConn& sock, int status, const std::string& reason,
                     const std::unordered_map<std::string, std::string>& headers,
                     const std::uint8_t* body, std::size_t body_len, bool keep_alive) {
   std::ostringstream oss;
@@ -416,27 +432,28 @@ bool expects_100_continue(const std::unordered_map<std::string, std::string>& he
   return exp.find("100-continue") != std::string::npos;
 }
 
-bool write_100_continue(tcp::socket& sock) {
+bool write_100_continue(HttpConn& sock) {
   static constexpr char kMsg[] = "HTTP/1.1 100 Continue\r\n\r\n";
   boost::system::error_code ec;
   return sock_write_all(sock, kMsg, sizeof(kMsg) - 1, ec);
 }
 
-void write_json(tcp::socket& sock, int status, const std::string& reason,
+void write_json(HttpConn& sock, int status, const std::string& reason,
                 const nlohmann::json& j, bool keep_alive) {
   const auto body = json_dump(j);
   write_response(sock, status, reason, {{"Content-Type", "application/json"}},
                  reinterpret_cast<const std::uint8_t*>(body.data()), body.size(), keep_alive);
 }
 
-void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
+void write_not_primary(HttpConn& sock, const std::string& path_with_query,
                        const ApiResult& r, bool keep_alive) {
   nlohmann::json acting = nlohmann::json::array();
   std::string location;
   if (!r.placement.acting_set.empty()) {
     const auto& p = r.placement.acting_set[0];
     if (!p.http_addr.empty()) {
-      location = "http://" + p.http_addr + path_with_query;
+      // TLS is cluster-wide: the peer speaks the scheme this connection arrived on.
+      location = (sock.tls() ? "https://" : "http://") + p.http_addr + path_with_query;
     }
     for (const auto& t : r.placement.acting_set) {
       acting.push_back({{"node_id", t.node_id},
@@ -475,9 +492,33 @@ void write_not_primary(tcp::socket& sock, const std::string& path_with_query,
 
 // Stream a regular file to an already-connected TCP socket. Prefer sendfile
 // (no userspace bounce); fall back to read+send. Avoids iostreams on the hot path.
-bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t file_offset, std::uint64_t size,
+bool sock_send_file(HttpConn& sock, int in_fd, std::uint64_t file_offset, std::uint64_t size,
                     boost::system::error_code& ec) {
-  const int out_fd = static_cast<int>(sock.native_handle());
+  if (sock.tls()) {
+    // No sendfile through TLS: bounce through userspace in large reads.
+    std::vector<std::uint8_t> buf(1u << 20);
+    std::uint64_t left = size;
+    std::uint64_t off = file_offset;
+    while (left > 0) {
+      const auto want = static_cast<std::size_t>(std::min<std::uint64_t>(left, buf.size()));
+      const ssize_t r = ::pread(in_fd, buf.data(), want, static_cast<off_t>(off));
+      if (r < 0) {
+        if (errno == EINTR) continue;
+        ec = boost::system::error_code(errno, boost::system::system_category());
+        return false;
+      }
+      if (r == 0) {
+        ec = boost::asio::error::eof;
+        return false;
+      }
+      if (!sock_write_all(sock, buf.data(), static_cast<std::size_t>(r), ec)) return false;
+      left -= static_cast<std::uint64_t>(r);
+      off += static_cast<std::uint64_t>(r);
+    }
+    ec = {};
+    return true;
+  }
+  const int out_fd = sock.fd();
   std::uint64_t sent = 0;
 
   auto wait_writable = [&]() -> bool {
@@ -554,7 +595,7 @@ bool sock_send_file(tcp::socket& sock, int in_fd, std::uint64_t file_offset, std
   return true;
 }
 
-bool write_file_body(tcp::socket& sock, int status, const std::string& reason,
+bool write_file_body(HttpConn& sock, int status, const std::string& reason,
                      std::unordered_map<std::string, std::string> headers,
                      const std::string& path, std::uint64_t file_offset, std::uint64_t size,
                      bool head_only, bool keep_alive) {
@@ -671,7 +712,7 @@ struct PipelineStager {
   }
 };
 
-void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& path_q,
+void write_api_error(HttpConn& sock, const ApiResult& r, const std::string& path_q,
                      bool keep_alive) {
   if (r.code == "not_primary" || r.code == "not_local") {
     if (!r.placement.acting_set.empty()) {
@@ -697,7 +738,7 @@ void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& p
              {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
 }
 
-void write_long_poll_busy(tcp::socket& sock, bool keep_alive) {
+void write_long_poll_busy(HttpConn& sock, bool keep_alive) {
   const auto j = json_dump(nlohmann::json{{"error", "too many concurrent long polls"},
                                           {"code", "long_poll_limit"}});
   write_response(sock, 503, "Service Unavailable",
@@ -708,7 +749,7 @@ void write_long_poll_busy(tcp::socket& sock, bool keep_alive) {
 // Body of a detached long-poll thread. An exception here would otherwise call
 // std::terminate and take the daemon down with it.
 template <typename Fn>
-void detached_body(tcp::socket& sock, Fn&& fn) {
+void detached_body(HttpConn& sock, Fn&& fn) {
   try {
     fn();
   } catch (const std::exception& e) {
@@ -723,7 +764,7 @@ void detached_body(tcp::socket& sock, Fn&& fn) {
   }
 }
 
-bool read_line(tcp::socket& sock, std::string& line, boost::system::error_code& ec) {
+bool read_line(HttpConn& sock, std::string& line, boost::system::error_code& ec) {
   line.clear();
   char c;
   while (true) {
@@ -772,13 +813,32 @@ PeerAdminResult peer_admin_request(const Config& cfg, const std::string& http_ad
     out.error = "resolve peer: " + ec.message();
     return out;
   }
-  tcp::socket sock(ioc);
-  boost::asio::connect(sock, endpoints, ec);
+  HttpConn sock(ioc);
+  boost::asio::connect(sock.sock, endpoints, ec);
   if (ec) {
     out.error = "connect peer: " + ec.message();
     return out;
   }
   set_session_timeouts(sock, 2500);
+  // Peers speak the same scheme as this node's own listener.
+  if (!cfg.http_tls_cert.empty()) {
+    std::string terr;
+    // Trust the configured CA, else this node's own chain (a shared cluster
+    // cert is the common lab setup); never verify against nothing.
+    const std::string ca = !cfg.http_tls_ca.empty() ? cfg.http_tls_ca
+                           : !cfg.http_tls_chain.empty() ? cfg.http_tls_chain
+                                                          : cfg.http_tls_cert;
+    auto cctx = TlsClientContext::create(ca, false, terr);
+    if (!cctx) {
+      out.error = "peer tls: " + terr;
+      return out;
+    }
+    sock.stream = std::make_unique<TlsStream>(sock.fd(), cctx, host);
+    if (!sock.stream->connect(terr)) {
+      out.error = "peer tls handshake: " + terr;
+      return out;
+    }
+  }
 
   std::ostringstream req;
   req << method << " " << path << " HTTP/1.1\r\nHost: " << host << ":" << port << "\r\n";
@@ -851,7 +911,7 @@ PeerAdminResult peer_admin_request(const Config& cfg, const std::string& http_ad
   return out;
 }
 
-void write_peer_admin(tcp::socket& sock, bool keep_alive, const PeerAdminResult& r) {
+void write_peer_admin(HttpConn& sock, bool keep_alive, const PeerAdminResult& r) {
   if (!r.error.empty() && !r.json.is_object()) {
     write_json(sock, r.status > 0 ? r.status : 502, "Bad Gateway", {{"error", r.error}},
                keep_alive);
@@ -989,7 +1049,7 @@ std::string admin_static_content_type(const std::string& filename) {
   return "application/octet-stream";
 }
 
-bool serve_admin_static(tcp::socket& sock, const std::string& path, bool keep_alive) {
+bool serve_admin_static(HttpConn& sock, const std::string& path, bool keep_alive) {
   auto root = find_admin_web_root();
   if (root.empty()) {
     write_json(sock, 503, "Service Unavailable",
@@ -1102,6 +1162,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"node_id", c.node_id},
       {"listen", c.listen},
       {"http_listen", c.http_listen},
+      {"http_tls", !c.http_tls_cert.empty()},
       {"peers", c.peers},
       {"cluster_key", "***"},
       {"bag_encryption_key", c.bag_encryption_key.empty() ? "" : "***"},
@@ -1176,6 +1237,7 @@ nlohmann::json HttpServer::admin_status_json() const {
       {"node_id", cfg_.node_id},
       {"listen", cfg_.listen},
       {"http_listen", cfg_.http_listen},
+      {"http_tls", tls_ != nullptr},
       {"admin", cfg_.admin},
       {"admin_metrics_public", cfg_.admin_metrics_public},
       {"map_epoch", objects_.map().epoch},
@@ -1260,6 +1322,14 @@ HttpServer::HttpServer(boost::asio::io_context& ioc, Config& cfg, ObjectService&
       vbd_registry_(std::move(vbd_registry)),
       acceptor_(ioc),
       workers_(http_worker_count(cfg)) {
+  if (!cfg_.http_tls_cert.empty() || !cfg_.http_tls_key.empty()) {
+    if (cfg_.http_tls_cert.empty() || cfg_.http_tls_key.empty()) {
+      throw std::runtime_error("http_tls_cert and http_tls_key must be set together");
+    }
+    std::string terr;
+    tls_ = TlsServerContext::load(cfg_.http_tls_cert, cfg_.http_tls_key, cfg_.http_tls_chain, terr);
+    if (!tls_) throw std::runtime_error("HTTP TLS: " + terr);
+  }
   std::string host, port;
   if (!split_host_port(cfg_.http_listen, host, port)) {
     throw std::runtime_error("invalid http_listen: " + cfg_.http_listen);
@@ -1346,7 +1416,7 @@ void HttpServer::note_login_success(const std::string& peer) {
   login_failures_.erase(peer);
 }
 
-void HttpServer::handle_ticket_grant(tcp::socket& sock, const std::vector<std::uint8_t>& body,
+void HttpServer::handle_ticket_grant(HttpConn& sock, const std::vector<std::uint8_t>& body,
                                      const std::string& peer, bool keep_alive) {
   // Proof guessing is throttled per source address exactly like admin login.
   if (login_throttled(peer)) {
@@ -1407,7 +1477,7 @@ void HttpServer::handle_ticket_grant(tcp::socket& sock, const std::vector<std::u
   write_json(sock, 200, "OK", ticket_reply_to_json(*reply), keep_alive);
 }
 
-bool HttpServer::handle_principal_admin(tcp::socket& sock, const std::string& method,
+bool HttpServer::handle_principal_admin(HttpConn& sock, const std::string& method,
                                         const std::string& path,
                                         const std::vector<std::uint8_t>& body, bool keep_alive) {
   constexpr const char* kBase = "/admin/api/principals";
@@ -1548,8 +1618,9 @@ HttpServer::DetachedGuard::~DetachedGuard() {
 
 namespace {
 
-void force_close_http_socket(tcp::socket& s) {
+void force_close_http_socket(HttpConn& c) {
   boost::system::error_code ignored;
+  tcp::socket& s = c.sock;
   if (s.is_open()) {
     const int fd = static_cast<int>(s.native_handle());
     if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
@@ -1559,8 +1630,8 @@ void force_close_http_socket(tcp::socket& s) {
   s.close(ignored);
 }
 
-void wake_http_socket_fd(tcp::socket& s) {
-  const int fd = static_cast<int>(s.native_handle());
+void wake_http_socket_fd(HttpConn& c) {
+  const int fd = c.fd();
   if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
 }
 
@@ -1626,8 +1697,8 @@ void HttpServer::start() { do_accept(); }
 
 void HttpServer::do_accept() {
   if (closing_.load(std::memory_order_acquire) || !acceptor_.is_open()) return;
-  auto sock = std::make_shared<tcp::socket>(ioc_);
-  acceptor_.async_accept(*sock, [this, sock](boost::system::error_code ec) {
+  auto sock = std::make_shared<HttpConn>(ioc_);
+  acceptor_.async_accept(sock->sock, [this, sock](boost::system::error_code ec) {
     if (!ec) {
       bool drop = false;
       {
@@ -1639,7 +1710,7 @@ void HttpServer::do_accept() {
           set_session_timeouts(*sock, cfg_.http_idle_timeout_ms);
           {
             boost::system::error_code nec;
-            sock->set_option(tcp::no_delay(true), nec);
+            sock->sock.set_option(tcp::no_delay(true), nec);
           }
           // Session I/O is synchronous; run off ioc_ so parallel browser connections
           // (HTML + CSS + JS) are not stalled by keep-alive reads.
@@ -1672,9 +1743,21 @@ void HttpServer::do_accept() {
   });
 }
 
-void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
+void HttpServer::handle_session(std::shared_ptr<HttpConn> sock) {
   boost::system::error_code ec;
   bool keep_alive = true;
+
+  // Plain or TLS is the listener's choice; handshake before the first byte of
+  // HTTP. A plaintext client on an HTTPS port fails here (and vice versa), which
+  // is the intended answer: there is no scheme negotiation on one port.
+  sock->stream = std::make_unique<TlsStream>(sock->fd(), tls_);
+  {
+    std::string terr;
+    if (!sock->stream->accept(terr)) {
+      AIOS_LOG_WARN("http tls handshake: ", terr);
+      return;
+    }
+  }
 
   while (keep_alive) {
     if (closing_.load(std::memory_order_acquire)) return;
@@ -1763,7 +1846,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     bool peer_loopback = false;
     {
       boost::system::error_code pec;
-      const auto ep = sock->remote_endpoint(pec);
+      const auto ep = sock->sock.remote_endpoint(pec);
       if (!pec) {
         peer_addr = ep.address().to_string();
         peer_loopback = ep.address().is_loopback();
@@ -2229,7 +2312,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
         std::string peer;
         {
           boost::system::error_code pec;
-          const auto ep = sock->remote_endpoint(pec);
+          const auto ep = sock->sock.remote_endpoint(pec);
           peer = pec ? std::string("unknown") : ep.address().to_string();
         }
         if (login_throttled(peer)) {
@@ -3332,6 +3415,7 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (method == "GET" && path == "/map") {
       auto j = objects_.map().to_json();
       j["io_path"] = cfg_.io_path;
+      j["tls"] = tls_ != nullptr;
       {
         const auto g = objects_.map_gate();
         j["consensus"] = g.consensus;

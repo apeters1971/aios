@@ -2186,6 +2186,8 @@ aios_posix_fs* aios_posix_mount(const aios_posix_config* cfg, int* err_out) {
     aios::SessionConfig sc;
     sc.endpoint = cfg->endpoint;
     sc.cluster_key = cfg->cluster_key;
+    if (cfg->tls_ca && cfg->tls_ca[0]) sc.tls_ca = cfg->tls_ca;
+    sc.tls_insecure = (cfg->flags & AIOS_POSIX_F_TLS_INSECURE) != 0;
     // Default frontend label "fs" so FUSE/posix object OPS and logical IO are separated from S3/VBD.
     if (cfg->app_label && cfg->app_label[0]) sc.app_label = cfg->app_label;
     else sc.app_label = aios::kFrontendFs;

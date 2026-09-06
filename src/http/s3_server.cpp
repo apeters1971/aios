@@ -481,11 +481,14 @@ void collect_list(aios_posix_fs* fs, uint64_t dir_ino, const std::string& prefix
 
 }  // namespace
 
-std::string s3_loopback_http_endpoint(const std::string& http_listen) {
+std::string s3_loopback_http_endpoint(const Config& cfg) {
   std::string host, port;
-  if (!split_host_port(http_listen, host, port)) return {};
+  if (!split_host_port(cfg.http_listen, host, port)) return {};
   if (host == "0.0.0.0" || host == "*" || host == "::" || host.empty()) host = "127.0.0.1";
-  return host + ":" + port;
+  // A TLS listener is TLS for loopback too; consumers of this endpoint skip
+  // certificate verification (same host, same process; the certificate rarely
+  // carries a loopback SAN).
+  return (cfg.http_tls_cert.empty() ? "" : "https://") + host + ":" + port;
 }
 
 S3Server::S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_http_endpoint,
@@ -563,6 +566,7 @@ void S3Server::start() {
   pcfg.volume = cfg_.s3_volume.c_str();
   pcfg.app_label = "s3";
   pcfg.rstat_interval_ms = 60000;
+  if (!cfg_.http_tls_cert.empty()) pcfg.flags |= AIOS_POSIX_F_TLS_INSECURE;
   int err = 0;
   fs_ = aios_posix_mount(&pcfg, &err);
   if (!fs_) {

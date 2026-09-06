@@ -61,6 +61,7 @@ class S3Server {
 };
 
 // Dialable 127.0.0.1:PORT from http_listen (maps 0.0.0.0 / :: → 127.0.0.1).
-std::string s3_loopback_http_endpoint(const std::string& http_listen);
+// "https://host:port" when the HTTP listener is TLS, else "host:port".
+std::string s3_loopback_http_endpoint(const Config& cfg);
 
 }  // namespace aios

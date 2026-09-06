@@ -2,6 +2,7 @@
 
 #include "ec/codec_factory.hpp"
 #include "http/http_auth.hpp"
+#include "http/tls_stream.hpp"
 #include "util/auth.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
@@ -38,15 +39,17 @@ using tcp = boost::asio::ip::tcp;
 
 bool parse_location(const std::string& loc, std::string& host, std::string& port,
                     std::string& path) {
-  if (loc.rfind("http://", 0) == 0) {
-    auto rest = loc.substr(7);
+  bool abs_tls = false;
+  std::string hostpath;
+  if (aios::split_endpoint_scheme(loc, abs_tls, hostpath) && hostpath != loc) {
+    auto rest = hostpath;
     auto slash = rest.find('/');
     auto hp = slash == std::string::npos ? rest : rest.substr(0, slash);
     path = slash == std::string::npos ? std::string("/") : rest.substr(slash);
     auto colon = hp.rfind(':');
     if (colon == std::string::npos) {
       host = hp;
-      port = "80";
+      port = abs_tls ? "443" : "80";
     } else {
       host = hp.substr(0, colon);
       port = hp.substr(colon + 1);
@@ -95,40 +98,23 @@ void apply_socket_deadlines(tcp::socket& sock, int timeout_ms) {
   throw client_error("http", std::string(what) + ": " + ec.message());
 }
 
-bool timed_write(tcp::socket& sock, const void* in, std::size_t n,
-                 boost::system::error_code& ec) {
-#ifndef _WIN32
-  const int fd = static_cast<int>(sock.native_handle());
-  const auto* p = static_cast<const char*>(in);
-  std::size_t done = 0;
-  while (done < n) {
-#ifdef MSG_NOSIGNAL
-    const auto r = ::send(fd, p + done, n - done, MSG_NOSIGNAL);
-#else
-    const auto r = ::send(fd, p + done, n - done, 0);
-#endif
-    if (r > 0) {
-      done += static_cast<std::size_t>(r);
-      continue;
-    }
-    if (r < 0 && errno == EINTR) continue;
-    ec = boost::system::error_code(r == 0 ? EPIPE : errno, boost::system::system_category());
-    return false;
+// Plain or TLS: TlsStream drives the blocking fd with recv/send (or SSL_read /
+// SSL_write on top of it), so SO_RCVTIMEO / SO_SNDTIMEO stay observable.
+bool timed_write(TlsStream& sock, const void* in, std::size_t n, boost::system::error_code& ec) {
+  int err = 0;
+  if (sock.write_all(in, n, err)) {
+    ec = {};
+    return true;
   }
-  ec = {};
-  return true;
-#else
-  boost::asio::write(sock, boost::asio::buffer(in, n), ec);
-  return !ec;
-#endif
+  ec = boost::system::error_code(err ? err : EPIPE, boost::system::system_category());
+  return false;
 }
 
-bool timed_read_some(tcp::socket& sock, void* out, std::size_t n, std::size_t& got,
+bool timed_read_some(TlsStream& sock, void* out, std::size_t n, std::size_t& got,
                      boost::system::error_code& ec) {
   got = 0;
-#ifndef _WIN32
-  const int fd = static_cast<int>(sock.native_handle());
-  const auto r = ::recv(fd, out, n, 0);
+  int err = 0;
+  const long r = sock.read_some(out, n, err);
   if (r > 0) {
     got = static_cast<std::size_t>(r);
     ec = {};
@@ -138,21 +124,17 @@ bool timed_read_some(tcp::socket& sock, void* out, std::size_t n, std::size_t& g
     ec = boost::asio::error::eof;
     return false;
   }
-  if (errno == EINTR) {
+  if (err == EINTR) {
     ec = {};
     return true;
   }
-  ec = boost::system::error_code(errno, boost::system::system_category());
+  ec = boost::system::error_code(err, boost::system::system_category());
   return false;
-#else
-  got = sock.read_some(boost::asio::buffer(out, n), ec);
-  return !ec && got > 0;
-#endif
 }
 
 constexpr std::size_t kMaxHeaderBytes = 64u * 1024u;
 
-bool timed_read_until(tcp::socket& sock, std::string& acc, const char* delim,
+bool timed_read_until(TlsStream& sock, std::string& acc, const char* delim,
                       boost::system::error_code& ec) {
   const std::size_t delim_len = std::char_traits<char>::length(delim);
   char tmp[4096];
@@ -230,7 +212,7 @@ bool is_peer_closed(const boost::system::error_code& ec) {
 #endif
 }
 
-HttpResponse exchange_http(tcp::socket& sock, std::string& leftover, const std::string& method,
+HttpResponse exchange_http(TlsStream& sock, std::string& leftover, const std::string& method,
                            const std::string& path, const std::string& host,
                            const std::string& port,
                            const std::unordered_map<std::string, std::string>& headers,
@@ -365,12 +347,14 @@ struct Session::ConnPool {
     Conn() : sock(ioc) {}
     boost::asio::io_context ioc;
     boost::asio::ip::tcp::socket sock;
+    std::unique_ptr<TlsStream> stream;  // plain or TLS over sock's fd
     std::string host;
     std::string port;
     std::string leftover;
     bool open{false};
   };
   std::vector<std::unique_ptr<Conn>> idle;
+  std::shared_ptr<TlsClientContext> tls;  // null => plain http
 
   std::unique_ptr<Conn> take(const std::string& host, const std::string& port, int timeout_ms,
                              bool* reused) {
@@ -428,6 +412,11 @@ struct Session::ConnPool {
     if (resolve_ec) throw client_error("http", "resolve: " + resolve_ec.message());
     if (connect_ec) throw client_error("http", "connect: " + connect_ec.message());
     apply_socket_deadlines(c->sock, timeout_ms);
+    c->stream = std::make_unique<TlsStream>(static_cast<int>(c->sock.native_handle()), tls, host);
+    {
+      std::string terr;
+      if (!c->stream->connect(terr)) throw client_error("http", "tls: " + terr);
+    }
     c->host = host;
     c->port = port;
     c->open = true;
@@ -454,6 +443,11 @@ Session::Session(SessionConfig cfg) : cfg_(std::move(cfg)), pool_(std::make_uniq
     throw client_error("bad_request", "cluster_key or principal+principal_key required");
   }
   parse_endpoint();
+  if (cfg_.tls) {
+    std::string terr;
+    pool_->tls = TlsClientContext::create(cfg_.tls_ca, cfg_.tls_insecure, terr);
+    if (!pool_->tls) throw client_error("bad_request", "tls: " + terr);
+  }
   allow_redirect_peer(host_ + ":" + port_);
   for (const auto& p : cfg_.redirect_peers) allow_redirect_peer(p);
 }
@@ -461,12 +455,20 @@ Session::Session(SessionConfig cfg) : cfg_(std::move(cfg)), pool_(std::make_uniq
 Session::~Session() = default;
 
 void Session::parse_endpoint() {
-  auto colon = cfg_.endpoint.rfind(':');
+  // "https://host:port" turns TLS on; "http://" is accepted and stripped.
+  bool scheme_tls = false;
+  std::string hostport;
+  if (!split_endpoint_scheme(cfg_.endpoint, scheme_tls, hostport)) {
+    throw client_error("bad_request", "endpoint must be [http[s]://]HOST:PORT");
+  }
+  if (scheme_tls) cfg_.tls = true;
+  cfg_.endpoint = hostport;
+  auto colon = hostport.rfind(':');
   if (colon == std::string::npos) {
     throw client_error("bad_request", "endpoint must be HOST:PORT");
   }
-  host_ = cfg_.endpoint.substr(0, colon);
-  port_ = cfg_.endpoint.substr(colon + 1);
+  host_ = hostport.substr(0, colon);
+  port_ = hostport.substr(colon + 1);
 }
 
 std::string Session::normalize_host_port(std::string host, std::string port) {
@@ -513,7 +515,7 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
     ExchangeIo io;
     try {
       bool close_conn = false;
-      auto r = exchange_http(conn->sock, conn->leftover, "GET", path, host_, port_, headers, {},
+      auto r = exchange_http(*conn->stream, conn->leftover, "GET", path, host_, port_, headers, {},
                              &close_conn, &io);
       pool_->put(std::move(conn), !close_conn);
       return r;
@@ -524,7 +526,7 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
       auto fresh = pool_->take(host_, port_, cfg_.socket_timeout_ms, &ignored);
       try {
         bool close_conn = false;
-        auto r = exchange_http(fresh->sock, fresh->leftover, "GET", path, host_, port_, headers, {},
+        auto r = exchange_http(*fresh->stream, fresh->leftover, "GET", path, host_, port_, headers, {},
                                &close_conn);
         pool_->put(std::move(fresh), !close_conn);
         return r;
@@ -644,7 +646,7 @@ HttpResponse Session::post_ticket_request(const std::string& body) {
   }
   try {
     bool close_conn = false;
-    auto r = exchange_http(conn->sock, conn->leftover, "POST", "/auth/ticket", host_, port_,
+    auto r = exchange_http(*conn->stream, conn->leftover, "POST", "/auth/ticket", host_, port_,
                            headers, body, &close_conn);
     pool_->put(std::move(conn), !close_conn);
     return r;
@@ -752,7 +754,7 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
       ExchangeIo io;
       try {
         bool close_conn = false;
-        auto r = exchange_http(conn->sock, conn->leftover, method, path, host, port, headers, body,
+        auto r = exchange_http(*conn->stream, conn->leftover, method, path, host, port, headers, body,
                                &close_conn, &io);
         pool_->put(std::move(conn), !close_conn);
         return r;
@@ -766,7 +768,7 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
         add_auth(headers, method, path, body);
         try {
           bool close_conn = false;
-          auto r = exchange_http(fresh->sock, fresh->leftover, method, path, host, port, headers,
+          auto r = exchange_http(*fresh->stream, fresh->leftover, method, path, host, port, headers,
                                  body, &close_conn);
           pool_->put(std::move(fresh), !close_conn);
           return r;
@@ -821,7 +823,7 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
       }
       // Absolute Locations may point anywhere; only follow cluster HTTP peers.
       // Relative Locations keep the current hop host (already connected/trusted path).
-      if (loc.rfind("http://", 0) == 0) {
+      if (loc.rfind("http://", 0) == 0 || loc.rfind("https://", 0) == 0) {
         if (!redirect_allowed(new_host, new_port)) {
           refresh_redirect_allowlist();
           if (!redirect_allowed(new_host, new_port)) {

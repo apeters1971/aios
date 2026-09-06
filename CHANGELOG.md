@@ -12,6 +12,20 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Added — TLS on the HTTP API
+
+`http_tls_cert` / `http_tls_key` (+ `http_tls_chain`, `http_tls_ca`) make the HTTP listener speak
+TLS natively — object API, `/admin/*`, `/metrics` and `POST /auth/ticket` together, cluster-wide.
+Nodes call each other's admin API with the same scheme (verifying against `http_tls_ca`, else their
+own chain), redirects are issued as `https://`, and `GET /map` / `/admin/status` report `http_tls`.
+On the client side an `https://` endpoint turns TLS on in `aios::Session` (`SessionConfig::tls`,
+`tls_ca`, `tls_insecure`), `libaios_posix` (`aios_posix_config::tls_ca`, `AIOS_POSIX_F_TLS_INSECURE`),
+the bench client, and the tools (`aios`, `aios-bench`, `aios-posix-fsck`: `--tls-ca` / `--tls-insecure`;
+`aios-fuse`, `aios-fusell`: `-o tls_ca=…,tls_insecure`). Hostnames are verified (DNS via SAN/CN, IP
+literals via IP SAN); the daemon's own loopback consumers (S3 gateway mount, admin-UI bench) connect
+insecurely. `TlsStream` gained a client mode and moved into `aios_core`. The kernel modules stay plain
+HTTP. Tests: `tests/test_http_tls.cpp`.
+
 ### Added — `aios-posix-fsck`
 
 Offline consistency check and repair of a `libaios_posix` volume from its objects

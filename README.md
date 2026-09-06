@@ -622,6 +622,38 @@ Wrong primary → **307** with `Location` to the coordinator. Full contract: [`p
 
 **Locks / watches** are primary-local and in-memory (lost on restart or primary move), except durable pub/sub message bodies.
 
+### HTTPS on the object API
+
+The HTTP listener speaks TLS natively when given a certificate; the same listener carries the
+object API, `/admin/*`, `/metrics` and the ticket grant, so all of them become HTTPS at once:
+
+```yaml
+http_listen: 0.0.0.0:7480
+http_tls_cert: /etc/aios/node.crt    # PEM leaf (or full chain, leaf first)
+http_tls_key: /etc/aios/node.key     # PEM private key, mode 0600
+http_tls_chain: /etc/aios/ca.pem     # optional extra intermediates
+http_tls_ca: /etc/aios/ca.pem        # optional: CA this node trusts when calling peers
+```
+
+The setting is cluster-wide: nodes call each other's admin API with the same scheme as their own
+listener (trusting `http_tls_ca`, else their own chain), and `307` redirects are issued with
+`https://`. Clients turn TLS on with an `https://` endpoint and verify against the system store,
+`--tls-ca PEM`, or skip verification with `--tls-insecure` (labs with self-signed certificates):
+
+```bash
+aios --endpoint https://node-a:7480 --cluster-key $KEY --tls-ca /etc/aios/ca.pem put demo/x file
+aios-bench --endpoint https://node-a:7480 --cluster-key $KEY --tls-insecure --mode object
+aios-fuse -o endpoint=https://node-a:7480,cluster_key=$KEY,tls_ca=/etc/aios/ca.pem /mnt/aios
+aios-posix-fsck --volume default --endpoint https://node-a:7480 --tls-ca /etc/aios/ca.pem
+```
+
+`aios::SessionConfig{.tls, .tls_ca, .tls_insecure}` and `aios_posix_config{.tls_ca}` with
+`AIOS_POSIX_F_TLS_INSECURE` are the library equivalents. Certificates are matched against the host
+part of the endpoint (DNS name via SAN/CN, IP literal via an IP SAN); the daemon's own loopback
+consumers (S3 gateway mount, admin-UI bench) connect insecurely since a cluster certificate rarely
+carries a loopback SAN. Plain-text clients on an HTTPS port are dropped at the handshake. The
+kernel modules (`aiosfs`, `aios_http`) still speak plain HTTP.
+
 ---
 
 ## S3-compatible API
@@ -1023,6 +1055,8 @@ authenticate as **principals** with their own key and receive a short-lived **ti
 | HTTP, shared key (legacy) | Same header with `Credential=<label>`, HMAC keyed by `cluster_key`; full access |
 | S3 | AWS SigV4 with per-bucket IAM keys ([S3 auth](#auth-and-per-bucket-credentials)); the wire needs TLS (`s3_tls_cert` / `s3_tls_key`) |
 
+Both HTTP listeners can run TLS natively: [`http_tls_cert`](#https-on-the-object-api) for the object API / admin / metrics, [`s3_tls_cert`](#https) for S3.
+
 ### Principals and tickets
 
 A principal is `name + 64-hex key + role + optional oid-prefix caps`, stored in a cluster-wide
@@ -1065,18 +1099,18 @@ who can reach the ports or observe the wire.
 
 | Property | Current state |
 |----------|---------------|
-| **Transport** | Plaintext for gossip/RPC (TCP++), the HTTP object API, admin UI/API and the kernel modules: no TLS, so anyone on the path can read object bodies and admin session cookies (not credentials: principal keys never travel, and a captured ticket is useless without its session key). The **S3 gateway can run HTTPS** (`s3_tls_cert` / `s3_tls_key`); SigV4 offers no confidentiality on its own, so enable it for any S3 client outside the private network. |
+| **Transport** | The **HTTP object API, admin UI/API and metrics can run HTTPS** (`http_tls_cert` / `http_tls_key`, see [HTTPS on the object API](#https-on-the-object-api)) and so can the **S3 gateway** (`s3_tls_cert` / `s3_tls_key`; SigV4 offers no confidentiality on its own). Gossip/RPC between nodes (TCP++) and the kernel modules are still plaintext: on that path object bodies are readable (not credentials: principal keys never travel, and a captured ticket is useless without its session key). |
 | **Shared secret vs principals** | `cluster_key` remains the **node** secret (join the cluster, receive replicas, participate in placement), the **admin UI password** and the **S3 root secret** (`s3_access_key` / `cluster_key`); anyone holding it has every power. HTTP clients no longer need it: create **principals** (`aios admin principal create`) with role `client` and oid-prefix caps, and set `http_shared_key_clients: loopback` so the shared key is refused from remote clients. Per-bucket S3 IAM keys scope the S3 surface. |
 | **Integrity of bodies** | HMAC-SHA256 covers the canonical request/frame metadata. Streamed bodies are covered only when the client sends a content hash: HTTP PUTs above 256 KiB are currently signed as `UNSIGNED-PAYLOAD`, and replica RPC frames carry the body as an unsigned trailer with a CRC32C (being fixed — see `CHANGELOG.md` OBJ-13 / POS-11). Until then, an on-path party can substitute object contents while the signature still verifies. |
 | **Replay** | Requests are valid for the `auth_skew_ms` window (default **60 s**). RPC frames have a nonce + replay cache; HTTP requests currently do not (HTTP-4). Clocks must be synchronised (NTP) across nodes and clients. |
 | **Key rotation** | Principal keys rotate individually (`aios admin principal rotate`): issued tickets run to their expiry, new grants need the new key. Changing `cluster_key` still means restarting every node with the new value; there is no dual-key grace period, and it re-seals the keyring (principals must be recreated). Per-bucket IAM secrets can be deleted and recreated individually. |
 | **Authorization** | Principal tickets carry a role (`client` / `admin`) and optional oid-prefix caps enforced on `/o`, `/txn` and LIST. There is no finer per-object ACL, and the shared `cluster_key` still grants everything. POSIX uid/gid checks apply on the FUSE/S3/XRootD paths only. |
-| **Admin UI** | Cookie session (`HttpOnly; SameSite=Strict`), constant-time password compare; no CSRF token, no login rate limiting, no TLS. |
+| **Admin UI** | Cookie session (`HttpOnly; SameSite=Strict`), constant-time password compare; no CSRF token, no login rate limiting; TLS when `http_tls_cert` is set. |
 
 **Recommendations**
 
 - Run all nodes on a **private / isolated network** (VLAN, VPC, WireGuard); firewall `listen`, `http_listen`, `s3_listen`, `cuobject_listen` so only nodes and trusted clients reach them.
-- Enable **HTTPS on the S3 gateway** (`s3_tls_cert` / `s3_tls_key`) and put a **TLS-terminating reverse proxy** (nginx, HAProxy, Envoy) in front of the HTTP API and admin UI for anything that leaves that network; bind the daemon ports to loopback or the private interface.
+- Enable **HTTPS** on both listeners (`http_tls_cert` / `http_tls_key`, `s3_tls_cert` / `s3_tls_key`) for anything that leaves that network, or put a TLS-terminating reverse proxy in front; bind the daemon ports to loopback or the private interface. The TCP++ node-to-node port has no TLS: keep it on the private network.
 - Give every application its own **principal** (`role: client`, caps on its prefixes) and set `http_shared_key_clients: loopback`; use **per-bucket IAM keys** for S3 users; never hand out `cluster_key` to an application.
 - Treat `cluster_key` as a root credential: keep it out of shell history and process listings (`--config` file with mode `0600` rather than `--cluster-key` on the command line).
 - Keep NTP running; a skewed clock is indistinguishable from an attack and is rejected with `401`.

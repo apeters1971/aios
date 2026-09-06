@@ -8,6 +8,7 @@
 #include "http/quota_admin.hpp"
 #include "http/s3_iam.hpp"
 #include "http/space_history.hpp"
+#include "http/tls_stream.hpp"
 #include "http/vbd_registry.hpp"
 #include "membership.hpp"
 #include "object/object_service.hpp"
@@ -26,6 +27,17 @@
 #include <unordered_set>
 
 namespace aios {
+
+// One accepted HTTP connection: the socket plus the byte stream over it (plain
+// or TLS, decided by the listener's configuration). Every read and write of a
+// session goes through `stream` so the same handlers serve http:// and https://.
+struct HttpConn {
+  explicit HttpConn(boost::asio::io_context& ioc) : sock(ioc) {}
+  boost::asio::ip::tcp::socket sock;
+  std::unique_ptr<TlsStream> stream;  // set once the socket is accepted
+  int fd() { return static_cast<int>(sock.native_handle()); }
+  bool tls() const { return stream && stream->tls(); }
+};
 
 class HttpServer {
  public:
@@ -70,7 +82,7 @@ class HttpServer {
 
  private:
   void do_accept();
-  void handle_session(std::shared_ptr<boost::asio::ip::tcp::socket> sock);
+  void handle_session(std::shared_ptr<HttpConn> conn);
   void kick_sessions();
   // Long-poll replies (watch, pubsub subscribe) are written from a detached thread
   // so the worker is freed. Those threads hold references to this server and to
@@ -85,10 +97,10 @@ class HttpServer {
   void note_login_failure(const std::string& peer);
   void note_login_success(const std::string& peer);
   // POST /auth/ticket: proof-of-key -> sealed ticket (util/ticket.hpp).
-  void handle_ticket_grant(boost::asio::ip::tcp::socket& sock, const std::vector<std::uint8_t>& body,
+  void handle_ticket_grant(HttpConn& sock, const std::vector<std::uint8_t>& body,
                            const std::string& peer, bool keep_alive);
   // /admin/api/principals[...]; returns false when the route did not match.
-  bool handle_principal_admin(boost::asio::ip::tcp::socket& sock, const std::string& method,
+  bool handle_principal_admin(HttpConn& sock, const std::string& method,
                               const std::string& path, const std::vector<std::uint8_t>& body,
                               bool keep_alive);
   nlohmann::json admin_status_json() const;
@@ -120,7 +132,8 @@ class HttpServer {
   boost::asio::thread_pool workers_;
   std::atomic<bool> closing_{false};
   std::mutex sessions_mu_;
-  std::unordered_set<std::shared_ptr<boost::asio::ip::tcp::socket>> sessions_;
+  std::unordered_set<std::shared_ptr<HttpConn>> sessions_;
+  std::shared_ptr<TlsServerContext> tls_;  // null => plain HTTP listener
   std::mutex detached_mu_;
   std::condition_variable detached_cv_;
   int detached_{0};

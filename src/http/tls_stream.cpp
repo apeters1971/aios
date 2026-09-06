@@ -7,6 +7,7 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <cerrno>
 #include <cstring>
@@ -87,7 +88,106 @@ std::shared_ptr<TlsServerContext> TlsServerContext::load(const std::string& cert
   return out;
 }
 
+TlsClientContext::~TlsClientContext() {
+  if (ctx_) SSL_CTX_free(ctx_);
+}
+
+std::shared_ptr<TlsClientContext> TlsClientContext::create(const std::string& ca_pem,
+                                                           bool insecure, std::string& err) {
+  SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+  if (!ctx) {
+    err = "SSL_CTX_new: " + openssl_error_string();
+    return nullptr;
+  }
+  std::shared_ptr<TlsClientContext> out(new TlsClientContext(ctx, insecure));
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+  if (insecure) {
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    return out;
+  }
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+  if (!ca_pem.empty()) {
+    if (SSL_CTX_load_verify_locations(ctx, ca_pem.c_str(), nullptr) != 1) {
+      err = "load CA " + ca_pem + ": " + openssl_error_string();
+      return nullptr;
+    }
+  } else if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+    err = "system CA store: " + openssl_error_string();
+    return nullptr;
+  }
+  return out;
+}
+
+bool split_endpoint_scheme(const std::string& endpoint, bool& tls_out, std::string& hostport_out) {
+  tls_out = false;
+  hostport_out = endpoint;
+  auto strip = [&](const char* prefix, bool tls) {
+    const std::size_t n = std::strlen(prefix);
+    if (endpoint.size() > n && endpoint.compare(0, n, prefix) == 0) {
+      tls_out = tls;
+      hostport_out = endpoint.substr(n);
+      while (!hostport_out.empty() && hostport_out.back() == '/') hostport_out.pop_back();
+      return true;
+    }
+    return false;
+  };
+  if (strip("https://", true) || strip("http://", false)) return true;
+  return endpoint.find("://") == std::string::npos;
+}
+
 TlsStream::TlsStream(int fd) : fd_(fd) {}
+
+TlsStream::TlsStream(int fd, std::shared_ptr<TlsClientContext> ctx, const std::string& host)
+    : fd_(fd), cctx_(std::move(ctx)) {
+  if (!cctx_) return;
+  ssl_ = SSL_new(cctx_->native());
+  if (!ssl_) return;
+  SSL_set_fd(ssl_, fd_);
+  // SNI + hostname verification. An IP literal has no name to match, so only
+  // set the host check for DNS names (IPs are matched via the SAN IP entries
+  // when present; a plain IP with a CN-only cert needs --tls-insecure or a
+  // cert that carries an IP SAN).
+  const bool is_ip = !host.empty() && (host.find_first_not_of("0123456789.") == std::string::npos ||
+                                       host.find(':') != std::string::npos);
+  if (!is_ip) SSL_set_tlsext_host_name(ssl_, host.c_str());
+  if (!cctx_->insecure()) {
+    X509_VERIFY_PARAM* vp = SSL_get0_param(ssl_);
+    X509_VERIFY_PARAM_set_hostflags(vp, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(vp, host.c_str());
+    else X509_VERIFY_PARAM_set1_host(vp, host.c_str(), 0);
+  }
+}
+
+bool TlsStream::connect(std::string& err_out) {
+  if (!ssl_) {
+    if (cctx_) {
+      err_out = "SSL_new failed";
+      return false;
+    }
+    return true;
+  }
+  ERR_clear_error();
+  const int r = SSL_connect(ssl_);
+  if (r == 1) {
+    handshaken_ = true;
+    return true;
+  }
+  const int reason = SSL_get_error(ssl_, r);
+  if (reason == SSL_ERROR_SYSCALL) {
+    const int e = errno;
+    err_out = e == 0 ? "server closed during TLS handshake (plain HTTP endpoint?)"
+                     : std::string(strerror(e));
+    if (e == EAGAIN || e == EWOULDBLOCK) err_out = "TLS handshake timed out";
+  } else {
+    const long vr = SSL_get_verify_result(ssl_);
+    err_out = openssl_error_string();
+    if (vr != X509_V_OK) {
+      err_out += std::string(" (certificate: ") + X509_verify_cert_error_string(vr) + ")";
+    }
+  }
+  return false;
+}
 
 TlsStream::TlsStream(int fd, std::shared_ptr<TlsServerContext> ctx)
     : fd_(fd), ctx_(std::move(ctx)) {

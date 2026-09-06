@@ -203,7 +203,7 @@ Full PUT/GET bodies are streamed to/from filesystem staging when larger than 256
 
 Mutating requests on a non-primary return **307** with:
 
-- `Location: http://{primary.http_addr}/o/{oid}…`
+- `Location: http://{primary.http_addr}/o/{oid}…` (`https://` when the listener has `http_tls_cert`)
 - `x-aios-primary`, `x-aios-acting-set` (JSON)
 - JSON body `{ code: "not_primary", acting_set, epoch }`
 

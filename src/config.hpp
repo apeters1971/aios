@@ -191,6 +191,17 @@ struct Config {
   // principal ticket: "any" (default, compatible) or "loopback" (only peers on
   // 127.0.0.0/8 or ::1 — the daemon's own S3 gateway and local tools).
   std::string http_shared_key_clients{"any"};
+  // PEM certificate + private key for the HTTP API listener (object API, admin,
+  // /metrics). Both set => HTTPS, both empty => plain HTTP. Cluster-wide
+  // setting: 307 redirects between nodes and the daemon's own consumers (S3
+  // gateway mount, bench, admin proxy) assume every node speaks the same scheme.
+  // http_tls_ca is what this node trusts when it connects to peers over HTTPS
+  // (admin proxy); empty => its own certificate chain is trusted for loopback and
+  // peers are verified against the system store.
+  std::string http_tls_cert;
+  std::string http_tls_key;
+  std::string http_tls_chain;
+  std::string http_tls_ca;
   // S3-compatible API listen address; empty disables. Uses libaios_posix on s3_volume.
   std::string s3_listen;
   // PEM certificate + private key for the S3 listener. Both set => HTTPS; both

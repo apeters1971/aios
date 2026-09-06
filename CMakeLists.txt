@@ -238,6 +238,7 @@ add_library(aios_core STATIC
   src/http/posix_layout_store.cpp
   src/http/vbd_registry.cpp
   src/http/space_history.cpp
+  src/http/tls_stream.cpp
   src/metrics/ops_counters.cpp
   src/metrics/app_label.cpp
   src/metrics/qos_rates.cpp
@@ -259,6 +260,7 @@ target_link_libraries(aios_core PUBLIC
   Threads::Threads
   Boost::headers
   OpenSSL::Crypto
+  OpenSSL::SSL
   SQLite3::SQLite3
   yaml-cpp
   nlohmann_json::nlohmann_json
@@ -338,7 +340,6 @@ endif()
 add_library(aios_s3 STATIC
   src/http/s3_server.cpp
   src/http/s3_range.cpp
-  src/http/tls_stream.cpp
 )
 target_include_directories(aios_s3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -612,6 +613,7 @@ add_executable(aios_tests
   tests/test_client_io.cpp
   tests/test_ticket_auth.cpp
   tests/test_s3_tls.cpp
+  tests/test_http_tls.cpp
 )
 target_include_directories(aios_tests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/tests

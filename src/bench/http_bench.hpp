@@ -34,6 +34,11 @@ struct HttpBenchConfig {
   std::string mode{"object"};
   std::vector<std::string> stl_types;
   std::string stl_sync{"both"};
+  // HTTPS: set by an "https://" endpoint or explicitly. tls_ca empty => system
+  // store; tls_insecure skips verification (self-signed labs, loopback).
+  bool tls{false};
+  std::string tls_ca;
+  bool tls_insecure{false};
 };
 
 void http_bench_apply_cli_defaults(HttpBenchConfig& c);

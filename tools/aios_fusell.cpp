@@ -20,14 +20,16 @@ struct Options {
   uint64_t stripe_unit{0};
   uint32_t stripe_width{0};
   bool nolease{false};
+  std::string tls_ca;        // https:// endpoint: PEM bundle to trust
+  bool tls_insecure{false};  // https:// endpoint: skip verification
 };
 
 void usage(const char* argv0) {
   std::fprintf(stderr,
-               "Usage: %s [FUSE options] -o endpoint=HOST:PORT,cluster_key=KEY[,volume=NAME] "
+               "Usage: %s [FUSE options] -o endpoint=[https://]HOST:PORT,cluster_key=KEY[,volume=NAME] "
                "MOUNTPOINT\n\n"
                "AIOS options: endpoint, cluster_key, volume, app_label, stripe_unit, "
-               "stripe_width, nolease\n",
+               "stripe_width, nolease, tls_ca, tls_insecure\n",
                argv0);
   fuse_cmdline_help();
   fuse_lowlevel_help();
@@ -35,7 +37,8 @@ void usage(const char* argv0) {
 
 bool is_aios_opt(const std::string& k) {
   return k == "endpoint" || k == "cluster_key" || k == "volume" || k == "app_label" ||
-         k == "stripe_unit" || k == "stripe_width" || k == "nolease";
+         k == "stripe_unit" || k == "stripe_width" || k == "nolease" || k == "tls_ca" ||
+         k == "tls_insecure";
 }
 
 void apply_aios_opt(const std::string& k, const std::string& v, Options& opt) {
@@ -46,6 +49,8 @@ void apply_aios_opt(const std::string& k, const std::string& v, Options& opt) {
   else if (k == "stripe_unit") opt.stripe_unit = std::stoull(v);
   else if (k == "stripe_width") opt.stripe_width = static_cast<uint32_t>(std::stoul(v));
   else if (k == "nolease") opt.nolease = true;
+  else if (k == "tls_ca") opt.tls_ca = v;
+  else if (k == "tls_insecure") opt.tls_insecure = true;
 }
 
 /* Consume AIOS keys from a comma-separated -o list. Return leftover FUSE keys. */
@@ -150,6 +155,8 @@ int main(int argc, char** argv) {
   cfg.uid = static_cast<uint32_t>(::geteuid());
   cfg.gid = static_cast<uint32_t>(::getegid());
   cfg.rstat_interval_ms = 60000;
+  if (!opt.tls_ca.empty()) cfg.tls_ca = opt.tls_ca.c_str();
+  if (opt.tls_insecure) cfg.flags |= AIOS_POSIX_F_TLS_INSECURE;
   if (opt.nolease) cfg.flags |= AIOS_POSIX_F_NOLEASE;
 
   int err = 0;

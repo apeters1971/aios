@@ -15,7 +15,9 @@ void usage() {
       << "\n"
       << "Multithreaded HTTP client benchmark.\n"
       << "\n"
-      << "  --endpoint HOST:PORT   HTTP API (default 127.0.0.1:7480)\n"
+      << "  --endpoint [https://]HOST:PORT  HTTP API (default 127.0.0.1:7480)\n"
+      << "  --tls-ca PEM           CA bundle for https:// (default: system store)\n"
+      << "  --tls-insecure         https:// without certificate verification\n"
       << "  --cluster-key KEY      required shared secret\n"
       << "  --mode object|stl      object = raw PUT/GET (default); stl = aios_client types\n"
       << "  --threads N            worker threads (default: hardware concurrency)\n"
@@ -94,6 +96,18 @@ bool parse_args(int argc, char** argv, aios::HttpBenchConfig& a, bool& json_out)
       const char* v = need("--cluster-key");
       if (!v) return false;
       a.cluster_key = v;
+      continue;
+    }
+    if (arg == "--tls-ca") {
+      const char* v = need("--tls-ca");
+      if (!v) return false;
+      a.tls_ca = v;
+      a.tls = true;
+      continue;
+    }
+    if (arg == "--tls-insecure") {
+      a.tls_insecure = true;
+      a.tls = true;
       continue;
     }
     if (arg == "--mode") {

@@ -1,5 +1,6 @@
 #include "client/session.hpp"
 #include "http/http_auth.hpp"
+#include "http/tls_stream.hpp"
 #include "metrics/ops_counters.hpp"
 #include "util/log.hpp"
 
@@ -45,6 +46,10 @@ constexpr std::size_t kIoChunk = 256u * 1024u;
 struct Args {
   std::string endpoint{"127.0.0.1:7480"};
   std::string cluster_key;
+  // HTTPS: "https://" endpoint or --tls; --tls-ca PEM bundle; --tls-insecure.
+  bool tls{false};
+  std::string tls_ca;
+  bool tls_insecure{false};
   std::string app_label;
   std::string cmd;
   std::vector<std::string> positional;
@@ -58,8 +63,8 @@ struct Args {
 
 void usage() {
   std::cout
-      << "usage: aios --cluster-key KEY [--endpoint HOST:PORT] [--app-label LABEL]\n"
-      << "            <cmd> [args]\n"
+      << "usage: aios --cluster-key KEY [--endpoint [https://]HOST:PORT] [--app-label LABEL]\n"
+      << "            [--tls-ca PEM] [--tls-insecure] <cmd> [args]\n"
       << "       aios --principal NAME --key HEX [--endpoint HOST:PORT] <cmd> [args]\n"
       << "       aios --version\n"
       << "\n"
@@ -132,6 +137,22 @@ bool parse_args(int argc, char** argv, Args& a) {
       a.app_label = v;
       continue;
     }
+    if (arg == "--tls") {
+      a.tls = true;
+      continue;
+    }
+    if (arg == "--tls-ca") {
+      const char* v = need("--tls-ca");
+      if (!v) return false;
+      a.tls_ca = v;
+      a.tls = true;
+      continue;
+    }
+    if (arg == "--tls-insecure") {
+      a.tls_insecure = true;
+      a.tls = true;
+      continue;
+    }
     if (arg == "--principal") {
       const char* v = need("--principal");
       if (!v) return false;
@@ -196,7 +217,15 @@ bool parse_args(int argc, char** argv, Args& a) {
 // Credential label in Authorization: "cli" with the shared key, or the ticket.
 std::string g_credential = "cli";
 
-void parse_endpoint(const std::string& ep, std::string& host, std::string& port) {
+// Accepts "[http[s]://]HOST:PORT"; sets tls_out when the scheme is https.
+void parse_endpoint(const std::string& ep_in, std::string& host, std::string& port,
+                    bool* tls_out = nullptr) {
+  bool scheme_tls = false;
+  std::string ep;
+  if (!aios::split_endpoint_scheme(ep_in, scheme_tls, ep)) {
+    throw std::runtime_error("endpoint must be [http[s]://]HOST:PORT");
+  }
+  if (tls_out && scheme_tls) *tls_out = true;
   auto colon = ep.rfind(':');
   if (colon == std::string::npos) throw std::runtime_error("endpoint must be HOST:PORT");
   host = ep.substr(0, colon);
@@ -220,6 +249,7 @@ void add_auth(std::unordered_map<std::string, std::string>& headers, const std::
 
 // Set by main from --app-label for http_exchange.
 std::string g_app_label;
+std::shared_ptr<aios::TlsClientContext> g_tls;  // null => plain http
 
 struct HttpResp {
   int status{-1};
@@ -230,15 +260,17 @@ struct HttpResp {
 
 bool parse_location(const std::string& loc, std::string& host, std::string& port,
                     std::string& path) {
-  if (loc.rfind("http://", 0) == 0) {
-    auto rest = loc.substr(7);
+  bool abs_tls = false;
+  std::string hostpath;
+  if (aios::split_endpoint_scheme(loc, abs_tls, hostpath) && hostpath != loc) {
+    auto rest = hostpath;
     auto slash = rest.find('/');
     auto hp = slash == std::string::npos ? rest : rest.substr(0, slash);
     path = slash == std::string::npos ? std::string("/") : rest.substr(slash);
     auto colon = hp.rfind(':');
     if (colon == std::string::npos) {
       host = hp;
-      port = "80";
+      port = abs_tls ? "443" : "80";
     } else {
       host = hp.substr(0, colon);
       port = hp.substr(colon + 1);
@@ -290,6 +322,33 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
       resp.error = "connect: " + ec.message();
       return resp;
     }
+    sock.non_blocking(false, ec);
+    aios::TlsStream stream(static_cast<int>(sock.native_handle()), g_tls, host);
+    {
+      std::string terr;
+      if (!stream.connect(terr)) {
+        resp.error = "tls: " + terr;
+        return resp;
+      }
+    }
+    auto write_all = [&](const void* p, std::size_t n) {
+      int err = 0;
+      if (stream.write_all(p, n, err)) return true;
+      ec = boost::system::error_code(err ? err : EPIPE, boost::system::system_category());
+      return false;
+    };
+    // Reads at least one byte (or fails); ec == eof on a clean close.
+    auto read_some = [&](void* p, std::size_t n) -> std::size_t {
+      int err = 0;
+      const long r = stream.read_some(p, n, err);
+      if (r > 0) {
+        ec = {};
+        return static_cast<std::size_t>(r);
+      }
+      ec = r == 0 ? boost::system::error_code(asio::error::eof)
+                  : boost::system::error_code(err ? err : EIO, boost::system::system_category());
+      return 0;
+    };
 
     std::ostringstream req;
     req << method << ' ' << target << " HTTP/1.1\r\n";
@@ -298,8 +357,7 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
     for (const auto& [k, v] : headers) req << k << ": " << v << "\r\n";
     req << "\r\n";
     const auto head = req.str();
-    asio::write(sock, asio::buffer(head), ec);
-    if (ec) {
+    if (!write_all(head.data(), head.size())) {
       resp.error = "write headers: " + ec.message();
       return resp;
     }
@@ -318,8 +376,7 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
         in.read(buf.data(), n);
         const auto got = in.gcount();
         if (got <= 0) break;
-        asio::write(sock, asio::buffer(buf.data(), static_cast<std::size_t>(got)), ec);
-        if (ec) {
+        if (!write_all(buf.data(), static_cast<std::size_t>(got))) {
           resp.error = "write body: " + ec.message();
           return resp;
         }
@@ -332,7 +389,18 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
     }
 
     asio::streambuf buf;
-    asio::read_until(sock, buf, "\r\n\r\n", ec);
+    for (;;) {
+      const auto data = buf.data();
+      const std::string view(asio::buffers_begin(data), asio::buffers_end(data));
+      if (view.find("\r\n\r\n") != std::string::npos) {
+        ec = {};
+        break;
+      }
+      auto mb = buf.prepare(4096);
+      const std::size_t n = read_some(mb.data(), mb.size());
+      if (ec) break;
+      buf.commit(n);
+    }
     if (ec && ec != asio::error::eof) {
       resp.error = "read headers: " + ec.message();
       return resp;
@@ -378,8 +446,7 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
       std::vector<char> chunk(kIoChunk);
       while (need > 0) {
         const auto n = std::min(need, chunk.size());
-        const auto got =
-            asio::read(sock, asio::buffer(chunk.data(), n), asio::transfer_exactly(n), ec);
+        const auto got = read_some(chunk.data(), n);
         if (ec) {
           resp.error = "read body: " + ec.message();
           return resp;
@@ -392,9 +459,7 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
       resp.body = std::move(prelude);
       resp.body.resize(content_length);
       while (need > 0) {
-        const auto n =
-            asio::read(sock, asio::buffer(resp.body.data() + (content_length - need), need),
-                       asio::transfer_at_least(1), ec);
+        const auto n = read_some(resp.body.data() + (content_length - need), need);
         if (ec) {
           resp.error = "read body: " + ec.message();
           return resp;
@@ -408,7 +473,7 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
       if (it == resp.headers.end() || hop == max_redirects) return resp;
       std::string new_host = host, new_port = port, new_path;
       if (!parse_location(it->second, new_host, new_port, new_path)) return resp;
-      if (it->second.rfind("http://", 0) == 0) {
+      if (it->second.rfind("http://", 0) == 0 || it->second.rfind("https://", 0) == 0) {
         host = new_host;
         port = new_port;
       }
@@ -2033,7 +2098,12 @@ int main(int argc, char** argv) {
 
   std::string host, port;
   try {
-    parse_endpoint(args.endpoint, host, port);
+    parse_endpoint(args.endpoint, host, port, &args.tls);
+    if (args.tls) {
+      std::string terr;
+      g_tls = aios::TlsClientContext::create(args.tls_ca, args.tls_insecure, terr);
+      if (!g_tls) throw std::runtime_error("tls: " + terr);
+    }
   } catch (const std::exception& e) {
     std::cerr << e.what() << "\n";
     return 2;
@@ -2049,6 +2119,9 @@ int main(int argc, char** argv) {
     try {
       aios::SessionConfig scfg;
       scfg.endpoint = args.endpoint;
+      scfg.tls = args.tls;
+      scfg.tls_ca = args.tls_ca;
+      scfg.tls_insecure = args.tls_insecure;
       scfg.principal = args.principal;
       scfg.principal_key = args.principal_key;
       aios::Session s(scfg);
