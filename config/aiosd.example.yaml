@@ -135,6 +135,9 @@ http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # http_tls_key: /etc/aios/http.key
 # http_tls_chain: /etc/aios/http-chain.pem
 # http_tls_ca: /etc/aios/ca.pem        # what this node trusts when talking to peers
+# Refuse x-aios-content-sha256: UNSIGNED-PAYLOAD (body not covered by the signature).
+# All AIOS clients sign the body digest; enable once no third-party client needs the opt-out.
+# http_require_signed_payload: false
 # S3-compatible API (FS-backed via libaios_posix on s3_volume; requires http_listen):
 # s3_listen: "0.0.0.0:7481"
 # s3_volume: s3                 # POSIX volume; buckets = top-level directories

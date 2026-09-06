@@ -12,6 +12,19 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — every client signs the body digest
+
+The kernel module `aios_http`, the `aios` CLI and `aios-bench` used to sign `UNSIGNED-PAYLOAD`, so
+the HMAC covered the request line and headers but not the bytes: an on-path party could swap a
+PUT's payload under a valid signature (the CRC32C only catches accidents). They now send the body's
+SHA-256 in `x-aios-content-sha256` like `aios::Session` already did, and the server verifies the
+received bytes against it. Kernel: one `sha256` shash per client, one pass per request (the digest
+of the empty body for bodiless requests). CLI: one extra read pass over the file before the upload.
+Bench: signed by default so the numbers include the client-side hash; `--unsigned-payload` /
+`"unsigned_payload": true` measures the wire alone. The process smoke test runs its daemon with
+`http_require_signed_payload: true`, so a client that regresses to `UNSIGNED-PAYLOAD` fails CI.
+Remaining gap: node-to-node RPC trailers are bound to the signed envelope by CRC32C only.
+
 ### Added — TLS on the HTTP API
 
 `http_tls_cert` / `http_tls_key` (+ `http_tls_chain`, `http_tls_ca`) make the HTTP listener speak

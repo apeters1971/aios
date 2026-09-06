@@ -12,6 +12,12 @@ x-aios-date: <unix-ms>
 x-aios-content-sha256: <sha256-hex of body> | UNSIGNED-PAYLOAD
 ```
 
+`x-aios-content-sha256` is part of the canonical string, so a concrete digest binds the body to the
+signature; the server rejects a body that does not hash to it (`400 content_sha256_mismatch`).
+All AIOS clients (Session, CLI, bench, kernel `aios_http`) send the digest. `UNSIGNED-PAYLOAD`
+leaves the body unauthenticated and is refused with `401 signed_payload_required` when the cluster
+sets `http_require_signed_payload: true`.
+
 ### Application label (optional)
 
 Clients may tag requests with a workload label:
@@ -308,16 +314,16 @@ Subscribe long-polls use worker threads (same as watches).
 
 `Range: bytes=0-99` → `206` + `Content-Range: bytes 0-99/<size>`. Unsatisfiable → `416`.
 
-## Example (UNSIGNED-PAYLOAD)
+## Example (signed body digest)
 
 ```bash
 DATE=$(date +%s000)
 BODY='hello'
-HASH=UNSIGNED-PAYLOAD
-# Build signature with the same canonical rules, then:
+HASH=$(printf '%s' "$BODY" | sha256sum | cut -d' ' -f1)   # or UNSIGNED-PAYLOAD (see above)
+# Build signature with the same canonical rules (HASH is its last line), then:
 curl -X PUT "http://127.0.0.1:7480/o/myobj" \
   -H "Authorization: AIOS-HMAC-SHA256 Credential=cli, SignedHeaders=x-aios-date;x-aios-content-sha256, Signature=..." \
   -H "x-aios-date: $DATE" \
-  -H "x-aios-content-sha256: UNSIGNED-PAYLOAD" \
+  -H "x-aios-content-sha256: $HASH" \
   --data-binary "$BODY"
 ```

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "internal.h"
 
+#include <crypto/hash.h>
+
 #include <linux/atomic.h>
 #include <linux/ctype.h>
 #include <linux/mm.h>
@@ -76,6 +78,8 @@ void aios_http_client_destroy(struct aios_http_client *c)
 	kfree(c->reqbuf);
 	kfree(c->hdrbuf);
 	kfree(c->authbuf);
+	if (c->sha256)
+		crypto_free_shash(c->sha256);
 	kfree(c);
 }
 EXPORT_SYMBOL_GPL(aios_http_client_destroy);

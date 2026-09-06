@@ -39,6 +39,9 @@ struct HttpBenchConfig {
   bool tls{false};
   std::string tls_ca;
   bool tls_insecure{false};
+  // Object mode: sign UNSIGNED-PAYLOAD instead of the body digest (measures the
+  // wire without the client-side SHA-256; refused by http_require_signed_payload).
+  bool unsigned_payload{false};
 };
 
 void http_bench_apply_cli_defaults(HttpBenchConfig& c);

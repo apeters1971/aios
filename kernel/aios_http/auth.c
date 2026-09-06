@@ -48,6 +48,40 @@ out_tfm:
 	return err;
 }
 
+int aios_http_sha256_hex(struct aios_http_client *c, const void *body, size_t body_len,
+			 char *hex_out)
+{
+	u8 digest[32];
+	int err;
+	int i;
+
+	if (!c || !hex_out || (body_len && !body))
+		return -EINVAL;
+
+	if (!c->sha256) {
+		struct crypto_shash *tfm = crypto_alloc_shash("sha256", 0, 0);
+
+		if (IS_ERR(tfm))
+			return PTR_ERR(tfm);
+		c->sha256 = tfm;
+	}
+	{
+		SHASH_DESC_ON_STACK(desc, c->sha256);
+
+		desc->tfm = c->sha256;
+		err = crypto_shash_digest(desc, body_len ? body : (const u8 *)"", body_len,
+					  digest);
+		shash_desc_zero(desc);
+	}
+	if (err)
+		return err;
+
+	for (i = 0; i < 32; i++)
+		sprintf(hex_out + i * 2, "%02x", digest[i]);
+	hex_out[64] = '\0';
+	return 0;
+}
+
 static void random_hex(char *out, size_t bytes)
 {
 	static const char hex[] = "0123456789abcdef";
@@ -243,12 +277,14 @@ int aios_http_ensure_ticket(struct aios_http_client *c, bool force)
 }
 
 int aios_http_build_auth(struct aios_http_client *c, const char *method,
-			 const char *path, char *auth_hdrs, size_t auth_hdrs_len)
+			 const char *path, const void *body, size_t body_len,
+			 char *auth_hdrs, size_t auth_hdrs_len)
 {
-	/* Canonical: method\npath\ndate\nSignedHeaders:\nSignedHeaders\nUNSIGNED-PAYLOAD */
+	/* Canonical: method\npath\ndate\nSignedHeaders:\nSignedHeaders\n<body sha256 hex> */
 	char date[32];
 	char *canon;
 	char sig[65];
+	char body_sha[65];
 	const char *key;
 	const char *credential;
 	s64 ms;
@@ -276,6 +312,15 @@ int aios_http_build_auth(struct aios_http_client *c, const char *method,
 		credential = "stl";
 	}
 
+	/*
+	 * Sign the body's digest rather than UNSIGNED-PAYLOAD: the server checks
+	 * the received bytes against it, so an on-path party cannot swap the
+	 * payload of an otherwise valid request. Costs one SHA-256 pass per PUT.
+	 */
+	err = aios_http_sha256_hex(c, body, body_len, body_sha);
+	if (err)
+		return err;
+
 	ms = ktime_to_ms(ktime_get_real());
 	snprintf(date, sizeof(date), "%lld", (long long)ms);
 
@@ -293,8 +338,8 @@ int aios_http_build_auth(struct aios_http_client *c, const char *method,
 		     "%s\n%s\n%s\n"
 		     "x-aios-content-sha256;x-aios-date:\n"
 		     "x-aios-content-sha256;x-aios-date\n"
-		     "UNSIGNED-PAYLOAD",
-		     method, path, date);
+		     "%s",
+		     method, path, date, body_sha);
 	if (n < 0 || n >= (int)AIOS_HTTP_CANON_MAX) {
 		kfree(canon);
 		return -EOVERFLOW;
@@ -307,10 +352,10 @@ int aios_http_build_auth(struct aios_http_client *c, const char *method,
 
 	n = snprintf(auth_hdrs, auth_hdrs_len,
 		     "x-aios-date: %s\r\n"
-		     "x-aios-content-sha256: UNSIGNED-PAYLOAD\r\n"
+		     "x-aios-content-sha256: %s\r\n"
 		     "Authorization: AIOS-HMAC-SHA256 Credential=%s, "
 		     "SignedHeaders=x-aios-content-sha256;x-aios-date, Signature=%s\r\n",
-		     date, credential, sig);
+		     date, body_sha, credential, sig);
 	if (n < 0 || n >= (int)auth_hdrs_len)
 		return -EOVERFLOW;
 	return 0;

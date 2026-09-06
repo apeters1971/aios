@@ -370,7 +370,7 @@ static int tcp_request_once(struct aios_http_client *c, const char *method, cons
 	if (!req || !hdrbuf || !auth)
 		return -ENOMEM;
 
-	err = aios_http_build_auth(c, method, path, auth, AIOS_HTTP_AUTH_MAX);
+	err = aios_http_build_auth(c, method, path, body, body_len, auth, AIOS_HTTP_AUTH_MAX);
 	if (err)
 		return err;
 

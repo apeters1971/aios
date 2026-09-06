@@ -133,6 +133,7 @@ struct Daemon {
   std::filesystem::path root;
   std::filesystem::path scan_root;
   std::filesystem::path status_file;
+  std::filesystem::path config_file;
   std::filesystem::path log;
   int rpc_port{0};
   int http_port{0};
@@ -144,6 +145,10 @@ struct Daemon {
     log = root / "aiosd.log";
     std::filesystem::create_directories(scan_root);
     std::ofstream(scan_root / ".aios") << "storage_class: nvme\nweight: 1\nstate: up\n";
+    // Every client of this daemon (Session, the aios CLI) must sign its body
+    // digest; UNSIGNED-PAYLOAD is refused.
+    config_file = root / "aiosd.yaml";
+    std::ofstream(config_file) << "http_require_signed_payload: true\n";
     rpc_port = free_port();
     http_port = free_port();
   }
@@ -152,7 +157,8 @@ struct Daemon {
 
   void start() {
     child = Child::spawn(AIOS_TEST_AIOSD_PATH,
-                         {"--cluster-key", kClusterKey, "--node-id", "smoke",
+                         {"--config", config_file.string(),
+                          "--cluster-key", kClusterKey, "--node-id", "smoke",
                           "--listen", "127.0.0.1:" + std::to_string(rpc_port),
                           "--http-listen", endpoint(),
                           "--status-file", status_file.string(),

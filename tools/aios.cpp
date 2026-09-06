@@ -1,6 +1,8 @@
 #include "client/session.hpp"
 #include "http/http_auth.hpp"
 #include "http/tls_stream.hpp"
+
+#include <openssl/evp.h>
 #include "metrics/ops_counters.hpp"
 #include "util/log.hpp"
 
@@ -234,14 +236,51 @@ void parse_endpoint(const std::string& ep_in, std::string& host, std::string& po
 
 std::string url_encode_oid(const std::string& oid) { return aios::http_url_encode_oid(oid); }
 
+// SHA-256 (hex) of a file's contents, streamed; empty path => digest of "".
+bool sha256_file_hex(const std::string& path, std::string& hex_out, std::string& err) {
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (!ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+    if (ctx) EVP_MD_CTX_free(ctx);
+    err = "sha256 init";
+    return false;
+  }
+  if (!path.empty()) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      EVP_MD_CTX_free(ctx);
+      err = "open body file";
+      return false;
+    }
+    std::vector<char> buf(kIoChunk);
+    while (in) {
+      in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+      const auto got = in.gcount();
+      if (got > 0) EVP_DigestUpdate(ctx, buf.data(), static_cast<std::size_t>(got));
+    }
+  }
+  unsigned char md[EVP_MAX_MD_SIZE];
+  unsigned int md_len = 0;
+  EVP_DigestFinal_ex(ctx, md, &md_len);
+  EVP_MD_CTX_free(ctx);
+  static const char* hexd = "0123456789abcdef";
+  hex_out.assign(md_len * 2, '0');
+  for (unsigned i = 0; i < md_len; ++i) {
+    hex_out[i * 2] = hexd[md[i] >> 4];
+    hex_out[i * 2 + 1] = hexd[md[i] & 0xf];
+  }
+  return true;
+}
+
+// payload_hash: sha256 hex of the body (the server checks the bytes against it).
 void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
-              const std::string& target, const std::string& cluster_key) {
+              const std::string& target, const std::string& cluster_key,
+              const std::string& payload_hash) {
   const std::string date = std::to_string(aios::now_ms());
   headers["x-aios-date"] = date;
-  headers["x-aios-content-sha256"] = "UNSIGNED-PAYLOAD";
+  headers["x-aios-content-sha256"] = payload_hash;
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
   const auto canon =
-      aios::http_canonical(method, target, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
+      aios::http_canonical(method, target, date, signed_headers, headers, payload_hash);
   const auto sig = aios::http_sign(cluster_key, canon);
   headers["authorization"] = "AIOS-HMAC-SHA256 Credential=" + g_credential +
                              ", SignedHeaders=" + signed_headers + ", Signature=" + sig;
@@ -291,6 +330,7 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
                        const std::string& body_file, std::ostream* out_stream,
                        const std::string& cluster_key, int max_redirects = 5) {
   HttpResp resp;
+  std::string body_hash;
   for (int hop = 0; hop <= max_redirects; ++hop) {
     std::uint64_t body_len = 0;
     if (!body_file.empty()) {
@@ -306,7 +346,16 @@ HttpResp http_exchange(std::string host, std::string port, const std::string& me
     headers.erase("x-aios-date");
     headers["content-length"] = std::to_string(body_len);
     if (!g_app_label.empty()) headers["x-aios-app-label"] = g_app_label;
-    add_auth(headers, method, target, cluster_key);
+    // One extra read pass over the body file; the signature then covers the
+    // payload and the server rejects a body that was altered in flight.
+    if (body_hash.empty()) {
+      std::string herr;
+      if (!sha256_file_hex(body_len ? body_file : std::string(), body_hash, herr)) {
+        resp.error = herr;
+        return resp;
+      }
+    }
+    add_auth(headers, method, target, cluster_key, body_hash);
 
     asio::io_context ioc;
     boost::system::error_code ec;

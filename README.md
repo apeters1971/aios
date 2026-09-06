@@ -652,7 +652,9 @@ aios-posix-fsck --volume default --endpoint https://node-a:7480 --tls-ca /etc/ai
 part of the endpoint (DNS name via SAN/CN, IP literal via an IP SAN); the daemon's own loopback
 consumers (S3 gateway mount, admin-UI bench) connect insecurely since a cluster certificate rarely
 carries a loopback SAN. Plain-text clients on an HTTPS port are dropped at the handshake. The
-kernel modules (`aiosfs`, `aios_http`) still speak plain HTTP.
+kernel modules (`aiosfs`, `aios_http`) still speak plain HTTP: they are authenticated (tickets) and
+their bodies are integrity-protected (signed SHA-256), but not encrypted — put kernel mounts on the
+private network or under a WireGuard/IPsec tunnel when the path is untrusted.
 
 ---
 
@@ -1101,7 +1103,7 @@ who can reach the ports or observe the wire.
 |----------|---------------|
 | **Transport** | The **HTTP object API, admin UI/API and metrics can run HTTPS** (`http_tls_cert` / `http_tls_key`, see [HTTPS on the object API](#https-on-the-object-api)) and so can the **S3 gateway** (`s3_tls_cert` / `s3_tls_key`; SigV4 offers no confidentiality on its own). Gossip/RPC between nodes (TCP++) and the kernel modules are still plaintext: on that path object bodies are readable (not credentials: principal keys never travel, and a captured ticket is useless without its session key). |
 | **Shared secret vs principals** | `cluster_key` remains the **node** secret (join the cluster, receive replicas, participate in placement), the **admin UI password** and the **S3 root secret** (`s3_access_key` / `cluster_key`); anyone holding it has every power. HTTP clients no longer need it: create **principals** (`aios admin principal create`) with role `client` and oid-prefix caps, and set `http_shared_key_clients: loopback` so the shared key is refused from remote clients. Per-bucket S3 IAM keys scope the S3 surface. |
-| **Integrity of bodies** | HMAC-SHA256 covers the canonical request/frame metadata. Streamed bodies are covered only when the client sends a content hash: HTTP PUTs above 256 KiB are currently signed as `UNSIGNED-PAYLOAD`, and replica RPC frames carry the body as an unsigned trailer with a CRC32C (being fixed — see `CHANGELOG.md` OBJ-13 / POS-11). Until then, an on-path party can substitute object contents while the signature still verifies. |
+| **Integrity of bodies** | Every AIOS client — `aios::Session` (and so `libaios_posix`, FUSE, the S3 gateway's mount), the `aios` CLI, `aios-bench`, and the kernel module `aios_http` — signs the SHA-256 of the request body in `x-aios-content-sha256`, and the server verifies the received bytes against it (in memory or while streaming to disk), so an on-path party cannot swap a payload under a valid signature. `UNSIGNED-PAYLOAD` is still accepted from third-party clients unless `http_require_signed_payload: true`. Node-to-node replica RPC frames bind the body trailer to the signed envelope with a CRC32C only (not collision-resistant): the TCP++ port belongs on the private network. |
 | **Replay** | Requests are valid for the `auth_skew_ms` window (default **60 s**). RPC frames have a nonce + replay cache; HTTP requests currently do not (HTTP-4). Clocks must be synchronised (NTP) across nodes and clients. |
 | **Key rotation** | Principal keys rotate individually (`aios admin principal rotate`): issued tickets run to their expiry, new grants need the new key. Changing `cluster_key` still means restarting every node with the new value; there is no dual-key grace period, and it re-seals the keyring (principals must be recreated). Per-bucket IAM secrets can be deleted and recreated individually. |
 | **Authorization** | Principal tickets carry a role (`client` / `admin`) and optional oid-prefix caps enforced on `/o`, `/txn` and LIST. There is no finer per-object ACL, and the shared `cluster_key` still grants everything. POSIX uid/gid checks apply on the FUSE/S3/XRootD paths only. |

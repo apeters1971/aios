@@ -11,6 +11,8 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
+struct crypto_shash;
+
 #define AIOS_HTTP_MAX_BODY (16u * 1024u * 1024u)
 #define AIOS_HTTP_MAX_HDR (16u * 1024u)
 #define AIOS_HTTP_PATH_MAX 1100
@@ -56,6 +58,10 @@ struct aios_http_client {
 	char *reqbuf;
 	char *hdrbuf;
 	char *authbuf; /* AIOS_HTTP_AUTH_MAX, owned by mu */
+	/* Body digest transform, allocated on first use, owned by mu. Every
+	 * request signs the SHA-256 of its body (x-aios-content-sha256) so the
+	 * HMAC covers the payload, not just the request line and headers. */
+	struct crypto_shash *sha256;
 };
 
 struct aios_http_pool {
@@ -69,10 +75,17 @@ struct aios_http_pool {
 int aios_http_hmac_sha256_hex(const char *key, size_t key_len, const char *data,
 			      size_t data_len, char *hex_out /* 65 bytes */);
 
-/* Build Authorization + date headers into auth_hdrs (caller buffer). Caller
- * holds c->mu; in principal mode this may first fetch or renew the ticket. */
+/* SHA-256 of body (may be NULL/0: digest of the empty string) as 64 hex
+ * chars + NUL. Caller holds c->mu. */
+int aios_http_sha256_hex(struct aios_http_client *c, const void *body, size_t body_len,
+			 char *hex_out /* 65 bytes */);
+
+/* Build Authorization + date + content-sha256 headers into auth_hdrs (caller
+ * buffer) for a request carrying `body`. Caller holds c->mu; in principal
+ * mode this may first fetch or renew the ticket. */
 int aios_http_build_auth(struct aios_http_client *c, const char *method,
-			 const char *path, char *auth_hdrs, size_t auth_hdrs_len);
+			 const char *path, const void *body, size_t body_len,
+			 char *auth_hdrs, size_t auth_hdrs_len);
 
 /* Principal mode: obtain a ticket now if none is held or the current one is
  * past its half-life. Caller holds c->mu. */

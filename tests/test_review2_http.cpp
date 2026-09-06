@@ -687,6 +687,35 @@ TEST(Review2Http, RequireSignedPayloadRejectsUnsigned) {
   EXPECT_EQ(http_req(http.host, http.port, "GET", "/o/x", g, "").status, 200);
 }
 
+// The bench client signs the body digest by default (like every production
+// client), so it works against a cluster that requires signed payloads; the
+// explicit --unsigned-payload opt-out is what gets refused there.
+TEST(Review2Http, BenchClientSignsBodyDigest) {
+  HttpFixture http("aios-r2-pos11c", 21075,
+                   [](aios::Config& c) { c.http_require_signed_payload = true; });
+  aios::HttpBenchConfig c;
+  c.endpoint = http.host + ":" + http.port;
+  c.cluster_key = http.fx.cfg.cluster_key;
+  c.threads = 2;
+  c.ops = 4;
+  c.warmup = 1;
+  c.sizes = {1024, 300 * 1024};  // in-memory and streamed (> 256 KiB) server paths
+  c.prefix = "signed";
+  auto r = aios::run_http_bench(c);
+  ASSERT_FALSE(r.contains("error")) << r.dump();
+  ASSERT_FALSE(r["results"].empty());
+  for (const auto& phase : r["results"]) EXPECT_EQ(phase.value("err", 1), 0) << phase.dump();
+
+  c.unsigned_payload = true;
+  c.prefix = "unsigned";
+  r = aios::run_http_bench(c);
+  bool any_err = r.contains("error");
+  for (const auto& phase : r.value("results", nlohmann::json::array())) {
+    if (phase.value("op", "") != "read" && phase.value("err", 0) > 0) any_err = true;
+  }
+  EXPECT_TRUE(any_err) << r.dump();
+}
+
 // ---------------------------------------------------------------------------
 // STO-1: daemon-owned attributes and archive bag oids are off limits to clients.
 // ---------------------------------------------------------------------------

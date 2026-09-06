@@ -19,6 +19,8 @@ void usage() {
       << "  --tls-ca PEM           CA bundle for https:// (default: system store)\n"
       << "  --tls-insecure         https:// without certificate verification\n"
       << "  --cluster-key KEY      required shared secret\n"
+      << "  --unsigned-payload     object mode: skip the client-side body SHA-256 (sign\n"
+      << "                         UNSIGNED-PAYLOAD); default signs the digest like real clients\n"
       << "  --mode object|stl      object = raw PUT/GET (default); stl = aios_client types\n"
       << "  --threads N            worker threads (default: hardware concurrency)\n"
       << "  --ops N                operations per size per phase (default 200;\n"
@@ -108,6 +110,10 @@ bool parse_args(int argc, char** argv, aios::HttpBenchConfig& a, bool& json_out)
     if (arg == "--tls-insecure") {
       a.tls_insecure = true;
       a.tls = true;
+      continue;
+    }
+    if (arg == "--unsigned-payload") {
+      a.unsigned_payload = true;
       continue;
     }
     if (arg == "--mode") {

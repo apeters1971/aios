@@ -1,6 +1,7 @@
 #include "bench/http_bench.hpp"
 #include "client/stl.hpp"
 #include "http/http_auth.hpp"
+#include "util/auth.hpp"
 #include "http/tls_stream.hpp"
 #include "util/log.hpp"
 
@@ -164,13 +165,14 @@ bool parse_http_location(const std::string& loc, std::string& host, std::string&
 class HttpSession {
  public:
   HttpSession(std::string host, std::string port, std::string cluster_key,
-              std::shared_ptr<aios::TlsClientContext> tls = nullptr)
+              std::shared_ptr<aios::TlsClientContext> tls = nullptr, bool unsigned_payload = false)
       : host_(std::move(host)),
         port_(std::move(port)),
         bootstrap_host_(host_),
         bootstrap_port_(port_),
         cluster_key_(std::move(cluster_key)),
         tls_(std::move(tls)),
+        unsigned_payload_(unsigned_payload),
         resolver_(ioc_),
         sock_(ioc_) {
     allow_peer(host_ + ":" + port_);
@@ -317,14 +319,21 @@ class HttpSession {
     }
   }
 
+  // Signs the body digest like every production client does (the server checks
+  // the bytes against it), so the benchmark pays the same per-PUT SHA-256.
+  // unsigned_payload_ opts out to measure the wire alone.
   void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
-                const std::string& target) {
+                const std::string& target, const std::uint8_t* body, std::size_t body_len) {
     const std::string date = std::to_string(aios::now_ms());
     headers["x-aios-date"] = date;
-    headers["x-aios-content-sha256"] = "UNSIGNED-PAYLOAD";
+    const std::string payload_hash =
+        unsigned_payload_ ? std::string("UNSIGNED-PAYLOAD")
+                          : aios::sha256_hex(std::string(reinterpret_cast<const char*>(body),
+                                                         body ? body_len : 0));
+    headers["x-aios-content-sha256"] = payload_hash;
     const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
     const auto canon =
-        aios::http_canonical(method, target, date, signed_headers, headers, "UNSIGNED-PAYLOAD");
+        aios::http_canonical(method, target, date, signed_headers, headers, payload_hash);
     const auto sig = aios::http_sign(cluster_key_, canon);
     headers["authorization"] = "AIOS-HMAC-SHA256 Credential=bench, SignedHeaders=" +
                                signed_headers + ", Signature=" + sig;
@@ -477,7 +486,7 @@ class HttpSession {
     headers["content-length"] = std::to_string(body_len);
     const bool use_continue = body_len > kExpectContinueBytes;
     if (use_continue) headers["Expect"] = "100-continue";
-    add_auth(headers, method, target);
+    add_auth(headers, method, target, body, body_len);
 
     std::ostringstream req;
     req << method << ' ' << target << " HTTP/1.1\r\n";
@@ -528,6 +537,7 @@ class HttpSession {
   std::string bootstrap_port_;
   std::string cluster_key_;
   std::shared_ptr<aios::TlsClientContext> tls_;
+  bool unsigned_payload_{false};
   asio::io_context ioc_;
   tcp::resolver resolver_;
   tcp::socket sock_;
@@ -605,7 +615,7 @@ PhaseStats run_phase(const BenchArgs& a, const std::string& host, const std::str
 
   for (std::size_t t = 0; t < nthreads; ++t) {
     workers.emplace_back([&, t]() {
-      HttpSession sess(host, port, a.cluster_key, tls_context(a));
+      HttpSession sess(host, port, a.cluster_key, tls_context(a), a.unsigned_payload);
       auto& buf = thread_bufs[t];
 
       for (;;) {
@@ -1075,7 +1085,7 @@ bool probe_endpoint(const BenchArgs& args, const std::string& host, const std::s
   std::condition_variable cv;
   bool done = false;
   std::thread th([&] {
-    HttpSession probe(host, port, args.cluster_key, tls_context(args));
+    HttpSession probe(host, port, args.cluster_key, tls_context(args), args.unsigned_payload);
     auto local =
         probe.request("GET", "/o/" + url_encode_oid(args.prefix + "/probe"), nullptr, 0, {});
     probe.close();
@@ -1195,6 +1205,7 @@ HttpBenchConfig http_bench_from_json(const nlohmann::json& j) {
   c.tls = j.value("tls", c.tls);
   c.tls_ca = j.value("tls_ca", c.tls_ca);
   c.tls_insecure = j.value("tls_insecure", c.tls_insecure);
+  c.unsigned_payload = j.value("unsigned_payload", c.unsigned_payload);
   if (j.contains("threads") && j["threads"].is_number_unsigned()) {
     c.threads = j["threads"].get<unsigned>();
   }
