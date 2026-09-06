@@ -217,6 +217,7 @@ add_library(aios_core STATIC
   src/ec/isal_rs.cpp
   src/ec/codec_factory.cpp
   src/object/object_layout.cpp
+  src/object/placement_index.cpp
   src/object/locks_watches.cpp
   src/object/pubsub.cpp
   src/object/object_service.cpp
@@ -564,6 +565,7 @@ add_executable(aios_tests
   tests/test_cluster_map.cpp
   tests/test_map_monitor.cpp
   tests/test_placement.cpp
+  tests/test_repair_placement.cpp
   tests/test_object_rpc.cpp
   tests/test_object_rpc_advanced.cpp
   tests/test_object_service_advanced.cpp

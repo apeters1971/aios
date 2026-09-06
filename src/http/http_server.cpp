@@ -1196,6 +1196,7 @@ nlohmann::json HttpServer::admin_config_json() const {
       {"backup_rules", std::move(backups)},
       {"repair_interval_ms", c.repair_interval_ms},
       {"repair_batch_oids", c.repair_batch_oids},
+      {"repair_scrub_interval_ms", c.repair_scrub_interval_ms},
       {"transition_interval_ms", c.transition_interval_ms},
       {"transition_batch_oids", c.transition_batch_oids},
       {"archive_interval_ms", c.archive_interval_ms},

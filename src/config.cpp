@@ -394,6 +394,8 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
       cfg.repair_interval_ms = root["repair_interval_ms"].as<int>();
     if (root["repair_batch_oids"])
       cfg.repair_batch_oids = root["repair_batch_oids"].as<int>();
+    if (root["repair_scrub_interval_ms"])
+      cfg.repair_scrub_interval_ms = root["repair_scrub_interval_ms"].as<int>();
     if (root["transition_interval_ms"])
       cfg.transition_interval_ms = root["transition_interval_ms"].as<int>();
     if (root["transition_batch_oids"])

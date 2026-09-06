@@ -6,13 +6,18 @@
 #include "ec/ec_attrs.hpp"
 #include "net/object_client.hpp"
 #include "object/object_layout.hpp"
+#include "object/placement_index.hpp"
 #include "util/auth.hpp"
 #include "util/crc32c.hpp"
 #include "util/file_io.hpp"
 #include "util/log.hpp"
 
+#include <algorithm>
 #include <filesystem>
+#include <iterator>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aios {
@@ -453,11 +458,108 @@ bool repair_ec_object(const Config& cfg, const std::string& advertise, const Clu
   return all_ok;
 }
 
+std::vector<std::string> up_target_keys(const ClusterMap& map) {
+  std::vector<std::string> keys;
+  for (const auto& t : map.targets) {
+    if (t.state == LifecycleState::Up) keys.push_back(target_key(t));
+  }
+  std::sort(keys.begin(), keys.end());
+  return keys;
+}
+
+bool placement_topology_changed(const ClusterMap& prev, const ClusterMap& now) {
+  if (prev.replica_count != now.replica_count) return true;
+  if (prev.placement.vnodes_per_target != now.placement.vnodes_per_target) return true;
+  if (prev.placement.min_vnodes != now.placement.min_vnodes) return true;
+  if (prev.placement.max_vnodes != now.placement.max_vnodes) return true;
+  std::unordered_map<std::string, std::pair<int, std::string>> prev_meta;
+  for (const auto& t : prev.targets) {
+    if (t.state != LifecycleState::Up) continue;
+    prev_meta[target_key(t)] = {t.weight, t.rack};
+  }
+  for (const auto& t : now.targets) {
+    if (t.state != LifecycleState::Up) continue;
+    auto it = prev_meta.find(target_key(t));
+    if (it == prev_meta.end()) return true;  // added
+    if (it->second.first != t.weight || it->second.second != t.rack) return true;
+  }
+  return false;
+}
+
+bool is_local_primary(const Config& cfg, const std::string& path, const Placement& p) {
+  return !p.acting_set.empty() && p.acting_set[0].node_id == cfg.node_id &&
+         p.acting_set[0].aios_path == path;
+}
+
+// Whether this local target should remote-stat the acting set. Replicas whose
+// stored acting set still names a live primary leave the check to that primary.
+bool should_stat_acting_set(const Config& cfg, const std::string& path, const Placement& p,
+                            const std::optional<ObjectStore::ObjectPlacement>& stored) {
+  if (is_local_primary(cfg, path, p)) return true;
+  if (!stored || stored->target_keys.empty()) return true;
+  const auto now_keys = acting_target_keys(p);
+  if (stored->target_keys == now_keys) return false;
+  const std::string prim = target_key(p.acting_set[0]);
+  for (const auto& k : stored->target_keys) {
+    if (k == prim) return false;
+  }
+  std::unordered_set<std::string> in_new(now_keys.begin(), now_keys.end());
+  std::string best;
+  for (const auto& k : stored->target_keys) {
+    if (!in_new.count(k)) continue;
+    if (best.empty() || k < best) best = k;
+  }
+  return best == (cfg.node_id + "\n" + path);
+}
+
+std::vector<std::string> select_repair_oids(ObjectStore& store, const RepairHint& hint,
+                                            std::size_t max_oids, std::string& err) {
+  if (hint.select == RepairSelect::All || hint.scrub) {
+    return store.list_oids(max_oids, err);
+  }
+  if (hint.select == RepairSelect::Unverified) {
+    return store.list_oids_unverified(max_oids, err);
+  }
+  return store.list_oids_for_targets(hint.departed_keys, max_oids, err);
+}
+
 }  // namespace
 
-RepairStats run_repair(const Config& cfg, const std::string& advertise,
-                       const ClusterMap& map, LocalStores& stores,
-                       std::size_t max_oids_per_store) {
+RepairHint plan_repair(const ClusterMap* prev, const ClusterMap& now, bool scrub_due) {
+  RepairHint hint;
+  if (!prev) {
+    hint.select = RepairSelect::All;
+    return hint;
+  }
+  if (prev->content_hash() == now.content_hash()) {
+    if (scrub_due) {
+      hint.select = RepairSelect::All;
+      hint.scrub = true;
+    } else {
+      hint.select = RepairSelect::Unverified;
+    }
+    return hint;
+  }
+  if (placement_topology_changed(*prev, now)) {
+    hint.select = RepairSelect::All;
+    return hint;
+  }
+  const auto was = up_target_keys(*prev);
+  const auto is = up_target_keys(now);
+  std::vector<std::string> departed;
+  std::set_difference(was.begin(), was.end(), is.begin(), is.end(),
+                      std::back_inserter(departed));
+  if (!departed.empty()) {
+    hint.select = RepairSelect::Departed;
+    hint.departed_keys = std::move(departed);
+    return hint;
+  }
+  hint.select = RepairSelect::All;
+  return hint;
+}
+
+RepairStats run_repair(const Config& cfg, const std::string& advertise, const ClusterMap& map,
+                       LocalStores& stores, std::size_t max_oids_per_store, RepairHint hint) {
   RepairStats stats;
   if (map.targets.empty()) return stats;
 
@@ -465,7 +567,7 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
     auto* store = stores.get(path);
     if (!store) continue;
     std::string err;
-    auto oids = store->list_oids(max_oids_per_store, err);
+    auto oids = select_repair_oids(*store, hint, max_oids_per_store, err);
     if (!err.empty()) {
       AIOS_LOG_WARN("repair list_oids ", path, ": ", err);
       continue;
@@ -501,6 +603,25 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         }
       }
 
+      std::string perr;
+      auto stored = local ? local->get_placement(oid, perr) : std::nullopt;
+      const auto now_keys = acting_target_keys(p);
+      const bool fp_match = stored && stored->target_keys == now_keys;
+
+      if (local_in_set && !hint.scrub) {
+        if (fp_match && stored->verified) {
+          ++stats.oids_skipped;
+          continue;
+        }
+        if (!should_stat_acting_set(cfg, path, p, stored)) {
+          ++stats.oids_skipped;
+          if (fp_match && local && stored && !stored->verified) {
+            write_object_placement(local, oid, p, true);
+          }
+          continue;
+        }
+      }
+
       // Drain evacuate: still hold tip but no longer in acting set — push out.
       if (!local_in_set) {
         if (!local_target || local_target->state != LifecycleState::Drain) continue;
@@ -508,6 +629,7 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         auto tip = local->stat(oid, tip_err);
         if (!tip || tip->is_delete) continue;
 
+        ++stats.oids_stated;
         std::vector<TargetObjState> states(p.acting_set.size());
         std::vector<bool> has(p.acting_set.size(), false);
         for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
@@ -524,14 +646,16 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
             any_fix = true;
           }
         }
-        if (!any_fix) continue;
+        if (!any_fix) {
+          if (local) write_object_placement(local, oid, p, true);
+          continue;
+        }
 
         ++stats.under_replicated;
         if (!should_repair(cfg, p, has)) continue;
 
         bool all_ok = true;
         if (is_ec) {
-          // Push our shard to the acting-set slot matching ec_i when missing.
           int shard_i = -1;
           if (auto it = local_attrs.find(kEcAttrI); it != local_attrs.end()) {
             try {
@@ -573,12 +697,14 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         }
         if (all_ok) {
           ++stats.repaired;
+          if (local) write_object_placement(local, oid, p, true);
         } else {
           ++stats.failed;
         }
         continue;
       }
 
+      ++stats.oids_stated;
       std::vector<TargetObjState> states(p.acting_set.size());
       std::vector<bool> has(p.acting_set.size(), false);
       for (std::size_t i = 0; i < p.acting_set.size(); ++i) {
@@ -601,7 +727,10 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
           needs_fix[i] = true;
           any_fix = true;
         }
-        if (!any_fix) continue;
+        if (!any_fix) {
+          if (local) write_object_placement(local, oid, p, true);
+          continue;
+        }
         ++stats.under_replicated;
         if (!should_repair(cfg, p, has)) continue;
         bool all_ok = true;
@@ -619,6 +748,7 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
         }
         if (all_ok) {
           ++stats.repaired;
+          if (local) write_object_placement(local, oid, p, true);
         } else {
           ++stats.failed;
         }
@@ -663,7 +793,10 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
           AIOS_LOG_WARN("crc32c mismatch oid=", oid, " target=", p.acting_set[i].node_id);
         }
       }
-      if (!any_fix) continue;
+      if (!any_fix) {
+        if (local) write_object_placement(local, oid, p, true);
+        continue;
+      }
 
       ++stats.under_replicated;
       if (!should_repair(cfg, p, has)) continue;
@@ -698,6 +831,7 @@ RepairStats run_repair(const Config& cfg, const std::string& advertise,
       }
       if (all_ok) {
         ++stats.repaired;
+        if (local) write_object_placement(local, oid, p, true);
       } else {
         ++stats.failed;
       }

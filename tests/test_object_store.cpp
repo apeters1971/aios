@@ -106,4 +106,42 @@ TEST(ObjectStore, Basic) {
   EXPECT_TRUE(shard_of_oid("abc", 8) < 8) << "shard range";
 
   fs::remove_all(base);
-  }
+}
+
+TEST(ObjectStore, PlacementIndex) {
+  using namespace aios;
+  const auto base = fs::temp_directory_path() / "aios-store-place";
+  fs::remove_all(base);
+  fs::create_directories(base);
+  ObjectStoreOptions opts;
+  opts.shard_count = 4;
+  ObjectStore store;
+  std::string err;
+  ASSERT_TRUE(store.open(base.string(), opts, err));
+  ASSERT_TRUE(store.put("o1", std::string("x"), {}, true, err));
+  ASSERT_TRUE(store.put("o2", std::string("y"), {}, true, err));
+  ASSERT_TRUE(store.set_placement("o1", {"n1\n/a", "n2\n/b"}, false, err)) << err;
+  ASSERT_TRUE(store.set_placement("o2", {"n2\n/b", "n3\n/c"}, true, err)) << err;
+
+  auto p1 = store.get_placement("o1", err);
+  ASSERT_TRUE(p1.has_value());
+  EXPECT_EQ(p1->target_keys.size(), 2u);
+  EXPECT_FALSE(p1->verified);
+  auto p2 = store.get_placement("o2", err);
+  ASSERT_TRUE(p2.has_value());
+  EXPECT_TRUE(p2->verified);
+
+  auto hit = store.list_oids_for_targets({"n1\n/a"}, 64, err);
+  ASSERT_EQ(hit.size(), 1u);
+  EXPECT_EQ(hit[0], "o1");
+  auto both = store.list_oids_for_targets({"n2\n/b"}, 64, err);
+  EXPECT_EQ(both.size(), 2u);
+  auto unver = store.list_oids_unverified(64, err);
+  ASSERT_EQ(unver.size(), 1u);
+  EXPECT_EQ(unver[0], "o1");
+
+  ASSERT_TRUE(store.set_placement("o1", {"n1\n/a", "n2\n/b"}, true, err));
+  EXPECT_TRUE(store.list_oids_unverified(64, err).empty());
+
+  fs::remove_all(base);
+}

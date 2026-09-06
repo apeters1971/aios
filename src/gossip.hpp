@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -110,6 +111,8 @@ class GossipEngine {
   boost::asio::thread_pool gossip_workers_{4};
   std::atomic<bool> stopped_{false};
   std::atomic<bool> gossip_workers_joined_{false};
+  std::optional<ClusterMap> last_repair_map_;
+  std::int64_t last_scrub_ms_{0};
 };
 
 }  // namespace aios

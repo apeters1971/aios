@@ -294,8 +294,16 @@ bool ObjectStore::ensure_schema(sqlite3* db, std::string& err, bool data_fsync) 
 CREATE TABLE IF NOT EXISTS object_tips (
   oid TEXT PRIMARY KEY,
   tip_seq INTEGER NOT NULL,
-  ctime_ms INTEGER NOT NULL
+  ctime_ms INTEGER NOT NULL,
+  place_verified INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS object_placement (
+  oid TEXT NOT NULL,
+  slot INTEGER NOT NULL,
+  target_key TEXT NOT NULL,
+  PRIMARY KEY (oid, slot)
+);
+CREATE INDEX IF NOT EXISTS idx_object_placement_target ON object_placement(target_key);
 CREATE TABLE IF NOT EXISTS object_versions (
   oid TEXT NOT NULL,
   seq INTEGER NOT NULL,
@@ -343,6 +351,8 @@ CREATE INDEX IF NOT EXISTS idx_version_deltas_file ON version_deltas(oid, fs_pat
   sqlite3_exec(db, "ALTER TABLE object_versions ADD COLUMN block_crcs BLOB;", nullptr, nullptr,
                nullptr);
   sqlite3_exec(db, "ALTER TABLE object_versions ADD COLUMN delta INTEGER NOT NULL DEFAULT 0;",
+               nullptr, nullptr, nullptr);
+  sqlite3_exec(db, "ALTER TABLE object_tips ADD COLUMN place_verified INTEGER NOT NULL DEFAULT 0;",
                nullptr, nullptr, nullptr);
   return true;
 }
@@ -2491,9 +2501,10 @@ bool ObjectStore::publish_tip(const std::string& oid, std::uint64_t seq, std::st
   const auto now = now_ms();
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(s.db,
-                         "INSERT INTO object_tips(oid, tip_seq, ctime_ms) VALUES(?1,?2,?3) "
+                         "INSERT INTO object_tips(oid, tip_seq, ctime_ms, place_verified) "
+                         "VALUES(?1,?2,?3,0) "
                          "ON CONFLICT(oid) DO UPDATE SET tip_seq=excluded.tip_seq, "
-                         "ctime_ms=excluded.ctime_ms "
+                         "ctime_ms=excluded.ctime_ms, place_verified=0 "
                          "WHERE excluded.tip_seq > object_tips.tip_seq;",
                          -1, &stmt, nullptr) != SQLITE_OK) {
     err = sqlite3_errmsg(s.db);
@@ -3137,6 +3148,21 @@ bool ObjectStore::purge_version(const std::string& oid, std::uint64_t seq, bool 
       return false;
     }
     sqlite3_finalize(stmt);
+    sqlite3_stmt* pl = nullptr;
+    if (sqlite3_prepare_v2(s.db, "DELETE FROM object_placement WHERE oid=?1;", -1, &pl,
+                           nullptr) != SQLITE_OK) {
+      err = sqlite3_errmsg(s.db);
+      rollback(s);
+      return false;
+    }
+    sqlite3_bind_text(pl, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(pl) != SQLITE_DONE) {
+      err = sqlite3_errmsg(s.db);
+      sqlite3_finalize(pl);
+      rollback(s);
+      return false;
+    }
+    sqlite3_finalize(pl);
   }
   if (!commit(s, err)) {
     rollback(s);
@@ -3335,6 +3361,237 @@ std::vector<std::string> ObjectStore::list_oids(std::size_t max_count, std::stri
                            nullptr) != SQLITE_OK) {
       err = sqlite3_errmsg(s.db);
       return out;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      const auto* oid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+      if (oid) out.emplace_back(oid);
+      if (max_count > 0 && out.size() >= max_count) {
+        sqlite3_finalize(stmt);
+        return out;
+      }
+    }
+    sqlite3_finalize(stmt);
+  }
+  return out;
+}
+
+bool ObjectStore::set_placement(const std::string& oid, const std::vector<std::string>& target_keys,
+                                bool verified, std::string& err) {
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  if (oid.empty()) {
+    err = "empty oid";
+    return false;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
+  Shard& s = *sp;
+  std::lock_guard<std::recursive_mutex> guard(s.mu);
+  if (!begin(s, err)) return false;
+  sqlite3_stmt* del = nullptr;
+  if (sqlite3_prepare_v2(s.db, "DELETE FROM object_placement WHERE oid=?1;", -1, &del, nullptr) !=
+      SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    rollback(s);
+    return false;
+  }
+  sqlite3_bind_text(del, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(del) != SQLITE_DONE) {
+    err = sqlite3_errmsg(s.db);
+    sqlite3_finalize(del);
+    rollback(s);
+    return false;
+  }
+  sqlite3_finalize(del);
+  sqlite3_stmt* ins = nullptr;
+  if (sqlite3_prepare_v2(s.db,
+                         "INSERT INTO object_placement(oid, slot, target_key) VALUES(?1,?2,?3);",
+                         -1, &ins, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    rollback(s);
+    return false;
+  }
+  for (std::size_t i = 0; i < target_keys.size(); ++i) {
+    sqlite3_reset(ins);
+    sqlite3_clear_bindings(ins);
+    sqlite3_bind_text(ins, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins, 2, static_cast<sqlite3_int64>(i));
+    sqlite3_bind_text(ins, 3, target_keys[i].c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(ins) != SQLITE_DONE) {
+      err = sqlite3_errmsg(s.db);
+      sqlite3_finalize(ins);
+      rollback(s);
+      return false;
+    }
+  }
+  sqlite3_finalize(ins);
+  sqlite3_stmt* ver = nullptr;
+  if (sqlite3_prepare_v2(s.db, "UPDATE object_tips SET place_verified=?1 WHERE oid=?2;", -1, &ver,
+                         nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    rollback(s);
+    return false;
+  }
+  sqlite3_bind_int(ver, 1, verified ? 1 : 0);
+  sqlite3_bind_text(ver, 2, oid.c_str(), -1, SQLITE_TRANSIENT);
+  if (sqlite3_step(ver) != SQLITE_DONE) {
+    err = sqlite3_errmsg(s.db);
+    sqlite3_finalize(ver);
+    rollback(s);
+    return false;
+  }
+  sqlite3_finalize(ver);
+  if (!commit(s, err)) {
+    rollback(s);
+    return false;
+  }
+  err.clear();
+  return true;
+}
+
+std::optional<ObjectStore::ObjectPlacement> ObjectStore::get_placement(const std::string& oid,
+                                                                       std::string& err) {
+  if (!is_open()) {
+    err = "store not open";
+    return std::nullopt;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return std::nullopt;
+  }
+  Shard& s = *sp;
+  std::lock_guard<std::recursive_mutex> guard(s.mu);
+  ObjectPlacement out;
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(s.db,
+                         "SELECT slot, target_key FROM object_placement WHERE oid=?1 "
+                         "ORDER BY slot ASC;",
+                         -1, &stmt, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    return std::nullopt;
+  }
+  sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const auto* key = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+    if (key) out.target_keys.emplace_back(key);
+  }
+  sqlite3_finalize(stmt);
+  sqlite3_stmt* ver = nullptr;
+  if (sqlite3_prepare_v2(s.db, "SELECT place_verified FROM object_tips WHERE oid=?1;", -1, &ver,
+                         nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    return std::nullopt;
+  }
+  sqlite3_bind_text(ver, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+  bool have_tip = false;
+  if (sqlite3_step(ver) == SQLITE_ROW) {
+    have_tip = true;
+    out.verified = sqlite3_column_int(ver, 0) != 0;
+  }
+  sqlite3_finalize(ver);
+  err.clear();
+  if (!have_tip && out.target_keys.empty()) return std::nullopt;
+  return out;
+}
+
+std::vector<std::string> ObjectStore::list_oids_unverified(std::size_t max_count,
+                                                           std::string& err) {
+  std::vector<std::string> out;
+  if (!is_open()) {
+    err = "store not open";
+    return out;
+  }
+  err.clear();
+  const fs::path shards_root = fs::path(root_) / "shards";
+  std::error_code ec;
+  if (!fs::exists(shards_root, ec)) return out;
+
+  for (auto it = fs::directory_iterator(shards_root, ec); it != fs::directory_iterator(); ++it) {
+    if (!it->is_directory(ec)) continue;
+    const auto db_path = it->path() / "meta.sqlite";
+    if (!fs::is_regular_file(db_path, ec)) continue;
+    std::uint32_t id = 0;
+    try {
+      id = static_cast<std::uint32_t>(std::stoul(it->path().filename().string(), nullptr, 16));
+    } catch (...) {
+      continue;
+    }
+    if (id >= opts_.shard_count) continue;
+    if (!open_shard(id, err)) return out;
+    Shard& s = *shards_[id];
+    std::lock_guard<std::recursive_mutex> guard(s.mu);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(s.db,
+                           "SELECT oid FROM object_tips WHERE tip_seq > 0 AND "
+                           "place_verified = 0 ORDER BY oid;",
+                           -1, &stmt, nullptr) != SQLITE_OK) {
+      err = sqlite3_errmsg(s.db);
+      return out;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+      const auto* oid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+      if (oid) out.emplace_back(oid);
+      if (max_count > 0 && out.size() >= max_count) {
+        sqlite3_finalize(stmt);
+        return out;
+      }
+    }
+    sqlite3_finalize(stmt);
+  }
+  return out;
+}
+
+std::vector<std::string> ObjectStore::list_oids_for_targets(
+    const std::vector<std::string>& target_keys, std::size_t max_count, std::string& err) {
+  std::vector<std::string> out;
+  if (!is_open()) {
+    err = "store not open";
+    return out;
+  }
+  err.clear();
+  if (target_keys.empty()) return out;
+  const fs::path shards_root = fs::path(root_) / "shards";
+  std::error_code ec;
+  if (!fs::exists(shards_root, ec)) return out;
+
+  std::string sql =
+      "SELECT DISTINCT p.oid FROM object_placement p "
+      "INNER JOIN object_tips t ON t.oid = p.oid AND t.tip_seq > 0 "
+      "WHERE p.target_key IN (";
+  for (std::size_t i = 0; i < target_keys.size(); ++i) {
+    if (i) sql += ',';
+    sql += '?' + std::to_string(i + 1);
+  }
+  sql += ") ORDER BY p.oid;";
+
+  for (auto it = fs::directory_iterator(shards_root, ec); it != fs::directory_iterator(); ++it) {
+    if (!it->is_directory(ec)) continue;
+    const auto db_path = it->path() / "meta.sqlite";
+    if (!fs::is_regular_file(db_path, ec)) continue;
+    std::uint32_t id = 0;
+    try {
+      id = static_cast<std::uint32_t>(std::stoul(it->path().filename().string(), nullptr, 16));
+    } catch (...) {
+      continue;
+    }
+    if (id >= opts_.shard_count) continue;
+    if (!open_shard(id, err)) return out;
+    Shard& s = *shards_[id];
+    std::lock_guard<std::recursive_mutex> guard(s.mu);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(s.db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+      err = sqlite3_errmsg(s.db);
+      return out;
+    }
+    for (std::size_t i = 0; i < target_keys.size(); ++i) {
+      sqlite3_bind_text(stmt, static_cast<int>(i + 1), target_keys[i].c_str(), -1,
+                        SQLITE_TRANSIENT);
     }
     while (sqlite3_step(stmt) == SQLITE_ROW) {
       const auto* oid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));

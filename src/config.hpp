@@ -163,6 +163,8 @@ struct Config {
   int repair_interval_ms{30000};
   // Max oids scanned per local store each repair tick.
   int repair_batch_oids{256};
+  // Re-stat verified objects even when the map is unchanged. 0 disables.
+  int repair_scrub_interval_ms{3600000};
   int transition_interval_ms{30000};
   int transition_batch_oids{64};
   int archive_interval_ms{30000};

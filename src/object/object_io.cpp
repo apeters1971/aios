@@ -4,6 +4,7 @@
 #include "ec/ec_attrs.hpp"
 #include "net/object_client.hpp"
 #include "object/object_layout.hpp"
+#include "object/placement_index.hpp"
 #include "util/crc32c.hpp"
 #include "util/log.hpp"
 
@@ -180,11 +181,12 @@ bool install_replica_version(const Config& cfg, const std::string& advertise,
     AIOS_LOG_WARN("install_replica publish ", oid, ": ", err);
     return false;
   }
+  write_object_placement(primary.get(), oid, dest, false);
   for (std::size_t i = 1; i < dest.acting_set.size(); ++i) {
     const auto& t = dest.acting_set[i];
     if (t.node_id == cfg.node_id) {
       auto* s = stores.get(t.aios_path);
-      if (s) s->publish_tip(oid, pv.seq, err);
+      if (s && s->publish_tip(oid, pv.seq, err)) write_object_placement(s, oid, dest, false);
     } else {
       object_publish_tip_remote(t.addr, cfg.node_id, advertise, cfg.cluster_key, cfg.auth_skew_ms,
                                 map.epoch, t.aios_path, oid, pv.seq);

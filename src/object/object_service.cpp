@@ -7,6 +7,7 @@
 #include "object/archive_bag.hpp"
 #include "object/archive_pack.hpp"
 #include "object/object_layout.hpp"
+#include "object/placement_index.hpp"
 #include "util/auth.hpp"
 #include "util/base64.hpp"
 #include "util/compression.hpp"
@@ -489,7 +490,17 @@ bool ObjectService::local_publish(const std::string& aios_path, const std::strin
     err = "no local store for " + aios_path;
     return false;
   }
-  return store->publish_tip(oid, seq, err);
+  if (!store->publish_tip(oid, seq, err)) return false;
+  auto attrs = store->list_attrs(oid, err);
+  const int n = placement_n_for_attrs(attrs, map_.replica_count);
+  const std::string sc = storage_class_for_attrs(attrs, cfg_.default_storage_class);
+  auto p = place(oid, map_, n, sc);
+  if (p.acting_set.empty()) {
+    const std::string prev = storage_class_prev_for_attrs(attrs);
+    if (!prev.empty()) p = place(oid, map_, n, prev);
+  }
+  if (!p.acting_set.empty()) write_object_placement(store, oid, p, false);
+  return true;
 }
 
 bool ObjectService::local_abort(const std::string& aios_path, const std::string& oid,
@@ -737,6 +748,7 @@ ApiResult ObjectService::commit_prepared(
     replicate_abort(placement, pv.oid, pv.seq);
     return fail("store_error", err);
   }
+  write_object_placement(store, pv.oid, placement, false);
   replicate_publish(placement, pv.oid, pv.seq);
   signal_watch(pv.oid, pv.seq, pv.is_delete ? "del" : "put");
 
@@ -864,6 +876,7 @@ ApiResult ObjectService::commit_prepared_range(
     replicate_abort(placement, pv.oid, pv.seq);
     return fail("store_error", err);
   }
+  write_object_placement(store, pv.oid, placement, false);
   replicate_publish(placement, pv.oid, pv.seq);
   signal_watch(pv.oid, pv.seq, "put");
 
@@ -1660,6 +1673,7 @@ ApiResult ObjectService::commit_ec_put(
     replicate_abort(placement, oid, pv.seq);
     return fail("store_error", err);
   }
+  write_object_placement(store, oid, placement, false);
   replicate_publish(placement, oid, pv.seq);
   signal_watch(oid, pv.seq, "put");
 
@@ -2452,6 +2466,7 @@ ApiResult ObjectService::api_put_pipeline_finish(
       replicate_abort(placement, oid, seq);
       return fail("store_error", err);
     }
+    write_object_placement(store, oid, placement, false);
     pipelines_.erase(oid);
     // replicate_* use UnlockForRpc and require mu_ to be held by the caller.
     replicate_publish(placement, oid, seq);
@@ -3726,6 +3741,7 @@ ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   if (!store->publish_tip(oid, seq, err)) return fail("store_error", err);
+  write_object_placement(store, oid, placement, false);
   replicate_publish(placement, oid, seq);
   std::string op = "put";
   if (auto st = store->stat(oid, err)) {
@@ -4933,6 +4949,7 @@ ApiResult ObjectService::api_client_publish(const std::string& oid, const std::s
   if (!store->publish_tip(oid, g.seq, err)) {
     return fail("store_error", err);
   }
+  write_object_placement(store, oid, placement, false);
   replicate_publish(placement, oid, g.seq);
   signal_watch(oid, g.seq, "put");
   ops_.note_put(g.full_size);

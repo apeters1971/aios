@@ -311,6 +311,19 @@ class ObjectStore {
   std::size_t sweep_tmp(std::int64_t max_age_ms, std::string& err);
   std::vector<std::string> list_oids(std::size_t max_count, std::string& err);
 
+  // Last known acting set (ordered target_key list) for a published tip.
+  // Inverse index: list_oids_for_targets finds oids that shared a failed disk.
+  struct ObjectPlacement {
+    std::vector<std::string> target_keys;
+    bool verified{false};
+  };
+  bool set_placement(const std::string& oid, const std::vector<std::string>& target_keys,
+                     bool verified, std::string& err);
+  std::optional<ObjectPlacement> get_placement(const std::string& oid, std::string& err);
+  std::vector<std::string> list_oids_for_targets(const std::vector<std::string>& target_keys,
+                                                 std::size_t max_count, std::string& err);
+  std::vector<std::string> list_oids_unverified(std::size_t max_count, std::string& err);
+
   // Test-only: true if any cached statement of any open shard is still stepped.
   bool debug_any_stmt_busy() const;
 

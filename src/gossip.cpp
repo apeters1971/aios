@@ -565,25 +565,31 @@ void GossipEngine::on_repair_timer(const boost::system::error_code& ec) {
   const auto adv = advertise_addr();
   const auto batch = static_cast<std::size_t>(std::max(1, cfg_.repair_batch_oids));
   const auto interval = cfg_.repair_interval_ms;
+  const auto now = now_ms();
+  const bool scrub_due = cfg_.repair_scrub_interval_ms > 0 && last_scrub_ms_ > 0 &&
+                         (now - last_scrub_ms_ >= cfg_.repair_scrub_interval_ms);
+  const auto hint = plan_repair(last_repair_map_ ? &*last_repair_map_ : nullptr, map, scrub_due);
   // run_repair issues blocking object RPCs; running it on ioc_ stalls accept and
   // deadlocks the cluster when peers are also mid-repair waiting on each other.
-  boost::asio::post(gossip_workers_, [this, map, adv, batch, interval] {
+  boost::asio::post(gossip_workers_, [this, map, adv, batch, interval, hint] {
     try {
       if (stopped_.load()) return;
-      const auto stats = run_repair(cfg_, adv, map, local_stores_, batch);
+      const auto stats = run_repair(cfg_, adv, map, local_stores_, batch, hint);
       if (object_service_) {
         object_service_->ops().note_repair(stats.oids_scanned, stats.repaired, stats.failed);
       }
-      if (stats.oids_scanned > 0 || stats.under_replicated > 0) {
-        AIOS_LOG_INFO("repair scanned=", stats.oids_scanned,
-                      " under_replicated=", stats.under_replicated,
+      if (stats.oids_scanned > 0 || stats.under_replicated > 0 || stats.oids_skipped > 0) {
+        AIOS_LOG_INFO("repair scanned=", stats.oids_scanned, " skipped=", stats.oids_skipped,
+                      " stated=", stats.oids_stated, " under_replicated=", stats.under_replicated,
                       " repaired=", stats.repaired, " failed=", stats.failed);
       }
     } catch (const std::exception& e) {
       AIOS_LOG_WARN("background job aborted: ", e.what());
     }
-    boost::asio::post(ioc_, [this, interval] {
+    boost::asio::post(ioc_, [this, interval, map, hint] {
       if (stopped_.load()) return;
+      last_repair_map_ = map;
+      if (hint.scrub || last_scrub_ms_ == 0) last_scrub_ms_ = now_ms();
       repair_timer_.expires_after(std::chrono::milliseconds(interval));
       repair_timer_.async_wait([this](auto e) { on_repair_timer(e); });
     });

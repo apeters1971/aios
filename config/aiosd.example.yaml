@@ -128,6 +128,7 @@ placement:
 
 # repair_interval_ms: 30000
 # repair_batch_oids: 256
+# repair_scrub_interval_ms: 3600000
 http_listen: "0.0.0.0:7480"   # empty to disable HTTP object API
 # HTTPS for the object/admin API (cluster-wide: every node, same scheme; clients
 # then use https://host:port endpoints). Both cert and key, PEM; chain optional.
