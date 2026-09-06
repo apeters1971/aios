@@ -260,3 +260,48 @@ TEST(ObjectServiceAdvanced, Basic) {
   }
 
   }
+
+TEST(ObjectServiceAdvanced, RangeDeltaReplicatedAndFullFallback) {
+  using namespace aios;
+  using aios::test::DualStoreFixture;
+  DualStoreFixture fx("aios-svc-delta");
+  auto& svc = *fx.svc;
+
+  const std::string oid = "adv/delta-range";
+  std::vector<std::uint8_t> body(256 * 1024, 'A');
+  auto put = svc.api_put(oid, body.data(), body.size(), {}, true, {});
+  ASSERT_TRUE(put.ok && put.replicas == 2) << put.error;
+
+  const std::string patch(4096, 'B');
+  auto pr = svc.api_put_range(oid, 128, reinterpret_cast<const std::uint8_t*>(patch.data()),
+                              patch.size(), {}, false, {});
+  ASSERT_TRUE(pr.ok && pr.replicas == 2) << pr.error;
+
+  auto* s1 = fx.stores.get(fx.p1);
+  auto* s2 = fx.stores.get(fx.p2);
+  ASSERT_TRUE(s1 && s2);
+  std::string err;
+  auto t1 = s1->stat(oid, err);
+  auto t2 = s2->stat(oid, err);
+  ASSERT_TRUE(t1 && t2);
+  EXPECT_TRUE(t1->delta && t2->delta) << "both replicas recorded a delta version";
+  EXPECT_EQ(t1->size, t2->size);
+  EXPECT_EQ(t1->crc32c, t2->crc32c);
+  auto g1 = s1->get(oid, err);
+  auto g2 = s2->get(oid, err);
+  ASSERT_TRUE(g1 && g2);
+  EXPECT_EQ(*g1, *g2);
+
+  // Diverge the replica tip so the next delta is refused and the full body is shipped.
+  std::vector<std::uint8_t> other(256 * 1024, 'Z');
+  ASSERT_TRUE(s2->put(oid, other.data(), other.size(), {}, true, err)) << err;
+  const std::string patch2(16, 'C');
+  auto pr2 = svc.api_put_range(oid, 0, reinterpret_cast<const std::uint8_t*>(patch2.data()),
+                               patch2.size(), {}, false, {});
+  ASSERT_TRUE(pr2.ok && pr2.replicas == 2) << pr2.error;
+  auto got = svc.api_get(oid, std::nullopt, std::nullopt, {});
+  ASSERT_TRUE(got.ok && got.data);
+  EXPECT_EQ(std::string(got.data->begin(), got.data->begin() + 16), patch2);
+  auto r2 = s2->get(oid, err);
+  ASSERT_TRUE(r2 && *r2 == *got.data);
+}

@@ -734,6 +734,12 @@ aios/
 - **Shard** = low bits of `SHA-256(oid)` (`shard_count` power of two; default 256)
 - **Inline** (`size ≤ inline_max_bytes`, default 64 KiB): body BLOB in SQLite
 - **Filesystem**: large bodies on disk; metadata/attrs always in SQLite
+- **Ranged writes** on an FS tip are a delta (same base file + `version_deltas` patch
+  rows) so a 4 KiB overwrite does not clone or re-read the object. The chain is folded
+  into a new body file after 64 patches, 1 MiB of patch bytes, or a single write larger
+  than 256 KiB. CRC32C is stored per 64 KiB block; a range write re-hashes only the
+  blocks it touches. Replicas apply the same patch (`ObjectInstallRange`) and fall back
+  to a full-body install if their tip has diverged.
 
 Objects larger than 256 KiB are streamed to disk on the HTTP path (default max 64 GiB via `max_object_bytes`).
 

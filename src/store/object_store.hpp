@@ -23,7 +23,25 @@ struct ObjectStoreOptions {
   bool clone_required{true};
   // When false, skip body/dir fsync and use SQLite synchronous=OFF (dev/bench only).
   bool data_fsync{true};
+  // Ranged writes on FS-backed tips are recorded as deltas (base file + patch
+  // rows in SQLite) instead of cloning and rewriting the body. A chain is
+  // materialized into a fresh body file once it holds delta_max_chain patches,
+  // delta_max_bytes patch bytes, or when a single write exceeds delta_max_write.
+  // delta_max_chain = 0 disables deltas (every range write clones the tip).
+  std::uint32_t delta_max_chain{64};
+  std::uint64_t delta_max_bytes{1024 * 1024};
+  std::size_t delta_max_write{256 * 1024};
+  // Debug/test: after every range write re-read the whole body and check the
+  // block-combined CRC against a full scan (O(object) — never enable in prod).
+  bool verify_range_crc{false};
 };
+
+// Body CRCs are also kept per fixed-size block so a ranged write only re-hashes
+// the blocks it touches (crc32c of the whole body == combine of the block CRCs).
+constexpr std::uint64_t kStoreCrcBlockSize = 64 * 1024;
+std::vector<std::uint32_t> crc32c_blocks(const std::uint8_t* data, std::size_t len);
+// Whole-body CRC from block CRCs of a body of `size` bytes (last block short).
+std::uint32_t crc32c_from_blocks(const std::vector<std::uint32_t>& blocks, std::uint64_t size);
 
 struct ObjectInfo {
   std::string oid;
@@ -39,6 +57,12 @@ struct ObjectInfo {
   bool is_delete{false};
   // If non-empty, this version is a redirect to another oid (no body).
   std::string redirect_oid;
+  // True when the body is fs_path (shared base file) plus the version_deltas
+  // patches with seq <= this seq. Such a version has no standalone body file.
+  bool delta{false};
+  // Per-block CRC32C (kStoreCrcBlockSize); empty when unknown (legacy rows or
+  // streamed uploads that never had a ranged write).
+  std::vector<std::uint32_t> block_crcs;
 };
 
 struct VersionInfo {
@@ -92,6 +116,11 @@ struct PreparedVersion {
   // When true, install_version trusts crc32c/size without re-reading the FS body
   // (e.g. CRC was accumulated while staging).
   bool crc_verified{false};
+  // Set by prepare_put_range when the version was recorded as a delta over the
+  // tip's body file (no standalone file; fs_path names the shared base).
+  bool delta{false};
+  // Per-block CRCs of the new body when known (see kStoreCrcBlockSize).
+  std::vector<std::uint32_t> block_crcs;
 };
 
 std::uint32_t shard_of_oid(const std::string& oid, std::uint32_t shard_count);
@@ -191,6 +220,17 @@ class ObjectStore {
                          const std::uint8_t* data, std::size_t len,
                          const std::unordered_map<std::string, std::string>& attrs,
                          bool replace_attrs, PreparedVersion& out, std::string& err);
+  // Replica-side counterpart of prepare_put_range: apply the same ranged write
+  // on top of the local tip, which must equal prev_tip, at exactly `seq`, and
+  // require the resulting body to have expected_size/expected_crc32c. Fails
+  // with err starting "range base mismatch" when the local history diverges
+  // (the caller then falls back to a full-body install). Idempotent when the
+  // identical version is already present.
+  bool install_range_version(const std::string& oid, std::uint64_t seq, std::uint64_t prev_tip,
+                             std::uint64_t offset, const std::uint8_t* data, std::size_t len,
+                             std::uint64_t expected_size, std::uint32_t expected_crc32c,
+                             const std::unordered_map<std::string, std::string>& attrs,
+                             std::string& err);
   bool prepare_delete(const std::string& oid, PreparedVersion& out, std::string& err);
   // Create a redirect version (empty body) pointing at target_oid.
   bool prepare_redirect(const std::string& oid, const std::string& target_oid,
@@ -285,6 +325,8 @@ class ObjectStore {
     sqlite3_stmt* stmt_load_version{nullptr};
     sqlite3_stmt* stmt_load_attrs{nullptr};
     sqlite3_stmt* stmt_get_inline{nullptr};
+    sqlite3_stmt* stmt_load_deltas{nullptr};
+    sqlite3_stmt* stmt_delta_stats{nullptr};
   };
 
   Shard* shard_for(const std::string& oid);
@@ -316,11 +358,44 @@ class ObjectStore {
                  bool do_fsync = true);
   bool crc_file_range(Shard& shard, const std::string& relpath, std::uint64_t offset,
                       std::uint64_t len, std::uint32_t& out_crc, std::string& err);
-  bool crc_after_range_update(Shard& shard, const std::string& relpath,
-                              std::uint64_t old_size, std::uint64_t offset,
-                              const std::uint8_t* data, std::size_t len,
-                              std::uint64_t new_size, std::uint32_t& out_crc,
-                              std::string& err);
+  // One ranged patch over a shared base body file.
+  struct Delta {
+    std::uint64_t seq{0};
+    std::uint64_t offset{0};
+    std::vector<std::uint8_t> data;
+  };
+  // Patches recorded on `fs_path` for `oid` with seq <= max_seq, oldest first.
+  bool load_deltas_locked(Shard& s, const std::string& oid, const std::string& fs_path,
+                          std::uint64_t max_seq, std::vector<Delta>& out, std::string& err);
+  // Patch count / bytes on a base file (materialization policy).
+  bool delta_stats_locked(Shard& s, const std::string& oid, const std::string& fs_path,
+                          std::uint64_t& count, std::uint64_t& bytes, std::string& err);
+  bool insert_delta_locked(Shard& s, const std::string& oid, std::uint64_t seq,
+                           const std::string& fs_path, std::uint64_t offset,
+                           const std::uint8_t* data, std::size_t len, std::string& err);
+  // Read [offset, offset+len) of a version's logical body: inline blob, body
+  // file (zero-filled past EOF up to the version size) plus delta overlay.
+  // `len` must fit inside info.size.
+  bool read_version_range_locked(Shard& s, const ObjectInfo& info, std::uint64_t offset,
+                                 std::size_t len, std::uint8_t* out, std::string& err);
+  // Read a byte range of a body file; bytes past EOF read as zero (sparse /
+  // delta-grown bodies). Fails only on I/O errors.
+  bool pread_fs_zero_fill(Shard& shard, const std::string& relpath, std::uint64_t offset,
+                          std::size_t len, std::uint8_t* out, std::string& err);
+  // Block CRCs of the tip body (loaded, or computed by one full read when the
+  // row predates block CRCs).
+  bool tip_block_crcs_locked(Shard& s, const ObjectInfo& tip, std::vector<std::uint32_t>& out,
+                             std::string& err);
+  // Shared body of prepare_put_range / install_range_version.
+  bool prepare_range_locked(Shard& s, const std::string& oid, std::optional<std::uint64_t> fixed_seq,
+                            std::optional<std::uint64_t> expected_prev_tip,
+                            std::optional<std::uint64_t> expected_size,
+                            std::optional<std::uint32_t> expected_crc32c, std::uint64_t offset,
+                            const std::uint8_t* data, std::size_t len,
+                            const std::unordered_map<std::string, std::string>& attrs,
+                            bool replace_attrs, PreparedVersion& out, std::string& err);
+  bool update_crc_locked(Shard& s, const std::string& oid, std::uint64_t seq, std::uint32_t crc,
+                         const std::vector<std::uint32_t>& blocks, std::string& err);
 
   bool begin(Shard& s, std::string& err);
   bool commit(Shard& s, std::string& err);

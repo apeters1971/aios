@@ -94,6 +94,21 @@ ObjectRpcResult object_install_file_remote(
     const std::string& abs_body_path);
 
 // Stage from an already-buffered body (shared fan-out after one primary read).
+// True when the peer never answered (connection/auth failure) as opposed to a
+// rejection carried in an ObjectReply.
+bool rpc_transport_failed(const ObjectRpcResult& r);
+
+// Delta replication of a ranged write: the replica applies [offset, offset+len)
+// over its own tip (which must be v.prev_tip) at v.seq and checks the result
+// against v.size / v.crc32c. code "range_base_mismatch" means the replica's
+// history diverged and the caller must fall back to a full-body install.
+ObjectRpcResult object_install_range_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
+    const std::unordered_map<std::string, std::string>& attrs, std::uint64_t offset,
+    const std::uint8_t* data, std::size_t len);
+
 ObjectRpcResult object_install_bytes_remote(
     const std::string& peer_addr, const std::string& local_node_id,
     const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,

@@ -33,6 +33,8 @@ const char* msg_type_name(MsgType t) {
       return "ObjectReply";
     case MsgType::ObjectPutRange:
       return "ObjectPutRange";
+    case MsgType::ObjectInstallRange:
+      return "ObjectInstallRange";
     case MsgType::ObjectPublishTip:
       return "ObjectPublishTip";
     case MsgType::ObjectAbortVersion:

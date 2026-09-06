@@ -753,6 +753,139 @@ ApiResult ObjectService::commit_prepared(
   return r;
 }
 
+int ObjectService::replicate_install_range(
+    ObjectStore* store, const Placement& placement, const PreparedVersion& v,
+    std::uint64_t offset, const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs) {
+  if (placement.acting_set.size() <= 1) return 0;
+  std::optional<UnlockForRpc> unlock;
+  if (placement_has_remote(placement, cfg_.node_id)) unlock.emplace(mu_);
+
+  // Full body is read from the primary only if some replica cannot apply the
+  // delta (diverged history, older peer without ObjectInstallRange, ...).
+  std::mutex full_mu;
+  std::shared_ptr<const std::vector<std::uint8_t>> full;
+  bool full_failed = false;
+  auto full_body = [&]() -> std::shared_ptr<const std::vector<std::uint8_t>> {
+    std::lock_guard lk(full_mu);
+    if (full || full_failed) return full;
+    std::string err;
+    auto got = store->get(v.oid, v.seq, err);
+    if (!got) {
+      AIOS_LOG_WARN("range fallback: cannot read ", v.oid, "@", v.seq, ": ", err);
+      full_failed = true;
+      return nullptr;
+    }
+    full = std::make_shared<const std::vector<std::uint8_t>>(std::move(*got));
+    return full;
+  };
+
+  std::atomic<int> ok{0};
+  std::vector<std::thread> workers;
+  ThreadJoiner joiner(workers);
+  workers.reserve(placement.acting_set.size() - 1);
+  for (std::size_t i = 1; i < placement.acting_set.size(); ++i) {
+    workers.emplace_back([&, i] {
+      const auto& t = placement.acting_set[i];
+      std::string why;
+      if (t.node_id == cfg_.node_id) {
+        auto* rs = stores_.get(t.aios_path);
+        if (!rs) {
+          AIOS_LOG_WARN("local replica range install failed ", t.aios_path, ": no local store");
+          return;
+        }
+        std::string err;
+        if (rs->install_range_version(v.oid, v.seq, v.prev_tip, offset, data, len, v.size,
+                                      v.crc32c, attrs, err)) {
+          ok.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        why = err;
+      } else {
+        auto r = object_install_range_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                             cfg_.auth_skew_ms, placement.epoch, t.aios_path, v,
+                                             attrs, offset, data, len);
+        if (r.ok) {
+          ok.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        if (rpc_transport_failed(r)) {
+          AIOS_LOG_WARN("remote replica range install failed ", t.addr, ": ", r.error);
+          return;
+        }
+        why = r.code + ": " + r.error;
+      }
+      // Delta refused: ship the whole body instead.
+      AIOS_LOG_INFO("range delta refused by ", t.node_id, " for ", v.oid, "@", v.seq, " (", why,
+                    "); falling back to full install");
+      auto body = full_body();
+      if (!body) return;
+      PreparedVersion fv = v;
+      fv.inline_body = false;
+      fv.delta = false;
+      fv.fs_path.clear();
+      fv.crc_verified = false;
+      std::string err;
+      bool done = false;
+      if (t.node_id == cfg_.node_id) {
+        done = local_install(t.aios_path, fv, body->data(), body->size(), attrs, err);
+      } else {
+        auto r = object_install_bytes_remote(t.addr, cfg_.node_id, advertise_, cfg_.cluster_key,
+                                             cfg_.auth_skew_ms, placement.epoch, t.aios_path, fv,
+                                             attrs, body->data(), body->size());
+        done = r.ok;
+        err = r.error;
+      }
+      if (done) {
+        ok.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        AIOS_LOG_WARN("replica full install after range fallback failed ", t.node_id, ": ", err);
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+  return ok.load();
+}
+
+ApiResult ObjectService::commit_prepared_range(
+    ObjectStore* store, const Placement& placement, PreparedVersion& pv, std::uint64_t offset,
+    const std::uint8_t* data, std::size_t len,
+    const std::unordered_map<std::string, std::string>& attrs) {
+  const int total_ok = 1 + replicate_install_range(store, placement, pv, offset, data, len, attrs);
+  if (total_ok < quorum_need(placement)) {
+    std::string aerr;
+    store->abort_version(pv.oid, pv.seq, aerr);
+    replicate_abort(placement, pv.oid, pv.seq);
+    return fail("quorum_failed", "quorum failed");
+  }
+  std::string err;
+  if (!store->publish_tip(pv.oid, pv.seq, err)) {
+    store->abort_version(pv.oid, pv.seq, err);
+    replicate_abort(placement, pv.oid, pv.seq);
+    return fail("store_error", err);
+  }
+  replicate_publish(placement, pv.oid, pv.seq);
+  signal_watch(pv.oid, pv.seq, "put");
+
+  ApiResult r;
+  r.ok = true;
+  r.epoch = cur_epoch();
+  r.replicas = total_ok;
+  r.placement = placement;
+  r.attrs = attrs;
+  if (auto st = store->stat(pv.oid, err)) {
+    r.info = st;
+  } else {
+    r.info = ObjectInfo{};
+    r.info->oid = pv.oid;
+    r.info->seq = pv.seq;
+    r.info->size = pv.size;
+    r.info->crc32c = pv.crc32c;
+    r.info->crc32c_known = true;
+  }
+  return r;
+}
+
 Frame ObjectService::handle(const Frame& req) {
   // Intentionally no outer mu_ lock: handlers that call api_*/replicate_* rely on
   // UnlockForRpc to release the mutex across peer RPC. An outer lock_guard would
@@ -786,6 +919,8 @@ Frame ObjectService::dispatch(const Frame& req) {
       return handle_put(req);
     case MsgType::ObjectPutRange:
       return handle_put_range(req);
+    case MsgType::ObjectInstallRange:
+      return handle_install_range(req);
     case MsgType::ObjectGet:
       return handle_get(req.body);
     case MsgType::ObjectDel:
@@ -1036,6 +1171,45 @@ Frame ObjectService::handle_put(const Frame& req) {
   f.body["prev_tip"] = pv.prev_tip;
   f.body["published"] = do_publish;
   if (!pv.redirect_oid.empty()) f.body["redirect"] = pv.redirect_oid;
+  return f;
+}
+
+Frame ObjectService::handle_install_range(const Frame& req) {
+  Frame errf;
+  const auto& body = req.body;
+  if (!epoch_ok(json_u64(body, "epoch"), errf)) return errf;
+  const std::string oid = json_str(body, "oid");
+  const std::string aios_path = json_str(body, "aios_path");
+  if (oid.empty() || aios_path.empty()) {
+    return reply_err(cur_epoch(), "bad_request", "oid and aios_path required");
+  }
+  if (json_str(body, "role", "replica") != "replica") {
+    return reply_err(cur_epoch(), "bad_request", "ObjectInstallRange is replica-only");
+  }
+  const std::uint64_t seq = json_u64(body, "seq");
+  if (seq == 0) return reply_err(cur_epoch(), "bad_request", "seq required");
+  const std::size_t len = json_u64(body, "len", req.raw_size());
+  if (len != req.raw_size()) {
+    return reply_err(cur_epoch(), "bad_request", "range body length mismatch");
+  }
+  ServiceLock lock(mu_);
+  if (!in_acting_set(oid, map_, storage_class_of_target(map_, cfg_.node_id, aios_path),
+                     cfg_.node_id, aios_path)) {
+    return reply_err(cur_epoch(), "not_replica", "not in acting set for oid");
+  }
+  auto* store = stores_.get(aios_path);
+  if (!store) return reply_err(cur_epoch(), "store_error", "no local store");
+  std::string err;
+  if (!store->install_range_version(oid, seq, json_u64(body, "base_seq"),
+                                    json_u64(body, "offset"), req.raw_data(), len,
+                                    json_u64(body, "size"), json_u32(body, "crc32c"),
+                                    parse_attrs_json(body), err)) {
+    const bool diverged = err.rfind("range base mismatch", 0) == 0 ||
+                          err.rfind("range result mismatch", 0) == 0;
+    return reply_err(cur_epoch(), diverged ? "range_base_mismatch" : "store_error", err);
+  }
+  auto f = reply_ok(cur_epoch());
+  f.body["seq"] = seq;
   return f;
 }
 
@@ -2445,9 +2619,9 @@ ApiResult ObjectService::api_put_range(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
     const std::optional<std::string>& lock_token) {
-  // Range/append writes materialize the full new version on the primary and
-  // replicate the whole body (not a delta), so memory and network cost scale
-  // with object size rather than write size. Delta replication is out of scope.
+  // The primary records the write as a delta version (or materializes when the
+  // chain is long) and replicas re-apply the same [offset, len) over their tip;
+  // only a replica with diverged history receives the full body.
   gc_client_writes();
   MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
   ServiceLock lock(mu_);
@@ -2493,14 +2667,7 @@ ApiResult ObjectService::api_put_range(
   if (!store->prepare_put_range(oid, offset, data, len, put_attrs, replace_attrs, pv, err)) {
     return fail("store_error", err);
   }
-  auto full = store->get(oid, pv.seq, err);
-  if (!full) {
-    store->abort_version(oid, pv.seq, err);
-    return fail("store_error", err);
-  }
-  PreparedVersion install = pv;
-  install.inline_body = false;
-  auto r = commit_prepared(store, placement, install, full->data(), full->size(), put_attrs);
+  auto r = commit_prepared_range(store, placement, pv, offset, data, len, put_attrs);
   if (r.ok) {
     ops_.note_put_range(len);
   }
@@ -2512,9 +2679,9 @@ ApiResult ObjectService::api_append(
     const std::unordered_map<std::string, std::string>& attrs, bool replace_attrs,
     const std::vector<AttrPrecondition>& preds, const LayoutRequest& layout_req,
     const std::optional<std::string>& lock_token) {
-  // Range/append writes materialize the full new version on the primary and
-  // replicate the whole body (not a delta), so memory and network cost scale
-  // with object size rather than write size. Delta replication is out of scope.
+  // The primary records the write as a delta version (or materializes when the
+  // chain is long) and replicas re-apply the same [offset, len) over their tip;
+  // only a replica with diverged history receives the full body.
   gc_client_writes();
   MutatingOid mutating(mu_, mutating_mu_, mutating_cv_, mutating_oids_, oid);
   ServiceLock lock(mu_);
@@ -2566,14 +2733,7 @@ ApiResult ObjectService::api_append(
   if (!store->prepare_put_range(oid, offset, data, len, put_attrs, replace_attrs, pv, err)) {
     return fail("store_error", err);
   }
-  auto full = store->get(oid, pv.seq, err);
-  if (!full) {
-    store->abort_version(oid, pv.seq, err);
-    return fail("store_error", err);
-  }
-  PreparedVersion install = pv;
-  install.inline_body = false;
-  auto r = commit_prepared(store, placement, install, full->data(), full->size(), put_attrs);
+  auto r = commit_prepared_range(store, placement, pv, offset, data, len, put_attrs);
   if (r.ok) {
     const std::uint64_t new_size = r.info ? r.info->size : offset + static_cast<std::uint64_t>(len);
     const std::uint64_t seq = r.info ? r.info->seq : 0;

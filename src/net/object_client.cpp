@@ -361,11 +361,11 @@ class ObjectRpcPool {
   std::unordered_map<std::string, std::vector<std::unique_ptr<ObjectRpcConn>>> idle_;
 };
 
+}  // namespace
+
 bool rpc_transport_failed(const ObjectRpcResult& r) {
   return r.code == "io" || r.code == "connect" || r.code == "resolve" || r.code == "auth";
 }
-
-}  // namespace
 
 void object_rpc_set_timeout_ms(int ms) {
   g_rpc_timeout_ms.store(ms > 0 ? ms : kRpcTimeoutDefaultMs, std::memory_order_relaxed);
@@ -537,6 +537,33 @@ ObjectRpcResult object_install_remote(
   }
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
                     MsgType::ObjectPut, std::move(body), std::move(raw));
+}
+
+ObjectRpcResult object_install_range_remote(
+    const std::string& peer_addr, const std::string& local_node_id,
+    const std::string& local_listen, const std::string& cluster_key, int auth_skew_ms,
+    std::uint64_t epoch, const std::string& aios_path, const PreparedVersion& v,
+    const std::unordered_map<std::string, std::string>& attrs, std::uint64_t offset,
+    const std::uint8_t* data, std::size_t len) {
+  nlohmann::json attrs_j = nlohmann::json::object();
+  for (const auto& [k, vattr] : attrs) attrs_j[k] = vattr;
+  nlohmann::json body = {
+      {"epoch", epoch},
+      {"aios_path", aios_path},
+      {"oid", v.oid},
+      {"seq", v.seq},
+      {"base_seq", v.prev_tip},
+      {"offset", offset},
+      {"len", len},
+      {"size", v.size},
+      {"crc32c", v.crc32c},
+      {"attrs", attrs_j},
+      {"role", "replica"},
+  };
+  std::vector<std::uint8_t> raw;
+  if (data && len > 0) raw.assign(data, data + len);
+  return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                    MsgType::ObjectInstallRange, std::move(body), std::move(raw));
 }
 
 ObjectRpcResult object_publish_tip_remote(const std::string& peer_addr,

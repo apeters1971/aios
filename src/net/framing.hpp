@@ -30,6 +30,7 @@ enum class MsgType : std::uint8_t {
   ObjectStageCommit = 19,  // finalize staged file → install_version
   ObjectList = 20,         // list tip objects on a node (local stores)
   MapRpc = 21,             // cluster-map consensus (vote / append); reply is ObjectReply
+  ObjectInstallRange = 22, // replica applies a ranged write over its tip (raw body = the write)
 };
 
 constexpr std::uint8_t kProtoVersion = 1;

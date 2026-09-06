@@ -12,6 +12,19 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — ranged writes are O(io), not O(object)
+
+`put_range` / append used to clone the tip file and re-CRC the whole body (a 4 KiB write
+on a 1 MiB object read ~2 MiB). FS-backed overwrites are now a SQLite delta over the
+shared base file (`version_deltas` + `object_versions.delta`); the chain is materialized
+into a fresh body when it hits `delta_max_chain` / `delta_max_bytes` / `delta_max_write`.
+Whole-object CRC32C is kept as the combine of per-64 KiB `block_crcs`, so a write only
+re-hashes the blocks it touches. Replicas apply the same `[offset, len)` via
+`ObjectInstallRange` and fall back to a full-body install if their tip has diverged.
+
+`aios-store-bench --mode fs --op range` on 1 MiB objects / 4 KiB writes went from
+~1.5k to ~5.5k ops/s (`--no-fsync`, 4 threads); append ~3k → ~10k.
+
 ### Changed — `aios-store-bench` measures the engine the way the daemon uses it
 
 `--threads N` (workers on disjoint objects; shards lock independently), `--no-fsync`

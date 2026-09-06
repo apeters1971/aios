@@ -253,7 +253,8 @@ bool is_object_req(MsgType t) {
          t == MsgType::ObjectPublishTip || t == MsgType::ObjectAbortVersion ||
          t == MsgType::ObjectListVersions || t == MsgType::ObjectPurgeVersions ||
          t == MsgType::ObjectStageBegin || t == MsgType::ObjectStageData ||
-         t == MsgType::ObjectStageCommit || t == MsgType::ObjectList;
+         t == MsgType::ObjectStageCommit || t == MsgType::ObjectList ||
+         t == MsgType::ObjectInstallRange;
 }
 
 }  // namespace

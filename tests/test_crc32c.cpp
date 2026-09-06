@@ -30,6 +30,11 @@ TEST(Crc32c, Basic) {
   const auto cz = crc32c(z.data(), z.size());
   EXPECT_TRUE(crc32c_update_zeros(0, 100) == cz) << "crc32c_update_zeros";
 
+  std::vector<std::uint8_t> wide(kStoreCrcBlockSize + 7, 0x5a);
+  const auto blocks = crc32c_blocks(wide.data(), wide.size());
+  EXPECT_EQ(blocks.size(), 2u);
+  EXPECT_EQ(crc32c_from_blocks(blocks, wide.size()), crc32c(wide.data(), wide.size()));
+
   // Store: full put + ranged update keep CRC correct
   const auto root = fs::temp_directory_path() / ("aios-crc-" + std::to_string(::getpid()));
   fs::create_directories(root);

@@ -39,6 +39,8 @@ Maximum frame body size: 16 MiB (object payloads may exceed this via staging).
 | 18   | ObjectStageData | raw chunk (`kFlagRawBody`); JSON has `offset` |
 | 19   | ObjectStageCommit | place staged file → `install_version` |
 | 20   | ObjectList | list tip objects on one node (scatter-gather leaf) |
+| 21   | MapRpc | cluster-map consensus (vote / append); reply is ObjectReply |
+| 22   | ObjectInstallRange | replica re-applies a ranged write over its tip (raw body = the write) |
 
 HTTP front-end (external clients): [`http.md`](http.md).
 
@@ -155,8 +157,18 @@ When `flags & 0x0001` is set, the frame body is:
 
 JSON fields: `epoch`, `aios_path`, `oid`, `offset`, `attrs`, `replace_attrs`, `range_crc32c`, `role`, `layout`, `ec_*`, `ts`, `sig`.
 Raw octets are the range payload (not base64). HMAC covers JSON only.
-`range_crc32c` is CRC32C of the raw range bytes; the store recomputes the **whole-object** CRC after applying the overwrite.
+`range_crc32c` is CRC32C of the raw range bytes; the store updates the whole-object CRC from
+per-block CRCs of the touched 64 KiB blocks (no full-object rescan).
 Ranged PUT requires replica layout (EC tips / `layout=ec` → error).
+
+### ObjectInstallRange (raw body)
+
+Replica-only. Same `[u32be json_len][json][raw]` layout as `ObjectPutRange`. JSON:
+`epoch`, `aios_path`, `oid`, `seq`, `base_seq`, `offset`, `len`, `size`, `crc32c`, `attrs`,
+`role=replica`. The replica applies `[offset, offset+len)` over its tip, which must equal
+`base_seq`, and checks the resulting body against `size`/`crc32c`. Reply `range_base_mismatch`
+means the replica's history diverged — the primary then ships the full body via the usual
+stage/install path.
 
 ### ObjectGet / ObjectDel / ObjectStat
 

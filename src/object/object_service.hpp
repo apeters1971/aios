@@ -263,6 +263,7 @@ class ObjectService {
   Frame dispatch(const Frame& req);
   Frame handle_put(const Frame& req);
   Frame handle_put_range(const Frame& req);
+  Frame handle_install_range(const Frame& req);
   Frame handle_get(const nlohmann::json& body);
   Frame handle_del(const nlohmann::json& body);
   Frame handle_stat(const nlohmann::json& body);
@@ -303,6 +304,17 @@ class ObjectService {
                         std::uint64_t seq);
   void replicate_abort(const Placement& placement, const std::string& oid, std::uint64_t seq);
 
+  // Delta replication for ranged writes: replicas re-apply [offset, offset+len)
+  // over their tip; a replica whose history diverged gets the full body instead.
+  int replicate_install_range(ObjectStore* store, const Placement& placement,
+                              const PreparedVersion& v, std::uint64_t offset,
+                              const std::uint8_t* data, std::size_t len,
+                              const std::unordered_map<std::string, std::string>& attrs);
+  // Like commit_prepared for a version produced by prepare_put_range.
+  ApiResult commit_prepared_range(ObjectStore* store, const Placement& placement,
+                                  PreparedVersion& pv, std::uint64_t offset,
+                                  const std::uint8_t* data, std::size_t len,
+                                  const std::unordered_map<std::string, std::string>& attrs);
   // prepare → install quorum → publish (or abort).
   ApiResult commit_prepared(ObjectStore* store, const Placement& placement,
                             PreparedVersion& pv, const std::uint8_t* data, std::size_t len,

@@ -180,7 +180,62 @@ bool migrate_fs_legacy_file(const std::string& shard_dir, const std::string& old
   return true;
 }
 
+// block_crcs column encoding: little-endian u32 per block.
+std::vector<std::uint8_t> encode_block_crcs(const std::vector<std::uint32_t>& blocks) {
+  std::vector<std::uint8_t> out(blocks.size() * 4);
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    out[i * 4] = static_cast<std::uint8_t>(blocks[i]);
+    out[i * 4 + 1] = static_cast<std::uint8_t>(blocks[i] >> 8);
+    out[i * 4 + 2] = static_cast<std::uint8_t>(blocks[i] >> 16);
+    out[i * 4 + 3] = static_cast<std::uint8_t>(blocks[i] >> 24);
+  }
+  return out;
+}
+
+std::vector<std::uint32_t> decode_block_crcs(const std::uint8_t* p, std::size_t n) {
+  std::vector<std::uint32_t> out;
+  if (!p || n % 4 != 0) return out;
+  out.resize(n / 4);
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    out[i] = static_cast<std::uint32_t>(p[i * 4]) | (static_cast<std::uint32_t>(p[i * 4 + 1]) << 8) |
+             (static_cast<std::uint32_t>(p[i * 4 + 2]) << 16) |
+             (static_cast<std::uint32_t>(p[i * 4 + 3]) << 24);
+  }
+  return out;
+}
+
+std::uint64_t block_count(std::uint64_t size) {
+  return (size + kStoreCrcBlockSize - 1) / kStoreCrcBlockSize;
+}
+
+std::uint64_t block_len(std::uint64_t index, std::uint64_t size) {
+  const std::uint64_t start = index * kStoreCrcBlockSize;
+  if (start >= size) return 0;
+  return std::min<std::uint64_t>(kStoreCrcBlockSize, size - start);
+}
+
 }  // namespace
+
+std::vector<std::uint32_t> crc32c_blocks(const std::uint8_t* data, std::size_t len) {
+  std::vector<std::uint32_t> out;
+  out.reserve(static_cast<std::size_t>(block_count(len)));
+  for (std::size_t off = 0; off < len; off += static_cast<std::size_t>(kStoreCrcBlockSize)) {
+    const std::size_t n = std::min<std::size_t>(static_cast<std::size_t>(kStoreCrcBlockSize),
+                                                len - off);
+    out.push_back(crc32c(data + off, n));
+  }
+  return out;
+}
+
+std::uint32_t crc32c_from_blocks(const std::vector<std::uint32_t>& blocks, std::uint64_t size) {
+  std::uint32_t crc = 0;
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    const auto n = block_len(i, size);
+    if (n == 0) break;
+    crc = i == 0 ? blocks[i] : crc32c_combine(crc, blocks[i], static_cast<std::size_t>(n));
+  }
+  return crc;
+}
 
 std::uint32_t shard_of_oid(const std::string& oid, std::uint32_t shard_count) {
   if (shard_count == 0) return 0;
@@ -200,6 +255,8 @@ void ObjectStore::close() {
     finalize_cached(s->stmt_load_version);
     finalize_cached(s->stmt_load_attrs);
     finalize_cached(s->stmt_get_inline);
+    finalize_cached(s->stmt_load_deltas);
+    finalize_cached(s->stmt_delta_stats);
     if (s->db) {
       sqlite3_close(s->db);
       s->db = nullptr;
@@ -214,7 +271,8 @@ bool ObjectStore::debug_any_stmt_busy() const {
     if (!s) continue;
     std::lock_guard<std::recursive_mutex> guard(s->mu);
     for (sqlite3_stmt* st : {s->stmt_tip_seq, s->stmt_max_seq, s->stmt_load_version,
-                             s->stmt_load_attrs, s->stmt_get_inline}) {
+                             s->stmt_load_attrs, s->stmt_get_inline, s->stmt_load_deltas,
+                             s->stmt_delta_stats}) {
       if (st && sqlite3_stmt_busy(st)) return true;
     }
   }
@@ -248,6 +306,8 @@ CREATE TABLE IF NOT EXISTS object_versions (
   is_delete INTEGER NOT NULL DEFAULT 0,
   ctime_ms INTEGER NOT NULL,
   redirect_oid TEXT,
+  block_crcs BLOB,
+  delta INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (oid, seq)
 );
 CREATE TABLE IF NOT EXISTS version_attrs (
@@ -257,9 +317,18 @@ CREATE TABLE IF NOT EXISTS version_attrs (
   value BLOB NOT NULL,
   PRIMARY KEY (oid, seq, key)
 );
+CREATE TABLE IF NOT EXISTS version_deltas (
+  oid TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  fs_path TEXT NOT NULL,
+  offset INTEGER NOT NULL,
+  data BLOB NOT NULL,
+  PRIMARY KEY (oid, seq)
+);
 CREATE INDEX IF NOT EXISTS idx_object_versions_oid ON object_versions(oid);
 CREATE INDEX IF NOT EXISTS idx_version_attrs_oid_seq ON version_attrs(oid, seq);
 CREATE INDEX IF NOT EXISTS idx_object_versions_fs_path ON object_versions(fs_path);
+CREATE INDEX IF NOT EXISTS idx_version_deltas_file ON version_deltas(oid, fs_path, seq);
 )SQL";
   if (!exec_db(db, "PRAGMA foreign_keys = ON;", err)) return false;
   if (!exec_db(db, "PRAGMA journal_mode = WAL;", err)) return false;
@@ -268,9 +337,13 @@ CREATE INDEX IF NOT EXISTS idx_object_versions_fs_path ON object_versions(fs_pat
   if (!exec_db(db, data_fsync ? "PRAGMA synchronous = FULL;" : "PRAGMA synchronous = OFF;", err))
     return false;
   if (!exec_db(db, ddl, err)) return false;
-  // Older versioned DBs may lack redirect_oid (duplicate column errors ignored).
+  // Older versioned DBs may lack these columns (duplicate column errors ignored).
   sqlite3_exec(db, "ALTER TABLE object_versions ADD COLUMN redirect_oid TEXT;", nullptr,
                nullptr, nullptr);
+  sqlite3_exec(db, "ALTER TABLE object_versions ADD COLUMN block_crcs BLOB;", nullptr, nullptr,
+               nullptr);
+  sqlite3_exec(db, "ALTER TABLE object_versions ADD COLUMN delta INTEGER NOT NULL DEFAULT 0;",
+               nullptr, nullptr, nullptr);
   return true;
 }
 
@@ -500,6 +573,11 @@ bool ObjectStore::load_or_init_layout(ObjectStoreOptions requested, std::string&
       opts_.force_mode = requested.force_mode;
       opts_.max_versions = requested.max_versions;
       opts_.clone_required = requested.clone_required;
+      opts_.data_fsync = requested.data_fsync;
+      opts_.delta_max_chain = requested.delta_max_chain;
+      opts_.delta_max_bytes = requested.delta_max_bytes;
+      opts_.delta_max_write = requested.delta_max_write;
+      opts_.verify_range_crc = requested.verify_range_crc;
       if (requested.shard_count != opts_.shard_count) {
         AIOS_LOG_WARN("ignoring requested shard_count=", requested.shard_count,
                       "; store.json has ", opts_.shard_count);
@@ -845,46 +923,6 @@ bool ObjectStore::crc_file_range(Shard& shard, const std::string& relpath,
   return true;
 }
 
-bool ObjectStore::crc_after_range_update(Shard& shard, const std::string& relpath,
-                                        std::uint64_t old_size, std::uint64_t offset,
-                                        const std::uint8_t* data, std::size_t len,
-                                        std::uint64_t new_size, std::uint32_t& out_crc,
-                                        std::string& err) {
-  std::uint32_t combined = 0;
-  const std::uint64_t range_end = offset + static_cast<std::uint64_t>(len);
-  if (offset > 0) {
-    const std::uint64_t solid = std::min(old_size, offset);
-    if (solid > 0) {
-      std::uint32_t pref = 0;
-      if (!crc_file_range(shard, relpath, 0, solid, pref, err)) return false;
-      combined = pref;
-    }
-    if (offset > old_size) {
-      combined = crc32c_update_zeros(combined, static_cast<std::size_t>(offset - old_size));
-    }
-  }
-  if (len > 0) {
-    combined = crc32c_combine(combined, crc32c(data, len), len);
-  }
-  if (range_end < new_size) {
-    std::uint32_t suf = 0;
-    const std::uint64_t suf_off = range_end;
-    const std::uint64_t suf_len = new_size - suf_off;
-    if (!crc_file_range(shard, relpath, suf_off, suf_len, suf, err)) return false;
-    combined = crc32c_combine(combined, suf, static_cast<std::size_t>(suf_len));
-  }
-
-  std::uint32_t full = 0;
-  if (!crc_file_range(shard, relpath, 0, new_size, full, err)) return false;
-  if (combined != full) {
-    AIOS_LOG_WARN("crc32c combine mismatch; using full scan");
-    out_crc = full;
-  } else {
-    out_crc = combined;
-  }
-  return true;
-}
-
 bool ObjectStore::tip_seq_locked(Shard& s, const std::string& oid, std::uint64_t& tip,
                                  std::string& err) {
   tip = 0;
@@ -933,8 +971,9 @@ bool ObjectStore::insert_version_locked(
   sqlite3_stmt* stmt = nullptr;
   if (sqlite3_prepare_v2(s.db,
                          "INSERT INTO object_versions"
-                         "(oid,seq,size,inline,fs_path,crc32c,is_delete,ctime_ms,redirect_oid) "
-                         "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);",
+                         "(oid,seq,size,inline,fs_path,crc32c,is_delete,ctime_ms,redirect_oid,"
+                         "block_crcs,delta) "
+                         "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11);",
                          -1, &stmt, nullptr) != SQLITE_OK) {
     err = sqlite3_errmsg(s.db);
     return false;
@@ -962,6 +1001,16 @@ bool ObjectStore::insert_version_locked(
   } else {
     sqlite3_bind_null(stmt, 9);
   }
+  std::vector<std::uint8_t> blocks_enc;
+  if (!v.block_crcs.empty() && !v.is_delete && !is_redir &&
+      v.block_crcs.size() == block_count(v.size)) {
+    blocks_enc = encode_block_crcs(v.block_crcs);
+    sqlite3_bind_blob(stmt, 10, blocks_enc.data(), static_cast<int>(blocks_enc.size()),
+                      SQLITE_STATIC);
+  } else {
+    sqlite3_bind_null(stmt, 10);
+  }
+  sqlite3_bind_int(stmt, 11, (v.delta && !v.fs_path.empty() && !v.is_delete && !is_redir) ? 1 : 0);
   if (sqlite3_step(stmt) != SQLITE_DONE) {
     err = sqlite3_errmsg(s.db);
     sqlite3_finalize(stmt);
@@ -1000,7 +1049,7 @@ bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uin
   sqlite3_stmt* stmt = cached_prepare(
       s.db, s.stmt_load_version,
       "SELECT size, inline, fs_path, crc32c, is_delete, ctime_ms, "
-      "redirect_oid FROM object_versions WHERE oid=?1 AND seq=?2;",
+      "redirect_oid, block_crcs, delta FROM object_versions WHERE oid=?1 AND seq=?2;",
       err);
   if (!stmt) return false;
   StmtReset reset(stmt);
@@ -1032,7 +1081,203 @@ bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uin
   out.mtime_ms = out.ctime_ms;
   const auto* redir = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
   if (redir) out.redirect_oid = redir;
+  if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+    out.block_crcs = decode_block_crcs(
+        reinterpret_cast<const std::uint8_t*>(sqlite3_column_blob(stmt, 7)),
+        static_cast<std::size_t>(sqlite3_column_bytes(stmt, 7)));
+    if (out.block_crcs.size() != block_count(out.size)) out.block_crcs.clear();
+  }
+  out.delta = sqlite3_column_int(stmt, 8) != 0;
   if (!out.fs_path.empty()) out.inline_body = false;
+  if (out.fs_path.empty()) out.delta = false;
+  return true;
+}
+
+bool ObjectStore::load_deltas_locked(Shard& s, const std::string& oid, const std::string& fs_path,
+                                     std::uint64_t max_seq, std::vector<Delta>& out,
+                                     std::string& err) {
+  out.clear();
+  sqlite3_stmt* stmt = cached_prepare(
+      s.db, s.stmt_load_deltas,
+      "SELECT seq, offset, data FROM version_deltas WHERE oid=?1 AND fs_path=?2 AND seq<=?3 "
+      "ORDER BY seq;",
+      err);
+  if (!stmt) return false;
+  StmtReset reset(stmt);
+  sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, fs_path.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(max_seq));
+  int rc = 0;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    Delta d;
+    d.seq = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
+    d.offset = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 1));
+    const auto* p = reinterpret_cast<const std::uint8_t*>(sqlite3_column_blob(stmt, 2));
+    const int n = sqlite3_column_bytes(stmt, 2);
+    if (p && n > 0) d.data.assign(p, p + n);
+    out.push_back(std::move(d));
+  }
+  if (rc != SQLITE_DONE) {
+    err = sqlite3_errmsg(s.db);
+    return false;
+  }
+  return true;
+}
+
+bool ObjectStore::delta_stats_locked(Shard& s, const std::string& oid, const std::string& fs_path,
+                                     std::uint64_t& count, std::uint64_t& bytes,
+                                     std::string& err) {
+  count = 0;
+  bytes = 0;
+  sqlite3_stmt* stmt = cached_prepare(
+      s.db, s.stmt_delta_stats,
+      "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM version_deltas "
+      "WHERE oid=?1 AND fs_path=?2;",
+      err);
+  if (!stmt) return false;
+  StmtReset reset(stmt);
+  sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, fs_path.c_str(), -1, SQLITE_TRANSIENT);
+  const int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_ROW) {
+    err = sqlite3_errmsg(s.db);
+    return false;
+  }
+  count = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
+  bytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 1));
+  return true;
+}
+
+bool ObjectStore::insert_delta_locked(Shard& s, const std::string& oid, std::uint64_t seq,
+                                      const std::string& fs_path, std::uint64_t offset,
+                                      const std::uint8_t* data, std::size_t len,
+                                      std::string& err) {
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(s.db,
+                         "INSERT INTO version_deltas(oid,seq,fs_path,offset,data) "
+                         "VALUES(?1,?2,?3,?4,?5);",
+                         -1, &stmt, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(seq));
+  sqlite3_bind_text(stmt, 3, fs_path.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(offset));
+  sqlite3_bind_blob(stmt, 5, len ? data : reinterpret_cast<const std::uint8_t*>(""),
+                    static_cast<int>(len), SQLITE_STATIC);
+  const int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_DONE) err = sqlite3_errmsg(s.db);
+  sqlite3_finalize(stmt);
+  return rc == SQLITE_DONE;
+}
+
+bool ObjectStore::pread_fs_zero_fill(Shard& shard, const std::string& relpath,
+                                     std::uint64_t offset, std::size_t len, std::uint8_t* out,
+                                     std::string& err) {
+  if (len == 0) return true;
+  if (!relpath_ok(relpath)) {
+    err = "invalid fs relpath";
+    return false;
+  }
+  const fs::path path = fs::path(shard.dir) / relpath;
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    err = std::string("open: ") + std::strerror(errno);
+    return false;
+  }
+  std::size_t done = 0;
+  while (done < len) {
+    const ssize_t n = ::pread(fd, out + done, len - done, static_cast<off_t>(offset + done));
+    if (n < 0) {
+      err = std::string("pread: ") + std::strerror(errno);
+      ::close(fd);
+      return false;
+    }
+    if (n == 0) break;
+    done += static_cast<std::size_t>(n);
+  }
+  ::close(fd);
+  if (done < len) std::memset(out + done, 0, len - done);
+  return true;
+}
+
+bool ObjectStore::read_version_range_locked(Shard& s, const ObjectInfo& info,
+                                            std::uint64_t offset, std::size_t len,
+                                            std::uint8_t* out, std::string& err) {
+  if (len == 0) return true;
+  if (offset > info.size || static_cast<std::uint64_t>(len) > info.size - offset) {
+    err = "range beyond version size";
+    return false;
+  }
+  if (info.fs_path.empty()) {
+    // Inline blob.
+    sqlite3_stmt* stmt = cached_prepare(
+        s.db, s.stmt_get_inline, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;",
+        err);
+    if (!stmt) return false;
+    StmtReset reset(stmt);
+    sqlite3_bind_text(stmt, 1, info.oid.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(info.seq));
+    const int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+      err = rc == SQLITE_DONE ? "object not found" : sqlite3_errmsg(s.db);
+      return false;
+    }
+    const auto* blob = reinterpret_cast<const std::uint8_t*>(sqlite3_column_blob(stmt, 0));
+    const auto blob_len = static_cast<std::uint64_t>(sqlite3_column_bytes(stmt, 0));
+    if (blob_len != info.size) {
+      err = "inline size mismatch";
+      return false;
+    }
+    std::memcpy(out, blob + offset, len);
+    return true;
+  }
+  if (!info.delta) {
+    // A standalone body file must hold every byte of the version; a short read
+    // means it was truncated or is being modified — never hand out zeros.
+    if (!relpath_ok(info.fs_path)) {
+      err = "invalid fs relpath";
+      return false;
+    }
+    const fs::path path = fs::path(s.dir) / info.fs_path;
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      err = std::string("open: ") + std::strerror(errno);
+      return false;
+    }
+    std::size_t done = 0;
+    while (done < len) {
+      const ssize_t n = ::pread(fd, out + done, len - done, static_cast<off_t>(offset + done));
+      if (n < 0) {
+        err = std::string("pread: ") + std::strerror(errno);
+        ::close(fd);
+        return false;
+      }
+      if (n == 0) break;
+      done += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+    if (done != len) {
+      err = "short read: got " + std::to_string(done) + " of " + std::to_string(len) + " bytes";
+      return false;
+    }
+    return true;
+  }
+  // Delta version: the base file may be shorter than the logical size (appends
+  // live in the patch rows); bytes past EOF are zero before the overlay.
+  if (!pread_fs_zero_fill(s, info.fs_path, offset, len, out, err)) return false;
+  std::vector<Delta> deltas;
+  if (!load_deltas_locked(s, info.oid, info.fs_path, info.seq, deltas, err)) return false;
+  const std::uint64_t end = offset + len;
+  for (const auto& d : deltas) {
+    const std::uint64_t d_end = d.offset + d.data.size();
+    const std::uint64_t lo = std::max(offset, d.offset);
+    const std::uint64_t hi = std::min(end, d_end);
+    if (lo >= hi) continue;
+    std::memcpy(out + (lo - offset), d.data.data() + (lo - d.offset),
+                static_cast<std::size_t>(hi - lo));
+  }
   return true;
 }
 
@@ -1078,7 +1323,50 @@ bool ObjectStore::delete_version_row_locked(Shard& s, const std::string& oid, st
   sqlite3_finalize(stmt);
 
   if (has && !info.fs_path.empty()) {
-    fs_unlink_out.push_back(info.fs_path);
+    // The body file may be shared by a delta chain (base + patch versions).
+    // Unlink it — and drop its patch rows — only once no version references it;
+    // otherwise drop just this version's own patch when nothing newer on the
+    // same file depends on it (abort of the newest delta; seq may be reused).
+    sqlite3_stmt* ref = nullptr;
+    if (sqlite3_prepare_v2(s.db,
+                           "SELECT MAX(seq) FROM object_versions WHERE oid=?1 AND fs_path=?2;",
+                           -1, &ref, nullptr) != SQLITE_OK) {
+      err = sqlite3_errmsg(s.db);
+      return false;
+    }
+    sqlite3_bind_text(ref, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ref, 2, info.fs_path.c_str(), -1, SQLITE_TRANSIENT);
+    const int rrc = sqlite3_step(ref);
+    const bool referenced = rrc == SQLITE_ROW && sqlite3_column_type(ref, 0) != SQLITE_NULL;
+    const std::uint64_t max_ref =
+        referenced ? static_cast<std::uint64_t>(sqlite3_column_int64(ref, 0)) : 0;
+    sqlite3_finalize(ref);
+    if (rrc != SQLITE_ROW) {
+      err = sqlite3_errmsg(s.db);
+      return false;
+    }
+    const char* sql = !referenced
+                          ? "DELETE FROM version_deltas WHERE oid=?1 AND fs_path=?2;"
+                          : (max_ref < seq ? "DELETE FROM version_deltas WHERE oid=?1 AND "
+                                             "fs_path=?2 AND seq>?3;"
+                                           : nullptr);
+    if (sql) {
+      sqlite3_stmt* dd = nullptr;
+      if (sqlite3_prepare_v2(s.db, sql, -1, &dd, nullptr) != SQLITE_OK) {
+        err = sqlite3_errmsg(s.db);
+        return false;
+      }
+      sqlite3_bind_text(dd, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(dd, 2, info.fs_path.c_str(), -1, SQLITE_TRANSIENT);
+      if (referenced) sqlite3_bind_int64(dd, 3, static_cast<sqlite3_int64>(max_ref));
+      const int drc = sqlite3_step(dd);
+      sqlite3_finalize(dd);
+      if (drc != SQLITE_DONE) {
+        err = sqlite3_errmsg(s.db);
+        return false;
+      }
+    }
+    if (!referenced) fs_unlink_out.push_back(info.fs_path);
   }
   return true;
 }
@@ -1149,7 +1437,8 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
   Shard& s = *sp;
   std::lock_guard<std::recursive_mutex> guard(s.mu);
 
-  const std::uint32_t body_crc = crc32c(data, len);
+  auto body_blocks = crc32c_blocks(data, len);
+  const std::uint32_t body_crc = crc32c_from_blocks(body_blocks, len);
   if (expected_crc32c.has_value() && *expected_crc32c != body_crc) {
     err = "crc32c mismatch";
     return false;
@@ -1204,6 +1493,7 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
   pv.size = len;
   pv.crc32c = body_crc;
   pv.is_delete = false;
+  pv.block_crcs = std::move(body_blocks);
 
   const bool as_inline = use_inline(len);
   if (as_inline) {
@@ -1503,6 +1793,271 @@ bool ObjectStore::prepare_put_file_at_seq(
   return true;
 }
 
+bool ObjectStore::tip_block_crcs_locked(Shard& s, const ObjectInfo& tip,
+                                        std::vector<std::uint32_t>& out, std::string& err) {
+  out.clear();
+  if (tip.size == 0) return true;
+  if (!tip.block_crcs.empty() && tip.block_crcs.size() == block_count(tip.size)) {
+    out = tip.block_crcs;
+    return true;
+  }
+  // Legacy row (or streamed upload) without block CRCs: one full read, after
+  // which the new version carries them and later writes stay O(io).
+  const auto nblocks = block_count(tip.size);
+  out.reserve(static_cast<std::size_t>(nblocks));
+  std::vector<std::uint8_t> buf(static_cast<std::size_t>(kStoreCrcBlockSize));
+  for (std::uint64_t b = 0; b < nblocks; ++b) {
+    const auto n = static_cast<std::size_t>(block_len(b, tip.size));
+    if (!read_version_range_locked(s, tip, b * kStoreCrcBlockSize, n, buf.data(), err)) {
+      return false;
+    }
+    out.push_back(crc32c(buf.data(), n));
+  }
+  return true;
+}
+
+bool ObjectStore::prepare_range_locked(
+    Shard& s, const std::string& oid, std::optional<std::uint64_t> fixed_seq,
+    std::optional<std::uint64_t> expected_prev_tip, std::optional<std::uint64_t> expected_size,
+    std::optional<std::uint32_t> expected_crc32c, std::uint64_t offset, const std::uint8_t* data,
+    std::size_t len, const std::unordered_map<std::string, std::string>& attrs,
+    bool replace_attrs, PreparedVersion& out, std::string& err) {
+  out = PreparedVersion{};
+  const std::uint64_t end = offset + static_cast<std::uint64_t>(len);
+
+  if (!begin(s, err)) return false;
+  // Any file created below is unlinked on failure.
+  std::string new_file;
+  auto fail = [&](const std::string& why) {
+    if (!new_file.empty()) {
+      std::string rm_err;
+      remove_fs_object(s, new_file, rm_err);
+    }
+    rollback(s);
+    if (!why.empty()) err = why;
+    return false;
+  };
+
+  std::uint64_t tip = 0;
+  if (!tip_seq_locked(s, oid, tip, err)) return fail("");
+  if (expected_prev_tip.has_value() && *expected_prev_tip != tip) {
+    return fail("range base mismatch: local tip " + std::to_string(tip) + " expected " +
+                std::to_string(*expected_prev_tip));
+  }
+
+  std::uint64_t old_size = 0;
+  bool tip_live = false;
+  ObjectInfo tip_info;
+  if (tip > 0) {
+    if (!load_version_locked(s, oid, tip, tip_info, err)) return fail("");
+    if (!tip_info.is_delete) {
+      tip_live = true;
+      old_size = tip_info.size;
+    }
+  }
+  // A redirect tip has no body: treat as empty.
+  const bool tip_has_body = tip_live && tip_info.redirect_oid.empty();
+  if (!tip_has_body) old_size = 0;
+
+  std::unordered_map<std::string, std::string> merged = attrs;
+  if (tip_live && !replace_attrs) {
+    std::unordered_map<std::string, std::string> tip_attrs;
+    if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, oid, tip, tip_attrs, err)) return fail("");
+    merged = std::move(tip_attrs);
+    for (const auto& [k, v] : attrs) merged[k] = v;
+  }
+
+  std::uint64_t seq = 0;
+  if (fixed_seq.has_value()) {
+    seq = *fixed_seq;
+    ObjectInfo existing;
+    std::string lerr;
+    if (load_version_locked(s, oid, seq, existing, lerr)) return fail("version already exists");
+    if (lerr != "object not found") return fail(lerr);
+  } else if (!next_seq_locked(s, oid, seq, err)) {
+    return fail("");
+  }
+
+  const std::uint64_t new_size = std::max(old_size, end);
+  if (expected_size.has_value() && *expected_size != new_size) {
+    return fail("range result mismatch: size " + std::to_string(new_size) + " expected " +
+                std::to_string(*expected_size));
+  }
+
+  // --- CRC: reuse untouched block CRCs, hash only the blocks the write changes.
+  std::vector<std::uint32_t> old_blocks;
+  if (tip_has_body && old_size > 0) {
+    if (!tip_block_crcs_locked(s, tip_info, old_blocks, err)) return fail("");
+  }
+  const std::uint64_t nblocks = block_count(new_size);
+  std::vector<std::uint32_t> blocks(static_cast<std::size_t>(nblocks), 0);
+  // Only the write-touched blocks are re-read / re-hashed (O(io)). A hole
+  // between old_size and offset is all zeros and uses crc32c_update_zeros.
+  // The last old block is a special case: if the object grew past its end, that
+  // short block is now longer (zero-padded) and cannot reuse its old CRC.
+  std::vector<std::uint8_t> region;
+  std::uint64_t region_start = 0;
+  std::uint64_t write_b_lo = 0;
+  std::uint64_t write_b_hi = 0;
+  const bool have_write = len > 0;
+  if (have_write) {
+    write_b_lo = offset / kStoreCrcBlockSize;
+    write_b_hi = (end - 1) / kStoreCrcBlockSize;
+    region_start = write_b_lo * kStoreCrcBlockSize;
+    const std::uint64_t region_end =
+        std::min(new_size, (write_b_hi + 1) * kStoreCrcBlockSize);
+    region.assign(static_cast<std::size_t>(region_end - region_start), 0);
+    if (tip_has_body && region_start < old_size) {
+      const std::uint64_t keep = std::min(old_size, region_end) - region_start;
+      if (!read_version_range_locked(s, tip_info, region_start, static_cast<std::size_t>(keep),
+                                     region.data(), err)) {
+        return fail("");
+      }
+    }
+    std::memcpy(region.data() + (offset - region_start), data, len);
+  }
+  for (std::uint64_t b = 0; b < nblocks; ++b) {
+    const auto n_new = static_cast<std::size_t>(block_len(b, new_size));
+    const auto n_old = static_cast<std::size_t>(block_len(b, old_size));
+    if (have_write && b >= write_b_lo && b <= write_b_hi) {
+      blocks[static_cast<std::size_t>(b)] =
+          crc32c(region.data() + (b * kStoreCrcBlockSize - region_start), n_new);
+    } else if (b < old_blocks.size() && n_new == n_old) {
+      blocks[static_cast<std::size_t>(b)] = old_blocks[static_cast<std::size_t>(b)];
+    } else if (n_old == 0) {
+      blocks[static_cast<std::size_t>(b)] = crc32c_update_zeros(0, n_new);
+    } else {
+      std::vector<std::uint8_t> blk(n_new, 0);
+      if (!read_version_range_locked(s, tip_info, b * kStoreCrcBlockSize, n_old, blk.data(),
+                                     err)) {
+        return fail("");
+      }
+      blocks[static_cast<std::size_t>(b)] = crc32c(blk.data(), n_new);
+    }
+  }
+  const std::uint32_t body_crc = crc32c_from_blocks(blocks, new_size);
+  if (expected_crc32c.has_value() && *expected_crc32c != body_crc) {
+    return fail("range result mismatch: crc32c differs (local history diverged)");
+  }
+
+  PreparedVersion pv;
+  pv.oid = oid;
+  pv.seq = seq;
+  pv.prev_tip = tip;
+  pv.size = new_size;
+  pv.crc32c = body_crc;
+  pv.is_delete = false;
+  pv.crc_verified = true;
+  pv.block_crcs = blocks;
+
+  // --- Body placement.
+  const bool tip_is_file = tip_has_body && !tip_info.fs_path.empty();
+  bool use_delta = tip_is_file && opts_.delta_max_chain > 0 && len <= opts_.delta_max_write;
+  if (use_delta) {
+    std::uint64_t dcount = 0, dbytes = 0;
+    if (!delta_stats_locked(s, oid, tip_info.fs_path, dcount, dbytes, err)) return fail("");
+    if (dcount + 1 > opts_.delta_max_chain || dbytes + len > opts_.delta_max_bytes) {
+      use_delta = false;
+    }
+  }
+
+  if (use_delta) {
+    // Patch row over the shared base file; no body I/O, no clone, no fsync
+    // beyond the SQLite commit.
+    pv.inline_body = false;
+    pv.fs_path = tip_info.fs_path;
+    pv.delta = true;
+    if (!insert_delta_locked(s, oid, seq, pv.fs_path, offset, data, len, err)) return fail("");
+  } else if ((!tip_is_file) && use_inline(new_size)) {
+    // Small body stays inline: build the new blob in memory.
+    std::vector<std::uint8_t> body(static_cast<std::size_t>(new_size), 0);
+    if (tip_has_body && old_size > 0) {
+      if (!read_version_range_locked(s, tip_info, 0, static_cast<std::size_t>(old_size),
+                                     body.data(), err)) {
+        return fail("");
+      }
+    }
+    if (len > 0) std::memcpy(body.data() + offset, data, len);
+    pv.inline_body = true;
+    if (!insert_version_locked(s, pv, body.data(), body.size(), merged, err)) return fail("");
+    if (!commit(s, err)) return fail("");
+    out = std::move(pv);
+    return true;
+  } else {
+    // Materialize a standalone body file for the new version.
+    const std::string new_rel = version_relpath(oid, seq);
+    const fs::path new_abs = fs::path(s.dir) / new_rel;
+    std::error_code ec;
+    fs::create_directories(new_abs.parent_path(), ec);
+    if (tip_is_file) {
+      if (!relpath_ok(tip_info.fs_path)) return fail("invalid fs relpath");
+      const fs::path src = fs::path(s.dir) / tip_info.fs_path;
+      if (!clone_or_copy_file(src.string(), new_abs.string(), !opts_.clone_required, err)) {
+        return fail("");
+      }
+      new_file = new_rel;
+      if (tip_info.delta) {
+        // Fold the chain into the clone.
+        std::vector<Delta> deltas;
+        if (!load_deltas_locked(s, oid, tip_info.fs_path, tip_info.seq, deltas, err)) {
+          return fail("");
+        }
+        for (const auto& d : deltas) {
+          if (d.data.empty()) continue;
+          if (!pwrite_fs(s, new_rel, d.offset, d.data.data(), d.data.size(), err,
+                         /*do_fsync=*/false)) {
+            return fail("");
+          }
+        }
+      }
+    } else if (tip_has_body && old_size > 0) {
+      // Inline tip outgrowing the inline limit.
+      std::vector<std::uint8_t> body(static_cast<std::size_t>(old_size));
+      if (!read_version_range_locked(s, tip_info, 0, body.size(), body.data(), err)) {
+        return fail("");
+      }
+      if (!write_fs_object(s, new_rel, body.data(), body.size(), err)) return fail("");
+      new_file = new_rel;
+    } else {
+      if (!ensure_fs_size(s, new_rel, 0, err)) return fail("");
+      new_file = new_rel;
+    }
+    if (!ensure_fs_size(s, new_rel, new_size, err)) return fail("");
+    if (len > 0 && !pwrite_fs(s, new_rel, offset, data, len, err, /*do_fsync=*/false)) {
+      return fail("");
+    }
+    if (opts_.data_fsync && !pwrite_fs(s, new_rel, 0, nullptr, 0, err, /*do_fsync=*/true)) {
+      return fail("");
+    }
+    pv.inline_body = false;
+    pv.fs_path = new_rel;
+    pv.delta = false;
+  }
+
+  if (!insert_version_locked(s, pv, nullptr, 0, merged, err)) return fail("");
+
+  if (opts_.verify_range_crc) {
+    ObjectInfo chk;
+    chk.oid = oid;
+    chk.seq = seq;
+    chk.size = new_size;
+    chk.fs_path = pv.fs_path;
+    chk.inline_body = false;
+    chk.delta = pv.delta;
+    std::vector<std::uint8_t> full(static_cast<std::size_t>(new_size));
+    if (!read_version_range_locked(s, chk, 0, full.size(), full.data(), err)) return fail("");
+    const std::uint32_t scan = crc32c(full.data(), full.size());
+    if (scan != body_crc) {
+      return fail("range crc verification failed: block-combined " + std::to_string(body_crc) +
+                  " vs scan " + std::to_string(scan));
+    }
+  }
+
+  if (!commit(s, err)) return fail("");
+  out = std::move(pv);
+  return true;
+}
+
 bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset,
                                     const std::uint8_t* data, std::size_t len,
                                     const std::unordered_map<std::string, std::string>& attrs,
@@ -1521,160 +2076,53 @@ bool ObjectStore::prepare_put_range(const std::string& oid, std::uint64_t offset
     err = "shard open failed";
     return false;
   }
+  std::lock_guard<std::recursive_mutex> guard(sp->mu);
+  return prepare_range_locked(*sp, oid, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                              offset, data, len, attrs, replace_attrs, out, err);
+}
+
+bool ObjectStore::install_range_version(
+    const std::string& oid, std::uint64_t seq, std::uint64_t prev_tip, std::uint64_t offset,
+    const std::uint8_t* data, std::size_t len, std::uint64_t expected_size,
+    std::uint32_t expected_crc32c, const std::unordered_map<std::string, std::string>& attrs,
+    std::string& err) {
+  if (!is_open()) {
+    err = "store not open";
+    return false;
+  }
+  if (oid.empty() || seq == 0) {
+    err = "empty oid or seq";
+    return false;
+  }
+  Shard* sp = shard_for(oid);
+  if (!sp) {
+    err = "shard open failed";
+    return false;
+  }
   Shard& s = *sp;
   std::lock_guard<std::recursive_mutex> guard(s.mu);
-  const std::uint64_t end = offset + static_cast<std::uint64_t>(len);
 
-  if (!begin(s, err)) return false;
-
-  std::uint64_t tip = 0;
-  if (!tip_seq_locked(s, oid, tip, err)) {
-    rollback(s);
+  // Idempotent retry: same version already installed.
+  ObjectInfo existing;
+  std::string lerr;
+  if (load_version_locked(s, oid, seq, existing, lerr)) {
+    if (!existing.is_delete && existing.redirect_oid.empty() && existing.size == expected_size &&
+        existing.crc32c_known && existing.crc32c == expected_crc32c) {
+      return true;
+    }
+    err = "version already exists";
     return false;
   }
-
-  std::uint64_t old_size = 0;
-  bool tip_live = false;
-  ObjectInfo tip_info;
-  std::vector<std::uint8_t> tip_inline;
-  if (tip > 0) {
-    if (!load_version_locked(s, oid, tip, tip_info, err)) {
-      rollback(s);
-      return false;
-    }
-    if (!tip_info.is_delete) {
-      tip_live = true;
-      old_size = tip_info.size;
-      if (tip_info.inline_body) {
-        sqlite3_stmt* stmt = cached_prepare(
-            s.db, s.stmt_get_inline, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;",
-            err);
-        if (!stmt) {
-          rollback(s);
-          return false;
-        }
-        StmtReset reset(stmt);
-        sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(tip));
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-          const void* blob = sqlite3_column_blob(stmt, 0);
-          const int n = sqlite3_column_bytes(stmt, 0);
-          if (n > 0 && blob) {
-            tip_inline.assign(reinterpret_cast<const std::uint8_t*>(blob),
-                              reinterpret_cast<const std::uint8_t*>(blob) + n);
-          }
-        }
-      }
-    }
-  }
-
-  std::unordered_map<std::string, std::string> merged = attrs;
-  if (tip_live) {
-    if (!replace_attrs) {
-      std::unordered_map<std::string, std::string> tip_attrs;
-      if (!load_attrs_for_seq(s.db, s.stmt_load_attrs, oid, tip, tip_attrs, err)) {
-        rollback(s);
-        return false;
-      }
-      merged = std::move(tip_attrs);
-      for (const auto& [k, v] : attrs) merged[k] = v;
-    }
-  }
-
-  std::uint64_t seq = 0;
-  if (!next_seq_locked(s, oid, seq, err)) {
-    rollback(s);
+  if (lerr != "object not found") {
+    err = lerr;
     return false;
   }
-
-  const std::string new_rel = version_relpath(oid, seq);
-  const fs::path new_abs = fs::path(s.dir) / new_rel;
-  std::error_code ec;
-  fs::create_directories(new_abs.parent_path(), ec);
-
-  if (tip_live && !tip_info.fs_path.empty()) {
-    if (!relpath_ok(tip_info.fs_path)) {
-      rollback(s);
-      err = "invalid fs relpath";
-      return false;
-    }
-    const fs::path src = fs::path(s.dir) / tip_info.fs_path;
-    if (!clone_or_copy_file(src.string(), new_abs.string(), !opts_.clone_required, err)) {
-      rollback(s);
-      return false;
-    }
-  } else if (tip_live && tip_info.inline_body) {
-    if (!write_fs_object(s, new_rel, tip_inline.data(), tip_inline.size(), err)) {
-      rollback(s);
-      return false;
-    }
-  } else {
-    // Create from empty (no tip / delete tip).
-    if (!ensure_fs_size(s, new_rel, 0, err)) {
-      rollback(s);
-      return false;
-    }
-  }
-
-  const std::uint64_t new_size = std::max(old_size, end);
-  if (!ensure_fs_size(s, new_rel, new_size, err)) {
-    std::string rm_err;
-    remove_fs_object(s, new_rel, rm_err);
-    rollback(s);
-    return false;
-  }
-  if (len > 0) {
-    if (!pwrite_fs(s, new_rel, offset, data, len, err, /*do_fsync=*/false)) {
-      std::string rm_err;
-      remove_fs_object(s, new_rel, rm_err);
-      rollback(s);
-      return false;
-    }
-  }
-
-  std::uint32_t body_crc = 0;
-  if (!crc_after_range_update(s, new_rel, old_size, offset, data, len, new_size, body_crc,
-                              err)) {
-    std::string rm_err;
-    remove_fs_object(s, new_rel, rm_err);
-    rollback(s);
-    return false;
-  }
-  if (opts_.data_fsync) {
-    if (!pwrite_fs(s, new_rel, 0, nullptr, 0, err, /*do_fsync=*/true)) {
-      std::string rm_err;
-      remove_fs_object(s, new_rel, rm_err);
-      rollback(s);
-      return false;
-    }
-  }
-
   PreparedVersion pv;
-  pv.oid = oid;
-  pv.seq = seq;
-  pv.prev_tip = tip;
-  pv.size = new_size;
-  pv.crc32c = body_crc;
-  pv.inline_body = false;
-  pv.fs_path = new_rel;
-  pv.is_delete = false;
-
-  if (!insert_version_locked(s, pv, nullptr, 0, merged, err)) {
-    std::string rm_err;
-    remove_fs_object(s, new_rel, rm_err);
-    rollback(s);
-    return false;
-  }
-
-  if (!commit(s, err)) {
-    std::string rm_err;
-    remove_fs_object(s, new_rel, rm_err);
-    rollback(s);
-    return false;
-  }
-  out = std::move(pv);
-  return true;
+  // Replicas apply the primary's merged attribute set verbatim.
+  return prepare_range_locked(s, oid, seq, prev_tip, expected_size, expected_crc32c, offset, data,
+                              len, attrs, /*replace_attrs=*/true, pv, err);
 }
+
 
 bool ObjectStore::prepare_delete(const std::string& oid, PreparedVersion& out, std::string& err) {
   out = PreparedVersion{};
@@ -1907,8 +2355,15 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
   // Caller-supplied bodies are verified against the prepared CRC unless the
   // caller already accumulated it while staging.
   auto data_crc_ok = [&]() -> bool {
+    // Callers may reuse a PreparedVersion of another body (EC shards): trust
+    // supplied block CRCs only when they combine to the declared crc32c.
+    const bool blocks_fit = pv.block_crcs.size() == block_count(len) &&
+                            crc32c_from_blocks(pv.block_crcs, len) == pv.crc32c;
+    if (pv.crc_verified && blocks_fit) return true;
+    pv.block_crcs = crc32c_blocks(data, len);
     if (pv.crc_verified) return true;
-    if (crc32c(data, len) != pv.crc32c) {
+    const std::uint32_t got = crc32c_from_blocks(pv.block_crcs, len);
+    if (got != pv.crc32c) {
       rollback(s);
       err = "install crc32c mismatch";
       return false;
@@ -1960,16 +2415,28 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
         return false;
       }
       if (!pv.crc_verified) {
-        std::uint32_t got_crc = 0;
-        if (!crc_file_range(s, pv.fs_path, 0, pv.size, got_crc, err)) {
-          rollback(s);
-          return false;
+        // Verify by blocks so the row gets block CRCs from the same read.
+        const auto nblocks = block_count(pv.size);
+        std::vector<std::uint32_t> blocks;
+        blocks.reserve(static_cast<std::size_t>(nblocks));
+        for (std::uint64_t b = 0; b < nblocks; ++b) {
+          std::uint32_t c = 0;
+          if (!crc_file_range(s, pv.fs_path, b * kStoreCrcBlockSize, block_len(b, pv.size), c,
+                              err)) {
+            rollback(s);
+            return false;
+          }
+          blocks.push_back(c);
         }
-        if (got_crc != pv.crc32c) {
+        if (crc32c_from_blocks(blocks, pv.size) != pv.crc32c) {
           rollback(s);
           err = "install crc32c mismatch";
           return false;
         }
+        pv.block_crcs = std::move(blocks);
+      } else if (pv.block_crcs.size() != block_count(pv.size) ||
+                 crc32c_from_blocks(pv.block_crcs, pv.size) != pv.crc32c) {
+        pv.block_crcs.clear();
       }
     } else {
       if (!ensure_fs_size(s, pv.fs_path, 0, err)) {
@@ -2264,40 +2731,10 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get(const std::string& oid
   Shard& s = *sp;
   std::lock_guard<std::recursive_mutex> guard(s.mu);
 
-  if (!info->fs_path.empty()) {
-    if (!relpath_ok(info->fs_path)) {
-      err = "invalid fs relpath";
-      return std::nullopt;
-    }
-    const auto abs = (fs::path(s.dir) / info->fs_path).string();
-    std::vector<std::uint8_t> out;
-    if (!file_read_exact(abs, static_cast<std::size_t>(info->size), out, err)) {
-      if (err.empty()) err = "cannot open fs object: " + info->fs_path;
-      return std::nullopt;
-    }
-    return out;
-  }
-
-  sqlite3_stmt* stmt = cached_prepare(
-      s.db, s.stmt_get_inline, "SELECT inline FROM object_versions WHERE oid=?1 AND seq=?2;", err);
-  if (!stmt) return std::nullopt;
-  StmtReset reset(stmt);
-  sqlite3_bind_text(stmt, 1, oid.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(info->seq));
-  const int rc = sqlite3_step(stmt);
-  if (rc != SQLITE_ROW) {
-    err = rc == SQLITE_DONE ? "object not found" : sqlite3_errmsg(s.db);
+  std::vector<std::uint8_t> out(static_cast<std::size_t>(info->size));
+  if (!read_version_range_locked(s, *info, 0, out.size(), out.data(), err)) {
+    if (err.empty()) err = "cannot read object body: " + info->fs_path;
     return std::nullopt;
-  }
-  const void* blob = sqlite3_column_blob(stmt, 0);
-  const int blob_len = sqlite3_column_bytes(stmt, 0);
-  if (static_cast<std::uint64_t>(blob_len) != info->size) {
-    err = "inline size mismatch";
-    return std::nullopt;
-  }
-  std::vector<std::uint8_t> out(static_cast<std::size_t>(blob_len));
-  if (blob_len > 0 && blob) {
-    std::memcpy(out.data(), blob, static_cast<std::size_t>(blob_len));
   }
   return out;
 }
@@ -2323,50 +2760,14 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get_range(
   const std::size_t want = std::min(len, static_cast<std::size_t>(avail));
   if (want == 0) return std::vector<std::uint8_t>{};
 
-  if (info->inline_body) {
-    auto full = get(oid, info->seq, err);
-    if (!full) return std::nullopt;
-    std::vector<std::uint8_t> out(full->begin() + static_cast<std::ptrdiff_t>(offset),
-                                  full->begin() + static_cast<std::ptrdiff_t>(offset + want));
-    return out;
-  }
-
   Shard* sp = shard_for(oid);
   if (!sp) {
     err = "shard open failed";
     return std::nullopt;
   }
   std::lock_guard<std::recursive_mutex> guard(sp->mu);
-  if (!relpath_ok(info->fs_path)) {
-    err = "invalid fs relpath";
-    return std::nullopt;
-  }
-  const fs::path path = fs::path(sp->dir) / info->fs_path;
-  int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) {
-    err = std::string("open: ") + std::strerror(errno);
-    return std::nullopt;
-  }
   std::vector<std::uint8_t> out(want);
-  std::size_t done = 0;
-  while (done < want) {
-    const ssize_t n =
-        ::pread(fd, out.data() + done, want - done, static_cast<off_t>(offset + done));
-    if (n < 0) {
-      err = std::string("pread: ") + std::strerror(errno);
-      ::close(fd);
-      return std::nullopt;
-    }
-    if (n == 0) break;
-    done += static_cast<std::size_t>(n);
-  }
-  ::close(fd);
-  if (done != want) {
-    // Short read means the backing file is truncated or was concurrently modified;
-    // returning the partial buffer would silently hand truncated data to the client.
-    err = "short read: got " + std::to_string(done) + " of " + std::to_string(want) + " bytes";
-    return std::nullopt;
-  }
+  if (!read_version_range_locked(*sp, *info, offset, want, out.data(), err)) return std::nullopt;
   return out;
 }
 
@@ -2377,6 +2778,12 @@ std::optional<std::string> ObjectStore::fs_body_path(const std::string& oid,
   if (!info) return std::nullopt;
   if (info->inline_body || info->fs_path.empty()) {
     err = "not fs-backed";
+    return std::nullopt;
+  }
+  if (info->delta) {
+    // Body = base file + patches; there is no single file to stream. Callers
+    // fall back to get()/get_range().
+    err = "delta version has no standalone body file";
     return std::nullopt;
   }
   if (!relpath_ok(info->fs_path)) {
@@ -2952,6 +3359,12 @@ std::size_t ObjectStore::scrub_orphans(std::string& err) {
     if (!open_shard(id, err)) return removed;
     Shard& s = *shards_[id];
     std::lock_guard<std::recursive_mutex> guard(s.mu);
+    // Patch rows whose base file no version references any more.
+    exec_db(s.db,
+            "DELETE FROM version_deltas WHERE NOT EXISTS (SELECT 1 FROM object_versions v "
+            "WHERE v.oid=version_deltas.oid AND v.fs_path=version_deltas.fs_path);",
+            err);
+    err.clear();
     const fs::path objects = fs::path(s.dir) / "objects";
     std::error_code ec;
     if (!fs::exists(objects, ec)) continue;
@@ -3017,36 +3430,61 @@ bool ObjectStore::recompute_crc32c(const std::string& oid, std::uint32_t& out_cr
     return false;
   }
   std::lock_guard<std::recursive_mutex> guard(sp->mu);
+  std::vector<std::uint32_t> blocks;
   if (info->size == 0) {
     out_crc = crc32c(nullptr, 0);
-  } else if (info->inline_body) {
+  } else if (info->inline_body || info->delta) {
     auto data = get(oid, info->seq, err);
     if (!data) return false;
-    out_crc = crc32c(data->data(), data->size());
-  } else if (!crc_file_range(*sp, info->fs_path, 0, info->size, out_crc, err)) {
-    return false;
+    blocks = crc32c_blocks(data->data(), data->size());
+    out_crc = crc32c_from_blocks(blocks, data->size());
+  } else {
+    // Stream the body file block by block (no whole-object buffer).
+    const auto nblocks = block_count(info->size);
+    blocks.reserve(static_cast<std::size_t>(nblocks));
+    for (std::uint64_t b = 0; b < nblocks; ++b) {
+      std::uint32_t c = 0;
+      if (!crc_file_range(*sp, info->fs_path, b * kStoreCrcBlockSize, block_len(b, info->size),
+                          c, err)) {
+        return false;
+      }
+      blocks.push_back(c);
+    }
+    out_crc = crc32c_from_blocks(blocks, info->size);
   }
 
   if (!begin(*sp, err)) return false;
-  sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(sp->db,
-                         "UPDATE object_versions SET crc32c=?1 WHERE oid=?2 AND seq=?3;", -1,
-                         &stmt, nullptr) != SQLITE_OK) {
-    err = sqlite3_errmsg(sp->db);
+  if (!update_crc_locked(*sp, oid, info->seq, out_crc, blocks, err)) {
     rollback(*sp);
     return false;
   }
-  sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(out_crc));
-  sqlite3_bind_text(stmt, 2, oid.c_str(), -1, SQLITE_TRANSIENT);
-  sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(info->seq));
-  if (sqlite3_step(stmt) != SQLITE_DONE) {
-    err = sqlite3_errmsg(sp->db);
-    sqlite3_finalize(stmt);
-    rollback(*sp);
-    return false;
-  }
-  sqlite3_finalize(stmt);
   return commit(*sp, err);
+}
+
+bool ObjectStore::update_crc_locked(Shard& s, const std::string& oid, std::uint64_t seq,
+                                    std::uint32_t crc, const std::vector<std::uint32_t>& blocks,
+                                    std::string& err) {
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(s.db,
+                         "UPDATE object_versions SET crc32c=?1, block_crcs=?2 "
+                         "WHERE oid=?3 AND seq=?4;",
+                         -1, &stmt, nullptr) != SQLITE_OK) {
+    err = sqlite3_errmsg(s.db);
+    return false;
+  }
+  const auto enc = encode_block_crcs(blocks);
+  sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(crc));
+  if (enc.empty()) {
+    sqlite3_bind_null(stmt, 2);
+  } else {
+    sqlite3_bind_blob(stmt, 2, enc.data(), static_cast<int>(enc.size()), SQLITE_STATIC);
+  }
+  sqlite3_bind_text(stmt, 3, oid.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(seq));
+  const int rc = sqlite3_step(stmt);
+  if (rc != SQLITE_DONE) err = sqlite3_errmsg(s.db);
+  sqlite3_finalize(stmt);
+  return rc == SQLITE_DONE;
 }
 
 }  // namespace aios
