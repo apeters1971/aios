@@ -350,6 +350,50 @@ TEST(MembershipRegression, OfflinePeerIsStillProbed) {
   EXPECT_TRUE(found) << "an offline peer must still be probed so it can rejoin";
 }
 
+TEST(MembershipRegression, PeersForGossipCanRestrictToHubAddrs) {
+  using namespace aios;
+  MembershipTable table;
+  table.set_local("mon-a", "127.0.0.1:7400");
+  const auto t0 = now_ms();
+  table.mark_alive("mon-b", "127.0.0.1:7401", t0);
+  table.mark_alive("osd-1", "127.0.0.1:7500", t0);
+  table.mark_alive("osd-2", "127.0.0.1:7501", t0);
+  const auto peers = table.peers_for_gossip(8, {"127.0.0.1:7400", "127.0.0.1:7401"});
+  ASSERT_EQ(peers.size(), 1u);
+  EXPECT_EQ(peers[0].node_id, "mon-b");
+}
+
+TEST(MembershipRegression, LocalOnlyJsonOmitsOtherMembers) {
+  using namespace aios;
+  MembershipTable table;
+  table.set_local("mon-a", "127.0.0.1:7400");
+  table.mark_alive("osd-1", "127.0.0.1:7500", now_ms());
+  const auto all = table.to_json(false);
+  const auto local = table.to_json(true);
+  ASSERT_TRUE(all["members"].is_array());
+  ASSERT_TRUE(local["members"].is_array());
+  EXPECT_EQ(all["members"].size(), 2u);
+  ASSERT_EQ(local["members"].size(), 1u);
+  EXPECT_EQ(local["members"][0].value("node_id", ""), "mon-a");
+}
+
+TEST(FsTableRegression, LocalOnlyJsonOmitsPeerTargets) {
+  using namespace aios;
+  FsTable table;
+  table.set_local("node-a", {aios::test::make_target("/data/a/aios")});
+  FsEntry peer;
+  peer.node_id = "node-b";
+  peer.aios_path = "/data/b/aios";
+  peer.storage_class = "nvme";
+  peer.usable = true;
+  peer.updated_ms = now_ms();
+  table.merge({peer});
+  EXPECT_EQ(table.snapshot().size(), 2u);
+  const auto local_j = table.to_json(true);
+  ASSERT_EQ(local_j["entries"].size(), 1u);
+  EXPECT_EQ(local_j["entries"][0].value("node_id", ""), "node-a");
+}
+
 // ---------------------------------------------------------------------------
 // Daemon serving paths
 // ---------------------------------------------------------------------------

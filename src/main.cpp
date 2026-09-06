@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
     std::cout
         << "usage: aiosd --cluster-key UUID [--config PATH] [--listen HOST:PORT]\n"
         << "             [--peer HOST:PORT] [--node-id ID] [--status-file PATH]\n"
+        << "             [--monitor HOST:PORT ...] [--map-lease-ms N]\n"
         << "             [--scan-root PATH] [--scan-prefix PATH]\n"
         << "             [--replica-count N] [--write-quorum N] [--io-path server|client]\n"
         << "             [--http-listen HOST:PORT] [--admin] [--admin-metrics-public]\n"
@@ -82,6 +83,12 @@ int main(int argc, char** argv) {
         << "(FS-backed via libaios_posix).\n"
         << "--scan-root/--scan-prefix PATH looks for PATH/.aios in addition to\n"
         << "mount roots (repeatable; also config scan_roots).\n"
+        << "--monitor lists the cluster-map voters (TCP++ addresses, repeatable; same\n"
+        << "set on every node). Gossip is then hub-and-spoke: monitors exchange full\n"
+        << "tables; other nodes report local state to them and pull the map. Small\n"
+        << "clusters: list every node (typically with --admin). Large clusters: 3–5\n"
+        << "admin/monitors. The elected leader publishes maps with monotonic epochs;\n"
+        << "primaries need a map lease (--map-lease-ms, < dead_after_ms).\n"
         << "--admin enables /admin/* and /metrics on http_listen.\n"
         << "--admin-metrics-public allows unauthenticated GET /metrics (scrape).\n"
         << "--no-fsync skips body/dir fsync (dev/bench only; not durable).\n";

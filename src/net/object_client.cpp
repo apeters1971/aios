@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <functional>
@@ -115,7 +116,25 @@ class ObjectRpcConn {
       err = "resolve " + peer_addr + ": " + ec.message();
       return false;
     }
-    boost::asio::connect(sock_, endpoints, ec);
+    // Bounded connect: a black-holed peer (host down, no RST) would otherwise hold
+    // the caller for the kernel's SYN timeout, which is far longer than any lease.
+    {
+      ioc_.restart();
+      bool done = false;
+      boost::asio::async_connect(sock_, endpoints,
+                                 [&](const boost::system::error_code& e, const tcp::endpoint&) {
+                                   ec = e;
+                                   done = true;
+                                 });
+      ioc_.run_for(std::chrono::milliseconds(rpc_timeout_ms()));
+      if (!done) {
+        boost::system::error_code ignore;
+        sock_.close(ignore);
+        ioc_.run();
+        ec = boost::asio::error::timed_out;
+      }
+      ioc_.restart();
+    }
     if (ec) {
       err = "connect " + peer_addr + ": " + ec.message();
       close();
@@ -913,6 +932,19 @@ ObjectRpcResult object_list_remote(const std::string& peer_addr,
   };
   return object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
                     MsgType::ObjectList, std::move(body));
+}
+
+std::optional<nlohmann::json> map_rpc_remote(const std::string& peer_addr,
+                                             const std::string& local_node_id,
+                                             const std::string& local_listen,
+                                             const std::string& cluster_key, int auth_skew_ms,
+                                             nlohmann::json req) {
+  auto r = object_rpc(peer_addr, local_node_id, local_listen, cluster_key, auth_skew_ms,
+                      MsgType::MapRpc, std::move(req));
+  if (!r.ok) return std::nullopt;
+  auto it = r.body.find("map");
+  if (it == r.body.end() || !it->is_object()) return std::nullopt;
+  return *it;
 }
 
 ObjectRpcResult object_get_range_remote(

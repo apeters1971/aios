@@ -29,6 +29,7 @@ enum class MsgType : std::uint8_t {
   ObjectStageData = 18,    // raw chunk (kFlagRawBody)
   ObjectStageCommit = 19,  // finalize staged file → install_version
   ObjectList = 20,         // list tip objects on a node (local stores)
+  MapRpc = 21,             // cluster-map consensus (vote / append); reply is ObjectReply
 };
 
 constexpr std::uint8_t kProtoVersion = 1;

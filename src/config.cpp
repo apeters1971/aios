@@ -337,6 +337,16 @@ bool load_config_file(const std::string& path, Config& cfg, std::string& err) {
     if (root["suspect_after_ms"])
       cfg.suspect_after_ms = root["suspect_after_ms"].as<int>();
     if (root["dead_after_ms"]) cfg.dead_after_ms = root["dead_after_ms"].as<int>();
+    if (root["monitors"]) {
+      if (!root["monitors"].IsSequence()) {
+        err = "monitors must be a sequence of host:port";
+        return false;
+      }
+      cfg.monitors.clear();
+      for (const auto& m : root["monitors"]) cfg.monitors.push_back(m.as<std::string>());
+    }
+    if (root["map_lease_ms"]) cfg.map_lease_ms = root["map_lease_ms"].as<int>();
+    if (root["map_state_file"]) cfg.map_state_file = root["map_state_file"].as<std::string>();
     if (root["scan_interval_ms"])
       cfg.scan_interval_ms = root["scan_interval_ms"].as<int>();
     if (root["scan_roots"]) {
@@ -686,6 +696,18 @@ bool parse_cli(int argc, char** argv, Config& cfg, std::string& err, bool& help)
       cfg.status_file = v;
       continue;
     }
+    if (arg == "--monitor") {
+      const char* v = need("--monitor");
+      if (!v) return false;
+      cfg.monitors.emplace_back(v);
+      continue;
+    }
+    if (arg == "--map-lease-ms") {
+      const char* v = need("--map-lease-ms");
+      if (!v) return false;
+      cfg.map_lease_ms = std::atoi(v);
+      continue;
+    }
     if (arg == "--scan-root" || arg == "--scan-prefix") {
       const char* v = need(arg.c_str());
       if (!v) return false;
@@ -857,6 +879,20 @@ bool normalize_config(Config& cfg, std::string& err) {
   if (cfg.suspect_after_ms >= cfg.dead_after_ms) {
     err = "suspect_after_ms must be less than dead_after_ms";
     return false;
+  }
+  if (!cfg.monitors.empty()) {
+    if (cfg.map_lease_ms < 2 * cfg.gossip_interval_ms) {
+      err = "map_lease_ms must be at least twice gossip_interval_ms";
+      return false;
+    }
+    if (cfg.map_lease_ms >= cfg.dead_after_ms) {
+      err = "map_lease_ms must be less than dead_after_ms (a cut-off primary has to stop "
+            "before the leader drops it from the map)";
+      return false;
+    }
+    if (cfg.map_state_file.empty() && !cfg.status_file.empty()) {
+      cfg.map_state_file = cfg.status_file + ".map";
+    }
   }
   cfg.io_path = lower_copy(cfg.io_path);
   if (cfg.io_path.empty()) cfg.io_path = "server";

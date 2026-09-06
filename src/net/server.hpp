@@ -48,6 +48,11 @@ struct RpcHandlers {
 
   // Handle ObjectPut/Get/Del/Stat → ObjectReply (caller signs reply).
   std::function<Frame(const Frame& req)> on_object;
+
+  // Cluster-map consensus RPC (MsgType::MapRpc): body in, reply body out. Answered
+  // as an ObjectReply so the pooled object RPC client can be reused. Unset →
+  // the request is refused.
+  std::function<nlohmann::json(const nlohmann::json& req)> on_map;
 };
 
 // Backward-compatible alias.

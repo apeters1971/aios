@@ -487,6 +487,20 @@ void TcpServer::run_session(tcp::socket& sock) {
       write_frame(sock, *gossip_reply, err, ec, idle);
       return;  // gossip sessions are one-shot
     }
+    if (req.type == MsgType::MapRpc) {
+      if (!handlers_.on_map) return;
+      if (!auth_verify(req.body, req.type, handlers_.cluster_key, handlers_.auth_skew_ms,
+                       err)) {
+        AIOS_LOG_WARN("reject map rpc auth from ", peer_id, ": ", err);
+        return;
+      }
+      Frame reply;
+      reply.type = MsgType::ObjectReply;
+      reply.body = {{"ok", true}, {"map", handlers_.on_map(req.body)}};
+      auth_sign(reply.body, MsgType::ObjectReply, handlers_.cluster_key);
+      if (!write_frame(sock, reply, err, ec, idle)) return;
+      continue;
+    }
     if (is_object_req(req.type)) {
       if (!handlers_.on_object) return;
       if (!auth_verify(req.body, req.type, handlers_.cluster_key, handlers_.auth_skew_ms,

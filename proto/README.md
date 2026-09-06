@@ -81,9 +81,18 @@ Short-lived TCP sessions:
 
 1. Client connects and sends `Hello`.
 2. Server replies with `Hello`.
-3. Client sends `Gossip` with its membership + FS table.
+3. Client sends `Gossip` with membership + FS table.
 4. Server merges, rebuilds cluster map, replies with `Gossip` (may include `cluster_map`).
 5. Connection closes.
+
+When `monitors` is unset, every node sends its **full** tables to a few random
+peers (mesh). When `monitors` is set, gossip is hub-and-spoke:
+
+- Monitor↔monitor: full tables, as above.
+- Storage→monitor: **local-only** membership row + local `fs_table` entries.
+  The monitor replies with `cluster_map` only (no full-table dump).
+- Storage nodes pull the committed map and a lease via MapRpc `op=pull` rather
+  than the leader unicasting `append` to every learner.
 
 ## Cluster map
 

@@ -71,9 +71,15 @@ std::vector<FsEntry> FsTable::snapshot() const {
   return out;
 }
 
-nlohmann::json FsTable::to_json() const {
+nlohmann::json FsTable::to_json(bool local_only) const {
+  std::string local;
+  {
+    std::lock_guard lock(mu_);
+    local = local_id_;
+  }
   nlohmann::json entries = nlohmann::json::array();
   for (const auto& e : snapshot()) {
+    if (local_only && e.node_id != local) continue;
     entries.push_back({
         {"node_id", e.node_id},
         {"mount", e.mount},

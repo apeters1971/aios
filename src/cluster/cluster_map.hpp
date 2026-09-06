@@ -33,9 +33,13 @@ struct StorageTarget {
   std::uint64_t bavail{0};
 };
 
-// Snapshot of placement-relevant cluster state. Epoch is a content hash of the
-// sorted target list + replica_count + placement knobs so peers with the same
-// view share an epoch.
+// Snapshot of placement-relevant cluster state.
+//
+// Without a map monitor (Config::monitors empty) the epoch is a content hash of
+// the sorted target list + replica_count + placement knobs, so peers with the
+// same gossip view share an epoch. With monitors the epoch is the monotonic index
+// assigned by the elected leader (cluster/map_monitor.hpp); content_hash() is then
+// only used to detect that the content changed.
 struct ClusterMap {
   std::uint64_t epoch{0};
   int replica_count{3};
@@ -46,6 +50,10 @@ struct ClusterMap {
 
   // Targets belonging to `storage_class` (preserves map sort order).
   std::vector<StorageTarget> targets_for_class(const std::string& storage_class) const;
+
+  // Hash of everything placement depends on (targets, states, weights, knobs;
+  // not bavail and not the epoch itself).
+  std::uint64_t content_hash() const;
 
   nlohmann::json to_json() const;
   static ClusterMap from_json(const nlohmann::json& j);

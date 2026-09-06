@@ -59,10 +59,15 @@ class MembershipTable {
   void age(std::int64_t now, int suspect_after_ms, int dead_after_ms);
 
   std::vector<Member> snapshot() const;
-  std::vector<Member> peers_for_gossip(std::size_t k) const;
+  // Up to `k` peers to dial this round (suspect, then offline, then online, then
+  // seeds). When `only_addrs` is non-empty, only those TCP++ addresses are eligible
+  // (hub-and-spoke: storage and monitors both dial the monitor set).
+  std::vector<Member> peers_for_gossip(std::size_t k,
+                                       const std::vector<std::string>& only_addrs = {}) const;
   std::optional<Member> find(const std::string& node_id) const;
 
-  nlohmann::json to_json() const;
+  // local_only: this node's row only (storage → monitor reports).
+  nlohmann::json to_json(bool local_only = false) const;
   static std::vector<Member> from_json(const nlohmann::json& j);
 
  private:

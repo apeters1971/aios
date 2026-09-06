@@ -222,6 +222,21 @@ class ObjectService {
   // half-written map.
   std::uint64_t update_cluster_map(ClusterMap m);
 
+  // Consensus state that gates primary work (cluster/map_monitor.hpp). With
+  // `consensus` set, epochs are monotonic: replica RPCs carrying an epoch older
+  // than the newest this node has seen are refused (epoch_mismatch), a primary
+  // without a valid map lease refuses with no_map_lease, and while map_.epoch is
+  // newer than active_epoch a node that was not already primary of an object in
+  // `previous` refuses writes to it with map_transition (HTTP 503, retryable).
+  struct MapGate {
+    bool consensus{false};
+    bool lease_valid{true};
+    std::uint64_t active_epoch{0};
+    std::optional<ClusterMap> previous;
+  };
+  void set_map_gate(MapGate gate);
+  MapGate map_gate() const;
+
   // Copy of the current map. Callers that hold the map across long work (repair,
   // transition, archive passes) must use this rather than map(): a concurrent
   // update_cluster_map reassigns the targets vector out from under a reference.
@@ -318,6 +333,9 @@ class ObjectService {
 
   ApiResult require_primary(const std::string& oid, Placement& placement_out,
                             const std::string& storage_class = {});
+  // Consensus-mode checks for a node that is primary of `oid` under `placement`
+  // (lease, epoch activation). ok when not in consensus mode.
+  ApiResult primary_gate(const std::string& oid, const Placement& placement);
   ApiResult enforce_lock(const std::string& oid, const std::optional<std::string>& token);
   void signal_watch(const std::string& oid, std::uint64_t seq, const std::string& op);
 
@@ -405,6 +423,10 @@ class ObjectService {
   LocalStores& stores_;
   std::string advertise_;
   mutable std::atomic<std::uint64_t> epoch_{0};
+  // Consensus mode: newest epoch seen on any inbound RPC or published map. Older
+  // requests are stale primaries and are fenced.
+  std::uint64_t fence_epoch_{0};
+  MapGate gate_;
   // Recursive: api_* nests (txn → prepare → install). Always take it through
   // ServiceLock (object_service.cpp) so UnlockForRpc can release the full depth.
   mutable std::recursive_mutex mu_;

@@ -187,17 +187,22 @@ ClusterMap ClusterMap::build(const MembershipTable& membership, const FsTable& f
               return a.aios_path < b.aios_path;
             });
 
-  std::ostringstream canon;
-  canon << "replica_count=" << map.replica_count << '\n';
-  canon << "vnodes_per_target=" << map.placement.vnodes_per_target << '\n';
-  canon << "min_vnodes=" << map.placement.min_vnodes << '\n';
-  canon << "max_vnodes=" << map.placement.max_vnodes << '\n';
-  for (const auto& t : map.targets) {
-    canon << t.storage_class << '\t' << t.node_id << '\t' << t.rack << '\t' << t.addr << '\t'
-          << t.aios_path << '\t' << t.weight << '\t' << lifecycle_state_name(t.state) << '\n';
-  }
-  map.epoch = hash_canonical(canon.str());
+  map.epoch = map.content_hash();
   return map;
+}
+
+std::uint64_t ClusterMap::content_hash() const {
+  std::ostringstream canon;
+  canon << "replica_count=" << replica_count << '\n';
+  canon << "vnodes_per_target=" << placement.vnodes_per_target << '\n';
+  canon << "min_vnodes=" << placement.min_vnodes << '\n';
+  canon << "max_vnodes=" << placement.max_vnodes << '\n';
+  for (const auto& t : targets) {
+    canon << t.storage_class << '\t' << t.node_id << '\t' << t.rack << '\t' << t.addr << '\t'
+          << t.http_addr << '\t' << t.aios_path << '\t' << t.weight << '\t'
+          << lifecycle_state_name(t.state) << '\n';
+  }
+  return hash_canonical(canon.str());
 }
 
 }  // namespace aios

@@ -270,7 +270,21 @@ int main(int argc, char** argv) {
   if (!json_out) {
     std::cerr << "aios-bench probing " << args.endpoint << " …\n" << std::flush;
   }
-  const auto doc = aios::run_http_bench(args);
+  // Long runs (STL sync mode at large sizes is thousands of round trips per op)
+  // otherwise look hung: report each measured phase as it completes.
+  aios::HttpBenchProgress progress;
+  if (!json_out) {
+    progress = [](const nlohmann::json& st) {
+      std::cerr << "  done " << st.value("stl_type", std::string("object")) << " "
+                << st.value("stl_sync", std::string("")) << " " << st.value("size_label", "")
+                << " " << st.value("op", "") << ": ok=" << st.value("ok", 0)
+                << " err=" << st.value("err", 0) << " iops=" << std::fixed << std::setprecision(1)
+                << st.value("iops", 0.0) << " p50=" << std::setprecision(3)
+                << st.value("p50_ms", 0.0) << "ms\n"
+                << std::flush;
+    };
+  }
+  const auto doc = aios::run_http_bench(args, {}, progress);
   if (doc.contains("error")) {
     std::cerr << doc["error"].get<std::string>() << "\n";
     return 1;

@@ -102,6 +102,22 @@ struct Config {
   int gossip_interval_ms{1000};
   int suspect_after_ms{5000};
   int dead_after_ms{15000};
+  // Cluster-map monitors (TCP++ addresses, same form as `listen`/`peers`). When
+  // set, only the leader elected among them publishes maps (monotonic epochs),
+  // primaries need a map lease from the leader, and epoch changes that move an
+  // object's primary wait for the old primary to have stopped. Gossip becomes
+  // hub-and-spoke: monitors exchange full tables with each other; everyone else
+  // reports local state to the monitors and pulls the committed map. Empty =
+  // legacy all-to-all gossip-derived map (no split-brain protection). This node
+  // votes only if its own advertise address is listed. Small clusters: list every
+  // node here (and start them with --admin). Large clusters: 3–5 admin/monitors.
+  std::vector<std::string> monitors;
+  // How long a node may act as primary without hearing from the map leader.
+  // Must be below dead_after_ms so a cut-off node stops before it is dropped.
+  int map_lease_ms{10000};
+  // Voter state (term / vote / latest map). Default: <status_file>.map, or
+  // memory only when status_file is empty (then a restart may vote twice in a term).
+  std::string map_state_file;
   int scan_interval_ms{5000};
   // Extra directories to scan for a top-level .aios (in addition to mount roots).
   std::vector<std::string> scan_roots;

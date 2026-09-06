@@ -340,6 +340,8 @@ int status_for(const ApiResult& r) {
   if (r.code == "frozen") return 409;
   if (r.code == "no_targets") return 503;
   if (r.code == "quorum_failed") return 503;
+  if (r.code == "map_transition") return 503;
+  if (r.code == "no_map_lease") return 503;
   if (r.code == "bad_request") return 400;
   if (r.code == "conflict") return 409;
   if (r.code == "lock_held") return 409;
@@ -681,11 +683,13 @@ void write_api_error(tcp::socket& sock, const ApiResult& r, const std::string& p
                {{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}, keep_alive);
     return;
   }
-  if (r.code == "restoring") {
+  if (r.code == "restoring" || r.code == "map_transition" || r.code == "no_map_lease") {
     const auto j =
         json_dump(nlohmann::json({{"error", r.error}, {"code", r.code}, {"epoch", r.epoch}}));
+    // Map transitions resolve within a lease period; restores take much longer.
+    const char* retry = r.code == "restoring" ? "30" : "1";
     write_response(sock, 503, "Service Unavailable",
-                   {{"Content-Type", "application/json"}, {"Retry-After", "30"}},
+                   {{"Content-Type", "application/json"}, {"Retry-After", retry}},
                    reinterpret_cast<const std::uint8_t*>(j.data()), j.size(), keep_alive);
     return;
   }
@@ -1175,6 +1179,9 @@ nlohmann::json HttpServer::admin_status_json() const {
       {"admin", cfg_.admin},
       {"admin_metrics_public", cfg_.admin_metrics_public},
       {"map_epoch", objects_.map().epoch},
+      {"map_consensus", objects_.map_gate().consensus},
+      {"map_lease_valid", objects_.map_gate().lease_valid},
+      {"map_active_epoch", objects_.map_gate().active_epoch},
       {"map_targets", objects_.map().targets.size()},
       {"replica_count", cfg_.replica_count},
       {"members", members.size()},
@@ -3325,6 +3332,14 @@ void HttpServer::handle_session(std::shared_ptr<tcp::socket> sock) {
     if (method == "GET" && path == "/map") {
       auto j = objects_.map().to_json();
       j["io_path"] = cfg_.io_path;
+      {
+        const auto g = objects_.map_gate();
+        j["consensus"] = g.consensus;
+        if (g.consensus) {
+          j["lease_valid"] = g.lease_valid;
+          j["active_epoch"] = g.active_epoch;
+        }
+      }
       write_json(*sock, 200, "OK", j, keep_alive);
       continue;
     }

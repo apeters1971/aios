@@ -333,7 +333,11 @@ status_file: "/tmp/aios-a.json"
 
 ### Admin & monitoring
 
-Enable on selected nodes with `admin: true` / `--admin`.
+Enable on selected nodes with `admin: true` / `--admin`. For a production cluster
+set `monitors` to those nodes’ TCP++ addresses (3–5): they are the map quorum and
+the gossip hub. Storage nodes list the same addresses as `peers` and do not
+need `--admin`. A lab of a handful of nodes can list **every** node in `monitors`
+(all-admin) and keep the simple full-table mesh among that small set.
 
 **Web UI:** open `http://HOST:7480/admin/` and sign in with the **cluster key**. Overview / cluster / config / actions, plus **S3 credentials** (when `s3_listen` is enabled), **Quotas**, and **QoS**. Branding icon: [`web/admin/aios-icon.png`](web/admin/aios-icon.png).
 

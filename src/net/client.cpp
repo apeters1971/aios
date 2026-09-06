@@ -20,7 +20,7 @@ GossipExchangeResult gossip_with_peer(const std::string& peer_addr,
                                       const std::string& local_listen,
                                       const std::string& cluster_key, int auth_skew_ms,
                                       MembershipTable& membership, FsTable& fs_table,
-                                      const std::string& local_http_addr) {
+                                      const std::string& local_http_addr, bool local_only) {
   GossipExchangeResult result;
   std::string host, port;
   if (!split_host_port(peer_addr, host, port)) {
@@ -76,8 +76,8 @@ GossipExchangeResult gossip_with_peer(const std::string& peer_addr,
   Frame gossip;
   gossip.type = MsgType::Gossip;
   gossip.body = {
-      {"membership", membership.to_json()},
-      {"fs_table", fs_table.to_json()},
+      {"membership", membership.to_json(local_only)},
+      {"fs_table", fs_table.to_json(local_only)},
   };
   auth_sign(gossip.body, MsgType::Gossip, cluster_key);
   if (!write_frame(sock, gossip, err, ec, kGossipIoTimeoutMs)) {

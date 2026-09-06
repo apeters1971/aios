@@ -8,6 +8,15 @@ cluster_key: "550e8400-e29b-41d4-a716-446655440000"
 peers:                     # none / one / several; may be empty (first node)
   - "host2:7400"
   - "host3:7400"
+# Cluster-map voters (TCP++). When set, gossip is hub-and-spoke: these nodes
+# exchange full membership/fs tables; everyone else reports local state here
+# and pulls the committed map. Small cluster: list every node and start them
+# with --admin. Large cluster: 3–5 admin nodes; storage `peers` should be this set.
+# monitors:
+#   - "host1:7400"
+#   - "host2:7400"
+#   - "host3:7400"
+# map_lease_ms: 10000      # must be < dead_after_ms
 gossip_interval_ms: 1000
 suspect_after_ms: 5000
 dead_after_ms: 15000

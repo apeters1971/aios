@@ -253,7 +253,19 @@ std::uint64_t ObjectService::update_cluster_map(ClusterMap m) {
   const auto prev = map_.epoch;
   map_ = std::move(m);
   epoch_.store(map_.epoch, std::memory_order_release);
+  if (gate_.consensus) fence_epoch_ = std::max(fence_epoch_, map_.epoch);
   return prev;
+}
+
+void ObjectService::set_map_gate(MapGate gate) {
+  ServiceLock lock(mu_);
+  gate_ = std::move(gate);
+  if (gate_.consensus) fence_epoch_ = std::max(fence_epoch_, map_.epoch);
+}
+
+ObjectService::MapGate ObjectService::map_gate() const {
+  ServiceLock lock(mu_);
+  return gate_;
 }
 
 ClusterMap ObjectService::map_snapshot() const {
@@ -284,7 +296,10 @@ Frame ObjectService::reply_err(std::uint64_t epoch, const std::string& code,
 
 ApiResult ObjectService::fail(const std::string& code, const std::string& error) const {
   // not_primary and not_local are redirect signals, not operator errors.
-  if (code != "not_primary" && code != "not_local") ops_.note_error();
+  if (code != "not_primary" && code != "not_local" && code != "map_transition" &&
+      code != "no_map_lease") {
+    ops_.note_error();
+  }
   ApiResult r;
   r.ok = false;
   r.code = code;
@@ -304,10 +319,38 @@ ApiResult ObjectService::require_primary(const std::string& oid, Placement& plac
     r.placement = placement_out;
     return r;
   }
+  if (auto g = primary_gate(oid, placement_out); !g.ok) return g;
   ApiResult ok;
   ok.ok = true;
   ok.epoch = cur_epoch();
   ok.placement = placement_out;
+  return ok;
+}
+
+ApiResult ObjectService::primary_gate(const std::string& oid, const Placement& placement) {
+  ApiResult ok;
+  ok.ok = true;
+  ok.epoch = cur_epoch();
+  if (!gate_.consensus) return ok;
+  // Consensus mode: we may only act as primary while the map leader still
+  // vouches for us, and, when this epoch made us primary of `oid`, only once the
+  // previous primary has provably stopped (see MapGate).
+  if (!gate_.lease_valid) {
+    return fail("no_map_lease", "no cluster-map lease from the leader; retry");
+  }
+  if (map_.epoch > gate_.active_epoch) {
+    bool was_primary = false;
+    if (gate_.previous && !gate_.previous->targets.empty()) {
+      const auto n = static_cast<int>(placement.acting_set.size());
+      const auto prev = place(oid, *gate_.previous, n > 0 ? n : gate_.previous->replica_count,
+                              placement.storage_class);
+      was_primary = !prev.acting_set.empty() && prev.acting_set[0].node_id == cfg_.node_id;
+    }
+    if (!was_primary) {
+      return fail("map_transition",
+                  "primary changed in a map epoch that is not active yet; retry");
+    }
+  }
   return ok;
 }
 
@@ -344,6 +387,17 @@ bool ObjectService::epoch_ok(std::uint64_t req_epoch, Frame& err_out) const {
   ServiceLock lock(mu_);
   epoch_.store(map_.epoch, std::memory_order_release);
   if (req_epoch == map_.epoch) return true;
+  if (gate_.consensus) {
+    // Monotonic epochs: a request from a newer committed map is fine (we are
+    // behind and will catch up); anything older than the newest epoch we have
+    // seen comes from a primary that has been superseded, and is fenced.
+    auto* self = const_cast<ObjectService*>(this);
+    if (req_epoch > fence_epoch_) {
+      self->fence_epoch_ = req_epoch;
+      return true;
+    }
+    if (req_epoch == fence_epoch_) return true;
+  }
   err_out = reply_err(map_.epoch, "epoch_mismatch", "cluster map epoch mismatch");
   err_out.body["cluster_map"] = map_.to_json();
   return false;
@@ -1610,6 +1664,7 @@ ApiResult ObjectService::api_put(const std::string& oid, const std::uint8_t* dat
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -1737,6 +1792,7 @@ ApiResult ObjectService::api_begin_put_staging(const std::string& oid,
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
   if (!store->create_staging_file(oid, staging_abs_out, err)) {
@@ -1826,6 +1882,7 @@ ApiResult ObjectService::api_begin_put_pipeline(const std::string& oid,
       r.placement = placement;
       return r;
     }
+    if (auto g = primary_gate(oid, placement); !g.ok) return g;
     auto* store = primary_store(placement, err);
     if (!store) return fail("store_error", err);
     {
@@ -2243,6 +2300,7 @@ ApiResult ObjectService::api_put_file(
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -2343,6 +2401,7 @@ ApiResult ObjectService::api_put_redirect(
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
@@ -2386,6 +2445,7 @@ ApiResult ObjectService::api_put_range(
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -2452,6 +2512,7 @@ ApiResult ObjectService::api_append(
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -2899,6 +2960,7 @@ ApiResult ObjectService::api_del(const std::string& oid,
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
@@ -3120,6 +3182,7 @@ ApiResult ObjectService::api_purge_version(const std::string& oid, std::uint64_t
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     return fail("not_primary", "this node is not primary for oid");
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -3148,6 +3211,7 @@ ApiResult ObjectService::api_trim_versions(const std::string& oid, int keep) {
   if (placement.acting_set[0].node_id != cfg_.node_id) {
     return fail("not_primary", "this node is not primary for oid");
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -3393,6 +3457,7 @@ ApiResult ObjectService::api_prepare_put(
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
@@ -3422,6 +3487,7 @@ ApiResult ObjectService::api_prepare_put_file(
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
@@ -3449,6 +3515,7 @@ ApiResult ObjectService::api_prepare_delete(const std::string& oid,
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
   std::string err;
   auto* store = primary_store(placement, err);
@@ -3473,6 +3540,7 @@ ApiResult ObjectService::api_publish_version(const std::string& oid, std::uint64
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -3500,6 +3568,7 @@ ApiResult ObjectService::api_abort_prepared(const std::string& oid, std::uint64_
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   std::string err;
   auto* store = primary_store(placement, err);
   if (!store) return fail("store_error", err);
@@ -3544,6 +3613,7 @@ ApiResult ObjectService::require_txn_primary(const std::string& txn_id,
     r.placement = placement;
     return r;
   }
+  if (auto g = primary_gate(oid, placement); !g.ok) return g;
   auto loaded = load_txn_state(txn_id, state_out);
   if (!loaded.ok) return loaded;
   loaded.placement = placement;
@@ -4484,6 +4554,7 @@ ApiResult ObjectService::api_client_prepare(
       r.placement = placement;
       return r;
     }
+    if (auto g = primary_gate(oid, placement); !g.ok) return g;
     if (auto lk = enforce_lock(oid, lock_token); !lk.ok) return lk;
     auto* store = primary_store(placement, err);
     if (!store) return fail("store_error", err);
@@ -4651,6 +4722,12 @@ ApiResult ObjectService::api_client_publish(const std::string& oid, const std::s
     r.placement = placement;
     return r;
   }
+  if (gate_.consensus && g.epoch < map_.epoch) {
+    // The grant was minted under a map that has since been superseded; the
+    // acting set it names may no longer be the one that must hold the copies.
+    return fail("epoch_mismatch", "write grant is from an older cluster map epoch");
+  }
+  if (auto gr = primary_gate(oid, placement); !gr.ok) return gr;
 
   const int installed = count_client_installs(g);
   const int need = g.is_ec() ? std::max(g.ec_k, quorum_need(placement)) : quorum_need(placement);

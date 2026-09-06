@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <random>
+#include <unordered_set>
 
 namespace aios {
 
@@ -129,8 +130,13 @@ std::vector<Member> MembershipTable::snapshot() const {
   return out;
 }
 
-std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
+std::vector<Member> MembershipTable::peers_for_gossip(
+    std::size_t k, const std::vector<std::string>& only_addrs) const {
   std::lock_guard lock(mu_);
+  std::unordered_set<std::string> allow;
+  for (const auto& a : only_addrs) {
+    if (!a.empty()) allow.insert(a);
+  }
   std::vector<Member> online;
   std::vector<Member> suspect;
   std::vector<Member> offline;
@@ -138,6 +144,7 @@ std::vector<Member> MembershipTable::peers_for_gossip(std::size_t k) const {
   for (const auto& [id, m] : members_) {
     if (id == local_id_) continue;
     if (m.addr.empty()) continue;
+    if (!allow.empty() && !allow.count(m.addr)) continue;
     if (id.rfind("seed:", 0) == 0) {
       seeds.push_back(m);
       continue;
@@ -191,9 +198,15 @@ std::optional<Member> MembershipTable::find(const std::string& node_id) const {
   return it->second;
 }
 
-nlohmann::json MembershipTable::to_json() const {
+nlohmann::json MembershipTable::to_json(bool local_only) const {
+  std::string local;
+  {
+    std::lock_guard lock(mu_);
+    local = local_id_;
+  }
   nlohmann::json members = nlohmann::json::array();
   for (const auto& m : snapshot()) {
+    if (local_only && m.node_id != local) continue;
     members.push_back({
         {"node_id", m.node_id},
         {"addr", m.addr},

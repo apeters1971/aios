@@ -39,6 +39,14 @@ ObjectRpcResult object_rpc(const std::string& peer_addr, const std::string& loca
                            int auth_skew_ms, MsgType req_type, nlohmann::json req_body,
                            std::vector<std::uint8_t> raw = {});
 
+// Cluster-map consensus RPC (MsgType::MapRpc). Returns the monitor's reply body,
+// nullopt on transport / auth failure or when the peer runs no monitor.
+std::optional<nlohmann::json> map_rpc_remote(const std::string& peer_addr,
+                                             const std::string& local_node_id,
+                                             const std::string& local_listen,
+                                             const std::string& cluster_key, int auth_skew_ms,
+                                             nlohmann::json req);
+
 // Drop idle pooled sockets (call before tearing down peer TcpServers / in tests).
 void object_rpc_pool_clear();
 // Per-RPC progress deadline for every object RPC (default 30 s; <=0 restores it).

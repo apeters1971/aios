@@ -39,6 +39,10 @@ struct SessionConfig {
   // Durability data path: "auto" (cluster GET /map io_path), "server" (PUT to
   // primary; aiosd fans out), or "client" (prepare + parallel install + publish).
   std::string io_path{"auto"};
+  // How long a request waits out a 503 `map_transition` / `no_map_lease` from a
+  // primary (cluster-map handover in progress) before the 503 is returned. 0
+  // disables the wait.
+  int map_transition_wait_ms{15000};
 };
 
 struct LockResult {

@@ -725,6 +725,9 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
   std::string path = target;
   HttpResponse resp;
   bool ticket_renewed = false;
+  int transition_waited_ms = 0;
+  constexpr int kTransitionWaitStepMs = 200;
+  const int kTransitionWaitMaxMs = std::max(0, cfg_.map_transition_wait_ms);
 
   ensure_ticket();
   for (int hop = 0; hop <= max_redirects; ++hop) {
@@ -791,6 +794,23 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
       }
     }
 
+    // A primary in the middle of a cluster-map transition (or without a map lease)
+    // answers 503 with a retryable code; the condition clears within a lease
+    // period, so wait it out instead of failing the caller.
+    if (resp.status == 503 && transition_waited_ms < kTransitionWaitMaxMs) {
+      std::string code;
+      try {
+        code = nlohmann::json::parse(resp.body).value("code", "");
+      } catch (...) {
+      }
+      if (code == "map_transition" || code == "no_map_lease") {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kTransitionWaitStepMs));
+        transition_waited_ms += kTransitionWaitStepMs;
+        --hop;
+        continue;
+      }
+    }
+
     if (resp.status == 307 || resp.status == 301 || resp.status == 302) {
       const auto loc = header_get(resp.headers, "location");
       std::string new_host = host;
@@ -805,7 +825,8 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
         if (!redirect_allowed(new_host, new_port)) {
           refresh_redirect_allowlist();
           if (!redirect_allowed(new_host, new_port)) {
-            throw client_error("http", "redirect target not in cluster");
+            throw client_error("http", "redirect target not in cluster: " + new_host + ":" +
+                                           new_port);
           }
         }
       }

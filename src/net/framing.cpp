@@ -49,6 +49,8 @@ const char* msg_type_name(MsgType t) {
       return "ObjectStageCommit";
     case MsgType::ObjectList:
       return "ObjectList";
+    case MsgType::MapRpc:
+      return "MapRpc";
   }
   return "Unknown";
 }

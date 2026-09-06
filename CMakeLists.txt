@@ -211,6 +211,7 @@ add_library(aios_core STATIC
   src/store/fs_clone.cpp
   src/store/local_stores.cpp
   src/cluster/cluster_map.cpp
+  src/cluster/map_monitor.cpp
   src/cluster/place.cpp
   src/ec/xor_parity.cpp
   src/ec/isal_rs.cpp
@@ -554,6 +555,7 @@ add_executable(aios_tests
   tests/test_fs_clone.cpp
   tests/test_object_store.cpp
   tests/test_cluster_map.cpp
+  tests/test_map_monitor.cpp
   tests/test_placement.cpp
   tests/test_object_rpc.cpp
   tests/test_object_rpc_advanced.cpp
@@ -599,6 +601,7 @@ add_executable(aios_tests
   tests/test_review2_posix.cpp
   tests/test_review2_kabi.cpp
   tests/test_process_smoke.cpp
+  tests/test_process_consensus.cpp
   tests/test_client_io.cpp
   tests/test_ticket_auth.cpp
   tests/test_s3_tls.cpp

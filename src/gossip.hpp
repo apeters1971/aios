@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cluster/cluster_map.hpp"
+#include "cluster/map_monitor.hpp"
 #include "config.hpp"
 #include "fs/fs_table.hpp"
 #include "http/backup_policy.hpp"
@@ -36,6 +37,8 @@ class GossipEngine {
   HttpServer* http() { return http_server_.get(); }
 
   const ClusterMap& cluster_map() const { return cluster_map_; }
+  // Null when Config::monitors is empty (legacy gossip-derived map).
+  MapMonitor* map_monitor() { return monitor_.get(); }
   LocalStores& local_stores() { return local_stores_; }
   ObjectService& object_service() { return *object_service_; }
   std::shared_ptr<S3IamStore> s3_iam() const { return s3_iam_; }
@@ -47,6 +50,7 @@ class GossipEngine {
 
  private:
   void on_gossip_timer(const boost::system::error_code& ec);
+  void on_monitor_timer(const boost::system::error_code& ec);
   void on_scan_timer(const boost::system::error_code& ec);
   void on_status_timer(const boost::system::error_code& ec);
   void on_repair_timer(const boost::system::error_code& ec);
@@ -56,6 +60,12 @@ class GossipEngine {
   void run_scan();
   void apply_target_weights(std::vector<AiosTarget>& targets);
   void rebuild_cluster_map();
+  // Consensus mode: hand the gossip-built content to the monitor (leader
+  // proposes it) and publish the committed map + gate instead of the content.
+  void publish_consensus_map(ClusterMap content);
+  bool is_monitor_addr(const std::string& addr) const;
+  bool hub_mode() const { return !cfg_.monitors.empty(); }
+  bool self_is_monitor() const { return monitor_ && monitor_->is_voter(); }
   // Copy of the published map. Every read outside the publishing call must go
   // through this: RPC and HTTP worker threads publish concurrently with the timers.
   ClusterMap map_snapshot() const;
@@ -74,6 +84,8 @@ class GossipEngine {
   ClusterMap cluster_map_;
   LocalStores local_stores_;
   std::unique_ptr<ObjectService> object_service_;
+  std::unique_ptr<MapMonitor> monitor_;
+  std::uint64_t published_epoch_{0};
   std::shared_ptr<S3IamStore> s3_iam_;
   std::shared_ptr<QuotaAdminStore> quota_;
   std::shared_ptr<QosAdminStore> qos_;
@@ -86,6 +98,7 @@ class GossipEngine {
   // Last advertised autotune weight per aios_path (hysteresis).
   std::unordered_map<std::string, int> autotune_weights_;
   boost::asio::steady_timer gossip_timer_;
+  boost::asio::steady_timer monitor_timer_;
   boost::asio::steady_timer scan_timer_;
   boost::asio::steady_timer status_timer_;
   boost::asio::steady_timer repair_timer_;

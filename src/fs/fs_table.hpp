@@ -45,7 +45,8 @@ class FsTable {
 
   std::vector<FsEntry> snapshot() const;
 
-  nlohmann::json to_json() const;
+  // local_only: this node's scan rows only (storage → monitor reports).
+  nlohmann::json to_json(bool local_only = false) const;
   static std::vector<FsEntry> from_json(const nlohmann::json& j);
 
  private:

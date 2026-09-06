@@ -54,6 +54,7 @@ GossipEngine::GossipEngine(boost::asio::io_context& ioc, Config cfg,
       membership_(membership),
       fs_table_(fs_table),
       gossip_timer_(ioc),
+      monitor_timer_(ioc),
       scan_timer_(ioc),
       status_timer_(ioc),
       repair_timer_(ioc),
@@ -61,6 +62,28 @@ GossipEngine::GossipEngine(boost::asio::io_context& ioc, Config cfg,
       archive_timer_(ioc),
       backup_timer_(ioc) {
   object_service_ = std::make_unique<ObjectService>(cfg_, cluster_map_, local_stores_);
+  if (!cfg_.monitors.empty()) {
+    MapMonitor::Options mo;
+    mo.node_id = cfg_.node_id;
+    mo.self_addr = advertise_addr();
+    mo.voters = cfg_.monitors;
+    mo.state_path = cfg_.map_state_file;
+    mo.tick_ms = cfg_.gossip_interval_ms;
+    mo.lease_ms = cfg_.map_lease_ms;
+    const std::string node_id = cfg_.node_id;
+    const std::string listen = mo.self_addr;
+    const std::string key = cfg_.cluster_key;
+    const int skew = cfg_.auth_skew_ms;
+    monitor_ = std::make_unique<MapMonitor>(
+        std::move(mo), [node_id, listen, key, skew](const std::string& addr,
+                                                     const nlohmann::json& req) {
+          return map_rpc_remote(addr, node_id, listen, key, skew, req);
+        });
+    ObjectService::MapGate gate;
+    gate.consensus = true;
+    gate.lease_valid = false;
+    object_service_->set_map_gate(std::move(gate));
+  }
 }
 
 std::string GossipEngine::advertise_addr() const {
@@ -80,6 +103,11 @@ void GossipEngine::rebuild_cluster_map() {
   pc.min_vnodes = cfg_.min_vnodes;
   pc.max_vnodes = cfg_.max_vnodes;
   auto built = ClusterMap::build(membership_, fs_table_, cfg_.replica_count, pc);
+  if (monitor_) {
+    publish_consensus_map(std::move(built));
+    if (space_history_) space_history_->maybe_record(fs_table_.snapshot(), cfg_.node_id);
+    return;
+  }
   const auto epoch = built.epoch;
   const auto targets = built.targets.size();
   const auto replicas = built.replica_count;
@@ -98,6 +126,37 @@ void GossipEngine::rebuild_cluster_map() {
     warn_thin_failure_domains(map_snapshot());
   }
   if (space_history_) space_history_->maybe_record(fs_table_.snapshot(), cfg_.node_id);
+}
+
+void GossipEngine::publish_consensus_map(ClusterMap content) {
+  const auto now = now_ms();
+  // Only the leader turns gossip content into a map; everyone else waits for the
+  // committed one. A leader proposes only when the content differs (no epoch
+  // churn from bavail updates).
+  content.epoch = 0;
+  monitor_->propose(content, now);
+  const auto v = monitor_->view(now);
+  ObjectService::MapGate gate;
+  gate.consensus = true;
+  gate.lease_valid = v.lease_valid;
+  gate.active_epoch = v.active_epoch;
+  gate.previous = v.previous;
+  if (v.committed && v.committed->epoch != published_epoch_) {
+    const auto epoch = v.committed->epoch;
+    const auto targets = v.committed->targets.size();
+    object_service_->update_cluster_map(*v.committed);
+    published_epoch_ = epoch;
+    AIOS_LOG_INFO("cluster map epoch=", epoch, " targets=", targets,
+                  " replica_count=", v.committed->replica_count, " term=", v.term,
+                  v.leader ? " (leader)" : "");
+    warn_thin_failure_domains(*v.committed);
+  }
+  object_service_->set_map_gate(std::move(gate));
+}
+
+bool GossipEngine::is_monitor_addr(const std::string& addr) const {
+  if (addr.empty()) return false;
+  return std::find(cfg_.monitors.begin(), cfg_.monitors.end(), addr) != cfg_.monitors.end();
 }
 
 ClusterMap GossipEngine::map_snapshot() const {
@@ -166,6 +225,38 @@ void GossipEngine::start() {
     return handle_inbound_gossip(peer_id, peer_listen, peer_http, req);
   };
   handlers.on_object = [this](const Frame& req) { return object_service_->handle(req); };
+  if (monitor_) {
+    handlers.on_map = [this](const nlohmann::json& req) {
+      auto reply = monitor_->handle(req, now_ms());
+      // A committed map may have arrived; publish it promptly rather than at the
+      // next timer so the lease/gate seen by request threads is current.
+      boost::asio::post(ioc_, [this] {
+        if (!stopped_.load()) rebuild_cluster_map();
+      });
+      return reply;
+    };
+    AIOS_LOG_INFO("cluster map consensus: ", cfg_.monitors.size(), " monitor(s), ",
+                  monitor_->is_voter() ? "this node votes" : "this node is a learner",
+                  ", lease ", cfg_.map_lease_ms, " ms",
+                  monitor_->is_voter() ? ", gossip mesh is monitors-only"
+                                       : ", reporting local state to monitors");
+    if (!monitor_->is_voter()) {
+      bool seeded = false;
+      for (const auto& p : cfg_.peers) {
+        if (is_monitor_addr(p)) {
+          seeded = true;
+          break;
+        }
+      }
+      if (!seeded) {
+        AIOS_LOG_WARN("no monitor listed in peers; this storage node cannot report in "
+                      "(peers should be the monitors: addresses)");
+      }
+    }
+  } else if (!cfg_.peers.empty()) {
+    AIOS_LOG_WARN("cluster map is gossip-derived (no monitors configured): a network "
+                  "partition can leave two primaries for one object; set `monitors`");
+  }
 
   server_ = std::make_unique<TcpServer>(ioc_, host, port, std::move(handlers));
   server_->start();
@@ -211,11 +302,14 @@ void GossipEngine::start() {
 
   boost::asio::post(gossip_workers_, [this] {
     try {
+      const bool local_only = hub_mode() && !self_is_monitor();
       for (const auto& p : cfg_.peers) {
         if (stopped_.load()) return;
+        if (hub_mode() && !is_monitor_addr(p)) continue;
         auto r = gossip_with_peer(p, cfg_.node_id, advertise_addr(), cfg_.cluster_key,
                                   cfg_.auth_skew_ms, membership_, fs_table_,
-                                  derive_http_addr(advertise_addr(), cfg_.http_listen));
+                                  derive_http_addr(advertise_addr(), cfg_.http_listen),
+                                  local_only);
         if (r.ok) {
           AIOS_LOG_INFO("seed gossip ok with ", p, " as ", r.peer_node_id);
           boost::asio::post(ioc_, [this] {
@@ -234,6 +328,11 @@ void GossipEngine::start() {
 
   gossip_timer_.expires_after(std::chrono::milliseconds(cfg_.gossip_interval_ms));
   gossip_timer_.async_wait([this](auto ec) { on_gossip_timer(ec); });
+
+  if (monitor_) {
+    monitor_timer_.expires_after(std::chrono::milliseconds(cfg_.gossip_interval_ms / 2 + 1));
+    monitor_timer_.async_wait([this](auto ec) { on_monitor_timer(ec); });
+  }
 
   scan_timer_.expires_after(std::chrono::milliseconds(cfg_.scan_interval_ms));
   scan_timer_.async_wait([this](auto ec) { on_scan_timer(ec); });
@@ -273,6 +372,7 @@ void GossipEngine::start() {
 void GossipEngine::stop() {
   stopped_.store(true);
   gossip_timer_.cancel();
+  monitor_timer_.cancel();
   scan_timer_.cancel();
   status_timer_.cancel();
   repair_timer_.cancel();
@@ -322,11 +422,19 @@ Frame GossipEngine::handle_inbound_gossip(const std::string& peer_node_id,
 
   Frame reply;
   reply.type = MsgType::Gossip;
-  reply.body = {
-      {"membership", membership_.to_json()},
-      {"fs_table", fs_table_.to_json()},
-      {"cluster_map", map_snapshot().to_json()},
-  };
+  const bool peer_is_monitor = is_monitor_addr(peer_listen);
+  // Mesh (no monitors): full tables. Monitor↔monitor: full tables. A storage
+  // report to a monitor (or any leftover storage↔storage dial) gets the map
+  // only so the reply stays O(1) in cluster size.
+  if (!hub_mode() || (self_is_monitor() && peer_is_monitor)) {
+    reply.body = {
+        {"membership", membership_.to_json()},
+        {"fs_table", fs_table_.to_json()},
+        {"cluster_map", map_snapshot().to_json()},
+    };
+  } else {
+    reply.body = {{"cluster_map", map_snapshot().to_json()}};
+  }
   return reply;
 }
 
@@ -335,7 +443,9 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
   const auto now = now_ms();
   membership_.age(now, cfg_.suspect_after_ms, cfg_.dead_after_ms);
 
-  auto peers = membership_.peers_for_gossip(3);
+  const bool local_only = hub_mode() && !self_is_monitor();
+  const std::vector<std::string> hub = hub_mode() ? cfg_.monitors : std::vector<std::string>{};
+  auto peers = membership_.peers_for_gossip(3, hub);
   const auto node_id = cfg_.node_id;
   const auto adv = advertise_addr();
   const auto key = cfg_.cluster_key;
@@ -346,12 +456,12 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
   // Blocking peer round-trips must not run on ioc_: that stalls async_accept and
   // deadlocks multi-node PUTs that need inbound object RPC while gossip is in flight.
   boost::asio::post(gossip_workers_, [this, peers, node_id, adv, key, skew, http_adv,
-                                      interval] {
+                                      interval, local_only] {
     try {
       for (const auto& p : peers) {
         if (stopped_.load()) return;
         auto r = gossip_with_peer(p.addr, node_id, adv, key, skew, membership_, fs_table_,
-                                  http_adv);
+                                  http_adv, local_only);
         if (r.ok) {
           AIOS_LOG_DEBUG("gossip ok ", p.addr, " -> ", r.peer_node_id);
         } else {
@@ -367,6 +477,26 @@ void GossipEngine::on_gossip_timer(const boost::system::error_code& ec) {
       if (object_service_) object_service_->ops().note_gossip_round();
       gossip_timer_.expires_after(std::chrono::milliseconds(interval));
       gossip_timer_.async_wait([this](auto e) { on_gossip_timer(e); });
+    });
+  });
+}
+
+void GossipEngine::on_monitor_timer(const boost::system::error_code& ec) {
+  if (ec || stopped_.load() || !monitor_) return;
+  const auto interval = cfg_.gossip_interval_ms;
+  // Own job, not folded into the gossip round: a slow gossip peer (15 s I/O
+  // timeout) must not delay heartbeats, or every lease in the cluster would lapse.
+  boost::asio::post(gossip_workers_, [this, interval] {
+    try {
+      if (!stopped_.load()) monitor_->tick(now_ms());
+    } catch (const std::exception& e) {
+      AIOS_LOG_WARN("map monitor tick aborted: ", e.what());
+    }
+    boost::asio::post(ioc_, [this, interval] {
+      if (stopped_.load()) return;
+      rebuild_cluster_map();
+      monitor_timer_.expires_after(std::chrono::milliseconds(interval));
+      monitor_timer_.async_wait([this](auto e) { on_monitor_timer(e); });
     });
   });
 }
@@ -569,6 +699,7 @@ void GossipEngine::write_status() {
       {"fs_table", fs_table_.to_json()},
       {"cluster_map", map.to_json()},
   };
+  if (monitor_) j["map_consensus"] = monitor_->view(now_ms()).to_json();
   if (object_service_) {
     auto admin = object_service_->ops().to_admin_json();
     j["ops"] = admin["ops"];
