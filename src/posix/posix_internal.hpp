@@ -41,6 +41,8 @@ inline constexpr size_t kDirCacheMaxEntries = 4096;
 // deferred size (dirty_sizes) always wins over the server copy during the merge.
 inline constexpr auto kInodeCacheTtl = std::chrono::milliseconds(1000);
 inline constexpr size_t kInodeCacheMaxEntries = 65536;
+// Durability points for deferred size *and* unpublished stripe bodies: fsync,
+// close/FUSE flush, sync/unmount, snapshot freeze, or these byte/age caps.
 inline constexpr uint64_t kDirtyFlushBytes = 4ull * 1024ull * 1024ull;
 inline constexpr auto kDirtyFlushAge = std::chrono::milliseconds(100);
 inline constexpr auto kDirtyFlushTick = std::chrono::milliseconds(50);
@@ -104,6 +106,9 @@ struct ChunkCache {
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
     for (auto& e : slots) {
       if (e.ino == ino && e.chunk == chunk) {
+        // Keep a same-or-newer published version: a reader that fetched v1 must
+        // not clobber v2 stored by a writer that raced it. Dirty (unpublished)
+        // bodies live in FsState::dirty_chunks and must not use this path.
         if (e.body && e.cas >= cas) {
           e.lru = ++clock;
           return;
@@ -204,6 +209,16 @@ struct DirtySize {
   uint64_t mtime_ns{0};
   uint64_t ctime_ns{0};
   uint64_t dirty_bytes{0};
+  std::chrono::steady_clock::time_point since{};
+};
+
+// Unpublished stripe body. Mutated in place under chunk_lock + dirty_chunk_mu;
+// published (put_bytes) at a durability point, not on every write(2).
+struct DirtyChunk {
+  std::string body;
+  uint64_t cas{0};
+  uint64_t accounted{0};
+  uint64_t gen{0};
   std::chrono::steady_clock::time_point since{};
 };
 
@@ -473,7 +488,9 @@ struct FsState {
   uint32_t default_gid{0};
   std::string frontend_label{"fs"};  // s3 | fs | custom (for IO monitoring)
   std::mutex mu;  // super, inode_cache, flock_tokens, rstat_dirty, dir_cache, dirty_sizes,
-                  // unpublished_dropped
+                  // unpublished_dropped. Never take chunk_lock or dirty_chunk_mu while
+                  // holding mu if the other holder might take mu (writers take chunk_lock
+                  // then dirty_chunk_mu, then release both before mu).
   SuperMeta super;
   std::chrono::steady_clock::time_point super_loaded{};
   std::unordered_map<uint64_t, InodeCacheEnt> inode_cache;
@@ -493,6 +510,11 @@ struct FsState {
   ChunkCache chunk_cache;
   std::unordered_map<uint64_t, DirCacheEnt> dir_cache;
   std::unordered_map<uint64_t, DirtySize> dirty_sizes;
+  // Unpublished data chunks. Separate from chunk_cache so a dirty body cannot be
+  // LRU-evicted before a durability point. Lock order: chunk_lock, then dirty_chunk_mu.
+  std::mutex dirty_chunk_mu;
+  std::unordered_map<uint64_t, std::unordered_map<uint64_t, DirtyChunk>> dirty_chunks;
+  uint64_t dirty_chunk_bytes{0};
   // Created under a lease then unlinked (or rmdir'd) before the flusher PUT.
   // publish_inodes must not recreate the object.
   std::unordered_set<uint64_t> unpublished_dropped;

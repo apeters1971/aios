@@ -322,6 +322,19 @@ TEST(Review2Posix, EightConcurrentDisjointWritersKeepFullSize) {
   ASSERT_EQ(aios_posix_getattr(m.fs, ino, &st), 0);
   EXPECT_EQ(st.size, kThreads * kRegion);
 
+  // Same-mount readers must see coalesced dirty stripes before any PUT.
+  {
+    std::vector<char> dirty(kThreads * kRegion);
+    size_t got = 0;
+    ASSERT_EQ(aios_posix_read(m.fs, ino, 0, dirty.data(), dirty.size(), &got), 0);
+    ASSERT_EQ(got, dirty.size());
+    for (int t = 0; t < kThreads; ++t) {
+      EXPECT_EQ(std::string(dirty.data() + static_cast<size_t>(t) * kRegion, kRegion),
+                std::string(kRegion, static_cast<char>('a' + t)))
+          << "dirty region " << t;
+    }
+  }
+
   // The deferred PUT must carry the merged size to a mount with a cold cache.
   ASSERT_EQ(aios_posix_fsync(m.fs, ino), 0);
   Mount peer(http, "pos2vol", 4096);

@@ -49,6 +49,140 @@ int validate_dentry_name(const char* name) {
   return 0;
 }
 
+// Caller may hold st.mu. Takes only dirty_chunk_mu (never chunk_lock).
+void drop_dirty_chunks(FsState& st, uint64_t ino, std::optional<uint64_t> min_chunk = std::nullopt) {
+  std::lock_guard lock(st.dirty_chunk_mu);
+  auto it = st.dirty_chunks.find(ino);
+  if (it == st.dirty_chunks.end()) return;
+  if (!min_chunk) {
+    for (const auto& [c, d] : it->second) {
+      (void)c;
+      st.dirty_chunk_bytes -= d.accounted;
+    }
+    st.dirty_chunks.erase(it);
+    return;
+  }
+  for (auto cit = it->second.begin(); cit != it->second.end();) {
+    if (cit->first >= *min_chunk) {
+      st.dirty_chunk_bytes -= cit->second.accounted;
+      cit = it->second.erase(cit);
+    } else {
+      ++cit;
+    }
+  }
+  if (it->second.empty()) st.dirty_chunks.erase(it);
+}
+
+bool has_dirty_chunk(FsState& st, uint64_t ino, uint64_t chunk) {
+  std::lock_guard lock(st.dirty_chunk_mu);
+  auto it = st.dirty_chunks.find(ino);
+  if (it == st.dirty_chunks.end()) return false;
+  return it->second.find(chunk) != it->second.end();
+}
+
+// Copies the overlapping dirty range into dst (which the caller zeroed). True if
+// this mount has an unpublished body for the stripe, even when the range is past
+// the dirty length (holes stay zero).
+bool copy_dirty_range(FsState& st, uint64_t ino, uint64_t chunk, uint64_t chunk_off, uint8_t* dst,
+                      size_t n) {
+  std::lock_guard lock(st.dirty_chunk_mu);
+  auto it = st.dirty_chunks.find(ino);
+  if (it == st.dirty_chunks.end()) return false;
+  auto cit = it->second.find(chunk);
+  if (cit == it->second.end()) return false;
+  const auto& body = cit->second.body;
+  if (chunk_off < body.size()) {
+    const size_t avail = static_cast<size_t>(body.size() - chunk_off);
+    const size_t take = std::min(n, avail);
+    std::memcpy(dst, body.data() + chunk_off, take);
+  }
+  return true;
+}
+
+void account_dirty_locked(FsState& st, DirtyChunk& d) {
+  st.dirty_chunk_bytes -= d.accounted;
+  d.accounted = d.body.size();
+  st.dirty_chunk_bytes += d.accounted;
+}
+
+void resize_dirty_chunk(FsState& st, uint64_t ino, uint64_t chunk, size_t keep) {
+  std::lock_guard chunk_guard(st.chunk_lock(ino, chunk));
+  std::lock_guard lock(st.dirty_chunk_mu);
+  auto it = st.dirty_chunks.find(ino);
+  if (it == st.dirty_chunks.end()) return;
+  auto cit = it->second.find(chunk);
+  if (cit == it->second.end()) return;
+  if (cit->second.body.size() > keep) cit->second.body.resize(keep);
+  account_dirty_locked(st, cit->second);
+  cit->second.gen++;
+}
+
+void flush_one_dirty_chunk(FsState& st, uint64_t ino, uint64_t chunk) {
+  std::lock_guard chunk_guard(st.chunk_lock(ino, chunk));
+  std::string body;
+  uint64_t cas = 0;
+  uint64_t gen = 0;
+  {
+    std::lock_guard dlock(st.dirty_chunk_mu);
+    auto it = st.dirty_chunks.find(ino);
+    if (it == st.dirty_chunks.end()) return;
+    auto cit = it->second.find(chunk);
+    if (cit == it->second.end()) return;
+    body = cit->second.body;
+    cas = cit->second.cas;
+    gen = cit->second.gen;
+  }
+  const auto layout = data_layout_for_ino(st, ino);
+  const std::string oid = chunk_oid(st.volume, ino, chunk);
+  for (int attempt = 0; attempt < kChunkWriteRetries; ++attempt) {
+    if (attempt > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1 + (attempt % 4)));
+    }
+    try {
+      const uint64_t new_cas =
+          st.session.put_bytes(oid, body, {}, cas, std::nullopt, layout);
+      bool published = false;
+      {
+        std::lock_guard dlock(st.dirty_chunk_mu);
+        auto it = st.dirty_chunks.find(ino);
+        if (it != st.dirty_chunks.end()) {
+          auto cit = it->second.find(chunk);
+          if (cit != it->second.end() && cit->second.gen == gen) {
+            st.dirty_chunk_bytes -= cit->second.accounted;
+            it->second.erase(cit);
+            if (it->second.empty()) st.dirty_chunks.erase(it);
+            published = true;
+          } else if (cit != it->second.end()) {
+            cit->second.cas = new_cas;
+          }
+        }
+      }
+      if (published) st.chunk_cache.store(ino, chunk, std::move(body), new_cas);
+      return;
+    } catch (const client_error& e) {
+      if (e.code() != "conflict") throw;
+      auto existing = st.session.get_object(oid);
+      cas = existing.exists ? cas_from_attrs(existing.attrs) : 0;
+    }
+  }
+  throw client_error("conflict", "chunk flush failed");
+}
+
+void flush_dirty_chunks(FsState& st, uint64_t ino) {
+  std::vector<uint64_t> chunks;
+  {
+    std::lock_guard lock(st.dirty_chunk_mu);
+    auto it = st.dirty_chunks.find(ino);
+    if (it == st.dirty_chunks.end()) return;
+    chunks.reserve(it->second.size());
+    for (const auto& [c, d] : it->second) {
+      (void)d;
+      chunks.push_back(c);
+    }
+  }
+  for (uint64_t chunk : chunks) flush_one_dirty_chunk(st, ino, chunk);
+}
+
 bool verify_dir_link(FsState& st, uint64_t parent, const char* name, uint64_t expected_ino) {
   DirTable verify = make_dir(st, parent);
   verify.load(false);
@@ -61,6 +195,7 @@ void delete_orphan_inode(FsState& st, uint64_t ino) {
     st.session.delete_object(ino_oid(st.volume, ino));
   } catch (...) {
   }
+  drop_dirty_chunks(st, ino);
   std::lock_guard lock(st.mu);
   st.inode_cache.erase(ino);
   st.dirty_sizes.erase(ino);
@@ -73,6 +208,7 @@ void delete_file_chunks(FsState& st, uint64_t ino, uint64_t size, uint64_t strip
                         uint32_t project_id, uint32_t uid, uint32_t gid) {
   const uint64_t unit = stripe_unit ? stripe_unit : st.stripe_unit;
   const uint64_t nchunk = size == 0 ? 0 : (size + unit - 1) / unit;
+  drop_dirty_chunks(st, ino);
   st.chunk_cache.drop(ino);
   for (uint64_t c = 0; c < nchunk; ++c) {
     try {
@@ -1389,6 +1525,7 @@ void store_inode(FsState& st, InodeMeta& m, const std::optional<std::string>& pa
 }
 
 void flush_dirty_inode(FsState& st, uint64_t ino) {
+  flush_dirty_chunks(st, ino);
   DirtySize d;
   std::optional<std::string> path;
   {
@@ -1401,6 +1538,7 @@ void flush_dirty_inode(FsState& st, uint64_t ino) {
   }
   InodeMeta m = load_inode(st, ino);
   if (!m.exists) {
+    drop_dirty_chunks(st, ino);
     std::lock_guard lock(st.mu);
     st.dirty_sizes.erase(ino);
     return;
@@ -1425,6 +1563,24 @@ void flush_all_dirty_inodes(FsState& st,
     for (const auto& [ino, d] : st.dirty_sizes) {
       if (min_age && now - d.since < *min_age) continue;
       inos.push_back(ino);
+    }
+  }
+  {
+    std::lock_guard lock(st.dirty_chunk_mu);
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& [ino, chunks] : st.dirty_chunks) {
+      if (std::find(inos.begin(), inos.end(), ino) != inos.end()) continue;
+      bool due = !min_age;
+      if (min_age) {
+        for (const auto& [c, d] : chunks) {
+          (void)c;
+          if (now - d.since >= *min_age) {
+            due = true;
+            break;
+          }
+        }
+      }
+      if (due) inos.push_back(ino);
     }
   }
   for (uint64_t ino : inos) {
@@ -1552,6 +1708,7 @@ void drop_nlink(FsState& st, uint64_t ino) {
     } catch (...) {
     }
   }
+  drop_dirty_chunks(st, ino);
   std::string flock_token;
   {
     std::lock_guard lock(st.mu);
@@ -1639,6 +1796,11 @@ int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len,
     const size_t n = static_cast<size_t>(chunk_end - pos);
     try {
       uint64_t cas = 0;
+      if (copy_dirty_range(st, ino, chunk, chunk_off, out + written, n)) {
+        pos += n;
+        written += n;
+        continue;
+      }
       ChunkCache::Body body = st.chunk_cache.lookup(ino, chunk, cas);
       if (!body) {
         auto snap = st.session.get_object(chunk_oid(st.volume, ino, chunk));
@@ -1733,6 +1895,7 @@ int prefetch_file(FsState& st, uint64_t ino, aios_range* ranges, uint32_t nrange
   miss.reserve(chunks.size());
   for (uint64_t chunk : chunks) {
     uint64_t cas = 0;
+    if (has_dirty_chunk(st, ino, chunk)) continue;
     if (!st.chunk_cache.lookup(ino, chunk, cas)) miss.push_back(chunk);
   }
   if (miss.empty()) return 0;
@@ -1792,7 +1955,6 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
   const auto* in = static_cast<const uint8_t*>(buf);
   uint64_t pos = offset;
   size_t done = 0;
-  const auto data_layout = data_layout_for_ino(st, ino);
 
   while (done < len) {
     const uint64_t chunk = pos / unit;
@@ -1806,22 +1968,44 @@ int write_file(FsState& st, uint64_t ino, uint64_t offset, const void* buf, size
         std::this_thread::sleep_for(std::chrono::milliseconds(1 + (attempt % 4)));
       }
       try {
-        std::string body;
-        uint64_t cas = 0;
-        if (auto cached = st.chunk_cache.lookup(ino, chunk, cas)) {
-          body = *cached;
-        } else {
-          auto existing = st.session.get_object(oid);
-          if (existing.exists) {
-            body = std::move(existing.body);
-            cas = cas_from_attrs(existing.attrs);
+        bool mutated = false;
+        {
+          std::lock_guard dlock(st.dirty_chunk_mu);
+          auto iit = st.dirty_chunks.find(ino);
+          if (iit != st.dirty_chunks.end()) {
+            auto cit = iit->second.find(chunk);
+            if (cit != iit->second.end()) {
+              auto& d = cit->second;
+              if (d.body.size() < chunk_off + n) d.body.resize(chunk_off + n, '\0');
+              std::memcpy(d.body.data() + chunk_off, in + done, n);
+              account_dirty_locked(st, d);
+              d.gen++;
+              mutated = true;
+            }
           }
         }
-        if (body.size() < chunk_off + n) body.resize(chunk_off + n, '\0');
-        std::memcpy(body.data() + chunk_off, in + done, n);
-        const uint64_t new_cas =
-            st.session.put_bytes(oid, body, {}, cas, std::nullopt, data_layout);
-        st.chunk_cache.store(ino, chunk, std::move(body), new_cas);
+        if (!mutated) {
+          std::string body;
+          uint64_t cas = 0;
+          if (auto cached = st.chunk_cache.lookup(ino, chunk, cas)) {
+            body = *cached;
+          } else {
+            auto existing = st.session.get_object(oid);
+            if (existing.exists) {
+              body = std::move(existing.body);
+              cas = cas_from_attrs(existing.attrs);
+            }
+          }
+          if (body.size() < chunk_off + n) body.resize(chunk_off + n, '\0');
+          std::memcpy(body.data() + chunk_off, in + done, n);
+          std::lock_guard dlock(st.dirty_chunk_mu);
+          auto& d = st.dirty_chunks[ino][chunk];
+          d.body = std::move(body);
+          d.cas = cas;
+          d.gen = 1;
+          d.since = std::chrono::steady_clock::now();
+          account_dirty_locked(st, d);
+        }
         chunk_rc = 0;
         break;
       } catch (const client_error& e) {
@@ -1894,6 +2078,17 @@ int truncate_file(FsState& st, uint64_t ino, uint64_t size) {
   if (size < meta.size) {
     const uint64_t first_drop = (size + unit - 1) / unit;
     const uint64_t old_chunks = (meta.size + unit - 1) / unit;
+    drop_dirty_chunks(st, ino, first_drop);
+    if (size > 0) {
+      const uint64_t last = (size - 1) / unit;
+      const uint64_t keep = size - last * unit;
+      resize_dirty_chunk(st, ino, last, static_cast<size_t>(keep));
+    }
+    try {
+      flush_dirty_chunks(st, ino);
+    } catch (const client_error& e) {
+      return map_error(e);
+    }
     st.chunk_cache.drop(ino);
     for (uint64_t c = first_drop; c < old_chunks; ++c) {
       try {

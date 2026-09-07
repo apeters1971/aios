@@ -4,6 +4,7 @@
 #include "client/session.hpp"
 #include "http/http_server.hpp"
 #include "posix/aios_posix.h"
+#include "posix/posix_internal.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -435,6 +436,62 @@ TEST(PosixFs, PrefetchvSparseRanges) {
   EXPECT_EQ(std::string(buf, 4096), b);
   ASSERT_EQ(aios_posix_read(fs, ino, 16384, buf, sizeof(buf), &got), 0);
   EXPECT_EQ(std::string(buf, 4096), c);
+
+  aios_posix_unmount(fs);
+}
+
+TEST(PosixFs, SmallWritesDeferChunkPut) {
+  HttpFixture http("aios-posix-dirty-chunk");
+
+  aios_posix_config cfg{};
+  const std::string ep = http.endpoint();
+  cfg.endpoint = ep.c_str();
+  cfg.cluster_key = http.fx.cfg.cluster_key.c_str();
+  cfg.volume = "vdirty";
+  cfg.stripe_unit = 4096;
+  cfg.stripe_width = 2;
+  cfg.uid = 1000;
+  cfg.gid = 1000;
+
+  int err = 0;
+  aios_posix_fs* fs = aios_posix_mount(&cfg, &err);
+  ASSERT_NE(fs, nullptr);
+
+  aios_posix_stat st{};
+  ASSERT_EQ(aios_posix_create(fs, 1, "coalesce.bin", 0644, &st), 0);
+  const uint64_t ino = st.ino;
+
+  std::string want;
+  want.reserve(8 * 512);
+  for (int i = 0; i < 8; ++i) {
+    const std::string piece(512, static_cast<char>('A' + i));
+    size_t wrote = 0;
+    ASSERT_EQ(aios_posix_write(fs, ino, static_cast<uint64_t>(i * 512), piece.data(), piece.size(),
+                               &wrote),
+              0);
+    want += piece;
+  }
+
+  std::vector<char> local(want.size());
+  size_t got = 0;
+  ASSERT_EQ(aios_posix_read(fs, ino, 0, local.data(), local.size(), &got), 0);
+  ASSERT_EQ(got, want.size());
+  EXPECT_EQ(std::string(local.data(), got), want);
+
+  aios::SessionConfig sc;
+  sc.endpoint = ep;
+  sc.cluster_key = http.fx.cfg.cluster_key;
+  aios::Session sess(std::move(sc));
+  const std::string oid = aios::posix::chunk_oid("vdirty", ino, 0);
+  auto before = sess.get_object(oid);
+  EXPECT_FALSE(before.exists) << "write(2) must not publish a chunk version";
+
+  ASSERT_EQ(aios_posix_fsync(fs, ino), 0);
+  auto after = sess.get_object(oid);
+  ASSERT_TRUE(after.exists);
+  EXPECT_EQ(after.seq, 1u) << "fsync should publish one coalesced version, not one per write";
+  ASSERT_GE(after.body.size(), want.size());
+  EXPECT_EQ(after.body.substr(0, want.size()), want);
 
   aios_posix_unmount(fs);
 }

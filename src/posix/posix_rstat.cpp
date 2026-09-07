@@ -110,9 +110,10 @@ void flush_rstats(FsState& st) {
 }
 
 // One maintenance thread per mount: a short tick lands deferred inode PUTs
-// (size/mtime) within ~kDirtyFlushAge even when no further write, fsync or
-// unmount follows (S3 gateway, XRootD); rstats and the quota tick keep their own,
-// much longer cadence (rstat_interval_ms; <= 0 disables only those).
+// (size/mtime) and unpublished stripe bodies within ~kDirtyFlushAge even when
+// no further write, fsync or unmount follows (S3 gateway, XRootD); rstats and
+// the quota tick keep their own, much longer cadence (rstat_interval_ms; <= 0
+// disables only those).
 void start_rstat_thread(FsState& st) {
   if (st.rstat_thread.joinable()) return;
   st.rstat_stop.store(false);
