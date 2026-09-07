@@ -6,6 +6,8 @@
 #include "util/crc32c.hpp"
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -292,9 +294,36 @@ TEST(ObjectServiceAdvanced, RangeDeltaReplicatedAndFullFallback) {
   ASSERT_TRUE(g1 && g2);
   EXPECT_EQ(*g1, *g2);
 
-  // Diverge the replica tip so the next delta is refused and the full body is shipped.
-  std::vector<std::uint8_t> other(256 * 1024, 'Z');
-  ASSERT_TRUE(s2->put(oid, other.data(), other.size(), {}, true, err)) << err;
+  // Diverge the replica's published body without allocating a new seq. A local
+  // put() would take the primary's next seq on that store, so both the delta
+  // install and the full-body fallback hit "version already exists". Which of
+  // p1/p2 is the replica depends on the temp path (Linux CI vs macOS).
+  auto pl = place(oid, fx.map, "nvme");
+  ASSERT_GE(pl.acting_set.size(), 2u);
+  const auto replica_root = pl.acting_set[1].aios_path;
+  auto* replica = fx.stores.get(replica_root);
+  ASSERT_TRUE(replica);
+  auto replica_tip = replica->stat(oid, err);
+  ASSERT_TRUE(replica_tip && !replica_tip->fs_path.empty());
+  std::filesystem::path body_file;
+  for (const auto& e : std::filesystem::recursive_directory_iterator(replica_root)) {
+    if (!e.is_regular_file()) continue;
+    const auto p = e.path().generic_string();
+    const auto& rel = replica_tip->fs_path;
+    if (p.size() >= rel.size() && p.compare(p.size() - rel.size(), rel.size(), rel) == 0) {
+      body_file = e.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(body_file.empty()) << replica_tip->fs_path;
+  {
+    std::fstream f(body_file, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(f) << body_file;
+    const char z = 'Z';
+    f.seekp(64);  // outside the follow-up range at offset 0
+    f.write(&z, 1);
+    ASSERT_TRUE(f);
+  }
   const std::string patch2(16, 'C');
   auto pr2 = svc.api_put_range(oid, 0, reinterpret_cast<const std::uint8_t*>(patch2.data()),
                                patch2.size(), {}, false, {});
@@ -302,6 +331,8 @@ TEST(ObjectServiceAdvanced, RangeDeltaReplicatedAndFullFallback) {
   auto got = svc.api_get(oid, std::nullopt, std::nullopt, {});
   ASSERT_TRUE(got.ok && got.data);
   EXPECT_EQ(std::string(got.data->begin(), got.data->begin() + 16), patch2);
-  auto r2 = s2->get(oid, err);
+  EXPECT_EQ((*got.data)[64], static_cast<std::uint8_t>('A'))
+      << "full fallback must ship the primary body, not the corrupted replica";
+  auto r2 = replica->get(oid, err);
   ASSERT_TRUE(r2 && *r2 == *got.data);
 }
