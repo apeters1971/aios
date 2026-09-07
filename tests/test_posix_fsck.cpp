@@ -213,7 +213,9 @@ TEST(PosixFsck, FindsAndRepairsEveryKindOfDamage) {
   auto young = run(s, "v", true, std::chrono::hours(1));
   EXPECT_EQ(young.repaired, 1u) << "only next_ino has no timestamp to respect";
   for (const auto& fnd : young.findings) {
-    if (fnd.kind != Kind::NextInoBehind) EXPECT_TRUE(fnd.skipped_young) << fsck_kind_name(fnd.kind);
+    if (fnd.kind != Kind::NextInoBehind) {
+      EXPECT_TRUE(fnd.skipped_young) << fsck_kind_name(fnd.kind);
+    }
   }
 
   // --- repair -----------------------------------------------------------------
