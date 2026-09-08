@@ -1354,9 +1354,28 @@ void inode_cache_evict_locked(FsState& st) {
 
 void cache_inode_locked(FsState& st, const InodeMeta& m) {
   auto& e = st.inode_cache[m.ino];
+  // First PUT of an unpublished create can race with mkdir/rmdir under that
+  // directory: the snapshot we send still has nlink=2 after a child mkdir has
+  // already bumped the in-core copy. Keep the in-core nlink/mtime, and stay
+  // unpublished so a later PUT publishes the bumped nlink (do not max() with
+  // the snapshot: that would resurrect nlink after rmdir).
+  const bool keep_dir = e.unpublished && e.meta.exists && S_ISDIR(e.meta.mode) && S_ISDIR(m.mode);
+  const uint32_t nlink = e.meta.nlink;
+  const uint64_t mtime_ns = e.meta.mtime_ns;
+  const uint64_t ctime_ns = e.meta.ctime_ns;
+  const auto create_path = e.create_path;
   e.meta = m;
   e.unpublished = false;
   e.create_path.reset();
+  if (keep_dir) {
+    e.meta.nlink = nlink;
+    e.meta.mtime_ns = std::max(e.meta.mtime_ns, mtime_ns);
+    e.meta.ctime_ns = std::max(e.meta.ctime_ns, ctime_ns);
+    if (nlink != m.nlink) {
+      e.unpublished = true;
+      e.create_path = create_path;
+    }
+  }
   merge_dirty_locked(st, e.meta);
   e.loaded = std::chrono::steady_clock::now();
   e.lru = ++st.inode_cache_clock;

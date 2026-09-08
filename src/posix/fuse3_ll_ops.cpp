@@ -110,7 +110,8 @@ void fill_entry(Entry* e, const aios_posix_stat& st) {
   e->ino = st.ino;
   e->generation = 0;
   copy_stat(st, &e->attr);
-  e->attr_timeout = kTimeout;
+  // Directory nlink/mtime change on mkdir/rmdir; a 1s cache would hide that.
+  e->attr_timeout = S_ISDIR(st.mode) ? 0.0 : kTimeout;
   e->entry_timeout = kTimeout;
 }
 
@@ -156,7 +157,7 @@ void reply_entry_stat(fuse_req_t req, const aios_posix_stat& st) {
 void reply_attr_stat(fuse_req_t req, const aios_posix_stat& st) {
   Attr attr{};
   copy_stat(st, &attr);
-  fuse_reply_attr(req, &attr, kTimeout);
+  fuse_reply_attr(req, &attr, S_ISDIR(st.mode) ? 0.0 : kTimeout);
 }
 
 void ll_init(void* userdata, struct fuse_conn_info* conn) {

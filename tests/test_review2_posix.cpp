@@ -1050,6 +1050,11 @@ TEST(Review2Posix, DirLeaseHeldWhileActiveAndReleasedOnUnmount) {
     // on the server after fsyncdir.
     aios_posix_stat d{};
     ASSERT_EQ(aios_posix_mkdir(a.fs, 1, "d", 0755, &d), 0);
+    aios_posix_stat sub{};
+    ASSERT_EQ(aios_posix_mkdir(a.fs, d.ino, "sub", 0755, &sub), 0);
+    aios_posix_stat dstat{};
+    ASSERT_EQ(aios_posix_getattr(a.fs, d.ino, &dstat), 0);
+    EXPECT_EQ(dstat.nlink, 3u) << "child mkdir must bump the unpublished dir, not the create snapshot";
     aios_posix_stat root{};
     ASSERT_EQ(aios_posix_getattr(a.fs, 1, &root), 0);
     EXPECT_EQ(root.nlink, 3u);
@@ -1066,6 +1071,28 @@ TEST(Review2Posix, DirLeaseHeldWhileActiveAndReleasedOnUnmount) {
   aios_posix_stat st{};
   EXPECT_EQ(aios_posix_lookup(c.fs, 1, "f1", &st), 0);
   EXPECT_EQ(aios_posix_lookup(c.fs, 1, "d", &st), 0);
+}
+
+TEST(Review2Posix, UnpublishedDirNlinkSurvivesCreatePublish) {
+  HttpFixture http("aios-r2p-nlinkpub", 23610);
+  Mount a(http, "nlinkpub", 4096);
+  for (int i = 0; i < 8; ++i) {
+    const std::string name = "d" + std::to_string(i);
+    aios_posix_stat d{};
+    ASSERT_EQ(aios_posix_mkdir(a.fs, 1, name.c_str(), 0755, &d), 0);
+    std::atomic<int> mkdir_rc{0};
+    std::thread child([&] {
+      aios_posix_stat sub{};
+      mkdir_rc = aios_posix_mkdir(a.fs, d.ino, "sub", 0755, &sub);
+    });
+    std::thread pub([&] { (void)aios_posix_fsyncdir(a.fs, 1); });
+    child.join();
+    pub.join();
+    ASSERT_EQ(mkdir_rc.load(), 0);
+    aios_posix_stat dstat{};
+    ASSERT_EQ(aios_posix_getattr(a.fs, d.ino, &dstat), 0);
+    EXPECT_EQ(dstat.nlink, 3u) << "create PUT must not clobber a concurrent child mkdir";
+  }
 }
 
 TEST(Review2Posix, DirLeaseLostToMapChangeIsReplayedUnderAFreshLease) {

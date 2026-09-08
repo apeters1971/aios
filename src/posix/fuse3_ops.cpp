@@ -745,7 +745,10 @@ void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
   }
   if (cfg) {
     cfg->kernel_cache = 1;
-    cfg->attr_timeout = 1.0;
+    // High-level FUSE has one timeout for every inode. Directory nlink/mtime
+    // change on mkdir/rmdir; a 1s cache would hide that from the next stat().
+    // (Do not fuse_invalidate_path from these handlers — it can deadlock.)
+    cfg->attr_timeout = 0.0;
     cfg->entry_timeout = 1.0;
     /* Our inode numbers are stable and unique: hand them to the kernel instead of
      * libfuse's synthesized ones (hard links then share st_ino as they should). */

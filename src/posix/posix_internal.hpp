@@ -558,8 +558,10 @@ void flush_all_dirty_inodes(FsState& st,
 
 // Inode cache maintenance; all require st.mu held by the caller.
 // cache_inode_locked replaces the record wholesale (fresh server copy or a PUT we
-// just made). cache_touch_size_locked merges a larger size/newer times without
-// disturbing other fields, which is what concurrent writers must use.
+// just made), except an unpublished directory keeps its in-core nlink/mtime so a
+// create PUT cannot clobber a concurrent mkdir/rmdir bump. cache_touch_size_locked
+// merges a larger size/newer times without disturbing other fields, which is what
+// concurrent writers must use.
 void cache_inode_locked(FsState& st, const InodeMeta& m);
 void cache_unpublished_locked(FsState& st, const InodeMeta& m,
                               const std::optional<std::string>& create_path);
