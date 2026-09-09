@@ -69,6 +69,15 @@ int lookup_path(aios_posix_fs* fs, const char* path, aios_posix_stat* st_out) {
   return 0;
 }
 
+// nullpath_ok skips the path lookup when fi is set (unlinked-but-open files,
+// and writeback setattr-on-close which always carries FATTR_FH). lookup_path
+// of a NULL path is -EINVAL, which GNU cp reports as "failed to close".
+int load_stat_path_or_fh(aios_posix_fs* fs, const char* path, struct fuse_file_info* fi,
+                         aios_posix_stat* st) {
+  if (fi && fi->fh) return aios_posix_getattr(fs, fi->fh, st);
+  return lookup_path(fs, path, st);
+}
+
 uint64_t path_ino(aios_posix_fs* fs, const char* path, struct fuse_file_info* fi);
 
 void fill_times(uint64_t ns, time_t* sec, long* nsec) {
@@ -102,12 +111,12 @@ void copy_stat(const aios_posix_stat& st, fuse_darwin_attr* out) {
   out->btimespec = out->ctimespec;
 }
 
-int posix_getattr(const char* path, fuse_darwin_attr* attr, struct fuse_file_info* /*fi*/) {
+int posix_getattr(const char* path, fuse_darwin_attr* attr, struct fuse_file_info* fi) {
   return guard([&] {
     auto* fs = fs_handle();
     if (!fs) return -EIO;
     aios_posix_stat st{};
-    int rc = lookup_path(fs, path, &st);
+    int rc = load_stat_path_or_fh(fs, path, fi, &st);
     if (rc) return rc;
     copy_stat(st, attr);
     return 0;
@@ -129,12 +138,12 @@ void copy_stat(const aios_posix_stat& st, struct stat* stbuf) {
   fill_times(st.ctime_ns, &stbuf->st_ctim.tv_sec, &stbuf->st_ctim.tv_nsec);
 }
 
-int posix_getattr(const char* path, struct stat* stbuf, struct fuse_file_info* /*fi*/) {
+int posix_getattr(const char* path, struct stat* stbuf, struct fuse_file_info* fi) {
   return guard([&] {
     auto* fs = fs_handle();
     if (!fs) return -EIO;
     aios_posix_stat st{};
-    int rc = lookup_path(fs, path, &st);
+    int rc = load_stat_path_or_fh(fs, path, fi, &st);
     if (rc) return rc;
     copy_stat(st, stbuf);
     return 0;
@@ -466,11 +475,11 @@ int posix_readlink(const char* path, char* buf, size_t size) {
   });
 }
 
-int posix_chmod(const char* path, mode_t mode, struct fuse_file_info* /*fi*/) {
+int posix_chmod(const char* path, mode_t mode, struct fuse_file_info* fi) {
   return guard([&] {
     auto* fs = fs_handle();
     aios_posix_stat st{};
-    int rc = lookup_path(fs, path, &st);
+    int rc = load_stat_path_or_fh(fs, path, fi, &st);
     if (rc) return rc;
     aios_posix_stat ps{};
     ps.mode = static_cast<uint32_t>(mode);
@@ -478,11 +487,11 @@ int posix_chmod(const char* path, mode_t mode, struct fuse_file_info* /*fi*/) {
   });
 }
 
-int posix_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* /*fi*/) {
+int posix_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* fi) {
   return guard([&] {
     auto* fs = fs_handle();
     aios_posix_stat st{};
-    int rc = lookup_path(fs, path, &st);
+    int rc = load_stat_path_or_fh(fs, path, fi, &st);
     if (rc) return rc;
     aios_posix_stat ps{};
     uint32_t set = 0;
@@ -498,11 +507,11 @@ int posix_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* /
   });
 }
 
-int posix_utimens(const char* path, const struct timespec tv[2], struct fuse_file_info* /*fi*/) {
+int posix_utimens(const char* path, const struct timespec tv[2], struct fuse_file_info* fi) {
   return guard([&] {
     auto* fs = fs_handle();
     aios_posix_stat st{};
-    int rc = lookup_path(fs, path, &st);
+    int rc = load_stat_path_or_fh(fs, path, fi, &st);
     if (rc) return rc;
     aios_posix_stat ps{};
     uint32_t set = 0;
@@ -760,8 +769,10 @@ void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
      * libfuse's synthesized ones (hard links then share st_ino as they should). */
     cfg->use_ino = 1;
     cfg->readdir_ino = 1;
-    /* read/write/flush/fsync/release work on fi->fh; libfuse can skip the path
-     * lookup for them, which also keeps unlinked-but-open files usable. */
+    /* Handlers that take fi must use fi->fh when path is NULL: libfuse skips
+     * the path lookup for write/flush/fsync/release *and* for setattr/getattr
+     * when the kernel sent FATTR_FH (writeback close). That also keeps
+     * unlinked-but-open files usable. */
     cfg->nullpath_ok = 1;
   }
   return fs;
