@@ -72,6 +72,11 @@ blkcnt_t posix_st_blocks(uint64_t size) {
   return static_cast<blkcnt_t>((size + 511ull) / 512ull);
 }
 
+// fuse_attr.blksize is copied into inode->i_blkbits. The stripe unit (1 MiB) is
+// a data layout, not a VFS block size; iomap writeback of 4 KiB pages then
+// returns EINVAL and `cp` fails on close. Keep this at PAGE_SIZE.
+blksize_t fuse_stat_blksize() { return 4096; }
+
 #ifdef __APPLE__
 void copy_stat(const aios_posix_stat& st, Attr* out) {
   std::memset(out, 0, sizeof(*out));
@@ -81,7 +86,7 @@ void copy_stat(const aios_posix_stat& st, Attr* out) {
   out->uid = st.uid;
   out->gid = st.gid;
   out->size = static_cast<off_t>(st.size);
-  out->blksize = static_cast<blksize_t>(st.stripe_unit ? st.stripe_unit : 4096);
+  out->blksize = fuse_stat_blksize();
   out->blocks = posix_st_blocks(st.size);
   fill_times(st.atime_ns, &out->atimespec.tv_sec, &out->atimespec.tv_nsec);
   fill_times(st.mtime_ns, &out->mtimespec.tv_sec, &out->mtimespec.tv_nsec);
@@ -97,7 +102,7 @@ void copy_stat(const aios_posix_stat& st, Attr* out) {
   out->st_uid = st.uid;
   out->st_gid = st.gid;
   out->st_size = static_cast<off_t>(st.size);
-  out->st_blksize = static_cast<blksize_t>(st.stripe_unit ? st.stripe_unit : 4096);
+  out->st_blksize = fuse_stat_blksize();
   out->st_blocks = posix_st_blocks(st.size);
   fill_times(st.atime_ns, &out->st_atim.tv_sec, &out->st_atim.tv_nsec);
   fill_times(st.mtime_ns, &out->st_mtim.tv_sec, &out->st_mtim.tv_nsec);
