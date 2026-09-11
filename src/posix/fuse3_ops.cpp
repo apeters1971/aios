@@ -246,7 +246,6 @@ int posix_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     if (rc) return rc;
     if (fi) {
       fi->fh = st.ino;
-      fi->keep_cache = 1;
     }
     return 0;
   });
@@ -336,7 +335,6 @@ int posix_open(const char* path, struct fuse_file_info* fi) {
     }
     if (fi) {
       fi->fh = st.ino;
-      fi->keep_cache = 1;
     }
     return 0;
   });
@@ -748,7 +746,11 @@ void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
     conn->max_read = io;
     conn->max_readahead = io * 4;
 #ifdef FUSE_CAP_WRITEBACK_CACHE
-    if (conn->capable & FUSE_CAP_WRITEBACK_CACHE) conn->want |= FUSE_CAP_WRITEBACK_CACHE;
+    // High-level libfuse gives each hard-link name its own nodeid. Writeback
+    // makes the kernel authoritative for i_size, so a write through one name
+    // never updates the other (smoke: `echo more >> hard` then `cat sub/f3`).
+    // aios-fusell replies with the shared ino and can keep writeback.
+    conn->want &= ~FUSE_CAP_WRITEBACK_CACHE;
 #endif
 #ifdef FUSE_CAP_ASYNC_READ
     if (conn->capable & FUSE_CAP_ASYNC_READ) conn->want |= FUSE_CAP_ASYNC_READ;
@@ -758,12 +760,12 @@ void* posix_init(struct fuse_conn_info* conn, struct fuse_config* cfg) {
 #endif
   }
   if (cfg) {
-    cfg->kernel_cache = 1;
-    // Directory nlink is kept correct in-core (cache_inode_locked). A 0s attr
-    // timeout makes the writeback path GETATTR before every write(2), which
-    // returns EINVAL on the kernel used in CI. mkdir still invalidates the
-    // parent via fuse_dir_changed.
-    cfg->attr_timeout = 1.0;
+    // Same split-nodeid problem as writeback: cached size/mtime on the original
+    // name would hide an append through the hard link. 0s attr timeout is safe
+    // now that writeback is off (with writeback it GETATTRs before every
+    // write(2) and used to return EINVAL). open(2) also drops the data cache.
+    cfg->kernel_cache = 0;
+    cfg->attr_timeout = 0.0;
     cfg->entry_timeout = 1.0;
     /* Our inode numbers are stable and unique: hand them to the kernel instead of
      * libfuse's synthesized ones (hard links then share st_ino as they should). */
