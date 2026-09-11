@@ -1562,10 +1562,24 @@ void flush_dirty_inode(FsState& st, uint64_t ino) {
     st.dirty_sizes.erase(ino);
     return;
   }
-  m.size = std::max(m.size, d.size);
-  m.mtime_ns = std::max(m.mtime_ns, d.mtime_ns);
-  m.ctime_ns = std::max(m.ctime_ns, d.ctime_ns);
-  store_inode(st, m, path, [d](InodeMeta& next) {
+  // Truncate drops dirty_sizes and PUTs the smaller size. A flusher that copied
+  // the pre-truncate DirtySize must not max() it back on (CAS conflict reapply
+  // used to restore 5 KiB after a shrink to 3, and PosixFs.Basic then read 8
+  // bytes via a hard link once the inode TTL expired).
+  auto dirty_still = [&st, ino, since = d.since]() {
+    auto it = st.dirty_sizes.find(ino);
+    return it != st.dirty_sizes.end() && it->second.since == since;
+  };
+  {
+    std::lock_guard lock(st.mu);
+    if (!dirty_still()) return;
+    m.size = std::max(m.size, d.size);
+    m.mtime_ns = std::max(m.mtime_ns, d.mtime_ns);
+    m.ctime_ns = std::max(m.ctime_ns, d.ctime_ns);
+  }
+  store_inode(st, m, path, [&st, d, dirty_still](InodeMeta& next) {
+    std::lock_guard lock(st.mu);
+    if (!dirty_still()) return;
     next.size = std::max(next.size, d.size);
     next.mtime_ns = std::max(next.mtime_ns, d.mtime_ns);
     next.ctime_ns = std::max(next.ctime_ns, d.ctime_ns);

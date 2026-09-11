@@ -375,6 +375,28 @@ TEST(Review2Posix, DeferredSizeVisibleToSecondMountWithoutFsync) {
   EXPECT_GT(st.mtime_ns, 0u);
 }
 
+// Truncate must not lose to a dirty-size flusher that copied the pre-shrink
+// size. After the inode TTL the cache is revalidated from the server; a stale
+// max() reapply would make a later read (PosixFs.Basic via a hard link) return
+// 8 bytes instead of 3.
+TEST(Review2Posix, TruncateSurvivesStaleDirtyFlush) {
+  HttpFixture http("aios-r2p-trunc", 23600);
+  Mount a(http, "truncvol", 4096);
+  const uint64_t ino = create_file(a.fs, 1, "t");
+  const std::string big(5000, 'Z');
+  size_t wrote = 0;
+  ASSERT_EQ(aios_posix_write(a.fs, ino, 0, big.data(), big.size(), &wrote), 0);
+  ASSERT_EQ(aios_posix_truncate(a.fs, ino, 3), 0);
+  std::this_thread::sleep_for(aios::posix::kInodeCacheTtl + std::chrono::milliseconds(200));
+  aios_posix_stat st{};
+  ASSERT_EQ(aios_posix_getattr(a.fs, ino, &st), 0);
+  EXPECT_EQ(st.size, 3u);
+  char buf[8]{};
+  size_t got = 0;
+  ASSERT_EQ(aios_posix_read(a.fs, ino, 0, buf, sizeof(buf), &got), 0);
+  EXPECT_EQ(got, 3u);
+}
+
 // ---------------------------------------------------------------------------
 // POS-3 — inode cache TTL: a peer's chmod becomes visible after the TTL
 // ---------------------------------------------------------------------------

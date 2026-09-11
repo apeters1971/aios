@@ -186,7 +186,9 @@ TEST(PosixFs, Basic) {
   char r2[8]{};
   size_t got2 = 0;
   EXPECT_TRUE(aios_posix_lookup(fs, dir2, "cross.txt", &looked) == 0 && looked.ino == file_ino) << "cross lookup";
-  EXPECT_TRUE(aios_posix_read(fs, looked.ino, 0, r2, sizeof(r2), &got2) == 0 && got2 == 3) << "via link";
+  const int link_rc = aios_posix_read(fs, looked.ino, 0, r2, sizeof(r2), &got2);
+  EXPECT_TRUE(link_rc == 0 && got2 == 3) << "via link rc=" << link_rc << " got=" << got2
+                                        << " size=" << looked.size;
 
   // flock exclusive
   EXPECT_TRUE(aios_posix_flock(fs, file_ino, LOCK_EX | LOCK_NB) == 0) << "flock ex";
