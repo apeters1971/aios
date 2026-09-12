@@ -12,6 +12,7 @@
 # with prove's status.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+BUILD_DIR=${1:?build dir}
 PJD=${2:?pjdfstest dir}
 shift 2 || true
 GROUPS_=("$@")
@@ -23,7 +24,7 @@ command -v prove > /dev/null || { echo "prove (perl) missing" >&2; exit 2; }
 PJD_OUT=${PJD_OUT:-$PWD/pjdfstest-results}
 
 # shellcheck source=tests/fuse_env.sh
-source tests/fuse_env.sh "$1"
+source tests/fuse_env.sh "$BUILD_DIR"
 VOLUME=pjd
 fuse_env_start
 MNT=$WORK/mnt
