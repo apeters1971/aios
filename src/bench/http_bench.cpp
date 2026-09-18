@@ -331,6 +331,7 @@ class HttpSession {
                           : aios::sha256_hex(std::string(reinterpret_cast<const char*>(body),
                                                          body ? body_len : 0));
     headers["x-aios-content-sha256"] = payload_hash;
+    headers[aios::kHttpNonceHeader] = aios::http_next_nonce();
     const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
     const auto canon =
         aios::http_canonical(method, target, date, signed_headers, headers, payload_hash);

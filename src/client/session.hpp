@@ -205,7 +205,6 @@ class Session {
   void add_auth(std::unordered_map<std::string, std::string>& headers, const std::string& method,
                 const std::string& target, const std::string& body) const;
   HttpResponse post_ticket_request(const std::string& body);
-  static std::string next_nonce();
   static void validate_header_value(const std::string& value, const char* what);
   static ObjectSnapshot parse_object_meta(const HttpResponse& resp, bool with_body);
 

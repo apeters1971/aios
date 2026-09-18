@@ -18,7 +18,6 @@
 #include <exception>
 #include <memory>
 #include <mutex>
-#include <random>
 #include <span>
 #include <sstream>
 #include <thread>
@@ -581,18 +580,6 @@ void Session::validate_header_value(const std::string& value, const char* what) 
   }
 }
 
-std::string Session::next_nonce() {
-  static const std::uint64_t salt = [] {
-    std::random_device rd;
-    return (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
-  }();
-  static std::atomic<std::uint64_t> seq{0};
-  std::ostringstream oss;
-  oss << std::hex << salt << '-' << static_cast<unsigned long>(::getpid()) << '-'
-      << seq.fetch_add(1, std::memory_order_relaxed);
-  return oss.str();
-}
-
 void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
                        const std::string& method, const std::string& target,
                        const std::string& body) const {
@@ -606,7 +593,7 @@ void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
   // (method, target, date, signature); two clients issuing an identical request
   // (e.g. POST .../lock with an empty body) in the same millisecond would
   // collide. A per-request nonce makes every signature unique.
-  headers[kHttpNonceHeader] = next_nonce();
+  headers[kHttpNonceHeader] = http_next_nonce();
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
   const auto canon =
       http_canonical(method, target, date, signed_headers, headers, payload_hash);

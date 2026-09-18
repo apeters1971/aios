@@ -245,6 +245,11 @@ TEST(SessionWireC8, RequestBodyIsContentSha256Hashed) {
   const auto expect = sha256_hex(body);
   EXPECT_NE(stub.last_request.find(expect), std::string::npos)
       << "request missing x-aios-content-sha256=" << expect;
+  auto lower_nonce = stub.last_request;
+  for (char& c : lower_nonce) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  EXPECT_NE(lower_nonce.find("x-aios-nonce:"), std::string::npos)
+      << "request missing x-aios-nonce\n"
+      << stub.last_request.substr(0, 800);
 }
 
 // Large bodies used to be sent as UNSIGNED-PAYLOAD; since POS-11 every body is

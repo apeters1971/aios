@@ -100,6 +100,34 @@ TEST(HttpAuth, CanonicalMatchesKernelClient) {
             "UNSIGNED-PAYLOAD");
 }
 
+TEST(HttpAuth, CanonicalAppendsNonceAfterPayloadHash) {
+  using namespace aios;
+  const std::string date = "1700000000000";
+  const std::string sh = "x-aios-content-sha256;x-aios-date";
+  std::unordered_map<std::string, std::string> headers = {
+      {"x-aios-date", date},
+      {"x-aios-content-sha256", "UNSIGNED-PAYLOAD"},
+      {kHttpNonceHeader, "0123456789abcdef0123456789abcdef"},
+  };
+  EXPECT_EQ(http_canonical("PUT", "/o/vd%2Fdefault%2Fdisk1%2Fheader", date, sh, headers,
+                           "UNSIGNED-PAYLOAD"),
+            "PUT\n"
+            "/o/vd%2Fdefault%2Fdisk1%2Fheader\n"
+            "1700000000000\n"
+            "x-aios-content-sha256;x-aios-date:\n"
+            "x-aios-content-sha256;x-aios-date\n"
+            "UNSIGNED-PAYLOAD\n"
+            "x-aios-nonce:0123456789abcdef0123456789abcdef");
+}
+
+TEST(HttpAuth, NextNonceIsUnique) {
+  using namespace aios;
+  const auto a = http_next_nonce();
+  const auto b = http_next_nonce();
+  EXPECT_FALSE(a.empty());
+  EXPECT_NE(a, b);
+}
+
 // CLI/Session historically diverged: leaving '/' raw made PUT /o/demo/hello look
 // like oid "demo" + unknown sub "hello" → 404. Shared encoder must escape it.
 TEST(HttpAuth, UrlEncodeOidEscapesSlash) {

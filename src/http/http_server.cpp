@@ -796,6 +796,7 @@ PeerAdminResult peer_admin_request(const Config& cfg, const std::string& http_ad
       sha256_hex(reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
   headers["x-aios-date"] = date;
   headers["x-aios-content-sha256"] = payload_hash;
+  headers[kHttpNonceHeader] = http_next_nonce();
   headers["content-type"] = "application/json";
   headers["content-length"] = std::to_string(body.size());
   headers["connection"] = "close";

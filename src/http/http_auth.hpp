@@ -21,6 +21,10 @@ inline constexpr std::size_t kHttpStreamBodyBytes = 256u * 1024u;
 // remembered for the skew window, so an identical request cannot be replayed.
 inline constexpr const char* kHttpNonceHeader = "x-aios-nonce";
 
+// Per-request value for x-aios-nonce (salt-pid-seq). First-party clients set
+// this before signing so GETs and UNSIGNED-PAYLOAD writes are not replayable.
+std::string http_next_nonce();
+
 // Remembers accepted signatures until the skew window has passed them by.
 // Keys are only inserted after a signature verified, so the size is bounded by
 // legitimate traffic; kMaxEntries is a hard ceiling on top of time eviction.

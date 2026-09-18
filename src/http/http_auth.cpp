@@ -4,13 +4,16 @@
 #include "util/log.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <random>
 #include <sstream>
 
 #include <time.h>
+#include <unistd.h>
 
 namespace aios {
 namespace {
@@ -74,6 +77,18 @@ std::vector<std::string> split_csv(const std::string& s) {
 }
 
 }  // namespace
+
+std::string http_next_nonce() {
+  static const std::uint64_t salt = [] {
+    std::random_device rd;
+    return (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+  }();
+  static std::atomic<std::uint64_t> seq{0};
+  std::ostringstream oss;
+  oss << std::hex << salt << '-' << static_cast<unsigned long>(::getpid()) << '-'
+      << seq.fetch_add(1, std::memory_order_relaxed);
+  return oss.str();
+}
 
 std::string header_get(const std::unordered_map<std::string, std::string>& headers,
                        const std::string& name) {

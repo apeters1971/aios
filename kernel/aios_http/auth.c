@@ -280,8 +280,10 @@ int aios_http_build_auth(struct aios_http_client *c, const char *method,
 			 const char *path, const void *body, size_t body_len,
 			 char *auth_hdrs, size_t auth_hdrs_len)
 {
-	/* Canonical: method\npath\ndate\nSignedHeaders:\nSignedHeaders\n<body sha256 hex> */
+	/* Canonical: method\npath\ndate\nSignedHeaders:\nSignedHeaders\n<body sha256 hex>
+	 * [\nx-aios-nonce:<hex>]. SignedHeaders stays the two-name ';' form. */
 	char date[32];
+	char nonce[33];
 	char *canon;
 	char sig[65];
 	char body_sha[65];
@@ -323,6 +325,7 @@ int aios_http_build_auth(struct aios_http_client *c, const char *method,
 
 	ms = ktime_to_ms(ktime_get_real());
 	snprintf(date, sizeof(date), "%lld", (long long)ms);
+	random_hex(nonce, 16);
 
 	canon = kmalloc(AIOS_HTTP_CANON_MAX, c->gfp);
 	if (!canon)
@@ -332,14 +335,16 @@ int aios_http_build_auth(struct aios_http_client *c, const char *method,
 	 * Must match src/http/http_auth.cpp http_canonical(). SignedHeaders is
 	 * split on commas only, so "x-aios-content-sha256;x-aios-date" is one
 	 * header name and that line's value is empty. Expanding into two
-	 * name:value lines (AWS-style) produces a 401 bad signature.
+	 * name:value lines (AWS-style) produces a 401 bad signature. A present
+	 * nonce is appended after the payload hash, not listed in SignedHeaders.
 	 */
 	n = snprintf(canon, AIOS_HTTP_CANON_MAX,
 		     "%s\n%s\n%s\n"
 		     "x-aios-content-sha256;x-aios-date:\n"
 		     "x-aios-content-sha256;x-aios-date\n"
-		     "%s",
-		     method, path, date, body_sha);
+		     "%s\n"
+		     "x-aios-nonce:%s",
+		     method, path, date, body_sha, nonce);
 	if (n < 0 || n >= (int)AIOS_HTTP_CANON_MAX) {
 		kfree(canon);
 		return -EOVERFLOW;
@@ -353,9 +358,10 @@ int aios_http_build_auth(struct aios_http_client *c, const char *method,
 	n = snprintf(auth_hdrs, auth_hdrs_len,
 		     "x-aios-date: %s\r\n"
 		     "x-aios-content-sha256: %s\r\n"
+		     "x-aios-nonce: %s\r\n"
 		     "Authorization: AIOS-HMAC-SHA256 Credential=%s, "
 		     "SignedHeaders=x-aios-content-sha256;x-aios-date, Signature=%s\r\n",
-		     date, body_sha, credential, sig);
+		     date, body_sha, nonce, credential, sig);
 	if (n < 0 || n >= (int)auth_hdrs_len)
 		return -EOVERFLOW;
 	return 0;

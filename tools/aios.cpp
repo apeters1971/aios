@@ -278,6 +278,7 @@ void add_auth(std::unordered_map<std::string, std::string>& headers, const std::
   const std::string date = std::to_string(aios::now_ms());
   headers["x-aios-date"] = date;
   headers["x-aios-content-sha256"] = payload_hash;
+  headers[aios::kHttpNonceHeader] = aios::http_next_nonce();
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
   const auto canon =
       aios::http_canonical(method, target, date, signed_headers, headers, payload_hash);

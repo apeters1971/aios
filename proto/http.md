@@ -10,6 +10,7 @@ Bodies are **raw octets** (never base64). Connections are HTTP/1.1 keep-alive by
 Authorization: AIOS-HMAC-SHA256 Credential=<id>, SignedHeaders=<list>, Signature=<hex>
 x-aios-date: <unix-ms>
 x-aios-content-sha256: <sha256-hex of body> | UNSIGNED-PAYLOAD
+x-aios-nonce: <unique per request>   # optional; first-party clients always send one
 ```
 
 `x-aios-content-sha256` is part of the canonical string, so a concrete digest binds the body to the
@@ -40,7 +41,17 @@ Canonical string:
 ...
 <SignedHeaders>\n
 <payload_hash>
+[\nx-aios-nonce:<nonce>]   # only when the header is present
 ```
+
+`x-aios-nonce` is **not** listed in `SignedHeaders` (the kernel-pinned list stays
+`x-aios-content-sha256;x-aios-date`). When present it is appended after the payload hash and
+bound into the HMAC. The server remembers `(date, nonce, signature)` for the skew window and
+rejects a second use with `401 replayed`. Without a nonce, mutating methods whose signature
+covers a concrete payload hash are still single-use on `(method, path, date, signature)`; GETs
+and `UNSIGNED-PAYLOAD` writes in the same millisecond remain replayable. All first-party clients
+(`Session`, `aios`, `aios-bench`, kernel `aios_http`, node-to-node admin HMAC) send a nonce.
+The header stays optional so older kernels and hand-rolled clients keep working.
 
 `Signature = HMAC-SHA256(key, canonical)` as lowercase hex, where `key` depends on the
 credential:

@@ -23,8 +23,8 @@ struct crypto_shash;
 #define AIOS_HTTP_DEFAULT_TIMEOUT_MS 30000u
 /* Sealed ticket blob ("t1." + base64) as issued by POST /auth/ticket. */
 #define AIOS_HTTP_TICKET_MAX 1024
-/* Auth header lines: date + content sha + Authorization carrying the ticket. */
-#define AIOS_HTTP_AUTH_MAX (AIOS_HTTP_TICKET_MAX + 256)
+/* Auth header lines: date + content sha + nonce + Authorization carrying the ticket. */
+#define AIOS_HTTP_AUTH_MAX (AIOS_HTTP_TICKET_MAX + 320)
 
 struct aios_http_client {
 	char host[256];

@@ -12,6 +12,12 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — first-party HTTP clients send `x-aios-nonce`
+
+The server already treated a present nonce as single-use (`Session` sent one). The CLI,
+`aios-bench`, kernel `aios_http`, and node-to-node admin HMAC now send one too, so GETs and
+`UNSIGNED-PAYLOAD` writes are not replayable inside the skew window. The header stays optional.
+
 ### Changed — ranged writes are O(io), not O(object)
 
 `put_range` / append used to clone the tip file and re-CRC the whole body (a 4 KiB write
