@@ -1,3 +1,4 @@
+// Path-based FUSE ops. aios-fuse links fuse3_ll_ops.cpp instead (shared ino + writeback).
 #include "posix/fuse3_ops.hpp"
 #include "posix/aios_posix.h"
 #include "posix/flock_owners.hpp"
@@ -247,7 +248,7 @@ int posix_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     if (fi) {
       fi->fh = st.ino;
     }
-    return 0;
+    return aios_posix_hold(fs, st.ino);
   });
 }
 
@@ -336,7 +337,7 @@ int posix_open(const char* path, struct fuse_file_info* fi) {
     if (fi) {
       fi->fh = st.ino;
     }
-    return 0;
+    return aios_posix_hold(fs, st.ino);
   });
 }
 
@@ -444,7 +445,8 @@ int posix_release(const char* /*path*/, struct fuse_file_info* fi) {
     if (flock_owners().note_unlocked(fi->fh, fi->lock_owner)) {
       (void)aios_posix_flock(fs, fi->fh, LOCK_UN);
     }
-    return rc;
+    const int rel = aios_posix_rele(fs, fi->fh);
+    return rc ? rc : rel;
   });
 }
 

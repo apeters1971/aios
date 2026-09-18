@@ -34,7 +34,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 
 | Access | How | Notes |
 |--------|-----|--------|
-| **POSIX (FUSE)** | `aios-fuse` / `aios-fusell` → `libaios_posix` | Userspace mount (Linux/macOS when libfuse3 is present; high-level or low-level) |
+| **POSIX (FUSE)** | `aios-fuse` / `aios-fusell` → `libaios_posix` | Userspace mount (Linux/macOS when libfuse3 is present; inode API) |
 | **POSIX (kernel)** | `aiosfs.ko` (`backend=http` or `upcall` + `aios-kbridge`) | AlmaLinux 9 VFS; can be re-exported via **nfsd** (below) |
 | **VBD (kernel)** | `aiosvd.ko` + `aios-vd` → `/dev/aiosvdN` | Object-striped block volumes |
 | **STL API (C++)** | `libaios_client` | Persistent `string` / containers / `mutex` over HTTP |
@@ -49,8 +49,8 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
-| `aios-fuse` | High-level FUSE3 mount of `libaios_posix` (built when `libfuse3` is found) |
-| `aios-fusell` | Low-level FUSE3 mount of the same ABI (`fuse_lowlevel_ops`) |
+| `aios-fuse` | FUSE3 mount of `libaios_posix` (inode API, writeback; built when `libfuse3` is found) |
+| `aios-fusell` | Same inode FUSE3 mount as `aios-fuse` (kept as a second binary) |
 | `aios-posix-fsck` | Check / repair a `libaios_posix` volume from its objects (no mount needed) |
 | `libXrdAios.so` | XRootD OSS plugin over `libaios_posix` (built when XRootD is found) |
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
@@ -890,7 +890,7 @@ Cross-directory `rename` uses a multi-object `/txn` compact rewrite of both dire
 
 **Directory leases.** A directory a mount is changing is *leased* (server lock on its meta object, renewed every second): `create`/`mkdir`/`unlink`/`symlink`/`link` then update an in-memory table and queue a changelog record that a flusher thread commits in batches (child inode objects are PUT just before the directory `Link` that names them), and `lookup`/`readdir` are served from that table — local after the lease is held, instead of about twelve round trips per create. Other mounts (userspace or the kernel `aiosfs`) that need the directory ask for the lease back and get it within the grace period (5 s). Metadata becomes durable at `fsync(dir)` / `syncfs` / unmount (`aios_posix_fsyncdir`, `aios_posix_sync`), as POSIX specifies; `-o nolease` (or `AIOS_POSIX_F_NOLEASE`) restores per-operation commits.
 
-When CMake finds **libfuse3**, it builds `aios-fuse` (high-level) and `aios-fusell` (low-level):
+When CMake finds **libfuse3**, it builds `aios-fuse` and `aios-fusell` (same inode API):
 
 ```bash
 aios-fuse -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
@@ -899,9 +899,9 @@ aios-fusell -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 # -o nolease: commit every directory operation synchronously
 ```
 
-`aios-fuse` uses libfuse's path-based API (`fuse_main`). `aios-fusell` uses the inode API
-(`fuse_session_new`); that matches `libaios_posix` directly (root is inode 1) and skips
-libfuse's path walk. Mount options and POSIX behaviour are the same. Sparse-range prefetch
+Both use libfuse's inode API (`fuse_session_new`) so hard links share a kernel inode and
+writeback cache can stay on. Mount options and POSIX behaviour match `libaios_posix`
+(root is inode 1). Sparse-range prefetch
 uses `ioctl(fd, AIOS_IOC_PREFETCHV, &req)` with the inline vector in
 [`kernel/aiosfs_uapi.h`](kernel/aiosfs_uapi.h); the helper `aios_prefetchv(fd, ranges, n)`
 is identical on FUSE and kernel aiosfs.

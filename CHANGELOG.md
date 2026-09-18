@@ -12,6 +12,14 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — `aios-fuse` uses the inode API so writeback and hard links agree
+
+High-level libfuse gives each hard-link name its own nodeid. Writeback then makes the kernel
+authoritative for `i_size` per name, so `echo more >> hard` was invisible to `cat` of the
+original. `aios-fuse` now mounts with the same low-level ops as `aios-fusell` (shared ino,
+`FUSE_CAP_WRITEBACK_CACHE`). `libaios_posix` counts open holds so an unlinked-but-open file
+keeps its chunks until the last close (the previous fusell known gap).
+
 ### Changed — first-party HTTP clients send `x-aios-nonce`
 
 The server already treated a present nonce as single-use (`Session` sent one). The CLI,

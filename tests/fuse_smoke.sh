@@ -89,15 +89,7 @@ exec 3<"$MNT_A/d1/hard"
 rm "$MNT_A/d1/hard"
 got=$(cat <&3 || true)
 exec 3<&-
-if [[ "$got" != $'hello\nmore' ]]; then
-  if [[ "${FUSELL:-0}" == 1 ]]; then
-    # Known gap: the low-level mount has no libfuse .fuse_hidden rename, and
-    # libaios_posix drops the chunks at nlink 0 without counting open handles.
-    echo "   KNOWN GAP (aios-fusell): unlinked-while-open data not readable"
-  else
-    fail "read from unlinked open file"
-  fi
-fi
+[[ "$got" == $'hello\nmore' ]] || fail "read from unlinked open file"
 
 step "xattrs"
 if command -v setfattr > /dev/null; then

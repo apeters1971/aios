@@ -1341,6 +1341,8 @@ void inode_cache_evict_locked(FsState& st) {
   clean.reserve(st.inode_cache.size());
   for (const auto& [ino, e] : st.inode_cache) {
     if (e.unpublished || st.dirty_sizes.count(ino)) continue;
+    auto oit = st.open_count.find(ino);
+    if (oit != st.open_count.end() && oit->second > 0) continue;
     clean.emplace_back(e.lru, ino);
   }
   const size_t target = kInodeCacheMaxEntries - kInodeCacheMaxEntries / 8;
@@ -1707,27 +1709,7 @@ void ensure_root(FsState& st) {
   dir.load(false);  // creates empty on first link
 }
 
-void drop_nlink(FsState& st, uint64_t ino) {
-  bool unpublished = false;
-  {
-    std::lock_guard lock(st.mu);
-    auto it = st.inode_cache.find(ino);
-    unpublished = it != st.inode_cache.end() && it->second.unpublished;
-    if (unpublished) st.unpublished_dropped.insert(ino);
-  }
-  if (!unpublished) flush_dirty_inode(st, ino);
-  auto m = load_inode(st, ino);
-  if (!m.exists) return;
-  if (m.nlink > 1) {
-    const uint64_t ts = now_ns();
-    m.nlink -= 1;
-    m.ctime_ns = ts;
-    store_inode(st, m, std::nullopt, [ts](InodeMeta& next) {
-      if (next.nlink > 0) next.nlink -= 1;
-      next.ctime_ns = ts;
-    });
-    return;
-  }
+void destroy_unlinked_inode(FsState& st, uint64_t ino, const InodeMeta& m, bool unpublished) {
   if (S_ISREG(m.mode)) {
     if (unpublished) {
       delete_file_chunks(st, ino, m.size, m.stripe_unit, m.project_id, m.uid, m.gid);
@@ -1759,6 +1741,82 @@ void drop_nlink(FsState& st, uint64_t ino) {
     } catch (...) {
     }
   }
+}
+
+void drop_nlink(FsState& st, uint64_t ino) {
+  bool unpublished = false;
+  uint32_t opens = 0;
+  {
+    std::lock_guard lock(st.mu);
+    auto it = st.inode_cache.find(ino);
+    unpublished = it != st.inode_cache.end() && it->second.unpublished;
+    if (unpublished) st.unpublished_dropped.insert(ino);
+    auto oit = st.open_count.find(ino);
+    if (oit != st.open_count.end()) opens = oit->second;
+  }
+  if (!unpublished) flush_dirty_inode(st, ino);
+  auto m = load_inode(st, ino);
+  if (!m.exists) return;
+  if (m.nlink > 1) {
+    const uint64_t ts = now_ns();
+    m.nlink -= 1;
+    m.ctime_ns = ts;
+    store_inode(st, m, std::nullopt, [ts](InodeMeta& next) {
+      if (next.nlink > 0) next.nlink -= 1;
+      next.ctime_ns = ts;
+    });
+    return;
+  }
+  if (opens > 0) {
+    const uint64_t ts = now_ns();
+    if (unpublished) {
+      std::lock_guard lock(st.mu);
+      auto it = st.inode_cache.find(ino);
+      if (it != st.inode_cache.end()) {
+        it->second.meta.nlink = 0;
+        it->second.meta.ctime_ns = ts;
+      }
+      return;
+    }
+    m.nlink = 0;
+    m.ctime_ns = ts;
+    store_inode(st, m, std::nullopt, [ts](InodeMeta& next) {
+      next.nlink = 0;
+      next.ctime_ns = ts;
+    });
+    return;
+  }
+  destroy_unlinked_inode(st, ino, m, unpublished);
+}
+
+void inode_hold(FsState& st, uint64_t ino) {
+  std::lock_guard lock(st.mu);
+  st.open_count[ino] += 1;
+}
+
+void inode_rele(FsState& st, uint64_t ino) {
+  bool last = false;
+  {
+    std::lock_guard lock(st.mu);
+    auto it = st.open_count.find(ino);
+    if (it == st.open_count.end()) return;
+    if (it->second > 1) {
+      it->second -= 1;
+      return;
+    }
+    st.open_count.erase(it);
+    last = true;
+  }
+  if (!last) return;
+  bool unpublished = false;
+  {
+    std::lock_guard lock(st.mu);
+    auto it = st.inode_cache.find(ino);
+    unpublished = it != st.inode_cache.end() && it->second.unpublished;
+  }
+  auto m = load_inode(st, ino);
+  if (!m.exists || m.nlink > 0) return;
+  destroy_unlinked_inode(st, ino, m, unpublished);
 }
 
 // mtime/ctime/nlink of a directory after a namespace change. Under a lease the
@@ -2721,6 +2779,23 @@ int aios_posix_readlink(aios_posix_fs* fs, uint64_t ino, char* buf, size_t size)
     std::memcpy(buf, m.symlink.data(), m.symlink.size());
     buf[m.symlink.size()] = '\0';
     return static_cast<int>(m.symlink.size());
+  } catch (const aios::client_error& e) {
+    return aios::posix::map_error(e);
+  }
+  AIOS_POSIX_CATCH_ALL
+}
+
+int aios_posix_hold(aios_posix_fs* fs, uint64_t ino) {
+  if (!fs || !fs->st || ino == 0) return -EINVAL;
+  aios::posix::inode_hold(*fs->st, ino);
+  return 0;
+}
+
+int aios_posix_rele(aios_posix_fs* fs, uint64_t ino) {
+  if (!fs || !fs->st || ino == 0) return -EINVAL;
+  try {
+    aios::posix::inode_rele(*fs->st, ino);
+    return 0;
   } catch (const aios::client_error& e) {
     return aios::posix::map_error(e);
   }

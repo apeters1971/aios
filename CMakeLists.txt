@@ -347,7 +347,7 @@ target_include_directories(aios_s3 PUBLIC
 )
 target_link_libraries(aios_s3 PUBLIC aios_core aios_posix aios_cuobject OpenSSL::SSL)
 
-# Optional FUSE3 mount helpers (high-level aios-fuse and low-level aios-fusell).
+# Optional FUSE3 mount helpers (aios-fuse / aios-fusell, both inode API).
 option(AIOS_WITH_FUSE "Build aios-fuse / aios-fusell when libfuse3 is available" ON)
 set(AIOS_HAVE_FUSE OFF)
 if(AIOS_WITH_FUSE)
@@ -396,7 +396,7 @@ install(TARGETS aios-cuobj-s3 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(AIOS_HAVE_FUSE)
   add_executable(aios-fuse
     tools/aios_fuse.cpp
-    src/posix/fuse3_ops.cpp
+    src/posix/fuse3_ll_ops.cpp
   )
   add_executable(aios-fusell
     tools/aios_fusell.cpp

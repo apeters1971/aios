@@ -1,6 +1,6 @@
 # POSIX filesystem client + FUSE3
 
-AIOS exposes a **C-portable POSIX ABI** (`aios_posix.h`) that maps a hierarchical filesystem onto objects. FUSE3 helpers (`aios-fuse` high-level, `aios-fusell` low-level) mount that ABI on Linux/macOS when `libfuse3` is available.
+AIOS exposes a **C-portable POSIX ABI** (`aios_posix.h`) that maps a hierarchical filesystem onto objects. FUSE3 helpers (`aios-fuse` / `aios-fusell`, both inode API) mount that ABI on Linux/macOS when `libfuse3` is available.
 
 Root directory is always **inode 1**.
 
@@ -166,9 +166,11 @@ aios-fusell -o endpoint=127.0.0.1:7480,cluster_key=$KEY,volume=default /mnt/aios
 
 Also accepts `AIOS_ENDPOINT` / `AIOS_CLUSTER_KEY`. Optional: `stripe_unit`, `stripe_width`, `app_label`, `nolease`. Process credentials from the kernel (`fuse_get_context` / `fuse_req_ctx`) drive permission checks.
 
-**`aios-fuse`** is high-level libfuse3 (`fuse_main`, multi-threaded unless `-s`), `kernel_cache` with 1 s attribute/entry timeouts, writeback cache when the kernel offers it, `use_ino`/`readdir_ino` (our inode numbers are exposed) and `nullpath_ok` (read/write/flush/fsync/release/readdir work on the file handle). `fsync(dirfd)` maps to `aios_posix_fsyncdir`.
-
-**`aios-fusell`** is the same filesystem over the low-level API (`fuse_session_new`, `fuse_lowlevel_ops`). The kernel already names inodes, so lookup/create/read skip libfuse's path resolution; root is `FUSE_ROOT_ID` (1), matching the POSIX ABI. Timeouts, writeback, `max_read`/`max_write`, `fsyncdir`, and `-o nolease` match `aios-fuse`. Hard links use `aios_posix_link_ino`.
+**`aios-fuse`** and **`aios-fusell`** are the same inode-based libfuse3 mount (`fuse_session_new`,
+`fuse_lowlevel_ops`): writeback cache when the kernel offers it, 1 s file attr/entry timeouts
+(directories 0 s), `max_read`/`max_write`, `fsyncdir`, and `-o nolease`. Root is `FUSE_ROOT_ID`
+(1). Hard links use `aios_posix_link_ino` so both names share a kernel inode. Open files hold the
+inode so unlink-while-open still reads until the last close.
 
 ## Sparse-range prefetch (`AIOS_IOC_PREFETCHV`)
 

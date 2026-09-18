@@ -309,6 +309,41 @@ TEST(PosixFs, Basic) {
   aios_posix_unmount(fs);
 }
 
+TEST(PosixFs, UnlinkKeepsDataWhileHeld) {
+  HttpFixture http("aios-posix-hold");
+
+  aios_posix_config cfg{};
+  const std::string ep = http.endpoint();
+  cfg.endpoint = ep.c_str();
+  cfg.cluster_key = http.fx.cfg.cluster_key.c_str();
+  cfg.volume = "vhold";
+  cfg.stripe_unit = 4096;
+  cfg.stripe_width = 2;
+  cfg.uid = 1000;
+  cfg.gid = 1000;
+
+  int err = 0;
+  aios_posix_fs* fs = aios_posix_mount(&cfg, &err);
+  ASSERT_NE(fs, nullptr);
+
+  aios_posix_stat st{};
+  ASSERT_EQ(aios_posix_create(fs, 1, "open.txt", 0644, &st), 0);
+  const uint64_t ino = st.ino;
+  size_t wrote = 0;
+  ASSERT_EQ(aios_posix_write(fs, ino, 0, "keep", 4, &wrote), 0);
+  ASSERT_EQ(aios_posix_hold(fs, ino), 0);
+  ASSERT_EQ(aios_posix_unlink(fs, 1, "open.txt"), 0);
+  EXPECT_EQ(aios_posix_lookup(fs, 1, "open.txt", &st), -ENOENT);
+  char buf[8]{};
+  size_t got = 0;
+  ASSERT_EQ(aios_posix_read(fs, ino, 0, buf, sizeof(buf), &got), 0);
+  EXPECT_EQ(std::string(buf, got), "keep");
+  ASSERT_EQ(aios_posix_rele(fs, ino), 0);
+  EXPECT_NE(aios_posix_getattr(fs, ino, &st), 0);
+
+  aios_posix_unmount(fs);
+}
+
 TEST(PosixFs, DirCacheDeferredSizeRenameSymlink) {
   HttpFixture http("aios-posix-review16");
 

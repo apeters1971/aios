@@ -111,6 +111,9 @@ int aios_posix_mkdir(aios_posix_fs* fs, uint64_t parent, const char* name, uint3
                      aios_posix_stat* st_out);
 int aios_posix_create(aios_posix_fs* fs, uint64_t parent, const char* name, uint32_t mode,
                       aios_posix_stat* st_out);
+/* Open-file holds so unlink of the last name keeps the inode until the last close. */
+int aios_posix_hold(aios_posix_fs* fs, uint64_t ino);
+int aios_posix_rele(aios_posix_fs* fs, uint64_t ino);
 int aios_posix_unlink(aios_posix_fs* fs, uint64_t parent, const char* name);
 int aios_posix_rmdir(aios_posix_fs* fs, uint64_t parent, const char* name);
 

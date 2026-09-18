@@ -492,6 +492,11 @@ void ll_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     }
     fi->fh = ino;
     fi->keep_cache = 1;
+    rc = aios_posix_hold(fs, ino);
+    if (rc) {
+      reply_err(req, rc);
+      return;
+    }
     fuse_reply_open(req, fi);
   });
 }
@@ -558,6 +563,7 @@ void ll_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     if (flock_owners().note_unlocked(file, fi->lock_owner)) {
       (void)aios_posix_flock(fs, file, LOCK_UN);
     }
+    (void)aios_posix_rele(fs, file);
     reply_err(req, rc);
   });
 }
@@ -858,6 +864,11 @@ void ll_create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode,
     }
     fi->fh = st.ino;
     fi->keep_cache = 1;
+    rc = aios_posix_hold(fs, st.ino);
+    if (rc) {
+      reply_err(req, rc);
+      return;
+    }
     Entry e{};
     fill_entry(&e, st);
     fuse_reply_create(req, &e, fi);

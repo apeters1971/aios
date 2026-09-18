@@ -488,7 +488,7 @@ struct FsState {
   uint32_t default_gid{0};
   std::string frontend_label{"fs"};  // s3 | fs | custom (for IO monitoring)
   std::mutex mu;  // super, inode_cache, flock_tokens, rstat_dirty, dir_cache, dirty_sizes,
-                  // unpublished_dropped. Never take chunk_lock or dirty_chunk_mu while
+                  // unpublished_dropped, open_count. Never take chunk_lock or dirty_chunk_mu while
                   // holding mu if the other holder might take mu (writers take chunk_lock
                   // then dirty_chunk_mu, then release both before mu).
   SuperMeta super;
@@ -518,6 +518,8 @@ struct FsState {
   // Created under a lease then unlinked (or rmdir'd) before the flusher PUT.
   // publish_inodes must not recreate the object.
   std::unordered_set<uint64_t> unpublished_dropped;
+  // FUSE open files. Unlink at nlink 0 keeps chunks until the last hold drops.
+  std::unordered_map<uint64_t, uint32_t> open_count;
   // Locally reserved inode numbers [ino_next, ino_end); under mu.
   uint64_t ino_next{0};
   uint64_t ino_end{0};
@@ -605,6 +607,8 @@ uint64_t alloc_ino(FsState& st);
 void ensure_super(FsState& st);
 void ensure_root(FsState& st);
 void drop_nlink(FsState& st, uint64_t ino);
+void inode_hold(FsState& st, uint64_t ino);
+void inode_rele(FsState& st, uint64_t ino);
 void release_all_flocks(FsState& st);
 
 int read_file(FsState& st, uint64_t ino, uint64_t offset, void* buf, size_t len, size_t* out_len);
