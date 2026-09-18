@@ -46,7 +46,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aiosd` | Cluster daemon (gossip, storage targets, object RPC, HTTP + optional S3 API, repair) |
 | `aios` | Thin HTTP client (put/get/del/stat/list/map/admin; follows `307`) |
 | `aios-bench` | Multithreaded HTTP create/update/read benchmark |
-| `aios-store-bench` | Local hybrid-store microbenchmark (no cluster) |
+| `aios-store-bench` | Local store microbenchmark (SQLite + packed segments; no cluster) |
 | `libaios_client` | STL-like persistent C++ API (`string` / `map` / `unordered_map` / `set` / `list` / `deque` / `mutex`) |
 | `libaios_posix` | C ABI POSIX filesystem over objects (inode 1 = `/`, striped files, changelog dirs) |
 | `aios-fuse` | FUSE3 mount of `libaios_posix` (inode API, writeback; built when `libfuse3` is found) |
@@ -56,7 +56,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/archive.md`](proto/archive.md) / [`proto/backup.md`](proto/backup.md) (cold archive & backup), [`proto/quota.md`](proto/quota.md) / [`proto/qos.md`](proto/qos.md) (quotas & QoS), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/archive.md`](proto/archive.md) / [`proto/backup.md`](proto/backup.md) (cold archive & backup), [`proto/quota.md`](proto/quota.md) / [`proto/qos.md`](proto/qos.md) (quotas & QoS), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE). Architecture slides: [`docs/AIOS-architecture-slides.html`](docs/AIOS-architecture-slides.html).
 
 ---
 
@@ -171,6 +171,20 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 4. Reads go to the primary (or any node that can reconstruct EC); wrong node → HTTP **307** with `Location`.
 5. Optional **transition** workers move tips between classes under `transition_rules`.
 
+Each `…/aios/` target is the local engine, not a second cluster. SQLite owns the map;
+the NVMe side is a packed body log (see [Local object store](#local-object-store)):
+
+```text
+  oid ──► shard (low bits of SHA-256(oid))
+            ├── meta.sqlite     tips, versions, attrs, deltas, placement
+            ├── segments/*.seg  packed bodies ≤ seg_max_record (16 MiB)
+            └── objects/…       standalone files when larger (or force_mode=fs)
+
+  GET        STAT in SQLite, then pread the locator (`get_many` → io_uring)
+  put_range  SQLite deltas over the immutable packed or FS base
+  replica    appends to its own log; peer locators are never reused
+```
+
 ---
 
 ## Build
@@ -199,7 +213,7 @@ Optional (auto-detected; each prints a `-- <dep>: enabled|not found` line at con
 | NVIDIA cuObjServer SDK | S3 GPUDirect / RDMA offload | `AIOS_WITH_CUOBJECT`, `CUOBJECT_ROOT` |
 | AlmaLinux 9 `kernel-devel` | `aios_http.ko` / `aiosfs.ko` / `aiosvd.ko` (separate `make -C kernel`) | — |
 
-**Linux** (Debian/Ubuntu package names; el9: `boost-devel openssl-devel sqlite-devel libzstd-devel fuse3-devel`):
+**Linux** (Debian/Ubuntu package names; el9: `boost-devel openssl-devel sqlite-devel libzstd-devel fuse3-devel`; optional `liburing-dev`):
 
 ```bash
 sudo apt-get install -y cmake ninja-build g++ pkg-config \
@@ -720,7 +734,7 @@ Details: [`proto/s3.md`](proto/s3.md).
 
 ## Local object store
 
-Each `…/aios/` target holds a sharded hybrid store:
+Each `…/aios/` target holds a sharded store (SQLite metadata + packed bodies):
 
 ```text
 aios/
@@ -736,8 +750,12 @@ aios/
 - **Shard** = low bits of `SHA-256(oid)` (`shard_count` power of two; default 256)
 - **Segment log** (`size ≤ seg_max_record`, default 16 MiB; `force_mode=auto` or `seg`):
   bodies packed into append-only `segments/*.seg`. SQLite stores a locator
-  `seg/<id>.seg:<off>:<len>`, not the bytes. `get_many` issues independent
-  preads (io_uring on Linux when liburing is present).
+  `seg/<id>.seg:<off>:<len>`, not the bytes. Location is per node, not a public
+  content hash. `get_many` issues independent preads (io_uring on Linux when
+  liburing is present). Replicas append to their own log; a peer-supplied
+  `fs_path` is never taken from the wire. Abort of an unpublished version
+  unlinks a standalone `objects/` file; packed records are left for later
+  segment GC (not implemented yet).
 - **Inline** (`force_mode=inline`): body BLOB in SQLite (comparison / tests)
 - **Filesystem** (`force_mode=fs`, or body larger than `seg_max_record`):
   one file per version under `objects/`
@@ -747,7 +765,8 @@ aios/
   after 64 patches, 1 MiB of patch bytes, or a single write larger than
   256 KiB. CRC32C is stored per 64 KiB block; a range write re-hashes only the
   blocks it touches. Replicas apply the same patch (`ObjectInstallRange`) and fall back
-  to a full-body install if their tip has diverged.
+  to a full-body install if their tip has diverged. `set_attr` on a packed
+  version shares the locator (the bytes are immutable).
 
 Objects larger than 256 KiB are streamed to disk on the HTTP path (default max 64 GiB via `max_object_bytes`).
 
@@ -1241,6 +1260,7 @@ Contributor workflow, style and commit conventions: [`CONTRIBUTING.md`](CONTRIBU
 | [`config/xrootd.aios.example.cf`](config/xrootd.aios.example.cf) | Example XRootD config for `libXrdAios` |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build, test, sanitizer presets, style, commit messages |
 | [`CHANGELOG.md`](CHANGELOG.md) | Unreleased fixes by area (OBJ-*, HTTP-*, STO-*, POS-*, KRN-*) |
+| [`docs/AIOS-architecture-slides.html`](docs/AIOS-architecture-slides.html) ([`.pptx`](docs/AIOS-architecture-slides.pptx)) | Architecture deck (cluster, packed store, HTTP/S3/POSIX/kernel, archive) |
 | [`docs/dev/`](docs/dev/) | Review audit trail (`CODE_REVIEW.md`) and development statistics (`STATS.md`) |
 
 Run the GoogleTest suite after changes — see [Testing & CI](#testing--ci).

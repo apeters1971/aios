@@ -214,7 +214,7 @@ Layout and class are stored on the version (`x-aios-attr-aios.layout`, `x-aios-a
 
 ### Large objects
 
-Full PUT/GET bodies are streamed to/from filesystem staging when larger than 256 KiB (no full-object RAM buffer on the server). Cap with config `max_object_bytes` (default 64 GiB). TCP++ frame size remains 16 MiB; replicas use chunked `ObjectStage*` messages.
+Full PUT/GET bodies are streamed to/from filesystem staging when larger than 256 KiB (no full-object RAM buffer on the server). Cap with config `max_object_bytes` (default 64 GiB). TCP++ frame size remains 16 MiB; replicas use chunked `ObjectStage*` messages. After staging, the local store packs bodies ≤ 16 MiB (`seg_max_record`) into append-only `segments/*.seg`; larger bodies stay one file under `objects/`. Replica installs pack locally — locators are not replicated. See the README [Local object store](../README.md#local-object-store).
 
 ### Wrong-node routing
 
@@ -226,7 +226,7 @@ Mutating requests on a non-primary return **307** with:
 
 ### Versions
 
-Every successful mutating write creates an immutable `seq` (uint64). Responses include `x-aios-version: {seq}`. Tip GET/HEAD/DELETE (without `version`) operate on the highest non-deleted tip, or a delete-marker tip after `DELETE`. Large (FS) versions use clone/COW (`FICLONE` / `clonefile`); set `clone_required: false` to allow full-copy fallback. Config: `max_versions` (default 16).
+Every successful mutating write creates an immutable `seq` (uint64). Responses include `x-aios-version: {seq}`. Tip GET/HEAD/DELETE (without `version`) operate on the highest non-deleted tip, or a delete-marker tip after `DELETE`. Packed-segment versions share the locator (bytes are immutable). Standalone filesystem versions use clone/COW (`FICLONE` / `clonefile`); set `clone_required: false` to allow full-copy fallback. Config: `max_versions` (default 16).
 
 ### Redirects
 
@@ -315,7 +315,7 @@ Subscribe long-polls use worker threads (same as watches).
 
 ### Partial PUT (random overwrite)
 
-`Content-Range: bytes 1000-1999/*` with body length 1000 writes at offset 1000, growing the object; holes are sparse zeros. Always FS-backed.
+`Content-Range: bytes 1000-1999/*` with body length 1000 writes at offset 1000, growing the object; holes are sparse zeros. Recorded as a SQLite delta over the packed or filesystem base (same as TCP++ `ObjectPutRange`); the chain is folded into a new body after 64 patches, 1 MiB of patch bytes, or a write larger than 256 KiB.
 
 ### Atomic append
 

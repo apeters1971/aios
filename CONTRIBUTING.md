@@ -15,6 +15,7 @@ Requirements and platform notes are in [README → Build](README.md#build). Shor
 ```bash
 # Linux
 sudo apt-get install -y cmake ninja-build g++ pkg-config libboost-dev libssl-dev libsqlite3-dev libzstd-dev libfuse3-dev
+# optional: liburing-dev  (batched body-log reads; AIOS_WITH_LIBURING)
 # macOS
 brew install cmake boost openssl@3 sqlite zstd isa-l pkg-config
 
@@ -27,7 +28,7 @@ ctest --preset default
 (`AIOS_WERROR`, `AIOS_SANITIZE`), `macos-homebrew.cmake` (prefix discovery) and
 `aios_version.hpp.in` (generated into `<build>/generated/include/aios_version.hpp`).
 
-Optional components (`libXrdAios`, `aios-fuse` / `aios-fusell`, ISA-L, zstd, cuObject) are auto-detected and
+Optional components (`libXrdAios`, `aios-fuse` / `aios-fusell`, ISA-L, zstd, liburing, cuObject) are auto-detected and
 print one status line each; see the README for `-DXRootD_ROOT=…` and the `AIOS_WITH_*` switches.
 Third-party sources are pinned to commit hashes in `CMakeLists.txt`; bump the hash and the
 comment together.
@@ -88,6 +89,8 @@ AlmaLinux 9 `kernel-devel` with `KCFLAGS=-Werror`. A PR should be green on `linu
 - Kernel modules: follow Linux kernel coding style, keep stack frames under 2 KiB
   (`CONFIG_FRAME_WARN`), and build against el9 `kernel-devel` before pushing.
 - Protocol or on-disk changes must update the matching `proto/*.md` in the same commit.
+  Cluster or local-store picture changes also update [`docs/AIOS-architecture-slides.html`](docs/AIOS-architecture-slides.html)
+  and the README Architecture / Local object store sections.
 
 ## Commit messages
 
@@ -117,4 +120,4 @@ Parse only the digits of aiosvd header integers so remapping an existing volume 
 | `tests/` | GoogleTest suite |
 | `config/` | Example configs |
 | `cmake/` | Build helpers |
-| `docs/dev/` | Review audit trail and development statistics |
+| `docs/` | Architecture slides (`AIOS-architecture-slides.html`) and `docs/dev/` audit trail |

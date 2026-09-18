@@ -35,9 +35,9 @@ Maximum frame body size: 16 MiB (object payloads may exceed this via staging).
 | 14   | ObjectAbortVersion | drop unpublished / non-tip `seq` |
 | 15   | ObjectListVersions | list versions for oid |
 | 16   | ObjectPurgeVersions | trim (`keep`) or purge one `seq` |
-| 17   | ObjectStageBegin | start FS body staging for replica install |
+| 17   | ObjectStageBegin | start body staging for replica install (temp file) |
 | 18   | ObjectStageData | raw chunk (`kFlagRawBody`); JSON has `offset` |
-| 19   | ObjectStageCommit | place staged file → `install_version` |
+| 19   | ObjectStageCommit | stage → `install_version` (pack into the local segment log) |
 | 20   | ObjectList | list tip objects on one node (scatter-gather leaf) |
 | 21   | MapRpc | cluster-map consensus (vote / append); reply is ObjectReply |
 | 22   | ObjectInstallRange | replica re-applies a ranged write over its tip (raw body = the write) |
@@ -143,6 +143,7 @@ Clients compute `place(oid)` from the cluster map and send mutating ops to the *
 ```
 
 `role` is `primary` (prepare → quorum install → publish) or `replica` with `seq` (install unpublished version only). Replica install fields: `seq`, `base_seq`, `size`, `inline_body`, `fs_path`, `is_delete`, `redirect`, `crc32c`.
+`fs_path` is never taken from the wire (a peer path would be a traversal vector). The receiving store appends the body to its own packed segment log (or writes a standalone `objects/` file when larger than `seg_max_record`); `inline_body` on the wire does not force a SQLite BLOB.
 Optional `crc32c` is verified against the body before accept; replicas should send it.
 Optional `layout` / `ec_k` / `ec_m` / `ec_codec` select per-version durability (same semantics as HTTP `x-aios-*` headers; omit → cluster defaults). See [`layout.md`](layout.md).
 Reply may include `seq`. Set `"redirect":"other-oid"` (no `data_b64`) to create a redirect version.
@@ -190,7 +191,7 @@ Optional `seq` selects a version for Get/Stat. `ObjectDel` prepares a delete-mar
 { "epoch": 1, "aios_path": "/data/aios", "oid": "my-object", "seq": 3, "role": "replica" }
 ```
 
-Publish moves tip to `seq` (then trims to `max_versions`). Abort drops an unpublished (or non-tip) version and unlinks its FS body.
+Publish moves tip to `seq` (then trims to `max_versions`). Abort drops an unpublished (or non-tip) version and unlinks a standalone `objects/` file. Packed `seg/…` locators are not unlinked; dead bytes wait for segment GC.
 
 ### ObjectListVersions / ObjectPurgeVersions
 

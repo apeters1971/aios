@@ -130,5 +130,6 @@ Do **not** transition 1:1 onto tape. For cold data, use [`archive.md`](archive.m
 
 - HTTP API: [`http.md`](http.md)
 - TCP++ wire format: [`README.md`](README.md)
+- Local store (SQLite metadata + packed segments): [README → Local object store](../README.md#local-object-store)
 - Admin: [`admin.md`](admin.md)
 - Cold archive: [`archive.md`](archive.md)
