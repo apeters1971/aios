@@ -12,6 +12,17 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — small object bodies leave SQLite
+
+Random GETs of objects ≤ 16 MiB (`seg_max_record`) no longer copy bytes out of a
+SQLite BLOB or open a hashed per-version file. Bodies are appended to large
+`segments/*.seg` files; the version row stores `seg/<id>.seg:<off>:<len>`.
+Tips, attrs, versions, prefix list, and placement stay in SQLite. `put_range`
+still records SQLite deltas over that immutable base (no extent map, no RMW of
+the whole object). `ObjectStore::get_many` batches the packed reads (io_uring
+when liburing is available). `force_mode=inline|fs` keeps the old paths for
+benchmarks; `aios-store-bench --mode all --sizes 256,4k,64k` compares them.
+
 ### Changed — `aios-fuse` uses the inode API so writeback and hard links agree
 
 High-level libfuse gives each hard-link name its own nodeid. Writeback then makes the kernel

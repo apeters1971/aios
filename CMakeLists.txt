@@ -185,6 +185,31 @@ if(AIOS_WITH_ZSTD)
   endif()
 endif()
 
+# Optional liburing for batched NVMe reads on Linux.
+option(AIOS_WITH_LIBURING "Enable io_uring for the local body log when liburing is found" ON)
+set(AIOS_HAVE_LIBURING OFF)
+if(AIOS_WITH_LIBURING)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LIBURING QUIET IMPORTED_TARGET liburing)
+  endif()
+  if(TARGET PkgConfig::LIBURING)
+    set(AIOS_HAVE_LIBURING ON)
+    message(STATUS "liburing: enabled (pkg-config)")
+  else()
+    find_path(LIBURING_INCLUDE_DIR NAMES liburing.h
+      PATHS ${AIOS_HOMEBREW_PREFIX}/include /usr/local/include /usr/include)
+    find_library(LIBURING_LIBRARY NAMES uring
+      PATHS ${AIOS_HOMEBREW_PREFIX}/lib /usr/local/lib /usr/lib)
+    if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+      set(AIOS_HAVE_LIBURING ON)
+      message(STATUS "liburing: enabled (${LIBURING_LIBRARY})")
+    else()
+      message(STATUS "liburing: not found (POSIX pread/pwrite for body log)")
+    endif()
+  endif()
+endif()
+
 add_compile_options(-Wall -Wextra -Wpedantic)
 aios_apply_werror()   # -Werror only for AIOS targets (declared below), never for _deps
 
@@ -208,6 +233,8 @@ add_library(aios_core STATIC
   src/util/ticket.cpp
   src/util/write_grant.cpp
   src/store/object_store.cpp
+  src/store/body_log.cpp
+  src/store/io_engine.cpp
   src/store/fs_clone.cpp
   src/store/local_stores.cpp
   src/cluster/cluster_map.cpp
@@ -282,6 +309,15 @@ if(AIOS_HAVE_ZSTD)
   else()
     target_include_directories(aios_core PUBLIC ${ZSTD_INCLUDE_DIR})
     target_link_libraries(aios_core PUBLIC ${ZSTD_LIBRARY})
+  endif()
+endif()
+if(AIOS_HAVE_LIBURING)
+  target_compile_definitions(aios_core PUBLIC AIOS_HAVE_LIBURING=1)
+  if(TARGET PkgConfig::LIBURING)
+    target_link_libraries(aios_core PUBLIC PkgConfig::LIBURING)
+  else()
+    target_include_directories(aios_core PUBLIC ${LIBURING_INCLUDE_DIR})
+    target_link_libraries(aios_core PUBLIC ${LIBURING_LIBRARY})
   endif()
 endif()
 
@@ -562,6 +598,7 @@ add_executable(aios_tests
   tests/test_auth.cpp
   tests/test_fs_clone.cpp
   tests/test_object_store.cpp
+  tests/test_body_log.cpp
   tests/test_cluster_map.cpp
   tests/test_map_monitor.cpp
   tests/test_placement.cpp
@@ -637,7 +674,7 @@ install(TARGETS aiosd aios aios-bench aios-store-bench RUNTIME DESTINATION ${CMA
 # aios_client and aios_posix are static and depend on aios_core (HTTP HMAC helpers,
 # config, JSON); install all three so the installed archives are linkable:
 #   -laios_posix -laios_client -laios_core + yaml-cpp, sqlite3, crypto, pthread
-#   (+ zstd / isal when enabled) — see README "STL-like C++ client → Build / link".
+#   (+ zstd / isal / uring when enabled) — see README "STL-like C++ client → Build / link".
 install(TARGETS aios_core aios_client aios_posix ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES src/posix/aios_posix.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)
 install(FILES kernel/aiosfs_uapi.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/aios)

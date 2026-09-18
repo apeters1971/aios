@@ -1,6 +1,8 @@
 #include "store/object_store.hpp"
 
+#include "store/body_log.hpp"
 #include "store/fs_clone.hpp"
+#include "store/io_engine.hpp"
 #include "util/crc32c.hpp"
 #include "util/file_io.hpp"
 #include "util/log.hpp"
@@ -17,6 +19,8 @@
 #include <fcntl.h>
 #include <chrono>
 #include <filesystem>
+#include <limits>
+#include <span>
 #include <sys/stat.h>
 #include <fstream>
 #include <iomanip>
@@ -261,8 +265,10 @@ void ObjectStore::close() {
       sqlite3_close(s->db);
       s->db = nullptr;
     }
+    s->body_log.reset();
   }
   shards_.clear();
+  io_.reset();
   root_.clear();
 }
 
@@ -530,10 +536,38 @@ bool ObjectStore::rollback(Shard& s) {
   return exec_db(s.db, "ROLLBACK;", err);
 }
 
+bool ObjectStore::use_segment(std::size_t len) const {
+  if (opts_.force_mode == "inline" || opts_.force_mode == "fs") return false;
+  if (len > opts_.segment_size) return false;
+  if (len > std::numeric_limits<std::uint32_t>::max()) return false;
+  if (opts_.force_mode == "seg") return true;
+  return len <= opts_.seg_max_record;
+}
+
 bool ObjectStore::use_inline(std::size_t len) const {
+  if (use_segment(len)) return false;
   if (opts_.force_mode == "inline") return true;
   if (opts_.force_mode == "fs") return false;
   return len <= opts_.inline_max_bytes;
+}
+
+bool ObjectStore::ensure_body_log(Shard& s, std::string& err) {
+  if (s.body_log) return true;
+  if (!io_) io_ = make_io_engine();
+  auto log = std::make_unique<BodyLog>();
+  if (!log->open(s.dir, io_.get(), opts_.data_fsync, opts_.segment_size, err)) return false;
+  s.body_log = std::move(log);
+  return true;
+}
+
+bool ObjectStore::append_segment_body(Shard& s, const std::uint8_t* data, std::size_t len,
+                                      std::string& loc_out, std::string& err) {
+  if (!ensure_body_log(s, err)) return false;
+  BodyLocation loc;
+  const std::span<const std::uint8_t> bytes(data, len);
+  if (!s.body_log->append(bytes, loc, err)) return false;
+  loc_out = format_segment_locator(loc);
+  return true;
 }
 
 std::string ObjectStore::version_relpath(const std::string& oid, std::uint64_t seq) const {
@@ -588,6 +622,8 @@ bool ObjectStore::load_or_init_layout(ObjectStoreOptions requested, std::string&
       opts_.delta_max_bytes = requested.delta_max_bytes;
       opts_.delta_max_write = requested.delta_max_write;
       opts_.verify_range_crc = requested.verify_range_crc;
+      opts_.segment_size = requested.segment_size;
+      opts_.seg_max_record = requested.seg_max_record;
       if (requested.shard_count != opts_.shard_count) {
         AIOS_LOG_WARN("ignoring requested shard_count=", requested.shard_count,
                       "; store.json has ", opts_.shard_count);
@@ -659,12 +695,14 @@ bool ObjectStore::open(const std::string& aios_root, ObjectStoreOptions opts, st
     return false;
   }
   shards_.resize(opts_.shard_count);
+  io_ = make_io_engine();
   if (!open_shard(0, err)) {
     close();
     return false;
   }
   AIOS_LOG_INFO("object store open root=", root_, " shards=", opts_.shard_count,
-                " inline_max=", opts_.inline_max_bytes, " max_versions=", opts_.max_versions);
+                " inline_max=", opts_.inline_max_bytes, " seg_max=", opts_.seg_max_record,
+                " io=", io_ ? io_->name() : "none", " max_versions=", opts_.max_versions);
   return true;
 }
 
@@ -1100,6 +1138,7 @@ bool ObjectStore::load_version_locked(Shard& s, const std::string& oid, std::uin
   out.delta = sqlite3_column_int(stmt, 8) != 0;
   if (!out.fs_path.empty()) out.inline_body = false;
   if (out.fs_path.empty()) out.delta = false;
+  out.segment_body = is_segment_locator(out.fs_path);
   return true;
 }
 
@@ -1243,6 +1282,31 @@ bool ObjectStore::read_version_range_locked(Shard& s, const ObjectInfo& info,
     std::memcpy(out, blob + offset, len);
     return true;
   }
+  if (is_segment_locator(info.fs_path)) {
+    BodyLocation loc;
+    if (!parse_segment_locator(info.fs_path, loc)) {
+      err = "invalid segment locator";
+      return false;
+    }
+    if (!ensure_body_log(s, err)) return false;
+    if (!info.delta) {
+      if (!s.body_log->read(loc, offset, len, out, err)) return false;
+      return true;
+    }
+    if (!s.body_log->read(loc, offset, len, out, err)) return false;
+    std::vector<Delta> deltas;
+    if (!load_deltas_locked(s, info.oid, info.fs_path, info.seq, deltas, err)) return false;
+    const std::uint64_t end = offset + len;
+    for (const auto& d : deltas) {
+      const std::uint64_t d_end = d.offset + d.data.size();
+      const std::uint64_t lo = std::max(offset, d.offset);
+      const std::uint64_t hi = std::min(end, d_end);
+      if (lo >= hi) continue;
+      std::memcpy(out + (lo - offset), d.data.data() + (lo - d.offset),
+                  static_cast<std::size_t>(hi - lo));
+    }
+    return true;
+  }
   if (!info.delta) {
     // A standalone body file must hold every byte of the version; a short read
     // means it was truncated or is being modified — never hand out zeros.
@@ -1337,6 +1401,7 @@ bool ObjectStore::delete_version_row_locked(Shard& s, const std::string& oid, st
     // Unlink it — and drop its patch rows — only once no version references it;
     // otherwise drop just this version's own patch when nothing newer on the
     // same file depends on it (abort of the newest delta; seq may be reused).
+    // Segment locators are never unlinked (GC rewrites live records later).
     sqlite3_stmt* ref = nullptr;
     if (sqlite3_prepare_v2(s.db,
                            "SELECT MAX(seq) FROM object_versions WHERE oid=?1 AND fs_path=?2;",
@@ -1376,7 +1441,7 @@ bool ObjectStore::delete_version_row_locked(Shard& s, const std::string& oid, st
         return false;
       }
     }
-    if (!referenced) fs_unlink_out.push_back(info.fs_path);
+    if (!referenced && !is_segment_locator(info.fs_path)) fs_unlink_out.push_back(info.fs_path);
   }
   return true;
 }
@@ -1505,8 +1570,15 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
   pv.is_delete = false;
   pv.block_crcs = std::move(body_blocks);
 
-  const bool as_inline = use_inline(len);
-  if (as_inline) {
+  const bool as_seg = use_segment(len);
+  const bool as_inline = !as_seg && use_inline(len);
+  if (as_seg) {
+    pv.inline_body = false;
+    if (!append_segment_body(s, data, len, pv.fs_path, err)) {
+      rollback(s);
+      return false;
+    }
+  } else if (as_inline) {
     pv.inline_body = true;
   } else {
     pv.inline_body = false;
@@ -1518,7 +1590,7 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
   }
 
   if (!insert_version_locked(s, pv, data, len, merged, err)) {
-    if (!pv.fs_path.empty()) {
+    if (!pv.fs_path.empty() && !is_segment_locator(pv.fs_path)) {
       std::string rm_err;
       remove_fs_object(s, pv.fs_path, rm_err);
     }
@@ -1527,7 +1599,7 @@ bool ObjectStore::prepare_put(const std::string& oid, const std::uint8_t* data, 
   }
 
   if (!commit(s, err)) {
-    if (!pv.fs_path.empty()) {
+    if (!pv.fs_path.empty() && !is_segment_locator(pv.fs_path)) {
       std::string rm_err;
       remove_fs_object(s, pv.fs_path, rm_err);
     }
@@ -1961,8 +2033,14 @@ bool ObjectStore::prepare_range_locked(
   pv.block_crcs = blocks;
 
   // --- Body placement.
-  const bool tip_is_file = tip_has_body && !tip_info.fs_path.empty();
-  bool use_delta = tip_is_file && opts_.delta_max_chain > 0 && len <= opts_.delta_max_write;
+  // Decision: keep SQLite version_deltas over an immutable base (file or
+  // segment record). Do not RMW a new full object for a 4 KiB overwrite, and
+  // do not introduce extent maps. Materialize by appending a new packed record
+  // (segments) or cloning a file (legacy FS bodies).
+  const bool tip_is_seg = tip_has_body && is_segment_locator(tip_info.fs_path);
+  const bool tip_is_file = tip_has_body && !tip_info.fs_path.empty() && !tip_is_seg;
+  bool use_delta =
+      (tip_is_file || tip_is_seg) && opts_.delta_max_chain > 0 && len <= opts_.delta_max_write;
   if (use_delta) {
     std::uint64_t dcount = 0, dbytes = 0;
     if (!delta_stats_locked(s, oid, tip_info.fs_path, dcount, dbytes, err)) return fail("");
@@ -1972,12 +2050,24 @@ bool ObjectStore::prepare_range_locked(
   }
 
   if (use_delta) {
-    // Patch row over the shared base file; no body I/O, no clone, no fsync
-    // beyond the SQLite commit.
+    // Patch row over the shared base (file or segment record); no body rewrite.
     pv.inline_body = false;
     pv.fs_path = tip_info.fs_path;
     pv.delta = true;
     if (!insert_delta_locked(s, oid, seq, pv.fs_path, offset, data, len, err)) return fail("");
+  } else if (tip_is_seg || use_segment(new_size)) {
+    // Immutable segment: read the logical tip, apply the patch, append a new record.
+    std::vector<std::uint8_t> body(static_cast<std::size_t>(new_size), 0);
+    if (tip_has_body && old_size > 0) {
+      if (!read_version_range_locked(s, tip_info, 0, static_cast<std::size_t>(old_size),
+                                     body.data(), err)) {
+        return fail("");
+      }
+    }
+    if (len > 0) std::memcpy(body.data() + offset, data, len);
+    pv.inline_body = false;
+    pv.delta = false;
+    if (!append_segment_body(s, body.data(), body.size(), pv.fs_path, err)) return fail("");
   } else if ((!tip_is_file) && use_inline(new_size)) {
     // Small body stays inline: build the new blob in memory.
     std::vector<std::uint8_t> body(static_cast<std::size_t>(new_size), 0);
@@ -2391,6 +2481,23 @@ bool ObjectStore::install_version(const PreparedVersion& v, const std::uint8_t* 
       return false;
     }
     if (!data_crc_ok()) return false;
+  } else if (is_segment_locator(pv.fs_path) || (data && use_segment(len))) {
+    // Replica must append to its own log; the primary's locator is not a file.
+    if (len != pv.size) {
+      rollback(s);
+      err = "install size mismatch";
+      return false;
+    }
+    if (pv.size > 0 && !(data && len > 0)) {
+      rollback(s);
+      err = "install missing segment body";
+      return false;
+    }
+    if (pv.size > 0 && !data_crc_ok()) return false;
+    if (!append_segment_body(s, data, len, pv.fs_path, err)) {
+      rollback(s);
+      return false;
+    }
   } else {
     if (!pv.fs_path.empty() && !relpath_ok(pv.fs_path)) {
       AIOS_LOG_WARN("install_version ", pv.oid, "@", pv.seq, ": ignoring unsafe fs_path '",
@@ -2782,12 +2889,87 @@ std::optional<std::vector<std::uint8_t>> ObjectStore::get_range(
   return out;
 }
 
+std::vector<std::optional<std::vector<std::uint8_t>>> ObjectStore::get_many(
+    const std::vector<std::string>& oids, std::string& err) {
+  err.clear();
+  std::vector<std::optional<std::vector<std::uint8_t>>> out(oids.size());
+  if (!is_open()) {
+    err = "store not open";
+    return out;
+  }
+  if (oids.empty()) return out;
+
+  struct SegRead {
+    std::size_t index{0};
+    Shard* shard{nullptr};
+    BodyLocation loc;
+  };
+  std::vector<SegRead> segs;
+  segs.reserve(oids.size());
+
+  for (std::size_t i = 0; i < oids.size(); ++i) {
+    std::string lerr;
+    auto info = stat(oids[i], std::nullopt, lerr);
+    if (!info) continue;
+    if (info->is_delete || !info->redirect_oid.empty()) continue;
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(info->size));
+    if (info->size == 0) {
+      out[i] = std::move(buf);
+      continue;
+    }
+    if (info->segment_body && !info->delta) {
+      BodyLocation loc;
+      if (!parse_segment_locator(info->fs_path, loc)) {
+        err = "invalid segment locator";
+        return out;
+      }
+      Shard* sp = shard_for(oids[i]);
+      if (!sp) {
+        err = "shard open failed";
+        return out;
+      }
+      {
+        std::lock_guard<std::recursive_mutex> guard(sp->mu);
+        if (!ensure_body_log(*sp, err)) return out;
+      }
+      out[i] = std::move(buf);
+      segs.push_back({i, sp, loc});
+      continue;
+    }
+    Shard* sp = shard_for(oids[i]);
+    if (!sp) {
+      err = "shard open failed";
+      return out;
+    }
+    std::lock_guard<std::recursive_mutex> guard(sp->mu);
+    if (!read_version_range_locked(*sp, *info, 0, buf.size(), buf.data(), err)) return out;
+    out[i] = std::move(buf);
+  }
+
+  std::unordered_map<Shard*, std::vector<std::size_t>> groups;
+  for (std::size_t j = 0; j < segs.size(); ++j) groups[segs[j].shard].push_back(j);
+  for (auto& [shard, idxs] : groups) {
+    std::vector<BodyLog::ReadOp> ops;
+    ops.reserve(idxs.size());
+    for (std::size_t j : idxs) {
+      BodyLog::ReadOp op;
+      op.loc = segs[j].loc;
+      op.off = 0;
+      auto& buf = *out[segs[j].index];
+      op.buf = std::span<std::uint8_t>(buf.data(), buf.size());
+      ops.push_back(op);
+    }
+    if (!shard->body_log->read_many(ops, err)) return out;
+  }
+  return out;
+}
+
 std::optional<std::string> ObjectStore::fs_body_path(const std::string& oid,
                                                      std::optional<std::uint64_t> seq,
                                                      std::string& err) {
   auto info = stat(oid, seq, err);
   if (!info) return std::nullopt;
-  if (info->inline_body || info->fs_path.empty()) {
+  if (info->inline_body || info->fs_path.empty() || is_segment_locator(info->fs_path)) {
     err = "not fs-backed";
     return std::nullopt;
   }
@@ -2891,6 +3073,12 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
       inline_copy.assign(reinterpret_cast<const std::uint8_t*>(blob),
                          reinterpret_cast<const std::uint8_t*>(blob) + n);
     }
+  } else if (is_segment_locator(tip_info.fs_path)) {
+    // Immutable record: the new version shares the locator (and any delta chain).
+    pv.inline_body = false;
+    pv.fs_path = tip_info.fs_path;
+    pv.delta = tip_info.delta;
+    pv.block_crcs = tip_info.block_crcs;
   } else {
     pv.inline_body = false;
     pv.fs_path = version_relpath(oid, seq);
@@ -2916,7 +3104,7 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
   }
 
   if (!insert_version_locked(s, pv, inline_copy.data(), inline_copy.size(), attrs, err)) {
-    if (!pv.fs_path.empty()) {
+    if (!pv.fs_path.empty() && !is_segment_locator(pv.fs_path)) {
       std::string rm_err;
       remove_fs_object(s, pv.fs_path, rm_err);
     }
@@ -2924,7 +3112,7 @@ bool ObjectStore::set_attr(const std::string& oid, const std::string& key,
     return false;
   }
   if (!commit(s, err)) {
-    if (!pv.fs_path.empty()) {
+    if (!pv.fs_path.empty() && !is_segment_locator(pv.fs_path)) {
       std::string rm_err;
       remove_fs_object(s, pv.fs_path, rm_err);
     }
@@ -3690,7 +3878,7 @@ bool ObjectStore::recompute_crc32c(const std::string& oid, std::uint32_t& out_cr
   std::vector<std::uint32_t> blocks;
   if (info->size == 0) {
     out_crc = crc32c(nullptr, 0);
-  } else if (info->inline_body || info->delta) {
+  } else if (info->inline_body || info->delta || is_segment_locator(info->fs_path)) {
     auto data = get(oid, info->seq, err);
     if (!data) return false;
     blocks = crc32c_blocks(data->data(), data->size());

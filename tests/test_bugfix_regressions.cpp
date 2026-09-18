@@ -209,7 +209,8 @@ TEST(StoreRangeRegression, TruncatedBackingFileFailsInsteadOfReturningShortData)
   ObjectStore store;
   ObjectStoreOptions opts;
   opts.shard_count = 4;
-  opts.inline_max_bytes = 64;  // force an fs-backed body
+  opts.force_mode = "fs";  // this test truncates a standalone body file
+  opts.inline_max_bytes = 64;
   std::string err;
   ASSERT_TRUE(store.open(root.string(), opts, err)) << err;
 

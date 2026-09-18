@@ -557,11 +557,17 @@ TEST(Review2Store, InstallVersionIgnoresEscapingFsPath) {
     ASSERT_TRUE(st.publish_tip(oid, 1, err)) << err;
     auto info = st.stat(oid, err);
     ASSERT_TRUE(info.has_value()) << err;
-    EXPECT_EQ(info->fs_path.rfind("objects/", 0), 0u) << info->fs_path;
-    auto abs = st.fs_body_path(oid, err);
-    ASSERT_TRUE(abs.has_value()) << err;
-    const auto abs_canon = fs::weakly_canonical(*abs).string();
-    EXPECT_EQ(abs_canon.rfind(canon.string(), 0), 0u) << abs_canon;
+    EXPECT_EQ(info->fs_path.find(".."), std::string::npos) << info->fs_path;
+    EXPECT_NE(info->fs_path, evil);
+    if (info->segment_body) {
+      EXPECT_EQ(info->fs_path.rfind("seg/", 0), 0u) << info->fs_path;
+    } else {
+      EXPECT_EQ(info->fs_path.rfind("objects/", 0), 0u) << info->fs_path;
+      auto abs = st.fs_body_path(oid, err);
+      ASSERT_TRUE(abs.has_value()) << err;
+      const auto abs_canon = fs::weakly_canonical(*abs).string();
+      EXPECT_EQ(abs_canon.rfind(canon.string(), 0), 0u) << abs_canon;
+    }
     auto got = st.get(oid, err);
     ASSERT_TRUE(got.has_value()) << err;
     EXPECT_EQ(*got, body);

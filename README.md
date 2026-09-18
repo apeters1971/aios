@@ -100,7 +100,7 @@ Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto
 **Storage**
 
 - Discover mounts via top-level `.aios` markers (`storage_class` required); prepare `…/aios/` targets
-- Hybrid local store: SQLite metadata + inline or filesystem bodies, sharded by oid hash
+- Hybrid local store: SQLite metadata + packed segment bodies (or inline/FS), sharded by oid hash
 - Versioned objects (`max_versions`), attrs, ranged PUT/GET, delete markers, atomic append
 - Server-side **replica** or **erasure-coded** durability, with background repair
 - Optional **client I/O path** (`io_path: client`): clients write copies/shards; primary coordinates
@@ -193,6 +193,7 @@ Optional (auto-detected; each prints a `-- <dep>: enabled|not found` line at con
 |------------|---------|--------|
 | [ISA-L](https://github.com/intel/isa-l) | Reed–Solomon EC with `m > 1` (XOR `m = 1` always works) | `AIOS_WITH_ISAL` |
 | libzstd | `compression: zstd`, `bag_compression: zstd` | `AIOS_WITH_ZSTD` |
+| liburing | batched body-log reads via io_uring (Linux) | `AIOS_WITH_LIBURING` |
 | libfuse3 | `aios-fuse`, `aios-fusell` | `AIOS_WITH_FUSE` |
 | XRootD ≥ 5 | `libXrdAios.so` OSS plugin | `AIOS_WITH_XROOTD`, `XRootD_ROOT` |
 | NVIDIA cuObjServer SDK | S3 GPUDirect / RDMA offload | `AIOS_WITH_CUOBJECT`, `CUOBJECT_ROOT` |
@@ -726,18 +727,25 @@ aios/
   store.json                 # shard_count, inline_max_bytes (immutable after create)
   shards/
     0/ … ff/                 # hex shard ids (count is power of two)
-      meta.sqlite            # objects + attrs for this shard
-      objects/ab/cd/<hash>   # large bodies only
+      meta.sqlite            # tips, versions, attrs, deltas, placement
+      segments/*.seg         # packed bodies (default for ≤ seg_max_record, 16 MiB)
+      objects/ab/cd/<hash>   # oversized standalone bodies
       tmp/
 ```
 
 - **Shard** = low bits of `SHA-256(oid)` (`shard_count` power of two; default 256)
-- **Inline** (`size ≤ inline_max_bytes`, default 64 KiB): body BLOB in SQLite
-- **Filesystem**: large bodies on disk; metadata/attrs always in SQLite
-- **Ranged writes** on an FS tip are a delta (same base file + `version_deltas` patch
-  rows) so a 4 KiB overwrite does not clone or re-read the object. The chain is folded
-  into a new body file after 64 patches, 1 MiB of patch bytes, or a single write larger
-  than 256 KiB. CRC32C is stored per 64 KiB block; a range write re-hashes only the
+- **Segment log** (`size ≤ seg_max_record`, default 16 MiB; `force_mode=auto` or `seg`):
+  bodies packed into append-only `segments/*.seg`. SQLite stores a locator
+  `seg/<id>.seg:<off>:<len>`, not the bytes. `get_many` issues independent
+  preads (io_uring on Linux when liburing is present).
+- **Inline** (`force_mode=inline`): body BLOB in SQLite (comparison / tests)
+- **Filesystem** (`force_mode=fs`, or body larger than `seg_max_record`):
+  one file per version under `objects/`
+- **Ranged writes** on a packed or FS tip are a SQLite delta (same base +
+  `version_deltas` patch rows) so a 4 KiB overwrite does not rewrite the
+  object. The chain is folded into a new body (new segment record or file)
+  after 64 patches, 1 MiB of patch bytes, or a single write larger than
+  256 KiB. CRC32C is stored per 64 KiB block; a range write re-hashes only the
   blocks it touches. Replicas apply the same patch (`ObjectInstallRange`) and fall back
   to a full-body install if their tip has diverged.
 
@@ -785,12 +793,16 @@ Follows `307` redirects. Put/get stream file bytes (no full-object client buffer
 
 The object store engine alone: no daemon, no HTTP, no replication. What one primary gets from
 one store on one disk. `--mode` picks the body path (`inline` = SQLite BLOB, `fs` = file per
-version), `--op` the workload, `--threads` the concurrency (each worker on its own objects;
-shards are locked independently). Every op is timed: ops/s, MiB/s, p50 and p99 per phase.
+version, `seg` = packed segment log, `all` = all three). `--op put` times put, **stat**, get,
+and del so SQLite metadata cost is visible separately from body I/O. `--sizes 256,4k,64k`
+runs the same mix at several object sizes.
 
 ```bash
-# full-object put / get / del (default), both body paths
+# full-object put / stat / get / del, both legacy body paths
 ./build/aios-store-bench --root /tmp/aios-bench --mode both --shards 16 --count 1000
+# packed segments vs SQLite BLOB vs files at several sizes (engine cost only)
+./build/aios-store-bench --root /tmp/aios-bench --mode all --op put --threads 8 --count 2000 \
+    --sizes 256,4k,64k --no-fsync
 # concurrent 4 KiB random writes + reads inside 1 MiB objects, then appends; engine cost only
 ./build/aios-store-bench --root /tmp/aios-bench --mode fs --op all --threads 8 --count 4000 \
     --large-size 1048576 --io-size 4096 --no-fsync

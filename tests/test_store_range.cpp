@@ -223,6 +223,7 @@ TEST(StoreRange, SparseHoleAndAbortKeepsSharedBase) {
   opts.clone_required = false;
   opts.verify_range_crc = true;
   opts.data_fsync = false;
+  opts.force_mode = "fs";  // this test asserts the standalone base file survives abort
   std::string err;
   ASSERT_TRUE(store.open(root.string(), opts, err)) << err;
 

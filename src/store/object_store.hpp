@@ -1,5 +1,8 @@
 #pragma once
 
+#include "store/body_log.hpp"
+#include "store/io_engine.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -16,16 +19,22 @@ namespace aios {
 struct ObjectStoreOptions {
   std::uint32_t shard_count{256};
   std::size_t inline_max_bytes{64 * 1024};
-  std::string force_mode{"auto"};  // "auto" | "inline" | "fs"
+  std::string force_mode{"auto"};  // "auto" | "inline" | "fs" | "seg"
+  // auto: bodies <= seg_max_record go to append-only segment files (not SQLite
+  // BLOBs). Larger bodies stay one filesystem file per version. "seg" packs
+  // every body that fits in segment_size. "inline" keeps the SQLite BLOB path
+  // for comparison/tests.
+  std::uint64_t segment_size{1ULL << 30};
+  std::size_t seg_max_record{16 * 1024 * 1024};
   // Retain newest N versions per oid after publish (2B).
   int max_versions{16};
   // If true, FS COW requires reflink/clone; if false, allow full-copy fallback.
   bool clone_required{true};
   // When false, skip body/dir fsync and use SQLite synchronous=OFF (dev/bench only).
   bool data_fsync{true};
-  // Ranged writes on FS-backed tips are recorded as deltas (base file + patch
-  // rows in SQLite) instead of cloning and rewriting the body. A chain is
-  // materialized into a fresh body file once it holds delta_max_chain patches,
+  // Ranged writes on a packed-segment or FS tip are recorded as deltas (shared
+  // base + patch rows in SQLite) instead of rewriting the body. A chain is
+  // materialized into a fresh body once it holds delta_max_chain patches,
   // delta_max_bytes patch bytes, or when a single write exceeds delta_max_write.
   // delta_max_chain = 0 disables deltas (every range write clones the tip).
   std::uint32_t delta_max_chain{64};
@@ -50,6 +59,8 @@ struct ObjectInfo {
   std::uint64_t size{0};
   bool inline_body{false};
   std::string fs_path;
+  // True when fs_path is a segment locator (seg/<id>.seg:<off>:<len>).
+  bool segment_body{false};
   std::int64_t ctime_ms{0};
   std::int64_t mtime_ms{0};  // same as version ctime for immutable versions
   std::uint32_t crc32c{0};
@@ -265,6 +276,11 @@ class ObjectStore {
                                                      std::uint64_t offset, std::size_t len,
                                                      std::string& err);
 
+  // Resolve every oid, then issue independent body reads (io_uring batch when
+  // available). Missing objects are nullopt; a hard I/O error sets err.
+  std::vector<std::optional<std::vector<std::uint8_t>>> get_many(
+      const std::vector<std::string>& oids, std::string& err);
+
   std::optional<std::string> fs_body_path(const std::string& oid, std::string& err) {
     return fs_body_path(oid, std::nullopt, err);
   }
@@ -340,6 +356,7 @@ class ObjectStore {
     sqlite3_stmt* stmt_get_inline{nullptr};
     sqlite3_stmt* stmt_load_deltas{nullptr};
     sqlite3_stmt* stmt_delta_stats{nullptr};
+    std::unique_ptr<BodyLog> body_log;
   };
 
   Shard* shard_for(const std::string& oid);
@@ -352,6 +369,10 @@ class ObjectStore {
   static bool migrate_legacy_if_needed(sqlite3* db, const std::string& shard_dir,
                                        std::string& err);
   bool use_inline(std::size_t len) const;
+  bool use_segment(std::size_t len) const;
+  bool ensure_body_log(Shard& s, std::string& err);
+  bool append_segment_body(Shard& s, const std::uint8_t* data, std::size_t len,
+                           std::string& loc_out, std::string& err);
 
   std::string version_relpath(const std::string& oid, std::uint64_t seq) const;
   // A body relpath must stay inside shard.dir: relative, no leading "..".
@@ -431,6 +452,7 @@ class ObjectStore {
   std::string root_;
   ObjectStoreOptions opts_;
   std::vector<std::unique_ptr<Shard>> shards_;
+  std::unique_ptr<IoEngine> io_;
   // Guards lazy open_shard; shard ops themselves use Shard::mu.
   mutable std::mutex open_mu_;
 };

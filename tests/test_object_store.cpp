@@ -34,7 +34,8 @@ TEST(ObjectStore, Basic) {
     EXPECT_TRUE(store.put("small-1", std::string(32, 'x'), attrs, true, err)) << "put small";
     auto info = store.stat("small-1", err);
     EXPECT_TRUE(info.has_value()) << "stat small";
-    EXPECT_TRUE(info && info->inline_body) << "small is inline";
+    EXPECT_TRUE(info && info->segment_body) << "small is packed in a segment";
+    EXPECT_TRUE(info && !info->inline_body) << "small is not a SQLite BLOB";
     EXPECT_TRUE(info && info->size == 32) << "small size";
     EXPECT_TRUE(info && info->shard < 8) << "shard in range";
 
@@ -48,14 +49,9 @@ TEST(ObjectStore, Basic) {
     const std::string big(2048, 'y');
     EXPECT_TRUE(store.put("big-1", big, {{"kind", "big"}}, true, err)) << "put big";
     auto info = store.stat("big-1", err);
-    EXPECT_TRUE(info.has_value() && info && !info->inline_body) << "big on fs";
-    EXPECT_TRUE(info && !info->fs_path.empty()) << "fs_path set";
-    if (info) {
-      char buf[16];
-      std::snprintf(buf, sizeof(buf), "%x", info->shard);
-      const auto path = fs::path(store.root()) / "shards" / buf / info->fs_path;
-      EXPECT_TRUE(fs::is_regular_file(path)) << "fs body file exists";
-    }
+    EXPECT_TRUE(info.has_value() && info && info->segment_body) << "2 KiB still packed (seg_max 16 MiB)";
+    EXPECT_TRUE(info && !info->inline_body) << "not a SQLite BLOB";
+    EXPECT_TRUE(info && !info->fs_path.empty()) << "segment locator set";
 
     auto body = store.get("big-1", err);
     EXPECT_TRUE(body && body->size() == 2048) << "get big";

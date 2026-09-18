@@ -371,12 +371,17 @@ TEST(Review2Object, ReplicaPutIgnoresWireFsPath) {
   ASSERT_TRUE(info.has_value()) << err;
   EXPECT_EQ(info->size, data.size());
   EXPECT_EQ(info->fs_path.find(".."), std::string::npos) << info->fs_path;
-  auto body_path = store->fs_body_path(oid, 1, err);
-  ASSERT_TRUE(body_path.has_value()) << err;
-  const auto canon = std::filesystem::weakly_canonical(*body_path);
-  const auto root = std::filesystem::weakly_canonical(target);
-  EXPECT_EQ(canon.string().rfind(root.string(), 0), 0u) << canon << " not under " << root;
-  EXPECT_TRUE(std::filesystem::exists(canon));
+  EXPECT_NE(info->fs_path, "../../../../tmp/aios-r2-escaped");
+  if (info->segment_body) {
+    EXPECT_EQ(info->fs_path.rfind("seg/", 0), 0u) << info->fs_path;
+  } else {
+    auto body_path = store->fs_body_path(oid, 1, err);
+    ASSERT_TRUE(body_path.has_value()) << err;
+    const auto canon = std::filesystem::weakly_canonical(*body_path);
+    const auto root = std::filesystem::weakly_canonical(target);
+    EXPECT_EQ(canon.string().rfind(root.string(), 0), 0u) << canon << " not under " << root;
+    EXPECT_TRUE(std::filesystem::exists(canon));
+  }
   EXPECT_FALSE(std::filesystem::exists("/tmp/aios-r2-escaped"));
 }
 

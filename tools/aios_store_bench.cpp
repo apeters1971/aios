@@ -9,7 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
+#include <cctype>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
@@ -26,7 +26,7 @@ namespace {
 
 struct BenchArgs {
   std::string root;
-  std::string mode{"both"};  // inline | fs | both
+  std::string mode{"both"};  // inline | fs | seg | both | all
   std::string op{"put"};     // put | range | append | all
   std::uint32_t shards{16};
   std::size_t count{1000};
@@ -37,6 +37,8 @@ struct BenchArgs {
   unsigned threads{1};
   bool fsync{true};
   bool keep{false};
+  bool with_stat{true};
+  std::vector<std::size_t> sizes;  // if set, run put at each size (stat+get)
 };
 
 void usage() {
@@ -44,22 +46,26 @@ void usage() {
       << "usage: aios-store-bench --root DIR [options]\n"
       << "\n"
       << "Benchmark the local AIOS object store engine (no daemon, no network, no\n"
-      << "replication): SQLite inline bodies vs filesystem bodies.\n"
+      << "replication): SQLite inline BLOBs vs one-file-per-version vs packed segments.\n"
       << "\n"
       << "  --root DIR          working directory (created; contains aios/)\n"
-      << "  --mode inline|fs|both   body path to measure (default both)\n"
+      << "  --mode inline|fs|seg|both|all\n"
+      << "                      body path to measure (default both = inline+fs).\n"
+      << "                      all = inline+fs+seg. seg = append-only segment files.\n"
       << "  --op put|range|append|all\n"
-      << "                      put:    full-object put, get, del (default)\n"
+      << "                      put:    full-object put, stat, get, del (default)\n"
       << "                      range:  random --io-size writes then reads inside\n"
       << "                              existing objects of the mode's size\n"
       << "                      append: --io-size appends to one log per thread\n"
       << "  --threads N         concurrent workers, each on its own objects (default 1)\n"
       << "  --shards N          shard count, power of two (default 16)\n"
       << "  --count N           ops per phase per mode, split across threads (default 1000)\n"
-      << "  --small-size N      inline object bytes (default 256)\n"
+      << "  --small-size N      inline/seg object bytes (default 256)\n"
       << "  --large-size N      filesystem object bytes (default 262144)\n"
+      << "  --sizes N,N,…       extra put+stat+get sizes (e.g. 256,4k,64k,1M); implies --op put\n"
       << "  --io-size N         range / append I/O bytes (default 4096)\n"
       << "  --inline-max N      store inline_max_bytes (default 65536)\n"
+      << "  --no-stat           skip the STAT phase on --op put\n"
       << "  --no-fsync          skip body/dir fsync, SQLite synchronous=OFF (engine cost only)\n"
       << "  --keep              do not delete the bench directory\n";
 }
@@ -78,6 +84,24 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       const char* v = need(name);
       if (!v) return false;
       out = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+      return true;
+    };
+    auto parse_size = [](std::string s, std::size_t& out) -> bool {
+      if (s.empty()) return false;
+      std::uint64_t mul = 1;
+      const char last = static_cast<char>(std::tolower(static_cast<unsigned char>(s.back())));
+      if (last == 'k') {
+        mul = 1024;
+        s.pop_back();
+      } else if (last == 'm') {
+        mul = 1024ull * 1024ull;
+        s.pop_back();
+      }
+      if (s.empty()) return false;
+      char* end = nullptr;
+      const auto n = std::strtoull(s.c_str(), &end, 10);
+      if (end == s.c_str() || *end != '\0') return false;
+      out = static_cast<std::size_t>(n * mul);
       return true;
     };
     if (arg == "--help" || arg == "-h") {
@@ -114,6 +138,25 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
       if (!num("--io-size", a.io_size)) return false;
     } else if (arg == "--inline-max") {
       if (!num("--inline-max", a.inline_max)) return false;
+    } else if (arg == "--sizes") {
+      const char* v = need("--sizes");
+      if (!v) return false;
+      std::string rest = v;
+      std::size_t pos = 0;
+      while (pos < rest.size()) {
+        const auto comma = rest.find(',', pos);
+        const auto tok = rest.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        std::size_t n = 0;
+        if (!parse_size(tok, n) || n == 0) {
+          std::cerr << "bad --sizes token: " << tok << "\n";
+          return false;
+        }
+        a.sizes.push_back(n);
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
+    } else if (arg == "--no-stat") {
+      a.with_stat = false;
     } else if (arg == "--no-fsync") {
       a.fsync = false;
     } else if (arg == "--keep") {
@@ -127,8 +170,9 @@ bool parse_args(int argc, char** argv, BenchArgs& a) {
     std::cerr << "--root is required\n";
     return false;
   }
-  if (a.mode != "inline" && a.mode != "fs" && a.mode != "both") {
-    std::cerr << "--mode must be inline|fs|both\n";
+  if (a.mode != "inline" && a.mode != "fs" && a.mode != "seg" && a.mode != "both" &&
+      a.mode != "all") {
+    std::cerr << "--mode must be inline|fs|seg|both|all\n";
     return false;
   }
   if (a.op != "put" && a.op != "range" && a.op != "append" && a.op != "all") {
@@ -230,6 +274,17 @@ void run_put(aios::ObjectStore& store, const BenchArgs& a, const std::string& pr
                           if (!b.empty()) b[0] = static_cast<std::uint8_t>(i & 0xff);
                           return store.put(oid(i), b.data(), b.size(), attrs, true, err);
                         }));
+  if (a.with_stat) {
+    print_phase(run_phase("stat", a.threads, a.count, 0,
+                          [&](unsigned, std::size_t i, std::string& err) {
+                            auto st = store.stat(oid(i), err);
+                            if (!st || st->size != obj_size) {
+                              if (err.empty()) err = "stat failed";
+                              return false;
+                            }
+                            return true;
+                          }));
+  }
   print_phase(run_phase("get", a.threads, a.count, obj_size,
                         [&](unsigned, std::size_t i, std::string& err) {
                           auto d = store.get(oid(i), err);
@@ -329,18 +384,25 @@ void run_mode(const BenchArgs& a, const fs::path& work, const char* mode, std::s
   opts.inline_max_bytes = a.inline_max;
   opts.force_mode = mode;
   opts.data_fsync = a.fsync;
+  if (std::string(mode) == "seg") {
+    opts.seg_max_record = std::max(obj_size, a.inline_max);
+    opts.segment_size = std::max<std::uint64_t>(opts.seg_max_record * 4 + (1u << 20), 8ull << 20);
+  }
 
   aios::ObjectStore store;
   std::string err;
   std::error_code ec;
-  const fs::path root = work / (std::string("bench-") + mode);
+  const fs::path root = work / (std::string("bench-") + mode + "-" + std::to_string(obj_size));
   fs::create_directories(root, ec);
   if (!store.open(root.string(), opts, err)) {
     throw std::runtime_error(std::string("open ") + mode + " store: " + err);
   }
-  std::cout << "=== " << (std::string(mode) == "inline" ? "inline (SQLite BLOB)" : "filesystem bodies")
-            << " size=" << obj_size << " io=" << a.io_size << " count=" << a.count
-            << " threads=" << a.threads << " shards=" << a.shards
+  const char* label = mode;
+  if (std::string(mode) == "inline") label = "inline (SQLite BLOB)";
+  else if (std::string(mode) == "fs") label = "filesystem bodies";
+  else if (std::string(mode) == "seg") label = "segment log";
+  std::cout << "=== " << label << " size=" << obj_size << " io=" << a.io_size
+            << " count=" << a.count << " threads=" << a.threads << " shards=" << a.shards
             << (a.fsync ? "" : " no-fsync") << " ===\n";
   if (a.op == "put" || a.op == "all") run_put(store, a, mode, obj_size);
   if (a.op == "range" || a.op == "all") run_range(store, a, mode, obj_size);
@@ -362,8 +424,21 @@ int main(int argc, char** argv) {
   fs::create_directories(work, ec);
 
   try {
-    if (args.mode == "inline" || args.mode == "both") run_mode(args, work, "inline", args.small_size);
-    if (args.mode == "fs" || args.mode == "both") run_mode(args, work, "fs", args.large_size);
+    auto run = [&](const char* mode, std::size_t sz) { run_mode(args, work, mode, sz); };
+    const bool want_inline = args.mode == "inline" || args.mode == "both" || args.mode == "all";
+    const bool want_fs = args.mode == "fs" || args.mode == "both" || args.mode == "all";
+    const bool want_seg = args.mode == "seg" || args.mode == "all";
+    if (!args.sizes.empty()) {
+      for (std::size_t sz : args.sizes) {
+        if (want_inline) run("inline", sz);
+        if (want_fs) run("fs", sz);
+        if (want_seg) run("seg", sz);
+      }
+    } else {
+      if (want_inline) run("inline", args.small_size);
+      if (want_fs) run("fs", args.large_size);
+      if (want_seg) run("seg", args.small_size);
+    }
   } catch (const std::exception& e) {
     std::cerr << "bench error: " << e.what() << "\n";
     return 1;
