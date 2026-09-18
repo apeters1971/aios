@@ -1,0 +1,172 @@
+/* Print/PDF: keep the take-away in document flow so it cannot overprint. */
+html.printing .slide:has(.takeaway),
+body.printing .slide:has(.takeaway) {
+  display: flex !important;
+  flex-direction: column;
+  padding-bottom: 1.1rem;
+  gap: 0.4rem;
+}
+html.printing .takeaway,
+body.printing .takeaway {
+  position: static !important;
+  left: auto !important;
+  right: auto !important;
+  bottom: auto !important;
+  margin-top: auto !important;
+  flex: 0 0 auto;
+  z-index: auto;
+  background: transparent;
+}
+html.printing .slide:has(.takeaway) h2,
+body.printing .slide:has(.takeaway) h2 {
+  font-size: 1.68rem;
+  margin-bottom: 0.1rem;
+}
+html.printing .slide:has(.takeaway) .topic,
+body.printing .slide:has(.takeaway) .topic {
+  font-size: 1.02rem;
+  margin-bottom: 0.32rem;
+}
+html.printing .slide:has(.takeaway) p.lead,
+body.printing .slide:has(.takeaway) p.lead {
+  font-size: 1.05rem;
+  margin-bottom: 0.38rem;
+}
+html.printing .slide:has(.takeaway) .purpose,
+body.printing .slide:has(.takeaway) .purpose {
+  margin-bottom: 0.38rem;
+  padding: 0.38rem 0.8rem 0.42rem;
+}
+html.printing .slide:has(.takeaway) .purpose p,
+body.printing .slide:has(.takeaway) .purpose p {
+  font-size: 1.02rem;
+}
+html.printing .slide:has(.takeaway) .note,
+body.printing .slide:has(.takeaway) .note {
+  font-size: 0.86rem;
+  margin-top: 0.3rem;
+}
+html.printing .slide:has(.takeaway) .card,
+body.printing .slide:has(.takeaway) .card {
+  padding: 0.4rem 0.65rem;
+}
+html.printing .slide:has(.takeaway) .card h3,
+body.printing .slide:has(.takeaway) .card h3 {
+  font-size: 1.02rem;
+  margin-bottom: 0.22rem;
+}
+html.printing .slide:has(.takeaway) .card p,
+html.printing .slide:has(.takeaway) .card li,
+body.printing .slide:has(.takeaway) .card p,
+body.printing .slide:has(.takeaway) .card li {
+  font-size: 0.92rem;
+  line-height: 1.28;
+}
+html.printing .slide:has(.takeaway) pre.cmd,
+body.printing .slide:has(.takeaway) pre.cmd {
+  font-size: 0.76rem;
+  line-height: 1.3;
+}
+html.printing .term pre,
+body.printing .term pre {
+  font-size: 0.62rem;
+  line-height: 1.32;
+}
+html.printing .slide:has(.takeaway) .figwrap,
+body.printing .slide:has(.takeaway) .figwrap {
+  max-height: 12.5rem !important;
+  min-height: 0;
+  overflow: hidden;
+}
+html.printing .slide:has(.takeaway) svg.fig,
+body.printing .slide:has(.takeaway) svg.fig {
+  max-height: 11.5rem !important;
+}
+html.printing .slide.stats-ex .stats-pair,
+body.printing .slide.stats-ex .stats-pair,
+html.printing .slide.stats-ex .statframe,
+body.printing .slide.stats-ex .statframe {
+  flex: 0 1 auto !important;
+  max-height: 14rem !important;
+}
+html.printing .slide.stats-ex .statshot,
+body.printing .slide.stats-ex .statshot {
+  max-height: 13rem;
+}
+html.printing .slide:has(.takeaway) table.cmp,
+body.printing .slide:has(.takeaway) table.cmp {
+  font-size: 1.05rem;
+  flex: 0 1 auto;
+}
+html.printing .slide:has(.takeaway) table.cmp th,
+html.printing .slide:has(.takeaway) table.cmp td,
+body.printing .slide:has(.takeaway) table.cmp th,
+body.printing .slide:has(.takeaway) table.cmp td {
+  padding: 0.3rem 0.55rem;
+}
+html.printing .slide.table-room,
+html.printing .slide.table-room.on,
+body.printing .slide.table-room,
+body.printing .slide.table-room.on {
+  display: flex !important;
+  flex-direction: column;
+  padding-bottom: 1.1rem;
+}
+html.printing .slide.table-room table.cmp,
+body.printing .slide.table-room table.cmp {
+  flex: 0 1 auto !important;
+  font-size: 1.18rem;
+}
+
+@media print {
+  .slide:has(.takeaway),
+  .slide:has(.takeaway).on {
+    display: flex !important;
+    flex-direction: column;
+    padding-bottom: 1.1rem;
+    gap: 0.4rem;
+  }
+  .takeaway {
+    position: static !important;
+    left: auto !important;
+    right: auto !important;
+    bottom: auto !important;
+    margin-top: auto !important;
+    flex: 0 0 auto;
+    z-index: auto;
+    background: transparent;
+  }
+  .slide:has(.takeaway) h2 { font-size: 1.68rem; margin-bottom: 0.1rem; }
+  .slide:has(.takeaway) .topic { font-size: 1.02rem; margin-bottom: 0.32rem; }
+  .slide:has(.takeaway) p.lead { font-size: 1.05rem; margin-bottom: 0.38rem; }
+  .slide:has(.takeaway) .purpose { margin-bottom: 0.38rem; padding: 0.38rem 0.8rem 0.42rem; }
+  .slide:has(.takeaway) .purpose p { font-size: 1.02rem; }
+  .slide:has(.takeaway) .note { font-size: 0.86rem; margin-top: 0.3rem; }
+  .slide:has(.takeaway) .card { padding: 0.4rem 0.65rem; }
+  .slide:has(.takeaway) .card h3 { font-size: 1.02rem; margin-bottom: 0.22rem; }
+  .slide:has(.takeaway) .card p,
+  .slide:has(.takeaway) .card li { font-size: 0.92rem; line-height: 1.28; }
+  .slide:has(.takeaway) pre.cmd { font-size: 0.76rem; line-height: 1.3; }
+  .term pre { font-size: 0.62rem; line-height: 1.32; }
+  .slide:has(.takeaway) .figwrap { max-height: 12.5rem !important; min-height: 0; overflow: hidden; }
+  .slide:has(.takeaway) svg.fig { max-height: 11.5rem !important; }
+  .slide.stats-ex .stats-pair,
+  .slide.stats-ex .statframe {
+    flex: 0 1 auto !important;
+    max-height: 14rem !important;
+  }
+  .slide.stats-ex .statshot { max-height: 13rem; }
+  .slide:has(.takeaway) table.cmp { font-size: 1.05rem; flex: 0 1 auto; }
+  .slide:has(.takeaway) table.cmp th,
+  .slide:has(.takeaway) table.cmp td { padding: 0.3rem 0.55rem; }
+  .slide.table-room,
+  .slide.table-room.on {
+    display: flex !important;
+    flex-direction: column;
+    padding-bottom: 1.1rem;
+  }
+  .slide.table-room table.cmp {
+    flex: 0 1 auto !important;
+    font-size: 1.18rem !important;
+  }
+}
