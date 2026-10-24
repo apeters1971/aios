@@ -12,6 +12,10 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Added — NIXL plugin for cuObject transfers
+
+`libplugin_AIOS.so` is a NIXL storage backend. The agent registers a DRAM or VRAM buffer with its cuObject RDMA token and an object as `bucket/key`. A read or write is an S3 GET or PUT with an empty body and `x-amz-rdma-token`, so the existing cuObject path moves the payload. The plugin is built only when NIXL headers are found (`NIXL_ROOT`); the engine and `tests/test_nixl.cpp` always build. See [`proto/nixl.md`](proto/nixl.md).
+
 ### Changed — small object bodies leave SQLite
 
 Random GETs of objects ≤ 16 MiB (`seg_max_record`) no longer copy bytes out of a

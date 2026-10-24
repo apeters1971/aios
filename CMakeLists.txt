@@ -373,6 +373,73 @@ if(AIOS_HAVE_CUOBJECT)
   target_link_libraries(aios_cuobject PUBLIC ${CUOBJECT_LIBRARY})
 endif()
 
+# NIXL storage plugin (libplugin_AIOS.so). The engine always builds; the .so
+# is compiled only when NIXL headers are present (NIXL_ROOT or /usr).
+option(AIOS_WITH_NIXL "Build the NIXL AIOS plugin when headers are found" ON)
+set(AIOS_HAVE_NIXL OFF)
+if(AIOS_WITH_NIXL)
+  if(DEFINED ENV{NIXL_ROOT} AND NOT NIXL_ROOT)
+    set(NIXL_ROOT "$ENV{NIXL_ROOT}")
+  endif()
+  find_path(NIXL_INCLUDE_DIR NAMES nixl_types.h
+    PATHS ${NIXL_ROOT}/include ${NIXL_ROOT}/src/api/cpp
+          /usr/include /usr/local/include
+    PATH_SUFFIXES nixl)
+  find_path(NIXL_BACKEND_INCLUDE_DIR NAMES backend/backend_plugin.h
+    PATHS ${NIXL_INCLUDE_DIR} ${NIXL_ROOT}/src/api/cpp ${NIXL_ROOT}/include
+          /usr/include /usr/local/include
+    PATH_SUFFIXES nixl)
+  find_path(NIXL_COMMON_INCLUDE_DIR NAMES common/nixl_log.h
+    PATHS ${NIXL_ROOT}/src ${NIXL_ROOT}/include /usr/include /usr/local/include)
+  if(NIXL_INCLUDE_DIR AND NIXL_BACKEND_INCLUDE_DIR AND NIXL_COMMON_INCLUDE_DIR)
+    set(AIOS_HAVE_NIXL ON)
+    message(STATUS "NIXL: enabled (${NIXL_BACKEND_INCLUDE_DIR})")
+  else()
+    message(STATUS "NIXL: not found (libplugin_AIOS.so skipped)")
+  endif()
+endif()
+
+add_library(aios_nixl STATIC
+  src/nixl/aios_nixl.cpp
+  src/nixl/aios_nixl_s3.cpp
+)
+target_include_directories(aios_nixl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(aios_nixl PUBLIC aios_core)
+if(AIOS_HAVE_NIXL)
+  set_property(TARGET aios_core aios_nixl PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set(NIXL_PLUGIN_INCLUDES "")
+  foreach(dir
+      ${NIXL_ROOT}/src/api/cpp
+      ${NIXL_ROOT}/src
+      ${NIXL_ROOT}/src/core/telemetry
+      ${NIXL_ROOT}/include
+      ${NIXL_INCLUDE_DIR}
+      ${NIXL_BACKEND_INCLUDE_DIR}
+      ${NIXL_COMMON_INCLUDE_DIR})
+    if(dir AND EXISTS "${dir}")
+      list(APPEND NIXL_PLUGIN_INCLUDES "${dir}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES NIXL_PLUGIN_INCLUDES)
+  find_library(NIXL_LIBRARY NAMES nixl
+    PATHS ${NIXL_ROOT}/lib ${NIXL_ROOT}/lib64 ${NIXL_ROOT}/build
+          /usr/lib /usr/local/lib
+    PATH_SUFFIXES lib lib64)
+  add_library(nixl_plugin_AIOS MODULE src/nixl/nixl_plugin.cpp)
+  set_target_properties(nixl_plugin_AIOS PROPERTIES
+    PREFIX "libplugin_"
+    OUTPUT_NAME "AIOS"
+    SUFFIX ".so"
+  )
+  target_include_directories(nixl_plugin_AIOS PRIVATE ${NIXL_PLUGIN_INCLUDES})
+  target_compile_definitions(nixl_plugin_AIOS PRIVATE AIOS_HAVE_NIXL=1)
+  target_link_libraries(nixl_plugin_AIOS PRIVATE aios_nixl)
+  if(NIXL_LIBRARY)
+    target_link_libraries(nixl_plugin_AIOS PRIVATE ${NIXL_LIBRARY})
+  endif()
+  install(TARGETS nixl_plugin_AIOS LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/nixl/plugins)
+endif()
+
 # S3-compatible front-end (FS-backed). Separate from aios_core to avoid link cycle with aios_posix.
 add_library(aios_s3 STATIC
   src/http/s3_server.cpp
@@ -616,6 +683,7 @@ add_executable(aios_tests
   tests/test_frontend_io.cpp
   tests/test_compression.cpp
   tests/test_cuobject_s3.cpp
+  tests/test_nixl.cpp
   tests/test_s3_range.cpp
   tests/test_http_api.cpp
   tests/test_http_wire.cpp
@@ -658,7 +726,7 @@ target_include_directories(aios_tests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/tests
   ${CMAKE_CURRENT_SOURCE_DIR}/kernel
 )
-target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_xrd_cred GTest::gtest_main)
+target_link_libraries(aios_tests PRIVATE aios_client aios_posix aios_s3 aios_nixl aios_xrd_cred GTest::gtest_main)
 # The process-level smoke test spawns the real daemon and CLI binaries.
 target_compile_definitions(aios_tests PRIVATE
   AIOS_TEST_AIOSD_PATH="$<TARGET_FILE:aiosd>"

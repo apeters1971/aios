@@ -88,3 +88,5 @@ aios-cuobj-s3 get --endpoint 127.0.0.1:7481 --access-key aios --secret "$KEY" \
 | `src/http/s3_server.cpp` | Control-plane hooks |
 | `tools/aios_cuobj_s3.cpp` | Example SigV4 client |
 | `tests/test_cuobject_s3.cpp` | Stub-backed GET/PUT tests |
+
+A NIXL agent does not talk to cuObjServer itself. `libplugin_AIOS.so` ([`nixl.md`](nixl.md)) sends the S3 request with `x-amz-rdma-token`, and this endpoint performs the RDMA.

@@ -56,7 +56,7 @@ Clients talk to the **primary** for an object (HTTP or TCP++); the primary repli
 | `aios_http.ko` + `aiosfs.ko` | AlmaLinux 9 VFS (`backend=http` in-kernel, or `backend=upcall` + `aios-kbridge`) |
 | `aiosvd.ko` + `aios-vd` | AlmaLinux 9 block volume device (`/dev/aiosvdN`, object-striped) |
 
-Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/archive.md`](proto/archive.md) / [`proto/backup.md`](proto/backup.md) (cold archive & backup), [`proto/quota.md`](proto/quota.md) / [`proto/qos.md`](proto/qos.md) (quotas & QoS), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE). Architecture slides: [`docs/AIOS-architecture-slides.html`](docs/AIOS-architecture-slides.html).
+Protocol details: [`proto/http.md`](proto/http.md) (HTTP), [`proto/s3.md`](proto/s3.md) (S3), [`proto/cuobject.md`](proto/cuobject.md) (GPUDirect/cuObject), [`proto/nixl.md`](proto/nixl.md) (NIXL), [`proto/xrd_oss.md`](proto/xrd_oss.md) (XRootD), [`proto/admin.md`](proto/admin.md) (admin/metrics), [`proto/README.md`](proto/README.md) (TCP++), [`proto/layout.md`](proto/layout.md) (per-object layout), [`proto/archive.md`](proto/archive.md) / [`proto/backup.md`](proto/backup.md) (cold archive & backup), [`proto/quota.md`](proto/quota.md) / [`proto/qos.md`](proto/qos.md) (quotas & QoS), [`proto/stl_client.md`](proto/stl_client.md) (STL client), [`proto/posix_fuse.md`](proto/posix_fuse.md) (POSIX/FUSE). Architecture slides: [`docs/AIOS-architecture-slides.html`](docs/AIOS-architecture-slides.html).
 
 ---
 
@@ -211,6 +211,7 @@ Optional (auto-detected; each prints a `-- <dep>: enabled|not found` line at con
 | libfuse3 | `aios-fuse`, `aios-fusell` | `AIOS_WITH_FUSE` |
 | XRootD ≥ 5 | `libXrdAios.so` OSS plugin | `AIOS_WITH_XROOTD`, `XRootD_ROOT` |
 | NVIDIA cuObjServer SDK | S3 GPUDirect / RDMA offload | `AIOS_WITH_CUOBJECT`, `CUOBJECT_ROOT` |
+| [NIXL](https://github.com/ai-dynamo/nixl) | `libplugin_AIOS.so` (GPU buffer ↔ object via cuObject) | `AIOS_WITH_NIXL`, `NIXL_ROOT` |
 | AlmaLinux 9 `kernel-devel` | `aios_http.ko` / `aiosfs.ko` / `aiosvd.ko` (separate `make -C kernel`) | — |
 
 **Linux** (Debian/Ubuntu package names; el9: `boost-devel openssl-devel sqlite-devel libzstd-devel fuse3-devel`; optional `liburing-dev`):
@@ -726,7 +727,7 @@ fail `aiosd` startup. Plain-text clients on an HTTPS port are dropped at the han
 clients at `https://…` (`aws --endpoint-url https://host:7481 …`, add `--no-verify-ssl` or
 `AWS_CA_BUNDLE` for a private CA).
 
-Optional GPUDirect / cuObject RDMA payload offload (`cuobject_listen`, `x-amz-rdma-token`): [`proto/cuobject.md`](proto/cuobject.md). Example client: `aios-cuobj-s3`.
+Optional GPUDirect / cuObject RDMA payload offload (`cuobject_listen`, `x-amz-rdma-token`): [`proto/cuobject.md`](proto/cuobject.md). Example client: `aios-cuobj-s3`. A NIXL agent loads `libplugin_AIOS.so` and uses that same RDMA path: [`proto/nixl.md`](proto/nixl.md).
 
 Details: [`proto/s3.md`](proto/s3.md).
 
@@ -1245,6 +1246,7 @@ Contributor workflow, style and commit conventions: [`CONTRIBUTING.md`](CONTRIBU
 | [`proto/http.md`](proto/http.md) | HTTP API, locks, watches, pub/sub, txns, preconditions |
 | [`proto/s3.md`](proto/s3.md) | S3-compatible API (FS-backed, SigV4) |
 | [`proto/cuobject.md`](proto/cuobject.md) | GPUDirect / cuObject S3 RDMA offload |
+| [`proto/nixl.md`](proto/nixl.md) | NIXL plugin `AIOS` (VRAM/DRAM ↔ object over cuObject) |
 | [`proto/admin.md`](proto/admin.md) | Admin web UI, OPS counters, Prometheus `/metrics` |
 | [`proto/quota.md`](proto/quota.md) | Soft uid/gid + project (subtree) quotas |
 | [`proto/qos.md`](proto/qos.md) | Soft IOPS / bandwidth QoS (FUSE + S3) |
