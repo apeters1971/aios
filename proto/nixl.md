@@ -16,14 +16,14 @@ aiosd S3  -- cuObjServer RDMA -->  the registered buffer
 
 ## What a transfer may be
 
-cuObject accepts one whole object, at most 1 GiB, and no byte range.
+One call moves at most 1 GiB.
 
-- Remote `addr` (object offset) must be 0.
-- Local `addr` and `len` must be exactly the registered buffer. The RDMA token describes that buffer, not a subrange.
+- Remote `addr` (object offset) must be 0. The HTTP GET still sends `Range: bytes=0-(len-1)`, which is what NIXL's accelerated client sends. aiosd answers `200` when that span is the whole object and `206` when it is a prefix of a larger one. The reply value matches the status.
+- Local `addr` and `len` must be exactly the registered buffer. The RDMA token describes that buffer.
 - DRAM and VRAM `metaInfo` is the token from `cuMemObjGetRDMAToken` (or the backend option `rdma_token` when metaInfo is empty).
 - OBJ `metaInfo` is `bucket/key`. The plugin reads the key from registration metadata. Two objects may share a `devId`.
 
-A 200 response without `x-amz-rdma-reply` is a failure. That is the TCP fallback, and the registered buffer was not filled.
+Success is HTTP `200` or `206`, `ETag`, `x-amz-rdma-reply` equal to that status, and `x-amz-rdma-bytes-transferred` equal to `len`. A `200` with no reply, or a reply of `ok`, is a failure: the registered buffer was not filled. The plugin's PUT sends `Content-Length` set to `len`. NIXL's own client sends `Content-Length: 0` and puts the size in the token; aiosd accepts both.
 
 ## Build
 
@@ -47,7 +47,7 @@ Installs to `<prefix>/lib/nixl/plugins/libplugin_AIOS.so`. Point the agent at th
 | `rdma_token` | Token used when a DRAM/VRAM registration has empty metaInfo |
 | `socket_timeout_ms` | Connect and header timeout (default 30000) |
 
-`aiosd` must be started with `cuobject_listen` and a build that found cuObjServer. Without that, RDMA PUT returns 501 and RDMA GET falls back to a TCP body; the plugin treats both as errors.
+`aiosd` must be started with `cuobject_listen` and a build that found cuObjServer. Without that, a token PUT returns `501` and `x-amz-rdma-reply: 501`. A token GET falls back to a TCP body with no reply header. The plugin treats both as errors.
 
 ## Code map
 

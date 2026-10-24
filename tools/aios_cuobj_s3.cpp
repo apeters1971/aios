@@ -79,20 +79,25 @@ void sign_s3(const std::string& method, const std::string& uri, const std::strin
     canon_headers << amz_hdrs[i].first << ':' << amz_hdrs[i].second << '\n';
   }
   std::ostringstream canon;
-  canon << method << '\n' << uri << '\n' << '\n' << canon_headers.str() << signed_headers << '\n'
+  canon << method << '\n'
+        << uri << '\n'
+        << '\n'
+        << canon_headers.str() << signed_headers << '\n'
         << payload_hash;
   const auto canon_hash = sha256_hex(canon.str());
   std::ostringstream sts;
-  sts << "AWS4-HMAC-SHA256\n" << amz << '\n' << ds << '/' << region << "/s3/aws4_request\n"
+  sts << "AWS4-HMAC-SHA256\n"
+      << amz << '\n'
+      << ds << '/' << region << "/s3/aws4_request\n"
       << canon_hash;
   auto k_date = hmac_sha256_raw("AWS4" + secret, ds);
   auto k_region = hmac_sha256_raw(k_date, region);
   auto k_service = hmac_sha256_raw(k_region, "s3");
   auto k_signing = hmac_sha256_raw(k_service, "aws4_request");
   const auto sig = hex_lower(hmac_sha256_raw(k_signing, sts.str()));
-  headers["authorization"] =
-      "AWS4-HMAC-SHA256 Credential=" + access + "/" + ds + "/" + region +
-      "/s3/aws4_request, SignedHeaders=" + signed_headers + ", Signature=" + sig;
+  headers["authorization"] = "AWS4-HMAC-SHA256 Credential=" + access + "/" + ds + "/" + region +
+                             "/s3/aws4_request, SignedHeaders=" + signed_headers +
+                             ", Signature=" + sig;
 }
 
 bool split_host_port(const std::string& ep, std::string& host, std::string& port) {
@@ -187,9 +192,8 @@ HttpResp http_req(const std::string& host, const std::string& port, const std::s
   std::size_t need = content_length > have ? content_length - have : 0;
   resp.body.resize(content_length);
   while (need > 0) {
-    const auto n =
-        asio::read(sock, asio::buffer(resp.body.data() + (content_length - need), need),
-                   asio::transfer_at_least(1), ec);
+    const auto n = asio::read(sock, asio::buffer(resp.body.data() + (content_length - need), need),
+                              asio::transfer_at_least(1), ec);
     if (ec) break;
     need -= n;
   }
@@ -327,9 +331,12 @@ int main(int argc, char** argv) {
       // Without cuObjClient, data is already in GPU/host via RDMA; we only see empty HTTP body.
       // Write a marker file so scripts can detect offload success.
       if (r.body.empty()) {
+        const auto nbytes = r.headers.count(aios::kAmzRdmaBytesTransferred)
+                                ? r.headers[aios::kAmzRdmaBytesTransferred]
+                                : r.headers["content-length"];
         if (!write_file(file, std::string("# aios-cuobj-s3: payload delivered via RDMA; "
-                                          "Content-Length=") +
-                                  r.headers["content-length"] + "\n")) {
+                                          "bytes=") +
+                                  nbytes + "\n")) {
           std::cerr << "cannot write " << file << "\n";
           return 1;
         }

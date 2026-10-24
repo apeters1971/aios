@@ -1,7 +1,9 @@
 #include "cuobject/cuobject_endpoint.hpp"
+#include "cuobject/cuobject_s3_xfer.hpp"
 
 #include "util/log.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,8 +26,7 @@ namespace {
 
 class NvidiaCuObjectEndpoint final : public CuObjectEndpoint {
  public:
-  NvidiaCuObjectEndpoint(std::string ip, unsigned short port)
-      : ip_(std::move(ip)), port_(port) {
+  NvidiaCuObjectEndpoint(std::string ip, unsigned short port) : ip_(std::move(ip)), port_(port) {
     try {
       server_ = std::make_unique<cuObjServer>(ip_.c_str(), port_,
                                               static_cast<unsigned>(CUOBJ_PROTO_RDMA_DC_V1));
@@ -50,22 +51,31 @@ class NvidiaCuObjectEndpoint final : public CuObjectEndpoint {
       err = "cuobject not connected";
       return false;
     }
+    const auto tok = parse_rdma_token(token);
+    if (!tok.has_addr) {
+      err = "RDMA token has no remote address";
+      return false;
+    }
+    if (tok.has_size && len > tok.size) {
+      err = "transfer exceeds RDMA token buffer";
+      return false;
+    }
     std::lock_guard lock(mu_);
     void* buf = const_cast<void*>(local);
-    // Prefer registering caller memory; fall back to alloc+copy if required by SDK.
     struct rdma_buffer* handle = server_->registerBuffer(buf, len);
     if (!handle) {
       err = "registerBuffer failed";
       return false;
     }
     const uint16_t ch = server_->allocateChannelId();
-    ssize_t n = -1;
-    if (ch != INVALID_CHANNEL_ID) {
-      n = server_->handleGetObject(key, handle, 0, len, token, uint32_t{0}, ch);
-      server_->freeChannelId(ch);
-    } else {
-      n = server_->handleGetObject(key, handle, 0, len, token, uint32_t{0});
+    if (ch == INVALID_CHANNEL_ID) {
+      server_->deRegisterBuffer(handle);
+      err = "allocateChannelId failed";
+      return false;
     }
+    // remote_buf_start is field 1 of the token. Zero is rejected by cuObjServer.
+    const ssize_t n = server_->handleGetObject(key, handle, tok.addr, len, token, uint32_t{0}, ch);
+    server_->freeChannelId(ch);
     server_->deRegisterBuffer(handle);
     if (n < 0 || static_cast<std::size_t>(n) != len) {
       err = "handleGetObject failed rc=" + std::to_string(n);
@@ -81,6 +91,15 @@ class NvidiaCuObjectEndpoint final : public CuObjectEndpoint {
       err = "cuobject not connected";
       return false;
     }
+    const auto tok = parse_rdma_token(token);
+    if (!tok.has_addr) {
+      err = "RDMA token has no remote address";
+      return false;
+    }
+    if (tok.has_size && len > tok.size) {
+      err = "transfer exceeds RDMA token buffer";
+      return false;
+    }
     std::lock_guard lock(mu_);
     struct rdma_buffer* handle = server_->registerBuffer(local, len);
     if (!handle) {
@@ -88,13 +107,13 @@ class NvidiaCuObjectEndpoint final : public CuObjectEndpoint {
       return false;
     }
     const uint16_t ch = server_->allocateChannelId();
-    ssize_t n = -1;
-    if (ch != INVALID_CHANNEL_ID) {
-      n = server_->handlePutObject(key, handle, 0, len, token, uint32_t{0}, ch);
-      server_->freeChannelId(ch);
-    } else {
-      n = server_->handlePutObject(key, handle, 0, len, token, uint32_t{0});
+    if (ch == INVALID_CHANNEL_ID) {
+      server_->deRegisterBuffer(handle);
+      err = "allocateChannelId failed";
+      return false;
     }
+    const ssize_t n = server_->handlePutObject(key, handle, tok.addr, len, token, uint32_t{0}, ch);
+    server_->freeChannelId(ch);
     server_->deRegisterBuffer(handle);
     if (n < 0 || static_cast<std::size_t>(n) != len) {
       err = "handlePutObject failed rc=" + std::to_string(n);

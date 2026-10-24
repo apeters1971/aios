@@ -12,6 +12,10 @@ current fix cycle — check the regression test of the same name before relying 
 
 ## [Unreleased]
 
+### Changed — S3 RDMA replies match the NIXL cuObject client
+
+A token GET honors a single `Range` (NIXL always sends one) and answers `200` or `206` with `x-amz-rdma-reply` set to that status, `x-amz-rdma-bytes-transferred`, an `ETag`, and an empty body. A token PUT with `Content-Length: 0` takes its size from the token's buffer-size field and does not store a 0-byte object when the size is missing or cuObjServer is down (`501` plus reply `501`). The descriptor's remote address is passed to `handleGetObject` / `handlePutObject`. Multipart upload parts stay on the TCP body.
+
 ### Added — NIXL plugin for cuObject transfers
 
 `libplugin_AIOS.so` is a NIXL storage backend. The agent registers a DRAM or VRAM buffer with its cuObject RDMA token and an object as `bucket/key`. A read or write is an S3 GET or PUT with an empty body and `x-amz-rdma-token`, so the existing cuObject path moves the payload. The plugin is built only when NIXL headers are found (`NIXL_ROOT`); the engine and `tests/test_nixl.cpp` always build. See [`proto/nixl.md`](proto/nixl.md).

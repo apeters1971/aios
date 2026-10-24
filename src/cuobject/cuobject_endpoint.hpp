@@ -12,6 +12,7 @@ namespace aios {
 
 inline constexpr const char* kAmzRdmaToken = "x-amz-rdma-token";
 inline constexpr const char* kAmzRdmaReply = "x-amz-rdma-reply";
+inline constexpr const char* kAmzRdmaBytesTransferred = "x-amz-rdma-bytes-transferred";
 // cuObjServer per-call limit (NVIDIA docs).
 inline constexpr std::uint64_t kCuObjectMaxTransferBytes = 1ull << 30;
 
@@ -24,13 +25,11 @@ class CuObjectEndpoint {
 
   // RDMA_WRITE: push `len` bytes from `local` to the client described by `token`.
   virtual bool rdma_get(const std::string& key, const void* local, std::size_t len,
-                        const std::string& token, std::string& reply,
-                        std::string& err) = 0;
+                        const std::string& token, std::string& reply, std::string& err) = 0;
 
   // RDMA_READ: pull `len` bytes into `local` from the client described by `token`.
   virtual bool rdma_put(const std::string& key, void* local, std::size_t len,
-                        const std::string& token, std::string& reply,
-                        std::string& err) = 0;
+                        const std::string& token, std::string& reply, std::string& err) = 0;
 };
 
 // Always unavailable (default when SDK absent or cuobject_listen empty).

@@ -37,29 +37,31 @@ CLI: `--cuobject-listen HOST:PORT`. Empty (default) disables RDMA; S3 behaves as
 
 | Header | Direction | Meaning |
 |--------|-----------|---------|
-| `x-amz-rdma-token` | request | Opaque RDMA descriptor from cuObjClient (must be in SigV4 `SignedHeaders`) |
-| `x-amz-rdma-reply` | response | Present when the server completed RDMA offload |
+| `x-amz-rdma-token` | request | Opaque RDMA descriptor from cuObjClient (include it in SigV4 `SignedHeaders`) |
+| `x-amz-rdma-reply` | response | `200` whole object, `206` byte range, `501` declined, `400`/`500` on a failed attempt |
+| `x-amz-rdma-bytes-transferred` | response | Decimal byte count actually moved. Set only after the RDMA call succeeds |
+
+The token is colon-delimited hex. Field 1 is the remote address (`uint64`, at most 16 digits). Field 2 is the registered buffer size (`uint32`, at most 8 digits). The rest (rkey, LID, DCT number, GID) is passed through to `handleGetObject` / `handlePutObject` unchanged. A first field longer than 16 hex digits is not this scheme; aiosd answers `501` with `x-amz-rdma-reply: 501`.
 
 ## Server behaviour
 
 ### GET
 
 1. Authenticate as usual.
-2. If `x-amz-rdma-token` is set, object fits in one transfer (≤ 1 GiB), no `Range`, and cuobject is available:
-   - Read object into a host buffer via posix
-   - `rdma_get` / `handleGetObject` (RDMA_WRITE to client)
-   - HTTP `200` with **empty body**, `Content-Length` = logical size, `x-amz-rdma-reply`
-3. On RDMA failure or size/range limits: **fall back to TCP body** (no reply header).
-
-Clients that see `x-amz-rdma-reply` must **not** read a TCP body; `Content-Length` is the logical object size delivered over RDMA.
+2. If `x-amz-rdma-token` is set and the token is a DC descriptor, read the span into a host buffer and `rdma_get` (`handleGetObject`, RDMA_WRITE). NIXL always sends `Range`, including `bytes=0-(n-1)` for a full read.
+   - The span is the whole object (no `Range`, or a range that covers it): HTTP `200`, `x-amz-rdma-reply: 200`.
+   - The span is a sub-range: HTTP `206`, `x-amz-rdma-reply: 206`, plus `Content-Range`.
+   - `Content-Length` is `0`. The count is `x-amz-rdma-bytes-transferred`. The TCP body is empty.
+3. One transfer is at most 1 GiB. A token buffer smaller than the span is `400`. A transfer error falls back to the TCP body and does **not** set `x-amz-rdma-reply`.
 
 ### PUT
 
-1. `Content-Length` = object size; TCP body empty; prefer `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
-2. If token present and endpoint available: `rdma_put` then posix write; reply includes `x-amz-rdma-reply`.
-3. If token present but endpoint unavailable: **`501 NotImplemented`** (retry without token / use TCP PUT).
+1. TCP body empty. `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
+2. Object size is `Content-Length` when that is non-zero. NIXL's accelerated client sends `Content-Length: 0`; the size is then field 2 of the token. The two must agree when both are present.
+3. On success: HTTP `200`, `ETag`, `x-amz-rdma-reply: 200`, `x-amz-rdma-bytes-transferred`. The key is created only after the RDMA read completes, so a decline does not store a 0-byte object.
+4. No size, or cuObjServer is not available: **`501`** and `x-amz-rdma-reply: 501`. A malformed token is `400` with reply `400`. A failed RDMA call is `500` with reply `500`.
 
-Multipart UploadPart and ranged RDMA GET are out of scope for this scaffold.
+Multipart UploadPart (`uploadId`) stays on the TCP body. A token on that request is ignored.
 
 ## Client example
 

@@ -224,30 +224,50 @@ class S3CuObjectTransport final : public NixlRdmaTransport {
         for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         resp.emplace(std::move(name), std::move(value));
       }
-      if (status != 200) {
-        err = "S3 status " + std::to_string(status);
+      const auto reply = resp.find(kAmzRdmaReply);
+      const bool reply_ok =
+          reply != resp.end() && ((is_put && status == 200 && reply->second == "200") ||
+                                  (!is_put && (status == 200 || status == 206) &&
+                                   reply->second == std::to_string(status)));
+      if (!reply_ok) {
+        err = "cuObject RDMA was not used (x-amz-rdma-reply must be 200 or 206)";
         return false;
       }
-      if (!resp.count(kAmzRdmaReply)) {
-        err = "cuObject RDMA was not used (missing x-amz-rdma-reply)";
+      const auto etag = resp.find("etag");
+      if (etag == resp.end() || etag->second.empty()) {
+        err = "RDMA response missing etag";
+        return false;
+      }
+      const auto moved = resp.find(kAmzRdmaBytesTransferred);
+      unsigned long long reported = 0;
+      if (moved == resp.end()) {
+        err = "missing x-amz-rdma-bytes-transferred";
+        return false;
+      }
+      try {
+        reported = std::stoull(moved->second);
+      } catch (...) {
+        err = "bad x-amz-rdma-bytes-transferred";
+        return false;
+      }
+      if (reported != len) {
+        err = "x-amz-rdma-bytes-transferred does not match the registered buffer";
         return false;
       }
       if (!is_put) {
-        const auto it = resp.find("content-length");
-        unsigned long long reported = 0;
-        if (it == resp.end()) {
-          err = "RDMA GET missing content-length";
-          return false;
-        }
-        try {
-          reported = std::stoull(it->second);
-        } catch (...) {
-          err = "RDMA GET bad content-length";
-          return false;
-        }
-        if (reported != len) {
-          err = "RDMA GET content-length does not match the registered buffer";
-          return false;
+        const auto cl = resp.find("content-length");
+        if (cl != resp.end()) {
+          unsigned long long http_len = 0;
+          try {
+            http_len = std::stoull(cl->second);
+          } catch (...) {
+            err = "RDMA GET bad content-length";
+            return false;
+          }
+          if (http_len != 0 && http_len != len) {
+            err = "RDMA GET content-length does not match the registered buffer";
+            return false;
+          }
         }
       }
       return true;
@@ -284,6 +304,9 @@ S3RdmaRequest build_s3_rdma_request(const NixlConfig& cfg, bool is_put, const st
   out.payload_hash = is_put ? "UNSIGNED-PAYLOAD" : sha256_hex("");
   out.headers[kAmzRdmaToken] = rdma_token;
   if (is_put) out.headers["content-length"] = std::to_string(len);
+  // NIXL's accelerated GET always sends this range. A whole-object span is
+  // reply 200; a prefix of a larger object is reply 206.
+  if (!is_put && len > 0) out.headers["range"] = "bytes=0-" + std::to_string(len - 1);
   const auto region = cfg.region.empty() ? "us-east-1" : cfg.region;
   sign_s3(out.method, out.canonical_uri, cfg.s3_endpoint, amz_date, out.payload_hash,
           cfg.access_key, cfg.secret_key, region, out.headers);

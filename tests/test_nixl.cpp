@@ -310,6 +310,7 @@ TEST(NixlS3, SigV4MatchesServerCanonicalUri) {
       aios::build_s3_rdma_request(cfg, false, "bucket", "obj", 4, "rdma-tok", "20260101T000000Z");
   EXPECT_EQ(get.payload_hash, aios::sha256_hex(""));
   EXPECT_EQ(get.headers.count("content-length"), 0u);
+  EXPECT_EQ(get.headers.at("range"), "bytes=0-3");
   const auto get_auth = aios::s3_sigv4_verify(get.method, get.canonical_uri, "", get.headers,
                                               get.payload_hash, cfg.access_key, cfg.secret_key, 0);
   EXPECT_TRUE(get_auth.ok) << get_auth.error;
@@ -340,8 +341,10 @@ TEST(NixlS3, LoopbackRequiresRdmaReply) {
     }
     const char* resp =
         "HTTP/1.1 200 OK\r\n"
-        "x-amz-rdma-reply: ok\r\n"
-        "Content-Length: 4\r\n"
+        "ETag: \"abc\"\r\n"
+        "x-amz-rdma-reply: 200\r\n"
+        "x-amz-rdma-bytes-transferred: 4\r\n"
+        "Content-Length: 0\r\n"
         "Connection: close\r\n"
         "\r\n";
     asio::write(sock, asio::buffer(resp, std::strlen(resp)), ec);
@@ -360,6 +363,7 @@ TEST(NixlS3, LoopbackRequiresRdmaReply) {
   std::lock_guard lock(mu);
   EXPECT_NE(seen.find("GET /bucket/obj HTTP/1.1"), std::string::npos);
   EXPECT_NE(seen.find("x-amz-rdma-token: client-token"), std::string::npos);
+  EXPECT_NE(seen.find("range: bytes=0-3"), std::string::npos);
 
   tcp::acceptor acc2(ioc, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
   const auto port2 = acc2.local_endpoint().port();
@@ -382,4 +386,29 @@ TEST(NixlS3, LoopbackRequiresRdmaReply) {
   EXPECT_FALSE(transport2->read_object("bucket/obj", 4, "client-token", err));
   EXPECT_NE(err.find("x-amz-rdma-reply"), std::string::npos);
   server2.join();
+
+  tcp::acceptor acc3(ioc, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+  const auto port3 = acc3.local_endpoint().port();
+  std::thread server3([&] {
+    boost::system::error_code ec;
+    tcp::socket sock(ioc);
+    acc3.accept(sock, ec);
+    if (ec) return;
+    asio::streambuf buf;
+    asio::read_until(sock, buf, "\r\n\r\n", ec);
+    const char* resp =
+        "HTTP/1.1 200 OK\r\n"
+        "ETag: \"abc\"\r\n"
+        "x-amz-rdma-reply: ok\r\n"
+        "x-amz-rdma-bytes-transferred: 4\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    asio::write(sock, asio::buffer(resp, std::strlen(resp)), ec);
+  });
+  cfg.s3_endpoint = "127.0.0.1:" + std::to_string(port3);
+  auto transport3 = aios::make_s3_cuobject_transport(cfg);
+  EXPECT_FALSE(transport3->read_object("bucket/obj", 4, "client-token", err));
+  EXPECT_NE(err.find("x-amz-rdma-reply"), std::string::npos);
+  server3.join();
 }

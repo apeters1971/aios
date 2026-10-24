@@ -52,7 +52,8 @@ std::string lower(std::string s) {
   return s;
 }
 
-std::string header_get(const std::unordered_map<std::string, std::string>& h, const std::string& n) {
+std::string header_get(const std::unordered_map<std::string, std::string>& h,
+                       const std::string& n) {
   auto it = h.find(lower(n));
   return it == h.end() ? std::string{} : it->second;
 }
@@ -62,12 +63,23 @@ std::string xml_escape(const std::string& s) {
   o.reserve(s.size());
   for (char c : s) {
     switch (c) {
-      case '&': o += "&amp;"; break;
-      case '<': o += "&lt;"; break;
-      case '>': o += "&gt;"; break;
-      case '"': o += "&quot;"; break;
-      case '\'': o += "&apos;"; break;
-      default: o.push_back(c);
+      case '&':
+        o += "&amp;";
+        break;
+      case '<':
+        o += "&lt;";
+        break;
+      case '>':
+        o += "&gt;";
+        break;
+      case '"':
+        o += "&quot;";
+        break;
+      case '\'':
+        o += "&apos;";
+        break;
+      default:
+        o.push_back(c);
     }
   }
   return o;
@@ -89,8 +101,10 @@ std::string url_decode(const std::string& in, bool plus_is_space = false) {
         continue;
       }
     }
-    if (plus_is_space && in[i] == '+') out.push_back(' ');
-    else out.push_back(in[i]);
+    if (plus_is_space && in[i] == '+')
+      out.push_back(' ');
+    else
+      out.push_back(in[i]);
   }
   return out;
 }
@@ -139,8 +153,7 @@ std::string canonical_query_string(const std::string& raw_query) {
 
 bool is_hex_sha256(const std::string& s) {
   if (s.size() != 64) return false;
-  return std::all_of(s.begin(), s.end(),
-                     [](unsigned char c) { return std::isxdigit(c) != 0; });
+  return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
 }
 
 // Reads the header block (through the blank line) with raw recv so SO_RCVTIMEO
@@ -169,8 +182,8 @@ std::string md5_hex(const std::uint8_t* data, std::size_t len) {
   unsigned int md_len = 0;
   EVP_MD_CTX* ctx = EVP_MD_CTX_new();
   if (!ctx) return {};
-  if (EVP_DigestInit_ex(ctx, EVP_md5(), nullptr) != 1 ||
-      EVP_DigestUpdate(ctx, data, len) != 1 || EVP_DigestFinal_ex(ctx, md, &md_len) != 1) {
+  if (EVP_DigestInit_ex(ctx, EVP_md5(), nullptr) != 1 || EVP_DigestUpdate(ctx, data, len) != 1 ||
+      EVP_DigestFinal_ex(ctx, md, &md_len) != 1) {
     EVP_MD_CTX_free(ctx);
     return {};
   }
@@ -221,14 +234,17 @@ void write_http(TlsStream& sock, int status, const std::string& reason,
 }
 
 void write_s3_error(TlsStream& sock, int status, const std::string& code,
-                    const std::string& message, const std::string& resource = {}) {
+                    const std::string& message, const std::string& resource = {},
+                    const std::unordered_map<std::string, std::string>& extra = {}) {
   std::ostringstream xml;
   xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
       << "<Error><Code>" << xml_escape(code) << "</Code><Message>" << xml_escape(message)
       << "</Message>";
   if (!resource.empty()) xml << "<Resource>" << xml_escape(resource) << "</Resource>";
   xml << "</Error>";
-  write_http(sock, status, code, {{"Content-Type", "application/xml"}}, xml.str());
+  auto headers = extra;
+  headers["Content-Type"] = "application/xml";
+  write_http(sock, status, code, headers, xml.str());
 }
 
 bool valid_bucket_name(const std::string& b) {
@@ -431,8 +447,7 @@ struct ListEntry {
 
 void collect_list(aios_posix_fs* fs, uint64_t dir_ino, const std::string& prefix_path,
                   const std::string& prefix_filter, const std::string& delimiter,
-                  std::vector<ListEntry>& keys, std::vector<std::string>& common,
-                  int max_keys) {
+                  std::vector<ListEntry>& keys, std::vector<std::string>& common, int max_keys) {
   if (static_cast<int>(keys.size() + common.size()) >= max_keys) return;
   uint64_t off = 0;
   aios_posix_dirent ents[64];
@@ -441,8 +456,7 @@ void collect_list(aios_posix_fs* fs, uint64_t dir_ino, const std::string& prefix
     if (n <= 0) break;
     for (int i = 0; i < n; ++i) {
       if (ents[i].name[0] == '.' &&
-          (ents[i].name[1] == '\0' ||
-           (ents[i].name[1] == '.' && ents[i].name[2] == '\0')))
+          (ents[i].name[1] == '\0' || (ents[i].name[1] == '.' && ents[i].name[2] == '\0')))
         continue;
       std::string name = ents[i].name;
       std::string full = prefix_path.empty() ? name : prefix_path + "/" + name;
@@ -500,7 +514,9 @@ S3Server::S3Server(boost::asio::io_context& ioc, Config cfg, std::string posix_h
       cuobject_(cuobject ? std::move(cuobject) : make_cuobject_endpoint(cfg_)),
       acceptor_(ioc) {}
 
-S3Server::~S3Server() { stop(); }
+S3Server::~S3Server() {
+  stop();
+}
 
 void S3Server::stop() {
   bool expected = false;
@@ -600,12 +616,12 @@ void S3Server::start() {
   acceptor_.set_option(tcp::acceptor::reuse_address(true));
   acceptor_.bind(eps.begin()->endpoint());
   acceptor_.listen();
-  AIOS_LOG_INFO("S3 API listening on ", cfg_.s3_listen, tls_ ? " (https)" : " (http)",
-                " volume=", cfg_.s3_volume, " (posix via ", posix_endpoint_, ")",
-                cuobject_ && cuobject_->available()
-                    ? (cfg_.cuobject_listen.empty() ? " cuobject=on"
-                                                   : (" cuobject=" + cfg_.cuobject_listen))
-                    : " cuobject=off");
+  AIOS_LOG_INFO(
+      "S3 API listening on ", cfg_.s3_listen, tls_ ? " (https)" : " (http)",
+      " volume=", cfg_.s3_volume, " (posix via ", posix_endpoint_, ")",
+      cuobject_ && cuobject_->available()
+          ? (cfg_.cuobject_listen.empty() ? " cuobject=on" : (" cuobject=" + cfg_.cuobject_listen))
+          : " cuobject=off");
   do_accept();
 }
 
@@ -693,7 +709,8 @@ void S3Server::handle_session(TlsStream& conn) {
     path = url_decode(path);
     auto qmap = parse_query(query);
 
-    // RDMA PUT uses Content-Length as object size with an empty TCP body.
+    // RDMA PUT has an empty TCP body. The object size is Content-Length when that
+    // is non-zero, otherwise field 2 of x-amz-rdma-token (NIXL sends 0).
     const std::string rdma_token = header_get(headers, kAmzRdmaToken);
     std::size_t content_len = 0;
     if (auto cl = header_get(headers, "content-length"); !cl.empty()) {
@@ -714,8 +731,6 @@ void S3Server::handle_session(TlsStream& conn) {
     }
     const bool rdma_put =
         method == "PUT" && !rdma_token.empty() && qmap.find("uploadId") == qmap.end();
-    std::size_t rdma_object_size = 0;
-    if (rdma_put) rdma_object_size = content_len;
     const bool has_tcp_body = !rdma_put && content_len > 0;
 
     // The payload hash is a signed header, so the signature is checked from the
@@ -866,8 +881,8 @@ void S3Server::handle_session(TlsStream& conn) {
       std::ostringstream xml;
       xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
           << "<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-          << "<Owner><ID>" << xml_escape(akid)
-          << "</ID><DisplayName>" << xml_escape(akid) << "</DisplayName></Owner><Buckets>";
+          << "<Owner><ID>" << xml_escape(akid) << "</ID><DisplayName>" << xml_escape(akid)
+          << "</DisplayName></Owner><Buckets>";
       uint64_t off = 0;
       aios_posix_dirent ents[64];
       for (;;) {
@@ -1156,9 +1171,8 @@ void S3Server::handle_session(TlsStream& conn) {
       std::sort(parts.begin(), parts.end());
       uint64_t parent = 0;
       std::string name;
-      int err =
-          resolve_parent(fs_, tbucket, tkey, true, &parent, &name, nullptr, set_owner, own_uid,
-                         own_gid);
+      int err = resolve_parent(fs_, tbucket, tkey, true, &parent, &name, nullptr, set_owner,
+                               own_uid, own_gid);
       if (err) {
         write_s3_error(conn, 500, "InternalError", "resolve target failed", path);
         return;
@@ -1270,8 +1284,8 @@ void S3Server::handle_session(TlsStream& conn) {
       }
       uint64_t dp = 0;
       std::string dname;
-      err = resolve_parent(fs_, bucket, key, true, &dp, &dname, nullptr, set_owner, own_uid,
-                          own_gid);
+      err =
+          resolve_parent(fs_, bucket, key, true, &dp, &dname, nullptr, set_owner, own_uid, own_gid);
       if (err) {
         write_s3_error(conn, 500, "InternalError", "dest resolve failed", path);
         return;
@@ -1316,10 +1330,50 @@ void S3Server::handle_session(TlsStream& conn) {
         write_s3_error(conn, 404, "NoSuchBucket", "The specified bucket does not exist", path);
         return;
       }
+      std::string put_data;
+      bool did_rdma = false;
+      if (rdma_put) {
+        // Size and pull the payload before creating the key, so a decline does
+        // not leave a 0-byte object (NIXL treats 200+ETag with no reply as success).
+        const auto plan = s3_plan_rdma_put(content_len, rdma_token);
+        if (!plan.ok) {
+          const char* ename = plan.status == 501 ? "NotImplemented" : "InvalidArgument";
+          write_s3_error(conn, plan.status, ename, plan.message, path,
+                         {{std::string(kAmzRdmaReply), std::to_string(plan.status)}});
+          return;
+        }
+        if (plan.len > cfg_.max_object_bytes) {
+          write_s3_error(conn, 413, "EntityTooLarge", "Body exceeds max_object_bytes", path,
+                         {{std::string(kAmzRdmaReply), "413"}});
+          return;
+        }
+        if (!cuobject_ || !cuobject_->available()) {
+          write_s3_error(
+              conn, 501, "NotImplemented",
+              "RDMA PUT failed: cuobject unavailable; retry without " + std::string(kAmzRdmaToken),
+              path, {{std::string(kAmzRdmaReply), "501"}});
+          return;
+        }
+        put_data.resize(plan.len);
+        std::string endpoint_reply;
+        std::string rdma_err;
+        if (!s3_try_rdma_put(cuobject_.get(), bucket + "/" + key, rdma_token, put_data.data(),
+                             put_data.size(), endpoint_reply, rdma_err)) {
+          write_s3_error(
+              conn, 500, "InternalError",
+              "RDMA PUT failed: " + rdma_err + "; retry without " + std::string(kAmzRdmaToken),
+              path, {{std::string(kAmzRdmaReply), "500"}});
+          return;
+        }
+        did_rdma = true;
+      } else {
+        put_data = std::move(body);
+      }
+
       uint64_t parent = 0;
       std::string name;
       int err = resolve_parent(fs_, bucket, key, true, &parent, &name, nullptr, set_owner, own_uid,
-                              own_gid);
+                               own_gid);
       if (err) {
         write_s3_error(conn, 500, "InternalError", "path resolve failed", path);
         return;
@@ -1329,39 +1383,6 @@ void S3Server::handle_session(TlsStream& conn) {
       if (err) {
         write_s3_error(conn, 500, "InternalError", "create failed", path);
         return;
-      }
-
-      std::string put_data;
-      std::string rdma_reply;
-      if (rdma_put) {
-        if (rdma_object_size == 0 || rdma_object_size > kCuObjectMaxTransferBytes) {
-          write_s3_error(conn, 400, "InvalidArgument",
-                         "RDMA PUT size out of range; retry without " +
-                             std::string(kAmzRdmaToken),
-                         path);
-          return;
-        }
-        put_data.resize(rdma_object_size);
-        std::string rdma_err;
-        if (!s3_try_rdma_put(cuobject_.get(), bucket + "/" + key, rdma_token, put_data.data(),
-                             put_data.size(), rdma_reply, rdma_err)) {
-          int code = 500;
-          const char* ename = "InternalError";
-          if (!cuobject_ || !cuobject_->available()) {
-            code = 501;
-            ename = "NotImplemented";
-          } else if (rdma_object_size == 0 || rdma_object_size > kCuObjectMaxTransferBytes) {
-            code = 400;
-            ename = "InvalidArgument";
-          }
-          write_s3_error(conn, code, ename,
-                         "RDMA PUT failed: " + rdma_err + "; retry without " +
-                             std::string(kAmzRdmaToken),
-                         path);
-          return;
-        }
-      } else {
-        put_data = std::move(body);
       }
 
       aios_posix_truncate(fs_, ino, 0);
@@ -1384,7 +1405,10 @@ void S3Server::handle_session(TlsStream& conn) {
       }
       auto etag = md5_hex(reinterpret_cast<const std::uint8_t*>(put_data.data()), put_data.size());
       std::unordered_map<std::string, std::string> rh{{"ETag", "\"" + etag + "\""}};
-      if (!rdma_reply.empty()) rh[kAmzRdmaReply] = rdma_reply;
+      if (did_rdma) {
+        rh[kAmzRdmaReply] = "200";
+        rh[kAmzRdmaBytesTransferred] = std::to_string(put_data.size());
+      }
       write_http(conn, 200, "OK", rh, {});
       return;
     }
@@ -1436,14 +1460,27 @@ void S3Server::handle_session(TlsStream& conn) {
         out.resize(static_cast<std::size_t>(len));
         if (!len) return true;
         size_t got = 0;
-        int rerr =
-            aios_posix_read(fs_, st.ino, start, out.data(), static_cast<size_t>(len), &got);
+        int rerr = aios_posix_read(fs_, st.ino, start, out.data(), static_cast<size_t>(len), &got);
         if (rerr) return false;
         out.resize(got);
         return true;
       };
 
-      // Multi-range → multipart/byteranges (RFC 7233).
+      const auto rdma_tok = parse_rdma_token(rdma_token);
+      if (!rdma_token.empty()) {
+        if (rdma_tok.unsupported) {
+          write_s3_error(conn, 501, "NotImplemented", "RDMA token scheme is not supported", path,
+                         {{std::string(kAmzRdmaReply), "501"}});
+          return;
+        }
+        if (rdma_tok.malformed) {
+          write_s3_error(conn, 400, "InvalidArgument", "malformed x-amz-rdma-token", path,
+                         {{std::string(kAmzRdmaReply), "400"}});
+          return;
+        }
+      }
+
+      // Multi-range → multipart/byteranges (RFC 7233). One RDMA token names one buffer.
       if (ranged && ranges.ranges.size() > 1) {
         std::vector<std::string> parts;
         parts.reserve(ranges.ranges.size());
@@ -1458,8 +1495,8 @@ void S3Server::handle_session(TlsStream& conn) {
         const std::string boundary = "aiosboundary" + std::to_string(st.ino) + "x" +
                                      std::to_string(st.size) + "x" +
                                      std::to_string(ranges.ranges.size());
-        auto body = build_s3_multipart_byteranges(boundary, object_ctype, st.size, ranges.ranges,
-                                                  parts);
+        auto body =
+            build_s3_multipart_byteranges(boundary, object_ctype, st.size, ranges.ranges, parts);
         rh["Content-Type"] = "multipart/byteranges; boundary=" + boundary;
         write_http(conn, 206, "Partial Content", rh, body);
         return;
@@ -1475,6 +1512,14 @@ void S3Server::handle_session(TlsStream& conn) {
         end = 0;
       }
 
+      const std::uint64_t span_len =
+          (st.size == 0 && !ranged) ? 0 : (end >= start ? end - start + 1 : 0);
+      if (!rdma_token.empty() && rdma_tok.has_size && span_len > rdma_tok.size) {
+        write_s3_error(conn, 400, "InvalidArgument", "range exceeds RDMA token buffer", path,
+                       {{std::string(kAmzRdmaReply), "400"}});
+        return;
+      }
+
       std::string out;
       if (st.size == 0 && !ranged) {
         out.clear();
@@ -1483,15 +1528,26 @@ void S3Server::handle_session(TlsStream& conn) {
         return;
       }
 
-      // Whole-object RDMA GET (no Range): push host buffer to client GPU/system memory.
-      if (s3_want_rdma_get(rdma_token, ranged, method == "GET")) {
-        std::string rdma_reply;
+      // Push this span to the client buffer named by the token. NIXL always sends
+      // Range, including bytes=0-(n-1) for a whole-object read. Reply 200 only when
+      // that span is the whole object; a sub-range is 206. The HTTP body stays empty.
+      if (s3_want_rdma_get(rdma_token, false, true, static_cast<std::size_t>(span_len)) &&
+          out.size() == span_len) {
+        std::string endpoint_reply;
         std::string rdma_err;
         if (s3_try_rdma_get(cuobject_.get(), bucket + "/" + key, rdma_token, out.data(), out.size(),
-                            rdma_reply, rdma_err)) {
-          rh["Content-Length"] = std::to_string(out.size());
-          rh[kAmzRdmaReply] = rdma_reply;
-          write_http(conn, 200, "OK", rh, {});
+                            endpoint_reply, rdma_err)) {
+          const int http_status = s3_rdma_get_http_status(ranged, start, end, st.size);
+          rh["Content-Length"] = "0";
+          rh[kAmzRdmaReply] = std::to_string(http_status);
+          rh[kAmzRdmaBytesTransferred] = std::to_string(out.size());
+          if (http_status == 206) {
+            rh["Content-Range"] = "bytes " + std::to_string(start) + "-" + std::to_string(end) +
+                                  "/" + std::to_string(st.size);
+            write_http(conn, 206, "Partial Content", rh, {});
+          } else {
+            write_http(conn, 200, "OK", rh, {});
+          }
           return;
         }
         AIOS_LOG_WARN("S3 RDMA GET failed (", rdma_err, "); falling back to TCP body");
