@@ -1,11 +1,13 @@
-#include "test_helpers.hpp"
 #include <gtest/gtest.h>
+#include "test_helpers.hpp"
 
 #include "cluster/place.hpp"
+#include "store/body_log.hpp"
 #include "store/object_store.hpp"
 #include "util/crc32c.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -35,7 +37,8 @@ TEST(ObjectServiceAdvanced, Basic) {
   vers = svc.api_list_versions(oid);
   EXPECT_TRUE(vers.ok && vers.versions.size() == 2) << "list_versions size grows to 2";
   EXPECT_TRUE(!vers.versions.empty() && vers.versions[0].seq == 2) << "newest first seq2";
-  EXPECT_TRUE(vers.versions.size() >= 2 && vers.versions[0].size >= vers.versions[1].size) << "newest size >= older";
+  EXPECT_TRUE(vers.versions.size() >= 2 && vers.versions[0].size >= vers.versions[1].size)
+      << "newest size >= older";
 
   auto p3 = svc.api_put(oid, body3, 2, {{"n", "3"}}, true, {});
   EXPECT_TRUE(p3.ok) << "api_put v3";
@@ -45,7 +48,8 @@ TEST(ObjectServiceAdvanced, Basic) {
 
   auto old = svc.api_get(oid, std::nullopt, std::nullopt, {}, /*seq=*/1);
   EXPECT_TRUE(old.ok && old.data.has_value()) << "get seq1";
-  EXPECT_TRUE(old.data && std::string(old.data->begin(), old.data->end()) == "version-one") << "get seq1 body";
+  EXPECT_TRUE(old.data && std::string(old.data->begin(), old.data->end()) == "version-one")
+      << "get seq1 body";
 
   auto head = svc.api_head(oid, {});
   EXPECT_TRUE(head.ok && head.info.has_value()) << "api_head info";
@@ -90,8 +94,8 @@ TEST(ObjectServiceAdvanced, Basic) {
 
   // api_put_range with quorum.
   const std::string range_oid = "adv/range";
-  auto base = svc.api_put(range_oid, reinterpret_cast<const std::uint8_t*>("ABCDEFGH"), 8, {},
-                          true, {});
+  auto base =
+      svc.api_put(range_oid, reinterpret_cast<const std::uint8_t*>("ABCDEFGH"), 8, {}, true, {});
   EXPECT_TRUE(base.ok && base.replicas == 2) << "range base put";
   const std::string patch = "xy";
   auto pr = svc.api_put_range(range_oid, 2, reinterpret_cast<const std::uint8_t*>(patch.data()),
@@ -99,15 +103,16 @@ TEST(ObjectServiceAdvanced, Basic) {
   EXPECT_TRUE(pr.ok && pr.replicas == 2) << "api_put_range quorum";
   auto ranged = svc.api_get(range_oid, std::nullopt, std::nullopt, {});
   EXPECT_TRUE(ranged.ok && ranged.data.has_value()) << "get after range";
-  EXPECT_TRUE(ranged.data && std::string(ranged.data->begin(), ranged.data->end()) == "ABxyEFGH") << "range body";
+  EXPECT_TRUE(ranged.data && std::string(ranged.data->begin(), ranged.data->end()) == "ABxyEFGH")
+      << "range body";
 
   // Replace redirect with api_put body.
-  auto replace = svc.api_put(alias, reinterpret_cast<const std::uint8_t*>("real"), 4, {}, true,
-                             {});
+  auto replace = svc.api_put(alias, reinterpret_cast<const std::uint8_t*>("real"), 4, {}, true, {});
   EXPECT_TRUE(replace.ok) << "replace redirect";
   auto real = svc.api_get(alias, std::nullopt, std::nullopt, {});
   EXPECT_TRUE(real.ok && real.code != "redirect") << "no longer redirect";
-  EXPECT_TRUE(real.data && std::string(real.data->begin(), real.data->end()) == "real") << "real body after replace";
+  EXPECT_TRUE(real.data && std::string(real.data->begin(), real.data->end()) == "real")
+      << "real body after replace";
 
   // Empty oid / bad cases via store.
   auto placement = place(create_oid, fx.map, "nvme");
@@ -123,8 +128,8 @@ TEST(ObjectServiceAdvanced, Basic) {
   // prepare_put + abort leaves tip unchanged.
   {
     const std::string abort_oid = "adv/abort";
-    auto put = svc.api_put(abort_oid, reinterpret_cast<const std::uint8_t*>("tip"), 3, {}, true,
-                           {});
+    auto put =
+        svc.api_put(abort_oid, reinterpret_cast<const std::uint8_t*>("tip"), 3, {}, true, {});
     EXPECT_TRUE(put.ok) << "abort oid put";
     auto pl = place(abort_oid, fx.map, "nvme");
     auto* ps = fx.stores.get(pl.acting_set[0].aios_path);
@@ -135,12 +140,15 @@ TEST(ObjectServiceAdvanced, Basic) {
       EXPECT_TRUE(tip_before.has_value()) << "tip before prepare";
       PreparedVersion pv;
       EXPECT_TRUE(ps->prepare_put(abort_oid, reinterpret_cast<const std::uint8_t*>("zzz"), 3, {},
-                             true, std::nullopt, pv, err)) << "prepare_put";
+                                  true, std::nullopt, pv, err))
+          << "prepare_put";
       EXPECT_TRUE(ps->abort_version(abort_oid, pv.seq, err)) << "abort_version";
       auto tip_after = ps->stat(abort_oid, err);
-      EXPECT_TRUE(tip_after && tip_before && tip_after->seq == tip_before->seq) << "tip unchanged after abort";
+      EXPECT_TRUE(tip_after && tip_before && tip_after->seq == tip_before->seq)
+          << "tip unchanged after abort";
       auto body = ps->get(abort_oid, err);
-      EXPECT_TRUE(body && std::string(body->begin(), body->end()) == "tip") << "tip body after abort";
+      EXPECT_TRUE(body && std::string(body->begin(), body->end()) == "tip")
+          << "tip body after abort";
     }
   }
 
@@ -162,22 +170,28 @@ TEST(ObjectServiceAdvanced, Basic) {
     EXPECT_TRUE(svc.api_get(pred_oid, std::nullopt, std::nullopt, must).ok) << "pred MustExist";
     std::vector<AttrPrecondition> bad_eq = {{AttrPrecondition::Kind::Eq, "color", "green"}};
     EXPECT_TRUE(svc.api_get(pred_oid, std::nullopt, std::nullopt, bad_eq).code ==
-               "precondition_failed") << "pred Eq fail";
+                "precondition_failed")
+        << "pred Eq fail";
     std::vector<AttrPrecondition> bad_ne = {{AttrPrecondition::Kind::Ne, "color", "red"}};
-    EXPECT_TRUE(svc.api_put(pred_oid, reinterpret_cast<const std::uint8_t*>("q"), 1, {}, true, bad_ne)
-               .code == "precondition_failed") << "pred Ne fail on put";
+    EXPECT_TRUE(
+        svc.api_put(pred_oid, reinterpret_cast<const std::uint8_t*>("q"), 1, {}, true, bad_ne)
+            .code == "precondition_failed")
+        << "pred Ne fail on put";
   }
 
   // List with prefix + attrs + attr_eq (may see duplicates across local replica stores).
   {
     EXPECT_TRUE(svc.api_put("list/a", reinterpret_cast<const std::uint8_t*>("1"), 1,
-                       {{"team", "x"}}, true, {})
-               .ok) << "list put a";
+                            {{"team", "x"}}, true, {})
+                    .ok)
+        << "list put a";
     EXPECT_TRUE(svc.api_put("list/b", reinterpret_cast<const std::uint8_t*>("2"), 1,
-                       {{"team", "y"}}, true, {})
-               .ok) << "list put b";
-    EXPECT_TRUE(svc.api_put("other/c", reinterpret_cast<const std::uint8_t*>("3"), 1, {}, true, {})
-               .ok) << "list put other";
+                            {{"team", "y"}}, true, {})
+                    .ok)
+        << "list put b";
+    EXPECT_TRUE(
+        svc.api_put("other/c", reinterpret_cast<const std::uint8_t*>("3"), 1, {}, true, {}).ok)
+        << "list put other";
     auto lst = svc.api_list("list/", "", "", 10, "", true);
     EXPECT_TRUE(lst.ok && lst.list.objects.size() >= 2) << "list prefix";
     bool saw_a = false, saw_b = false, saw_attrs = false;
@@ -217,10 +231,12 @@ TEST(ObjectServiceAdvanced, Basic) {
   }
 
   // Self-redirect rejected via API.
-  EXPECT_TRUE(!svc.api_put_redirect("adv/self", "adv/self", {}, true, {}).ok) << "api self-redirect";
+  EXPECT_TRUE(!svc.api_put_redirect("adv/self", "adv/self", {}, true, {}).ok)
+      << "api self-redirect";
 
   // Missing object get.
-  EXPECT_TRUE(svc.api_get("adv/nope", std::nullopt, std::nullopt, {}).code == "not_found") << "missing get";
+  EXPECT_TRUE(svc.api_get("adv/nope", std::nullopt, std::nullopt, {}).code == "not_found")
+      << "missing get";
 
   // Cross-object txn: prepare two puts, commit → tips visible; abort path hides tips.
   {
@@ -240,8 +256,10 @@ TEST(ObjectServiceAdvanced, Basic) {
     EXPECT_TRUE(pb_r.ok && pb_r.info && pb_r.info->seq > 0) << "txn prepare b";
 
     // Unpublished: tip GET must miss until commit.
-    EXPECT_TRUE(svc.api_get(a, std::nullopt, std::nullopt, {}).code == "not_found") << "txn a invisible before commit";
-    EXPECT_TRUE(svc.api_get(b, std::nullopt, std::nullopt, {}).code == "not_found") << "txn b invisible before commit";
+    EXPECT_TRUE(svc.api_get(a, std::nullopt, std::nullopt, {}).code == "not_found")
+        << "txn a invisible before commit";
+    EXPECT_TRUE(svc.api_get(b, std::nullopt, std::nullopt, {}).code == "not_found")
+        << "txn b invisible before commit";
 
     auto committed = svc.api_txn_commit(txn_id);
     EXPECT_TRUE(committed.ok) << "txn commit";
@@ -258,10 +276,10 @@ TEST(ObjectServiceAdvanced, Basic) {
     EXPECT_TRUE(svc.api_txn_prepare_put(txn2, a, pc, 7, {}, {}).ok) << "txn2 prepare";
     EXPECT_TRUE(svc.api_txn_abort(txn2).ok) << "txn2 abort";
     auto ga2 = svc.api_get(a, std::nullopt, std::nullopt, {});
-    EXPECT_TRUE(ga2.ok && std::string(ga2.data->begin(), ga2.data->end()) == "alpha") << "txn2 abort keeps old tip";
+    EXPECT_TRUE(ga2.ok && std::string(ga2.data->begin(), ga2.data->end()) == "alpha")
+        << "txn2 abort keeps old tip";
   }
-
-  }
+}
 
 TEST(ObjectServiceAdvanced, RangeDeltaReplicatedAndFullFallback) {
   using namespace aios;
@@ -305,14 +323,38 @@ TEST(ObjectServiceAdvanced, RangeDeltaReplicatedAndFullFallback) {
   ASSERT_TRUE(replica);
   auto replica_tip = replica->stat(oid, err);
   ASSERT_TRUE(replica_tip && !replica_tip->fs_path.empty());
+  // Packed bodies live at seg/<id>.seg:<off>:<len> inside shards/*/segments.
+  // Legacy bodies are a file whose path ends with fs_path. Byte 64 is outside
+  // the follow-up range at offset 0 and inside the first CRC block, so the
+  // replica's delta CRC no longer matches the primary.
   std::filesystem::path body_file;
-  for (const auto& e : std::filesystem::recursive_directory_iterator(replica_root)) {
-    if (!e.is_regular_file()) continue;
-    const auto p = e.path().generic_string();
-    const auto& rel = replica_tip->fs_path;
-    if (p.size() >= rel.size() && p.compare(p.size() - rel.size(), rel.size(), rel) == 0) {
-      body_file = e.path();
-      break;
+  std::uint64_t poke_at = 64;
+  if (is_segment_locator(replica_tip->fs_path)) {
+    BodyLocation loc;
+    ASSERT_TRUE(parse_segment_locator(replica_tip->fs_path, loc)) << replica_tip->fs_path;
+    char name[32];
+    std::snprintf(name, sizeof(name), "%012u.seg", loc.segment_id);
+    for (const auto& e : std::filesystem::recursive_directory_iterator(replica_root)) {
+      if (!e.is_regular_file() || e.path().filename() != name) continue;
+      std::ifstream in(e.path(), std::ios::binary);
+      in.seekg(static_cast<std::streamoff>(loc.offset));
+      char c = 0;
+      in.get(c);
+      if (c == 'A') {
+        body_file = e.path();
+        poke_at = loc.offset + 64;
+        break;
+      }
+    }
+  } else {
+    for (const auto& e : std::filesystem::recursive_directory_iterator(replica_root)) {
+      if (!e.is_regular_file()) continue;
+      const auto p = e.path().generic_string();
+      const auto& rel = replica_tip->fs_path;
+      if (p.size() >= rel.size() && p.compare(p.size() - rel.size(), rel.size(), rel) == 0) {
+        body_file = e.path();
+        break;
+      }
     }
   }
   ASSERT_FALSE(body_file.empty()) << replica_tip->fs_path;
@@ -320,7 +362,7 @@ TEST(ObjectServiceAdvanced, RangeDeltaReplicatedAndFullFallback) {
     std::fstream f(body_file, std::ios::in | std::ios::out | std::ios::binary);
     ASSERT_TRUE(f) << body_file;
     const char z = 'Z';
-    f.seekp(64);  // outside the follow-up range at offset 0
+    f.seekp(static_cast<std::streamoff>(poke_at));
     f.write(&z, 1);
     ASSERT_TRUE(f);
   }
