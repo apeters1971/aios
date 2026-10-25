@@ -1,6 +1,6 @@
 // Native TLS on the S3 listener (s3_tls_cert / s3_tls_key / s3_tls_chain).
-#include "test_helpers.hpp"
 #include <gtest/gtest.h>
+#include "test_helpers.hpp"
 
 #include "http/http_server.hpp"
 #include "http/s3_iam.hpp"
@@ -37,7 +37,9 @@ namespace fs = std::filesystem;
 using tcp = boost::asio::ip::tcp;
 using aios::test::DualStoreFixture;
 
-int pid_port(int base) { return base + static_cast<int>(::getpid() % 200); }
+int pid_port(int base) {
+  return base + static_cast<int>(::getpid() % 200);
+}
 
 // Self-signed cert + key for 127.0.0.1, written as PEM. Returns false on error.
 bool make_self_signed(const fs::path& cert_pem, const fs::path& key_pem, const char* cn) {
@@ -49,10 +51,18 @@ bool make_self_signed(const fs::path& cert_pem, const fs::path& key_pem, const c
   X509_gmtime_adj(X509_get_notBefore(x), -60);
   X509_gmtime_adj(X509_get_notAfter(x), 3600);
   X509_set_pubkey(x, pkey);
-  X509_NAME* name = X509_get_subject_name(x);
-  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                             reinterpret_cast<const unsigned char*>(cn), -1, -1, 0);
+  // OpenSSL 3 returns a const subject name; build one and install copies.
+  X509_NAME* name = X509_NAME_new();
+  if (!name) {
+    X509_free(x);
+    EVP_PKEY_free(pkey);
+    return false;
+  }
+  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(cn),
+                             -1, -1, 0);
+  X509_set_subject_name(x, name);
   X509_set_issuer_name(x, name);
+  X509_NAME_free(name);
   if (X509_sign(x, pkey, EVP_sha256()) == 0) return false;
 
   bool ok = true;
@@ -105,14 +115,18 @@ void sign_s3(const std::string& method, const std::string& uri, const std::strin
   headers["x-amz-date"] = amz;
   headers["x-amz-content-sha256"] = payload_hash;
   headers["host"] = hostport;
-  const std::string canon_headers = "host:" + hostport + "\nx-amz-content-sha256:" + payload_hash +
-                                    "\nx-amz-date:" + amz + "\n";
+  const std::string canon_headers =
+      "host:" + hostport + "\nx-amz-content-sha256:" + payload_hash + "\nx-amz-date:" + amz + "\n";
   const std::string signed_headers = "host;x-amz-content-sha256;x-amz-date";
   std::ostringstream canon;
-  canon << method << '\n' << uri << "\n\n" << canon_headers << signed_headers << '\n'
+  canon << method << '\n'
+        << uri << "\n\n"
+        << canon_headers << signed_headers << '\n'
         << payload_hash;
   std::ostringstream sts;
-  sts << "AWS4-HMAC-SHA256\n" << amz << '\n' << ds << '/' << region << "/s3/aws4_request\n"
+  sts << "AWS4-HMAC-SHA256\n"
+      << amz << '\n'
+      << ds << '/' << region << "/s3/aws4_request\n"
       << sha256_hex(canon.str());
   auto k = hmac_sha256_raw("AWS4" + secret, ds);
   k = hmac_sha256_raw(k, region);
@@ -262,9 +276,11 @@ TEST(S3Tls, ContextLoadValidatesFiles) {
   // Cert file may double as chain file (leaf appended again is harmless).
   EXPECT_TRUE(aios::TlsServerContext::load(cert.string(), key.string(), cert.string(), err)) << err;
 
-  EXPECT_FALSE(aios::TlsServerContext::load((root / "missing.pem").string(), key.string(), "", err));
+  EXPECT_FALSE(
+      aios::TlsServerContext::load((root / "missing.pem").string(), key.string(), "", err));
   EXPECT_NE(err.find("load certificate"), std::string::npos) << err;
-  EXPECT_FALSE(aios::TlsServerContext::load(cert.string(), (root / "missing.pem").string(), "", err));
+  EXPECT_FALSE(
+      aios::TlsServerContext::load(cert.string(), (root / "missing.pem").string(), "", err));
   EXPECT_NE(err.find("load private key"), std::string::npos) << err;
 
   // Key that does not belong to the certificate.
@@ -280,8 +296,8 @@ TEST(S3Tls, ContextLoadValidatesFiles) {
 
   // Chain file without certificates.
   std::ofstream(root / "empty.pem") << "not a certificate\n";
-  EXPECT_FALSE(
-      aios::TlsServerContext::load(cert.string(), key.string(), (root / "empty.pem").string(), err));
+  EXPECT_FALSE(aios::TlsServerContext::load(cert.string(), key.string(),
+                                            (root / "empty.pem").string(), err));
   EXPECT_NE(err.find("no certificates"), std::string::npos) << err;
   fs::remove_all(root);
 }

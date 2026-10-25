@@ -1,6 +1,6 @@
 // Regression tests for the 2026-09-02 code review (posix slice).
-#include "test_helpers.hpp"
 #include <gtest/gtest.h>
+#include "test_helpers.hpp"
 
 #include "client/changelog.hpp"
 #include "client/error.hpp"
@@ -19,24 +19,24 @@
 
 #include <boost/asio.hpp>
 
+#include <errno.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <errno.h>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
-#include <sys/file.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -110,9 +110,9 @@ struct Mount {
 // clients cannot deadlock the test. The handler may answer, answer-and-close,
 // or drop the connection without a byte in response.
 struct StubReply {
-  std::string body;      // full HTTP response bytes; ignored when drop
-  bool close{true};      // close the socket after answering
-  bool drop{false};      // close without responding
+  std::string body;  // full HTTP response bytes; ignored when drop
+  bool close{true};  // close the socket after answering
+  bool drop{false};  // close without responding
 };
 
 struct StubServer {
@@ -174,7 +174,9 @@ struct StubServer {
       poke.connect(tcp::endpoint(boost::asio::ip::address_v4::loopback(), listen_port), ec);
     } catch (...) {
     }
-    acc.close(ec);
+    // Join before acc.close. Closing the acceptor while this thread is inside
+    // accept() is a data race on the acceptor (TSAN). stop is already set, so
+    // the poke connection makes accept return and the thread exit.
     if (th.joinable()) th.join();
     {
       std::lock_guard lock(workers_mu);
@@ -182,6 +184,7 @@ struct StubServer {
         if (w.joinable()) w.join();
       }
     }
+    acc.close(ec);
     // Workers have left serve(); close from this thread only.
     std::lock_guard lock(live_mu);
     for (auto& s : live) {
@@ -208,8 +211,8 @@ struct StubServer {
       if (p != std::string::npos) {
         const auto end = lower.find("\r\n", p);
         try {
-          content_length = static_cast<std::size_t>(
-              std::stoull(lower.substr(p + 15, end - (p + 15))));
+          content_length =
+              static_cast<std::size_t>(std::stoull(lower.substr(p + 15, end - (p + 15))));
         } catch (...) {
         }
       }
@@ -310,9 +313,8 @@ TEST(Review2Posix, EightConcurrentDisjointWritersKeepFullSize) {
     ts.emplace_back([&, t] {
       const std::string data(kRegion, static_cast<char>('a' + t));
       size_t wrote = 0;
-      rcs[static_cast<size_t>(t)] =
-          aios_posix_write(m.fs, ino, static_cast<uint64_t>(t) * kRegion, data.data(),
-                           data.size(), &wrote);
+      rcs[static_cast<size_t>(t)] = aios_posix_write(m.fs, ino, static_cast<uint64_t>(t) * kRegion,
+                                                     data.data(), data.size(), &wrote);
     });
   }
   for (auto& t : ts) t.join();
@@ -553,8 +555,10 @@ TEST(Review2Posix, RedirectAllowlistConcurrentRefresh) {
     ts.emplace_back([&] {
       try {
         auto r = s.request("GET", "/o/x");
-        if (r.status == 200 && r.body == "peer-ok") ok.fetch_add(1);
-        else other.fetch_add(1);
+        if (r.status == 200 && r.body == "peer-ok")
+          ok.fetch_add(1);
+        else
+          other.fetch_add(1);
       } catch (const aios::client_error& e) {
         if (std::string(e.what()).find("redirect target not in cluster") != std::string::npos) {
           rejected.fetch_add(1);
@@ -604,7 +608,7 @@ TEST(Review2Posix, GetOnStaleIdleConnectionIsRetried) {
   StubServer stub([](const std::string& req, int conn) {
     if (conn == 0 && req.find("/o/first") != std::string::npos) {
       // Answer keep-alive, then the server drops the idle socket.
-      return StubReply{http_response(200, "first", true) , true, false};
+      return StubReply{http_response(200, "first", true), true, false};
     }
     return StubReply{http_response(200, "second", true), false, false};
   });
@@ -673,9 +677,9 @@ TEST(Review2Posix, ConnectToBlackholeFailsWithinTimeout) {
   aios::Session s(cfg);
   const auto t0 = std::chrono::steady_clock::now();
   EXPECT_THROW(s.request("GET", "/o/x"), aios::client_error);
-  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - t0)
-                      .count();
+  const auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+          .count();
   EXPECT_LT(ms, 5000) << "connect must honour socket_timeout_ms";
 }
 
@@ -1076,7 +1080,8 @@ TEST(Review2Posix, DirLeaseHeldWhileActiveAndReleasedOnUnmount) {
     ASSERT_EQ(aios_posix_mkdir(a.fs, d.ino, "sub", 0755, &sub), 0);
     aios_posix_stat dstat{};
     ASSERT_EQ(aios_posix_getattr(a.fs, d.ino, &dstat), 0);
-    EXPECT_EQ(dstat.nlink, 3u) << "child mkdir must bump the unpublished dir, not the create snapshot";
+    EXPECT_EQ(dstat.nlink, 3u)
+        << "child mkdir must bump the unpublished dir, not the create snapshot";
     aios_posix_stat root{};
     ASSERT_EQ(aios_posix_getattr(a.fs, 1, &root), 0);
     EXPECT_EQ(root.nlink, 3u);

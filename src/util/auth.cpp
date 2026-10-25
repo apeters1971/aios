@@ -2,9 +2,13 @@
 
 #include "util/log.hpp"
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/params.h>
+#endif
 
 #include <array>
 #include <cstdlib>
@@ -51,8 +55,7 @@ struct ReplayShard {
 
 std::array<ReplayShard, kReplayShards> g_replay;
 
-bool replay_mark(const std::string& digest, std::int64_t ts, std::int64_t now,
-                 int max_skew_ms) {
+bool replay_mark(const std::string& digest, std::int64_t ts, std::int64_t now, int max_skew_ms) {
   auto& shard = g_replay[std::hash<std::string>{}(digest) % kReplayShards];
   std::lock_guard lock(shard.mu);
   if (shard.seen.count(digest)) return false;
@@ -88,7 +91,14 @@ std::string to_hex_lower(const unsigned char* p, std::size_t n) {
   return out;
 }
 
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+void prime_openssl();
+#endif
+
 std::string random_nonce_hex() {
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+  prime_openssl();
+#endif
   unsigned char raw[16];
   if (RAND_bytes(raw, sizeof(raw)) != 1) {
     // Fall back to a process-local counter so signing still progresses.
@@ -106,9 +116,98 @@ std::string random_nonce_hex() {
   return to_hex_lower(raw, sizeof(raw));
 }
 
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+// HMAC() on OpenSSL 3 is EVP_Q_mac(), which fetches "HMAC" and "SHA256" on
+// every call. The namemap lookup is unlocked while another thread may be
+// inserting the same name under the namemap lock, so the first concurrent
+// burst (auth verify, HTTP signing) is a ThreadSanitizer race inside libcrypto.
+// Fetch each method once; the objects are immutable afterwards and safe to share.
+// Each call still gets its own context.
+struct Sha256Method {
+  EVP_MD* md{nullptr};
+  Sha256Method() { md = EVP_MD_fetch(nullptr, "SHA256", nullptr); }
+  ~Sha256Method() { EVP_MD_free(md); }
+  Sha256Method(const Sha256Method&) = delete;
+  Sha256Method& operator=(const Sha256Method&) = delete;
+};
+
+struct HmacMethod {
+  EVP_MAC* mac{nullptr};
+  HmacMethod() {
+    mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+    if (mac == nullptr) return;
+    // Resolve SHA-256 in the provider before any other thread starts an HMAC.
+    EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
+    if (ctx == nullptr) return;
+    char digest[] = "SHA256";
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string("digest", digest, 0),
+        OSSL_PARAM_construct_end(),
+    };
+    unsigned char key = 0;
+    unsigned char byte = 0;
+    unsigned char out[EVP_MAX_MD_SIZE];
+    std::size_t out_len = 0;
+    if (EVP_MAC_init(ctx, &key, 1, params) == 1 && EVP_MAC_update(ctx, &byte, 1) == 1) {
+      EVP_MAC_final(ctx, out, &out_len, sizeof(out));
+    }
+    EVP_MAC_CTX_free(ctx);
+  }
+  ~HmacMethod() { EVP_MAC_free(mac); }
+  HmacMethod(const HmacMethod&) = delete;
+  HmacMethod& operator=(const HmacMethod&) = delete;
+};
+
+const EVP_MD* sha256_md() {
+  static const Sha256Method method;
+  return method.md;
+}
+
+const HmacMethod& hmac_method() {
+  static const HmacMethod method;
+  return method;
+}
+
+// One thread loads both methods and the DRBG. Callers block on this guard, so
+// the namemap is populated before any concurrent HMAC, SHA-256, or RAND_bytes.
+void prime_openssl() {
+  static const int once = [] {
+    OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS | OPENSSL_INIT_ADD_ALL_DIGESTS, nullptr);
+    (void)sha256_md();
+    (void)hmac_method();
+    unsigned char raw[16];
+    RAND_bytes(raw, sizeof(raw));
+    return 0;
+  }();
+  (void)once;
+}
+#endif
+
 }  // namespace
 
 std::string hmac_sha256_raw(const std::string& key, const std::string& data) {
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+  prime_openssl();
+  const auto& method = hmac_method();
+  if (method.mac == nullptr) return {};
+  EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(method.mac);
+  if (ctx == nullptr) return {};
+  char digest[] = "SHA256";
+  OSSL_PARAM params[] = {
+      OSSL_PARAM_construct_utf8_string("digest", digest, 0),
+      OSSL_PARAM_construct_end(),
+  };
+  unsigned char md[EVP_MAX_MD_SIZE];
+  std::size_t md_len = 0;
+  const bool ok =
+      EVP_MAC_init(ctx, reinterpret_cast<const unsigned char*>(key.data()), key.size(), params) ==
+          1 &&
+      EVP_MAC_update(ctx, reinterpret_cast<const unsigned char*>(data.data()), data.size()) == 1 &&
+      EVP_MAC_final(ctx, md, &md_len, sizeof(md)) == 1;
+  EVP_MAC_CTX_free(ctx);
+  if (!ok || md_len == 0) return {};
+  return std::string(reinterpret_cast<char*>(md), md_len);
+#else
   unsigned char md[EVP_MAX_MD_SIZE];
   unsigned int md_len = 0;
   if (HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
@@ -117,6 +216,7 @@ std::string hmac_sha256_raw(const std::string& key, const std::string& data) {
     return {};
   }
   return std::string(reinterpret_cast<char*>(md), md_len);
+#endif
 }
 
 std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
@@ -128,9 +228,17 @@ std::string hmac_sha256_hex(const std::string& key, const std::string& data) {
 std::string sha256_hex(const std::string& data) {
   unsigned char md[EVP_MAX_MD_SIZE];
   unsigned int md_len = 0;
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+  prime_openssl();
+  const EVP_MD* sha = sha256_md();
+  if (sha == nullptr || EVP_Digest(data.data(), data.size(), md, &md_len, sha, nullptr) != 1) {
+    return {};
+  }
+#else
   if (EVP_Digest(data.data(), data.size(), md, &md_len, EVP_sha256(), nullptr) != 1) {
     return {};
   }
+#endif
   return to_hex_lower(md, md_len);
 }
 
@@ -195,8 +303,8 @@ bool auth_verify(const nlohmann::json& body, MsgType type, const std::string& cl
     return false;
   }
   // Prefer nonce when present (new peers); fall back to sig-only for older senders.
-  const auto replay_key = std::string(msg_type_name(type)) + "\n" + std::to_string(ts) + "\n" +
-                          nonce + "\n" + sig;
+  const auto replay_key =
+      std::string(msg_type_name(type)) + "\n" + std::to_string(ts) + "\n" + nonce + "\n" + sig;
   if (!replay_mark(replay_key, ts, now, max_skew_ms)) {
     err = "replay";
     return false;

@@ -18,17 +18,18 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <thread>
 #include <utility>
 
 #ifndef _WIN32
-#include <cerrno>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <cerrno>
 #endif
 
 namespace aios {
@@ -76,7 +77,7 @@ void apply_socket_deadlines(tcp::socket& sock, int timeout_ms) {
   const int fl = ::fcntl(fd, F_GETFL, 0);
   if (fl >= 0 && (fl & O_NONBLOCK)) ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
   if (timeout_ms > 0) {
-    struct timeval tv {};
+    struct timeval tv{};
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -373,38 +374,61 @@ struct Session::ConnPool {
     c = std::make_unique<Conn>();
     // Resolve + connect under one deadline: a black-holed peer must fail in
     // socket_timeout_ms, not hang in a synchronous connect for the TCP SYN timeout.
-    boost::asio::ip::tcp::resolver resolver(c->ioc);
+    // Numeric hosts skip getaddrinfo. Asio's resolver calls it on a process-wide
+    // helper, and concurrent lookups race (ThreadSanitizer) and can fail a connect.
+    boost::system::error_code addr_ec;
+    const auto address = boost::asio::ip::make_address(host, addr_ec);
+    unsigned short port_n = 0;
+    if (!addr_ec) {
+      try {
+        const auto n = std::stoul(port);
+        if (n > 0 && n <= 65535) port_n = static_cast<unsigned short>(n);
+      } catch (...) {
+      }
+    }
     boost::asio::steady_timer deadline(c->ioc);
-    boost::system::error_code resolve_ec = boost::asio::error::operation_aborted;
+    boost::system::error_code resolve_ec;
     boost::system::error_code connect_ec = boost::asio::error::operation_aborted;
     bool timed_out = false;
     bool finished = false;
+    std::optional<boost::asio::ip::tcp::resolver> resolver;
     if (timeout_ms > 0) {
       deadline.expires_after(std::chrono::milliseconds(timeout_ms));
       deadline.async_wait([&](const boost::system::error_code& e) {
         if (e || finished) return;
         timed_out = true;
-        resolver.cancel();
+        if (resolver) resolver->cancel();
         boost::system::error_code ignore;
         c->sock.close(ignore);
       });
     }
-    resolver.async_resolve(
-        host, port,
-        [&](const boost::system::error_code& e, tcp::resolver::results_type results) {
-          resolve_ec = e;
-          if (e) {
-            finished = true;
-            deadline.cancel();
-            return;
-          }
-          boost::asio::async_connect(
-              c->sock, results, [&](const boost::system::error_code& ce, const tcp::endpoint&) {
-                connect_ec = ce;
-                finished = true;
-                deadline.cancel();
-              });
-        });
+    if (port_n != 0) {
+      resolve_ec.clear();
+      c->sock.async_connect(tcp::endpoint(address, port_n),
+                            [&](const boost::system::error_code& ce) {
+                              connect_ec = ce;
+                              finished = true;
+                              deadline.cancel();
+                            });
+    } else {
+      resolver.emplace(c->ioc);
+      resolve_ec = boost::asio::error::operation_aborted;
+      resolver->async_resolve(
+          host, port, [&](const boost::system::error_code& e, tcp::resolver::results_type results) {
+            resolve_ec = e;
+            if (e) {
+              finished = true;
+              deadline.cancel();
+              return;
+            }
+            boost::asio::async_connect(
+                c->sock, results, [&](const boost::system::error_code& ce, const tcp::endpoint&) {
+                  connect_ec = ce;
+                  finished = true;
+                  deadline.cancel();
+                });
+          });
+    }
     c->ioc.run();
     c->ioc.restart();
     if (timed_out) throw client_error("http", "connect: timeout");
@@ -525,8 +549,8 @@ HttpResponse Session::bootstrap_get(const std::string& path) {
       auto fresh = pool_->take(host_, port_, cfg_.socket_timeout_ms, &ignored);
       try {
         bool close_conn = false;
-        auto r = exchange_http(*fresh->stream, fresh->leftover, "GET", path, host_, port_, headers, {},
-                               &close_conn);
+        auto r = exchange_http(*fresh->stream, fresh->leftover, "GET", path, host_, port_, headers,
+                               {}, &close_conn);
         pool_->put(std::move(fresh), !close_conn);
         return r;
       } catch (...) {
@@ -595,8 +619,7 @@ void Session::add_auth(std::unordered_map<std::string, std::string>& headers,
   // collide. A per-request nonce makes every signature unique.
   headers[kHttpNonceHeader] = http_next_nonce();
   const std::string signed_headers = "x-aios-content-sha256;x-aios-date";
-  const auto canon =
-      http_canonical(method, target, date, signed_headers, headers, payload_hash);
+  const auto canon = http_canonical(method, target, date, signed_headers, headers, payload_hash);
   std::string credential = "stl";
   std::string key = cfg_.cluster_key;
   if (uses_ticket()) {
@@ -659,7 +682,8 @@ void Session::ensure_ticket(bool force) {
     std::string msg = "ticket grant failed (HTTP " + std::to_string(resp.status) + ")";
     try {
       auto j = nlohmann::json::parse(resp.body);
-      if (j.contains("error") && j["error"].is_string()) msg += ": " + j["error"].get<std::string>();
+      if (j.contains("error") && j["error"].is_string())
+        msg += ": " + j["error"].get<std::string>();
       if (j.contains("code") && j["code"].is_string()) code = j["code"].get<std::string>();
     } catch (...) {
     }
@@ -741,8 +765,8 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
       ExchangeIo io;
       try {
         bool close_conn = false;
-        auto r = exchange_http(*conn->stream, conn->leftover, method, path, host, port, headers, body,
-                               &close_conn, &io);
+        auto r = exchange_http(*conn->stream, conn->leftover, method, path, host, port, headers,
+                               body, &close_conn, &io);
         pool_->put(std::move(conn), !close_conn);
         return r;
       } catch (const client_error&) {
@@ -814,8 +838,8 @@ HttpResponse Session::request_peer(const std::string& http_addr, const std::stri
         if (!redirect_allowed(new_host, new_port)) {
           refresh_redirect_allowlist();
           if (!redirect_allowed(new_host, new_port)) {
-            throw client_error("http", "redirect target not in cluster: " + new_host + ":" +
-                                           new_port);
+            throw client_error("http",
+                               "redirect target not in cluster: " + new_host + ":" + new_port);
           }
         }
       }
@@ -1006,8 +1030,8 @@ std::uint64_t Session::put_bytes_client(const std::string& oid, const std::strin
       throw client_error("bad_request", err);
     }
     std::vector<std::vector<std::uint8_t>> shards;
-    if (!ec->encode(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(body.data()),
-                                                  body.size()),
+    if (!ec->encode(std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(body.data()), body.size()),
                     shards, err)) {
       abort_grant();
       throw client_error("store_error", err);
@@ -1049,8 +1073,8 @@ std::uint64_t Session::put_bytes_client(const std::string& oid, const std::strin
         const auto crc = crc32c(reinterpret_cast<const std::uint8_t*>(piece.payload.data()),
                                 piece.payload.size());
         ih["x-aios-crc32c"] = std::to_string(crc);
-        auto resp = request_peer(piece.http_addr, "PUT", "/o/" + enc + "/install", ih,
-                                 piece.payload);
+        auto resp =
+            request_peer(piece.http_addr, "PUT", "/o/" + enc + "/install", ih, piece.payload);
         if (resp.status != 204 && resp.status != 200) {
           fails.fetch_add(1);
           std::lock_guard elock(err_mu);
@@ -1088,8 +1112,7 @@ void Session::put_range(const std::string& oid, std::uint64_t offset, const std:
   const std::uint64_t end = offset + static_cast<std::uint64_t>(data.size()) - 1;
   std::unordered_map<std::string, std::string> headers;
   headers["content-type"] = "application/octet-stream";
-  headers["content-range"] =
-      "bytes " + std::to_string(offset) + "-" + std::to_string(end) + "/*";
+  headers["content-range"] = "bytes " + std::to_string(offset) + "-" + std::to_string(end) + "/*";
   if (lock_token) {
     validate_header_value(*lock_token, "lock token");
     headers["x-aios-lock-token"] = *lock_token;
@@ -1101,8 +1124,7 @@ void Session::put_range(const std::string& oid, std::uint64_t offset, const std:
   }
 }
 
-void Session::delete_object(const std::string& oid,
-                            const std::optional<std::string>& lock_token) {
+void Session::delete_object(const std::string& oid, const std::optional<std::string>& lock_token) {
   std::unordered_map<std::string, std::string> headers;
   if (lock_token) {
     validate_header_value(*lock_token, "lock token");
@@ -1321,8 +1343,7 @@ std::string Session::txn_begin() {
 }
 
 void Session::txn_prepare_put(const std::string& txn_id, const std::string& oid,
-                              const std::string& body,
-                              std::optional<std::uint64_t> expected_cas,
+                              const std::string& body, std::optional<std::uint64_t> expected_cas,
                               const std::optional<std::string>& lock_token,
                               const std::unordered_map<std::string, std::string>& attrs) {
   if (txn_id.empty() || oid.empty()) throw client_error("bad_request", "txn_prepare_put args");

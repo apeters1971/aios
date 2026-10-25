@@ -1,7 +1,7 @@
 // TLS on the HTTP API listener (http_tls_cert / http_tls_key / http_tls_ca) and
 // the client side of it: aios::Session, libaios_posix, the bench client.
-#include "test_helpers.hpp"
 #include <gtest/gtest.h>
+#include "test_helpers.hpp"
 
 #include "bench/http_bench.hpp"
 #include "client/session.hpp"
@@ -29,7 +29,9 @@ namespace {
 namespace fs = std::filesystem;
 using aios::test::DualStoreFixture;
 
-int pid_port(int base) { return base + static_cast<int>(::getpid() % 200); }
+int pid_port(int base) {
+  return base + static_cast<int>(::getpid() % 200);
+}
 
 // Self-signed cert for 127.0.0.1. with_ip_san: also carry an IP SAN so a
 // verifying client can pin it; without one only --tls-insecure connects.
@@ -42,16 +44,23 @@ bool make_self_signed(const fs::path& cert_pem, const fs::path& key_pem, bool wi
   X509_gmtime_adj(X509_get_notBefore(x), -60);
   X509_gmtime_adj(X509_get_notAfter(x), 3600);
   X509_set_pubkey(x, pkey);
-  X509_NAME* name = X509_get_subject_name(x);
+  // OpenSSL 3 returns a const subject name; build one and install copies.
+  X509_NAME* name = X509_NAME_new();
+  if (!name) {
+    X509_free(x);
+    EVP_PKEY_free(pkey);
+    return false;
+  }
   X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                              reinterpret_cast<const unsigned char*>("127.0.0.1"), -1, -1, 0);
+  X509_set_subject_name(x, name);
   X509_set_issuer_name(x, name);
+  X509_NAME_free(name);
   if (with_ip_san) {
     X509V3_CTX ctx;
     X509V3_set_ctx_nodb(&ctx);
     X509V3_set_ctx(&ctx, x, x, nullptr, nullptr, 0);
-    X509_EXTENSION* ext =
-        X509V3_EXT_conf_nid(nullptr, &ctx, NID_subject_alt_name, "IP:127.0.0.1");
+    X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &ctx, NID_subject_alt_name, "IP:127.0.0.1");
     if (!ext) return false;
     X509_add_ext(x, ext, -1);
     X509_EXTENSION_free(ext);
